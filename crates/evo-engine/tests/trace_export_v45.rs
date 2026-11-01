@@ -9,6 +9,7 @@ use evo_core::{ArtifactKind, Context, Error, Feedback, Outcome, Prepare, Proposa
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, load_stored_source};
 use evo_engine::release_store::ReleaseStore;
 use evo_engine::service::{CompleteHostPrepareConfig, HostService};
+use evo_engine::trace_export::{compiled_exporter_identity, prepare_native_candidate};
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
 use serde_json::{Value, json};
@@ -17,8 +18,12 @@ fn context(actor: &str, role: Role) -> Context {
     Context::new("tenant-a", actor, role).unwrap()
 }
 
-#[tokio::test]
-async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity() {
+async fn setup() -> (
+    tempfile::TempDir,
+    HostService,
+    Context,
+    CompleteHostPrepareConfig,
+) {
     let source = evo_core::contract::ToolSourceV1 {
         schema_version: evo_core::contract::TOOL_SOURCE_SCHEMA.into(),
         domain: "mcp_protocol".into(),
@@ -104,7 +109,13 @@ async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity()
         evo_core::fingerprint(&record.manifest).unwrap()
     );
     let service = HostService::new(store, host.clone()).unwrap();
+    (dir, service, host, config)
+}
 
+#[tokio::test]
+async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity() {
+    let (_dir, service, host, config) = setup().await;
+    let admin = context("admin", Role::Admin);
     let agent = context("agent-a", Role::Agent);
     let request = Prepare {
         request_key: "capture-prepare".into(),
@@ -613,4 +624,268 @@ async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity()
     assert_eq!(live_body["facts"].as_array().unwrap().len(), 1);
     assert_eq!(live_body["facts"][0]["kind"], "service.prepare");
     assert_eq!(live.trace.outcome, TraceOutcome::Incomplete);
+}
+
+async fn captured_source() -> (
+    tempfile::TempDir,
+    HostService,
+    Context,
+    StoredTraceAuthority,
+) {
+    let (dir, service, host, config) = setup().await;
+    let agent = context("agent-a", Role::Agent);
+    let prepared = service
+        .prepare_complete(
+            &agent,
+            Prepare {
+                request_key: "native-prepare".into(),
+                goal: "native-private-goal".into(),
+                capabilities: vec!["fs_read".into()],
+            },
+            &config,
+        )
+        .await
+        .unwrap();
+    service
+        .feedback(
+            &agent,
+            Feedback {
+                request_key: "native-feedback".into(),
+                run_id: prepared.run.id.clone(),
+                outcome: Outcome::Failure,
+                details: "native-private-feedback".into(),
+                failure_class: evo_core::FailureClass::Reasoning,
+            },
+        )
+        .await
+        .unwrap();
+    let source = service
+        .record_service_facts(&host, &prepared.run.id)
+        .await
+        .unwrap();
+    (dir, service, context("admin", Role::Admin), source)
+}
+
+#[tokio::test]
+async fn trace_export_requires_frozen_native_event_shape_and_explicit_roles() {
+    let (_dir, service, admin, source) = captured_source().await;
+    let captured: Value = serde_json::from_slice(&source.record.body).unwrap();
+    let before = service.store().verify_audit(&admin).await.unwrap();
+    let mut session = service.store().session().await.unwrap();
+    let runs = session.namespace_object_count(&admin, "run").await.unwrap();
+    assert!(matches!(
+        prepare_native_candidate(&context("agent-a", Role::Agent), &mut session, "bad/id").await,
+        Err(Error::Forbidden)
+    ));
+    let bytes = prepare_native_candidate(&admin, &mut session, &source.record.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.namespace_object_count(&admin, "run").await.unwrap(),
+        runs
+    );
+    session.commit().await.unwrap();
+    assert_eq!(service.store().verify_audit(&admin).await.unwrap(), before);
+    let native: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(native["schema_version"], "rsia.trace.v1");
+    assert_eq!(native["run_id"], captured["service_run_id"]);
+    assert_eq!(native["events"].as_array().unwrap().len(), 2);
+    for (event, fact) in native["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(captured["facts"].as_array().unwrap())
+    {
+        assert_eq!(event["sequence"], fact["sequence"]);
+        assert_eq!(event["role"], fact["role"]);
+        assert_eq!(event["role"], "agent");
+        assert_eq!(event["kind"], fact["kind"]);
+        assert!(
+            event["content"]
+                .as_str()
+                .unwrap()
+                .contains(fact["subject_id"].as_str().unwrap())
+        );
+    }
+    assert_eq!(native["coverage"]["discovery_exhausted"], false);
+    assert_eq!(native["coverage"]["files_known"], false);
+    assert_eq!(native["coverage"]["events_seen"], 2);
+    assert_eq!(native["coverage"]["events_exported"], 2);
+    assert_eq!(native["coverage"]["bytes_read"], source.record.body.len());
+    // Prospective declarations in private bytes prove the frozen reader shape,
+    // never a completed human review, persistence or delivery.
+    assert_eq!(native["redaction_report"]["review_status"], "reviewed");
+    let decoded = evo_engine::import::parse_fixture(
+        evo_engine::import::SourceFormat::RsiaTraceV1,
+        std::str::from_utf8(&bytes).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(decoded.len(), 2);
+    assert!(decoded.iter().all(|event| event.role == "agent"
+        && event.attestation == ExecutionAttestation::UnverifiedImport));
+    assert!(
+        !std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("native-private-goal")
+    );
+    assert!(
+        !std::str::from_utf8(&bytes)
+            .unwrap()
+            .contains("native-private-feedback")
+    );
+    service
+        .feedback(
+            &context("agent-a", Role::Agent),
+            Feedback {
+                request_key: "after-capture".into(),
+                run_id: captured["service_run_id"].as_str().unwrap().into(),
+                outcome: Outcome::Success,
+                details: "later private content".into(),
+                failure_class: evo_core::FailureClass::Unknown,
+            },
+        )
+        .await
+        .unwrap();
+    let mut session = service.store().session().await.unwrap();
+    assert_eq!(
+        prepare_native_candidate(&admin, &mut session, &source.record.id)
+            .await
+            .unwrap(),
+        bytes
+    );
+    session.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn trace_export_uses_compiled_exporter_identity() {
+    let (_dir, service, admin, source) = captured_source().await;
+    let mut session = service.store().session().await.unwrap();
+    let compiled = option_env!("RSIA_EXPORTER_COMMIT").unwrap_or("unknown");
+    if matches!(compiled, "dirty" | "unknown") {
+        assert!(
+            matches!(compiled_exporter_identity(), Err(Error::Invalid(message)) if message == "native exporter requires a clean known build commit")
+        );
+        assert!(
+            matches!(prepare_native_candidate(&admin, &mut session, &source.record.id).await, Err(Error::Invalid(message)) if message == "native exporter requires a clean known build commit")
+        );
+    } else {
+        let exporter = compiled_exporter_identity().unwrap();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let actual = std::process::Command::new("git")
+            .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .args(["--no-optional-locks", "rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(actual.status.success(), "read actual repository HEAD");
+        let actual = String::from_utf8(actual.stdout).unwrap();
+        let actual = actual.trim();
+        assert_eq!(actual.len(), 40);
+        assert!(
+            actual
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert_eq!(exporter.commit, actual);
+        assert_eq!(compiled, actual);
+        assert_eq!(exporter.name, "rsia");
+        assert_eq!(exporter.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(exporter.commit, compiled);
+        assert_eq!(exporter.commit.len(), 40);
+        assert!(
+            exporter
+                .commit
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        let bytes = prepare_native_candidate(&admin, &mut session, &source.record.id)
+            .await
+            .unwrap();
+        let native: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(native["exporter"], serde_json::to_value(exporter).unwrap());
+    }
+    session.commit().await.unwrap();
+}
+
+#[tokio::test]
+async fn trace_export_legacy_opaque_run_never_becomes_native_events() {
+    let (_dir, service, admin, source) = captured_source().await;
+    let host = context("gateway-host", Role::Host);
+    let mut session = service.store().session().await.unwrap();
+    let healthy = prepare_native_candidate(&admin, &mut session, &source.record.id)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let mut opaque = source.clone();
+    opaque.record.id = "native-old-opaque".into();
+    opaque.record.body = b"old opaque conversation without service events".to_vec();
+    opaque.trace.run_id = opaque.record.id.clone();
+    opaque.trace.source_digest = hash(&opaque.record.body);
+    opaque.trace.excerpt = String::from_utf8(opaque.record.body.clone()).unwrap();
+    opaque.excerpt_end = opaque.record.body.len();
+    service.record_trace(&host, &opaque).await.unwrap();
+    let before = service.store().verify_audit(&admin).await.unwrap();
+    let mut session = service.store().session().await.unwrap();
+    assert!(
+        matches!(prepare_native_candidate(&admin, &mut session, &opaque.record.id).await, Err(Error::Invalid(message)) if message == "invalid service fact source")
+    );
+    assert_eq!(
+        load_stored_source(&mut session, &host, &opaque.record.id)
+            .await
+            .unwrap()
+            .record
+            .body,
+        opaque.record.body
+    );
+    session.commit().await.unwrap();
+    for (field, value, expected) in [
+        (
+            "schema_version",
+            json!("rsia.service_fact_source.future"),
+            "forbidden",
+        ),
+        ("license", json!("unknown"), "forbidden"),
+        ("role", json!("host"), "capture"),
+        ("sequence", json!(0), "capture"),
+    ] {
+        let mut changed = source.clone();
+        let mut body: Value = serde_json::from_slice(&changed.record.body).unwrap();
+        if matches!(field, "role" | "sequence") {
+            body["facts"][0][field] = value;
+        } else {
+            body[field] = value;
+        }
+        changed.record.body = serde_json::to_vec(&body).unwrap();
+        changed.trace.source_digest = hash(&changed.record.body);
+        changed.trace.excerpt = String::from_utf8(changed.record.body.clone()).unwrap();
+        changed.excerpt_end = changed.record.body.len();
+        let mut session = service.store().session().await.unwrap();
+        session
+            .put(&host, "run", &source.record.id, host.actor(), &changed)
+            .await
+            .unwrap();
+        let refused = prepare_native_candidate(&admin, &mut session, &source.record.id).await;
+        match expected {
+            "forbidden" => assert!(matches!(refused, Err(Error::Forbidden))),
+            _ => assert!(
+                matches!(refused, Err(Error::Conflict(message)) if message == "service fact source differs from authenticated capture")
+            ),
+        }
+        drop(session); // Tampering remains an uncommitted negative fixture.
+    }
+    let mut session = service.store().session().await.unwrap();
+    assert_eq!(
+        prepare_native_candidate(&admin, &mut session, &source.record.id)
+            .await
+            .unwrap(),
+        healthy
+    );
+    session.commit().await.unwrap();
+    assert_eq!(service.store().verify_audit(&admin).await.unwrap(), before);
 }
