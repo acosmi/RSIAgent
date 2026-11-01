@@ -155,3 +155,142 @@ pub async fn prepare_native_candidate(
     }
     Ok(bytes)
 }
+
+/// Files and exact tree identity for a future Admin decision. This is private
+/// preparation material; it carries no delivery or completed-review receipt.
+#[derive(Debug, Clone)]
+pub struct NativeCandidateMembers {
+    pub files: Vec<evo_storage::LocalExportFile>,
+    pub candidate_digest: String,
+    pub total_bytes: u64,
+}
+
+/// Only scanner rule names and counts leave this boundary. The package scanner's
+/// raw snippets, finding details and input paths are never copied to this report.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativePrivacyReport {
+    pub schema_version: String,
+    pub status: crate::packages::RedactionStatus,
+    pub findings_by_rule: std::collections::BTreeMap<String, u64>,
+    pub disclaimer: String,
+}
+
+/// Scan a bounded text-member set. This is policy inspection, not source
+/// authentication, review, or publication; the producer below supplies authority.
+pub fn scan_native_candidate_members(
+    files: &[evo_storage::LocalExportFile],
+) -> Result<NativePrivacyReport> {
+    if files.iter().any(|file| file.bytes.is_empty()) {
+        return Err(Error::Invalid(
+            "native candidate member validation failed".into(),
+        ));
+    }
+    let members: Vec<_> = files
+        .iter()
+        .map(|file| crate::packages::PackageMember {
+            path: file.path.clone(),
+            size: file.bytes.len() as u64,
+            compressed: file.bytes.len() as u64,
+        })
+        .collect();
+    crate::packages::reject_package(&members)
+        .map_err(|_| Error::Invalid("native candidate member validation failed".into()))?;
+    let mut findings_by_rule = std::collections::BTreeMap::new();
+    let mut status = crate::packages::RedactionStatus::Clean;
+    for file in files {
+        let text = std::str::from_utf8(&file.bytes)
+            .map_err(|_| Error::Invalid("native candidate member is not UTF-8".into()))?;
+        for input in [file.path.as_str(), text] {
+            let scanned = crate::packages::scan_privacy(input)?;
+            for finding in scanned.findings {
+                if finding.severity == crate::packages::FindingSeverity::Block {
+                    status = crate::packages::RedactionStatus::Blocked;
+                } else if status == crate::packages::RedactionStatus::Clean {
+                    status = crate::packages::RedactionStatus::Warning;
+                }
+                *findings_by_rule.entry(finding.rule).or_insert(0) += 1;
+            }
+        }
+    }
+    Ok(NativePrivacyReport {
+        schema_version: "rsia.trace_export.redaction_report.v1".into(),
+        status,
+        findings_by_rule,
+        disclaimer: crate::packages::PRIVACY_DISCLAIMER.into(),
+    })
+}
+
+/// Prepare multiple authenticated runs under one read transaction. The manifest
+/// covers each trace and the report; the final tree digest also covers the
+/// manifest itself, so the later decision can bind every exact candidate byte.
+pub async fn prepare_native_members(
+    ctx: &Context,
+    session: &mut Session,
+    source_ids: &[String],
+) -> Result<NativeCandidateMembers> {
+    ctx.require(&[Role::Admin])?;
+    if source_ids.is_empty() || source_ids.len() > crate::packages::MAX_FILES - 2 {
+        return Err(Error::Invalid(
+            "native trace source count is invalid".into(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for id in source_ids {
+        if !seen.insert(id) {
+            return Err(Error::Invalid("duplicate native trace source".into()));
+        }
+    }
+    let mut files = Vec::with_capacity(source_ids.len() + 2);
+    let mut sources = Vec::with_capacity(source_ids.len());
+    for (index, source_id) in source_ids.iter().enumerate() {
+        let path = format!("traces/{index:04}.json");
+        files.push(evo_storage::LocalExportFile {
+            path: path.clone(),
+            bytes: prepare_native_candidate(ctx, session, source_id).await?,
+        });
+        sources.push(json!({"source_id": source_id, "path": path}));
+    }
+    let report = scan_native_candidate_members(&files)?;
+    if report.status != crate::packages::RedactionStatus::Clean {
+        return Err(Error::Invalid(
+            "native candidate privacy scan rejected".into(),
+        ));
+    }
+    files.push(evo_storage::LocalExportFile {
+        path: "redaction-report.json".into(),
+        bytes: serde_json::to_vec(&report).map_err(|_| Error::Internal)?,
+    });
+    let entries: Vec<_> = files
+        .iter()
+        .map(|file| crate::packages::PackageEntry {
+            path: file.path.clone(),
+            digest_sha256: evo_core::hash(&file.bytes),
+            size_bytes: file.bytes.len() as u64,
+            compressed_bytes: file.bytes.len() as u64,
+        })
+        .collect();
+    files.push(evo_storage::LocalExportFile {
+        path: "manifest.json".into(),
+        bytes: serde_json::to_vec(&json!({
+            "schema_version": "rsia.trace_export.manifest.v1",
+            "kind": "trace",
+            "license": "RSIA-authored service success facts; origin instance and namespace only",
+            "recipient_scope": SERVICE_FACTS_RECIPIENT,
+            "sources": sources,
+            "files": entries,
+        }))
+        .map_err(|_| Error::Internal)?,
+    });
+    if scan_native_candidate_members(&files)?.status != crate::packages::RedactionStatus::Clean {
+        return Err(Error::Invalid(
+            "native candidate privacy scan rejected".into(),
+        ));
+    }
+    let (candidate_digest, total_bytes) = evo_storage::local_export_tree_digest(&files)?;
+    Ok(NativeCandidateMembers {
+        files,
+        candidate_digest,
+        total_bytes,
+    })
+}

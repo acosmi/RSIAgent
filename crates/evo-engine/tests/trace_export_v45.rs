@@ -9,7 +9,10 @@ use evo_core::{ArtifactKind, Context, Error, Feedback, Outcome, Prepare, Proposa
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, load_stored_source};
 use evo_engine::release_store::ReleaseStore;
 use evo_engine::service::{CompleteHostPrepareConfig, HostService};
-use evo_engine::trace_export::{compiled_exporter_identity, prepare_native_candidate};
+use evo_engine::trace_export::{
+    compiled_exporter_identity, prepare_native_candidate, prepare_native_members,
+    scan_native_candidate_members,
+};
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
 use serde_json::{Value, json};
@@ -888,4 +891,289 @@ async fn trace_export_legacy_opaque_run_never_becomes_native_events() {
     );
     session.commit().await.unwrap();
     assert_eq!(service.store().verify_audit(&admin).await.unwrap(), before);
+}
+
+#[tokio::test]
+async fn trace_export_removes_forbidden_content_before_publication() {
+    let (_dir, service, host, config) = setup().await;
+    let agent = context("agent-a", Role::Agent);
+    let admin = context("admin", Role::Admin);
+    let private =
+        "ANSWER: private-task-answer /Users/private/code sk-FAKE_PRIVATE_TOKEN 192.168.4.2";
+    let mut source_ids = Vec::new();
+    let mut run_ids = Vec::new();
+    for index in 0..2 {
+        let prepared = service
+            .prepare_complete(
+                &agent,
+                Prepare {
+                    request_key: format!("members-prepare-{index}"),
+                    goal: private.into(),
+                    capabilities: vec!["fs_read".into()],
+                },
+                &config,
+            )
+            .await
+            .unwrap();
+        let feedback = service
+            .feedback(
+                &agent,
+                Feedback {
+                    request_key: format!("members-feedback-{index}"),
+                    run_id: prepared.run.id.clone(),
+                    outcome: Outcome::Failure,
+                    details: private.into(),
+                    failure_class: evo_core::FailureClass::Reasoning,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .propose(
+                &agent,
+                Proposal {
+                    request_key: format!("members-propose-{index}"),
+                    run_id: prepared.run.id.clone(),
+                    kind: ArtifactKind::Skill,
+                    parent_snapshot: prepared.run.snapshot_id,
+                    hypothesis: private.into(),
+                    applicability: "reference host".into(),
+                    counterexample: "other hosts".into(),
+                    content: private.into(),
+                    evidence_refs: vec![feedback.id],
+                    required_capabilities: vec!["fs_read".into()],
+                    dependencies: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        let source = service
+            .record_service_facts(&host, &prepared.run.id)
+            .await
+            .unwrap();
+        source_ids.push(source.record.id);
+        run_ids.push(prepared.run.id);
+    }
+    let before = service.store().verify_audit(&admin).await.unwrap();
+    let mut session = service.store().session().await.unwrap();
+    let run_count = session.namespace_object_count(&admin, "run").await.unwrap();
+    let candidate = prepare_native_members(&admin, &mut session, &source_ids)
+        .await
+        .unwrap();
+    assert_eq!(candidate.files.len(), 4);
+    assert_eq!(
+        candidate.total_bytes,
+        candidate
+            .files
+            .iter()
+            .map(|file| file.bytes.len() as u64)
+            .sum::<u64>()
+    );
+    assert_eq!(
+        candidate.candidate_digest,
+        evo_storage::local_export_tree_digest(&candidate.files)
+            .unwrap()
+            .0
+    );
+    assert_eq!(
+        prepare_native_members(&admin, &mut session, &source_ids)
+            .await
+            .unwrap()
+            .candidate_digest,
+        candidate.candidate_digest
+    );
+    assert!(
+        matches!(prepare_native_members(&admin, &mut session, &[source_ids[0].clone(), source_ids[0].clone()]).await, Err(Error::Invalid(message)) if message == "duplicate native trace source")
+    );
+    assert!(
+        matches!(prepare_native_members(&admin, &mut session, &[]).await, Err(Error::Invalid(message)) if message == "native trace source count is invalid")
+    );
+    assert!(
+        matches!(prepare_native_members(&admin, &mut session, &vec![source_ids[0].clone(); 99]).await, Err(Error::Invalid(message)) if message == "native trace source count is invalid")
+    );
+    assert_eq!(
+        session.namespace_object_count(&admin, "run").await.unwrap(),
+        run_count
+    );
+    session.commit().await.unwrap();
+    assert_eq!(service.store().verify_audit(&admin).await.unwrap(), before);
+    let manifest: Value = serde_json::from_slice(
+        &candidate
+            .files
+            .iter()
+            .find(|file| file.path == "manifest.json")
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(manifest["schema_version"], "rsia.trace_export.manifest.v1");
+    assert_eq!(manifest["kind"], "trace");
+    assert_eq!(
+        manifest["license"],
+        "RSIA-authored service success facts; origin instance and namespace only"
+    );
+    assert_eq!(
+        manifest["recipient_scope"],
+        "origin_instance_local_namespace_only"
+    );
+    assert_eq!(manifest["sources"].as_array().unwrap().len(), 2);
+    for index in 0..2 {
+        let file = &candidate.files[index];
+        let native: Value = serde_json::from_slice(&file.bytes).unwrap();
+        assert_eq!(native["run_id"], run_ids[index]);
+        assert_eq!(manifest["sources"][index]["source_id"], source_ids[index]);
+        assert_eq!(manifest["sources"][index]["path"], file.path);
+        assert_eq!(native["events"].as_array().unwrap().len(), 3);
+        assert_eq!(native["events"][0]["kind"], "service.prepare");
+        assert_eq!(native["events"][1]["kind"], "service.feedback");
+        assert_eq!(native["events"][2]["kind"], "service.propose");
+        assert!(
+            native["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|event| event["role"] == "agent")
+        );
+    }
+    for file in &candidate.files {
+        let text = std::str::from_utf8(&file.bytes).unwrap();
+        for forbidden in [
+            "ANSWER:",
+            "/Users/",
+            "sk-",
+            "192.168.",
+            "private-task-answer",
+            "rsia.service_facts.summary.local.v1",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "private content omitted before scanning"
+            );
+        }
+        assert_eq!(
+            evo_engine::packages::scan_privacy(text).unwrap().status,
+            evo_engine::packages::RedactionStatus::Clean
+        );
+        assert_eq!(
+            evo_engine::packages::scan_privacy(&file.path)
+                .unwrap()
+                .status,
+            evo_engine::packages::RedactionStatus::Clean
+        );
+    }
+    let report: Value = serde_json::from_slice(
+        &candidate
+            .files
+            .iter()
+            .find(|file| file.path == "redaction-report.json")
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert_eq!(report["status"], "clean");
+    assert_eq!(report["findings_by_rule"], json!({}));
+    assert!(report.get("findings").is_none());
+    let mut changed = candidate.files.clone();
+    changed[0].bytes.push(b' ');
+    assert_ne!(
+        evo_storage::local_export_tree_digest(&changed).unwrap().0,
+        candidate.candidate_digest
+    );
+}
+
+#[test]
+fn trace_export_scans_manifest_paths_and_redaction_report_without_raw_snippets() {
+    use evo_engine::packages::{MAX_FILE, MAX_FILES, RedactionStatus};
+    use evo_storage::LocalExportFile;
+    // These members exercise scanner policy only. They grant no Native source,
+    // human review, publication, or delivery authority.
+    let file = |path: &str, bytes: &[u8]| LocalExportFile {
+        path: path.into(),
+        bytes: bytes.to_vec(),
+    };
+    for (path, secret) in [
+        ("traces/a.json", "sk-FAKE_TRACE_TOKEN"),
+        ("manifest.json", "sk-FAKE_MANIFEST_TOKEN"),
+        ("redaction-report.json", "sk-FAKE_REPORT_TOKEN"),
+        ("sk-FAKE_PATH_TOKEN.json", "sk-FAKE_PATH_TOKEN"),
+    ] {
+        let members = if path.starts_with("sk-") {
+            vec![file(path, b"{}")]
+        } else {
+            vec![file(path, secret.as_bytes())]
+        };
+        let report = scan_native_candidate_members(&members).unwrap();
+        assert_eq!(report.status, RedactionStatus::Blocked);
+        assert!(report.findings_by_rule["secret_token"] > 0);
+        let safe = serde_json::to_string(&report).unwrap();
+        assert!(!safe.contains(secret));
+        assert!(!safe.contains("snippet"));
+        assert!(!safe.contains("detail"));
+        assert!(!safe.contains(path));
+    }
+    for (text, rule) in [
+        ("ANSWER: hidden", "hidden_answer"),
+        ("BEGIN PRIVATE KEY", "private_key"),
+        ("/Users/alice/private", "local_user_path"),
+        ("192.168.1.15", "internal_network"),
+    ] {
+        let report = scan_native_candidate_members(&[file("a.json", text.as_bytes())]).unwrap();
+        assert_eq!(report.status, RedactionStatus::Blocked);
+        assert!(report.findings_by_rule[rule] > 0);
+        assert!(!serde_json::to_string(&report).unwrap().contains(text));
+    }
+    for path in [
+        "../a.json",
+        "/tmp/a.json",
+        "a//b.json",
+        "./a.json",
+        "C:/a.json",
+        "a.py",
+    ] {
+        assert!(
+            matches!(scan_native_candidate_members(&[file(path, b"{}")]), Err(Error::Invalid(message)) if message == "native candidate member validation failed")
+        );
+    }
+    for members in [
+        vec![file("A.json", b"{}"), file("a.json", b"{}")],
+        vec![file("a", b"{}"), file("a/b.json", b"{}")],
+    ] {
+        assert!(
+            matches!(scan_native_candidate_members(&members), Err(Error::Invalid(message)) if message == "native candidate member validation failed")
+        );
+    }
+    assert!(
+        matches!(scan_native_candidate_members(&[file("empty.json", b"")]), Err(Error::Invalid(message)) if message == "native candidate member validation failed")
+    );
+    assert!(
+        matches!(scan_native_candidate_members(&[file("invalid.json", &[255])]), Err(Error::Invalid(message)) if message == "native candidate member is not UTF-8")
+    );
+    let hundred: Vec<_> = (0..MAX_FILES)
+        .map(|index| file(&format!("{index}.json"), b"{}"))
+        .collect();
+    assert_eq!(
+        scan_native_candidate_members(&hundred).unwrap().status,
+        RedactionStatus::Clean
+    );
+    let mut too_many = hundred;
+    too_many.push(file("extra.json", b"{}"));
+    assert!(
+        matches!(scan_native_candidate_members(&too_many), Err(Error::Invalid(message)) if message == "native candidate member validation failed")
+    );
+    let max_file = vec![b'a'; MAX_FILE as usize];
+    let mut total: Vec<_> = (0..10)
+        .map(|index| file(&format!("large-{index}.json"), &max_file))
+        .collect();
+    assert_eq!(
+        scan_native_candidate_members(&total).unwrap().status,
+        RedactionStatus::Clean
+    );
+    total.push(file("one-more.json", b"a"));
+    assert!(
+        matches!(scan_native_candidate_members(&total), Err(Error::Invalid(message)) if message == "native candidate member validation failed")
+    );
+    let oversized = vec![b'a'; MAX_FILE as usize + 1];
+    assert!(
+        matches!(scan_native_candidate_members(&[file("too-large.json", &oversized)]), Err(Error::Invalid(message)) if message == "native candidate member validation failed")
+    );
 }
