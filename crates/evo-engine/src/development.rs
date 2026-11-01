@@ -3131,6 +3131,37 @@ mod pre_dispatch_tests {
                 )
                 .await
                 .unwrap();
+            let host = Context::new("n", "host", Role::Host).unwrap();
+            crate::evidence::store_trace_authority(
+                &store,
+                &host,
+                &crate::evidence::StoredTraceAuthority {
+                    schema_version: "rsia.optimization.source.v1".into(),
+                    record: crate::evidence::StoredRunRecord {
+                        id: "source".into(),
+                        body: b"source".to_vec(),
+                        parent_family: "family".into(),
+                        task_origin: evo_core::evidence::TaskOrigin::TrustedRun,
+                        execution_attestation:
+                            evo_core::evidence::ExecutionAttestation::TrustedHost,
+                        purpose: Purpose::Development,
+                    },
+                    trace: evo_core::optimization::OptimizationTrace {
+                        run_id: "source".into(),
+                        parent_family: "family".into(),
+                        source_digest: hash(b"source"),
+                        purpose: Purpose::Development,
+                        outcome: evo_core::optimization::TraceOutcome::Success,
+                        diagnosis: None,
+                        excerpt: "source".into(),
+                        seed: 1,
+                    },
+                    excerpt_start: 0,
+                    excerpt_end: 6,
+                },
+            )
+            .await
+            .unwrap();
             let call = store
                 .reserve_budget_call_with_sources(
                     &executor,
@@ -3429,37 +3460,6 @@ mod pre_dispatch_tests {
     async fn q03_proven_revocation_preserves_reserved_compensation_and_healthy_failure_releases() {
         for revoked in [false, true] {
             let fixture = CleanupFixture::new().await;
-            let host = Context::new("n", "host", Role::Host).unwrap();
-            crate::evidence::store_trace_authority(
-                &fixture.runner.store,
-                &host,
-                &crate::evidence::StoredTraceAuthority {
-                    schema_version: "rsia.optimization.source.v1".into(),
-                    record: crate::evidence::StoredRunRecord {
-                        id: "source".into(),
-                        body: b"source".to_vec(),
-                        parent_family: "family".into(),
-                        task_origin: evo_core::evidence::TaskOrigin::TrustedRun,
-                        execution_attestation:
-                            evo_core::evidence::ExecutionAttestation::TrustedHost,
-                        purpose: Purpose::Development,
-                    },
-                    trace: evo_core::optimization::OptimizationTrace {
-                        run_id: "source".into(),
-                        parent_family: "family".into(),
-                        source_digest: hash(b"source"),
-                        purpose: Purpose::Development,
-                        outcome: evo_core::optimization::TraceOutcome::Success,
-                        diagnosis: None,
-                        excerpt: "source".into(),
-                        seed: 1,
-                    },
-                    excerpt_start: 0,
-                    excerpt_end: 6,
-                },
-            )
-            .await
-            .unwrap();
             if revoked {
                 let admin = Context::new("n", "admin", Role::Admin).unwrap();
                 evo_storage::lifecycle::LifecycleStore::begin_revoke(

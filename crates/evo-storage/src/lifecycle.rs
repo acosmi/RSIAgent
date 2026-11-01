@@ -173,7 +173,10 @@ struct NativeRunRecordWire {
     purpose: evo_core::evidence::Purpose,
 }
 
-fn valid_native_trace_authority(node: &TypedObjectRef, value: &serde_json::Value) -> bool {
+pub(crate) fn valid_native_trace_authority(
+    node: &TypedObjectRef,
+    value: &serde_json::Value,
+) -> bool {
     let Ok(authority) = serde_json::from_value::<NativeTraceAuthorityWire>(value.clone()) else {
         return false;
     };
@@ -196,128 +199,15 @@ fn valid_native_trace_authority(node: &TypedObjectRef, value: &serde_json::Value
         && identifier(&record.parent_family).is_ok()
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RevocableImportEnvelope {
-    schema_version: String,
-    id: String,
-    namespace: String,
-    owner_actor: String,
-    request_key: String,
-    input_digest: String,
-    created_at: i64,
-    updated_at: i64,
-    source_refs: Vec<RevocableImportRef>,
-    revoke_watermark: u64,
-    payload: RevocableImportPayload,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RevocableImportRef {
-    kind: String,
-    id: String,
-    content_digest: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RevocableImportPayload {
-    selection_id: String,
-    logical_source_id: String,
-    authorized_path: String,
-    reader: String,
-    reader_version: String,
-    raw_digest: String,
-    observed_digest: Option<String>,
-    raw_blob_digest: String,
-    blob_published: bool,
-    byte_len: u64,
-    status: String,
-    task_origin: evo_core::evidence::TaskOrigin,
-    execution_attestation: evo_core::evidence::ExecutionAttestation,
-    purpose: evo_core::evidence::Purpose,
-}
-
-pub(crate) fn qualified_revocable_source(
+pub(crate) fn registered_import_source(
     namespace: &str,
-    owner: &str,
-    kind: evo_core::evidence::RevocableSourceKind,
-    id: &str,
+    source: &TypedObjectRef,
     value: &serde_json::Value,
 ) -> bool {
-    use evo_core::evidence::RevocableSourceKind;
-    if kind == RevocableSourceKind::TrustedRun {
-        return valid_native_trace_authority(
-            &TypedObjectRef {
-                kind: "run".into(),
-                id: id.into(),
-            },
-            value,
-        );
-    }
-    let Ok(envelope) = serde_json::from_value::<RevocableImportEnvelope>(value.clone()) else {
-        return false;
-    };
-    let p = &envelope.payload;
-    let valid_digest = |digest: &str| {
-        digest.len() == 64
-            && digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    };
-    if envelope.schema_version != "rsia.e16.import_source.v1"
-        || envelope.id != id
-        || envelope.namespace != namespace
-        || envelope.owner_actor != owner
-        || identifier(owner).is_err()
-        || identifier(&envelope.request_key).is_err()
-        || !valid_digest(&envelope.input_digest)
-        || envelope.created_at < 0
-        || envelope.updated_at < envelope.created_at
-        || identifier(&p.selection_id).is_err()
-        || identifier(&p.logical_source_id).is_err()
-        || p.authorized_path.is_empty()
-        || !matches!(
-            p.reader.as_str(),
-            "rsia_trace_v1" | "rsih_pi_fixture" | "claude_fixture"
-        )
-        || p.reader_version.is_empty()
-        || !valid_digest(&p.raw_digest)
-        || p.raw_blob_digest != p.raw_digest
-        || p.observed_digest
-            .as_deref()
-            .is_some_and(|digest| !valid_digest(digest))
-        || p.task_origin != evo_core::evidence::TaskOrigin::ImportedHistory
-        || p.execution_attestation != evo_core::evidence::ExecutionAttestation::UnverifiedImport
-        || envelope.source_refs.len() != 1
-        || envelope.source_refs[0].kind != "blob"
-        || envelope.source_refs[0].id != p.raw_blob_digest
-        || envelope.source_refs[0].content_digest != p.raw_digest
-    {
-        return false;
-    }
-    // These are identity fields, not permission to use imported content.
-    let _identity = (envelope.revoke_watermark, p.purpose);
-    match p.status.as_str() {
-        "prepared" => !p.blob_published && p.observed_digest.is_none() && p.byte_len == 0,
-        "ready" => {
-            p.blob_published
-                && p.byte_len > 0
-                && p.byte_len <= evo_core::evidence::MAX_TOTAL_READ_BYTES as u64
-                && p.observed_digest.as_deref() == Some(p.raw_digest.as_str())
-        }
-        "source_changed" => {
-            !p.blob_published && p.observed_digest.as_deref() != Some(p.raw_digest.as_str())
-        }
-        "zero_records" => {
-            !p.blob_published
-                && p.byte_len == 0
-                && p.observed_digest.as_deref() == Some(evo_core::hash(b"").as_str())
-        }
-        "missing" | "permission_denied" | "invalid_file" | "too_large" => !p.blob_published,
-        _ => false,
-    }
+    matches!(
+        validate_e16_envelope(namespace, source, value),
+        Ok("import_source")
+    )
 }
 
 impl LifecycleStore {
@@ -333,9 +223,7 @@ impl LifecycleStore {
         evo_core::text(reason, "revoke reason", 512)?;
         valid_time(now)?;
         let mut session = store.session().await?;
-        let existing_source = session
-            .get::<serde_json::Value>(ctx, &source.kind, &source.id)
-            .await?;
+        let existing_source = session.object_row(ctx, &source.kind, &source.id).await?;
         let existing_tombstone = session
             .object_row(ctx, "tombstone", &source.id)
             .await?
@@ -389,17 +277,17 @@ impl LifecycleStore {
             return status.ok_or(Error::Internal);
         }
         if source.kind == "artifact" {
-            let value = existing_source.ok_or(Error::NotFound)?;
-            if value.get("schema_version").and_then(|item| item.as_str())
-                != Some("rsia.e16.import_source.v1")
-                || validate_e16_envelope(ctx, &source, &value).is_err()
+            let row = existing_source.ok_or(Error::NotFound)?;
+            if !parse_strict_json(&row.body)
+                .ok()
+                .as_ref()
+                .is_some_and(|value| registered_import_source(ctx.namespace(), &source, value))
             {
                 return Err(Error::Invalid(
                     "only a strict E16 import_source artifact is a revocable source".into(),
                 ));
             }
         }
-        session.ensure_revocation_namespace_live(ctx).await?;
         let watermark_digest = fingerprint(&(
             "rsia.revoke_watermark.v1",
             ctx.namespace(),
@@ -2541,7 +2429,7 @@ fn e16_schema_kind(schema: &str) -> Option<&'static str> {
 }
 
 fn validate_e16_envelope(
-    ctx: &Context,
+    namespace: &str,
     node: &TypedObjectRef,
     value: &serde_json::Value,
 ) -> Result<&'static str> {
@@ -2571,7 +2459,7 @@ fn validate_e16_envelope(
         .and_then(e16_schema_kind)
         .ok_or_else(|| Error::Conflict("unknown E16 schema".into()))?;
     if object["id"].as_str() != Some(node.id.as_str())
-        || object["namespace"].as_str() != Some(ctx.namespace())
+        || object["namespace"].as_str() != Some(namespace)
         || object["owner_actor"].as_str().is_none()
         || object["request_key"].as_str().is_none()
         || !is_lower_hex_digest(&object["input_digest"])
@@ -2636,7 +2524,7 @@ async fn cleanup_e16_envelope(
     export_directory_rechecked: bool,
     now: i64,
 ) -> Result<()> {
-    let kind = match validate_e16_envelope(ctx, node, value) {
+    let kind = match validate_e16_envelope(ctx.namespace(), node, value) {
         Ok(kind) => kind,
         Err(_) => {
             return mark_unknown_scope(
@@ -3123,7 +3011,7 @@ async fn e16_payload_has_live_blob_reference(
             kind: "artifact".into(),
             id: value["id"].as_str().unwrap_or_default().into(),
         };
-        validate_e16_envelope(ctx, &node, &value)?;
+        validate_e16_envelope(ctx.namespace(), &node, &value)?;
         let schema = value["schema_version"].as_str().unwrap_or_default();
         let payload = &value["payload"];
         if !e16_record_keeps_blobs_alive(schema, payload) {
@@ -3433,7 +3321,7 @@ async fn cleanup_node_content(
             // before touching its controlled directory. Absent historical nodes
             // still require the path check; no user-supplied path is consulted.
             if (value["schema_version"] == "rsia.e16.export_attempt.v2"
-                && validate_e16_envelope(ctx, node, value).is_err())
+                && validate_e16_envelope(ctx.namespace(), node, value).is_err())
                 || (redacted_export
                     && (value["id"].as_str() != Some(node.id.as_str())
                         || value["original_kind"] != "export_attempt"

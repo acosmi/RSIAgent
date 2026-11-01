@@ -92,7 +92,12 @@ async fn put_run(store: &Store, id: &str) {
         store,
         "run",
         id,
-        &json!({"id": id, "schema_version": "rsia.optimization.source.v1", "body": "run-body"}),
+        &json!({
+            "schema_version":"rsia.optimization.source.v1",
+            "record":{"id":id,"body":id.as_bytes().to_vec(),"parent_family":format!("family-{id}"),"task_origin":"trusted_run","execution_attestation":"trusted_host","purpose":"development"},
+            "trace":{"run_id":id,"parent_family":format!("family-{id}"),"source_digest":hash(id.as_bytes()),"purpose":"development","outcome":"success","diagnosis":null,"excerpt":id,"seed":1},
+            "excerpt_start":0,"excerpt_end":id.len(),
+        }),
     )
     .await;
 }
@@ -502,6 +507,9 @@ async fn a_tombstone_of_an_artifact_with_the_same_id_does_not_refuse_the_run_sou
 async fn a_tombstone_that_cannot_be_read_fails_closed() {
     let (_dir, path, store) = database().await;
     authorize(&store).await;
+    for id in ["bad-shape", "bad-kind", "late-shape", "late-kind"] {
+        put_run(&store, id).await;
+    }
     // The object table only requires valid JSON whose `$.id` is the id.
     raw_put(
         &store,
