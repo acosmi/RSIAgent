@@ -1854,10 +1854,10 @@ async fn node_content_status(
             != Some(
                 fingerprint(&crate::optimization::select_development(&request, &report)?)?.as_str(),
             )
-        || node.node.status
-            != (ObservedStatus::Valid {
-                quality_micros: quality,
-            })
+        || !matches!(
+            &node.node.status,
+            ObservedStatus::Valid { quality_micros } if *quality_micros == quality
+        )
     {
         return Err(Error::Conflict(
             "exploration node differs from its actual development observation".into(),
