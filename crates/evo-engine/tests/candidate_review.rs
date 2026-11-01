@@ -48,8 +48,7 @@ use evo_engine::service::HostService;
 use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, ExecutionReceiptRequest, ExecutionSide, FixedGraderMethod,
     FixedGraderSpec, FrozenOracleEntry, GraderReceiptRequest, IndependentEvaluationControl,
-    IssueTicketRequest, ProtectedHoldoutRecord, ProtectedInputRef, RegisteredEvaluationControl,
-    StartExecutionRequest,
+    IssueTicketRequest, ProtectedInputRef, StartExecutionRequest,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -1890,6 +1889,17 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         .await
         .unwrap();
 
+    let host = ctx("host", Role::Host);
+    let authority = source("formal-fixture-source", "formal fixture development source");
+    store_trace_authority(&store, &host, &authority)
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    let watermark = session
+        .bump_watermark(&admin, &d("formal-fixture-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
     let mut v1 = ExperimentPlan::first_low_risk("formal-e05", 60).unwrap();
     v1.n_planned = n as usize;
     v1.monetary_budget = money("0.001");
@@ -1977,10 +1987,17 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         version: "exact-json-v1".into(),
         method: FixedGraderMethod::ExactJsonAnswerV1,
     };
-    let control = RegisteredEvaluationControl {
-        schema_version: RegisteredEvaluationControl::SCHEMA.into(),
+    let control = evo_engine::streaming_evaluator::RegisteredEvaluationControlV3 {
+        schema_version: evo_engine::streaming_evaluator::RegisteredEvaluationControlV3::SCHEMA
+            .into(),
         id: "control-1".into(),
         v1_plan_snapshot: v1.clone(),
+        max_regression: evo_core::evaluation::FixedRegressionThreshold::new(if sequential {
+            0.01
+        } else {
+            0.125
+        })
+        .unwrap(),
         formal_plan: formal,
         alpha_plan: alpha.clone(),
         optimizer_comparison: comparison,
@@ -2000,23 +2017,24 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         evidence_scope: EvaluationEvidenceScope::ProgramFixture,
         created_at_unix_seconds: 2,
     };
-    IndependentEvaluationControl::register_control(&evaluator, &store, control.clone())
+    IndependentEvaluationControl::register_current_control(&evaluator, &store, control.clone())
         .await
         .unwrap();
 
+    let progress = IndependentEvaluationControl::registration_progress(
+        &evaluator,
+        &store,
+        &control.id,
+        "holdout-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        progress.control_digest.as_deref(),
+        Some(control.digest().unwrap().as_str())
+    );
     // ProgramFixture's real Current candidate remains a software diagnostic:
     // it confers no external-host, provider, paid or promotion authority.
-    let host = ctx("host", Role::Host);
-    let authority = source("formal-fixture-source", "formal fixture development source");
-    store_trace_authority(&store, &host, &authority)
-        .await
-        .unwrap();
-    let mut session = store.session().await.unwrap();
-    let watermark = session
-        .bump_watermark(&admin, &d("formal-fixture-watermark"))
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
     let proposer = ctx("proposer", Role::Worker);
     let candidate = trusted_compiler_inputs::software_candidate_current(
         &store,
@@ -2090,10 +2108,11 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
             expected_answer_json: json!("ok").to_string(),
         })
         .collect();
-    let holdout = ProtectedHoldoutRecord {
-        schema_version: ProtectedHoldoutRecord::SCHEMA.into(),
+    let holdout = evo_engine::streaming_evaluator::ProtectedHoldoutRecordV2 {
+        schema_version: evo_engine::streaming_evaluator::ProtectedHoldoutRecordV2::SCHEMA.into(),
         id: "holdout-1".into(),
         registration_id: "control-1".into(),
+        frozen_configuration_digest: control.frozen_configuration().unwrap().digest().unwrap(),
         pair,
         manifest,
         candidate_bundle_digest: candidate.digest.clone(),
@@ -2103,9 +2122,6 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         oracle_payload_digest: evo_core::fingerprint(&oracle_entries).unwrap(),
         oracle_entries,
     };
-    IndependentEvaluationControl::register_holdout(&evaluator, &store, holdout.clone())
-        .await
-        .unwrap();
     // True-source order (L288): the candidate is staged, then the ticket is
     // issued and binds it (AG-100 issues no ticket without a candidate record).
     trusted_compiler_inputs::persist_bundle_current(
@@ -2135,6 +2151,9 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
     )
     .await
     .unwrap();
+    IndependentEvaluationControl::register_current_holdout(&evaluator, &store, holdout.clone())
+        .await
+        .unwrap();
     let ticket = IndependentEvaluationControl::issue_ticket(
         &evaluator,
         &store,

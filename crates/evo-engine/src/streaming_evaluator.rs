@@ -7,9 +7,10 @@ use crate::release_store::{
 };
 use crate::revocation_gate::{MAX_UPSTREAM_CLOSURE_NODES, judge_dependency};
 use evo_core::evaluation::{
-    BernsteinReport, ClusterObservation, ExperimentPlan, ExperimentPlanV2, FormalExperimentPlanV41,
+    BernsteinReport, ClusterObservation, ExperimentPlan, ExperimentPlanV2, ExperimentPlanV3,
+    FixedRegressionThreshold, FormalExperimentPlanV41, FrozenFixedSampleConfiguration,
     OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind, Verdict, decide,
-    empirical_bernstein, parse_decimal,
+    decide_fixed_sample_v45, empirical_bernstein, parse_decimal,
 };
 use evo_core::holdout::{
     AnchorCoverageMatrix, AnchorResult, ExposureLedger, ExposureState, FrozenCandidatePair,
@@ -212,6 +213,370 @@ impl RegisteredEvaluationControl {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredEvaluationControlV3 {
+    pub schema_version: String,
+    pub id: String,
+    pub v1_plan_snapshot: ExperimentPlan,
+    pub max_regression: FixedRegressionThreshold,
+    pub formal_plan: FormalExperimentPlanV41,
+    pub alpha_plan: ResearchFamilyAlphaPlan,
+    pub optimizer_comparison: OptimizerComparisonContract,
+    pub optimization_budget: OptimizationBudgetPlan,
+    pub early_stop_plan: Option<EarlyStopPlan>,
+    pub anchor_matrix: AnchorCoverageMatrix,
+    pub attempt_id: String,
+    pub fixed_sample_claim_id: String,
+    pub billing_scope: String,
+    pub executor_actor: String,
+    pub evaluator_actor: String,
+    pub proposer_actor: String,
+    pub approver_actor: String,
+    pub oracle_digest: String,
+    pub grader_digest: String,
+    pub fixed_grader: FixedGraderSpec,
+    pub evidence_scope: EvaluationEvidenceScope,
+    pub created_at_unix_seconds: i64,
+}
+
+impl RegisteredEvaluationControlV3 {
+    pub const SCHEMA: &'static str = "rsia.registered_evaluation_control.v3";
+
+    fn common_fields(&self) -> RegisteredEvaluationControl {
+        RegisteredEvaluationControl {
+            schema_version: self.schema_version.clone(),
+            id: self.id.clone(),
+            v1_plan_snapshot: self.v1_plan_snapshot.clone(),
+            formal_plan: self.formal_plan.clone(),
+            alpha_plan: self.alpha_plan.clone(),
+            optimizer_comparison: self.optimizer_comparison.clone(),
+            optimization_budget: self.optimization_budget.clone(),
+            early_stop_plan: self.early_stop_plan.clone(),
+            anchor_matrix: self.anchor_matrix.clone(),
+            attempt_id: self.attempt_id.clone(),
+            fixed_sample_claim_id: self.fixed_sample_claim_id.clone(),
+            billing_scope: self.billing_scope.clone(),
+            executor_actor: self.executor_actor.clone(),
+            evaluator_actor: self.evaluator_actor.clone(),
+            proposer_actor: self.proposer_actor.clone(),
+            approver_actor: self.approver_actor.clone(),
+            oracle_digest: self.oracle_digest.clone(),
+            grader_digest: self.grader_digest.clone(),
+            fixed_grader: self.fixed_grader.clone(),
+            evidence_scope: self.evidence_scope,
+            created_at_unix_seconds: self.created_at_unix_seconds,
+        }
+    }
+
+    pub fn frozen_configuration(&self) -> Result<FrozenFixedSampleConfiguration> {
+        FrozenFixedSampleConfiguration::new(self.v1_plan_snapshot.clone(), self.max_regression)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != Self::SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported registered-control schema".into(),
+            ));
+        }
+        let mut common = self.common_fields();
+        common.schema_version = RegisteredEvaluationControl::SCHEMA.into();
+        common.validate()?;
+        self.frozen_configuration()?
+            .validate_early_stop(self.early_stop_plan.as_ref())
+    }
+
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        fingerprint(self)
+    }
+}
+
+/// Preserves the complete original wire while exposing unchanged common fields
+/// to historical accounting and current transition checks.
+#[derive(Debug, Clone)]
+pub struct ReadRegisteredEvaluationControl {
+    common: Box<RegisteredEvaluationControl>,
+    current: Option<Box<RegisteredEvaluationControlV3>>,
+}
+
+impl std::ops::Deref for ReadRegisteredEvaluationControl {
+    type Target = RegisteredEvaluationControl;
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
+}
+impl From<RegisteredEvaluationControl> for ReadRegisteredEvaluationControl {
+    fn from(common: RegisteredEvaluationControl) -> Self {
+        Self {
+            common: Box::new(common),
+            current: None,
+        }
+    }
+}
+impl From<RegisteredEvaluationControlV3> for ReadRegisteredEvaluationControl {
+    fn from(current: RegisteredEvaluationControlV3) -> Self {
+        Self {
+            common: Box::new(current.common_fields()),
+            current: Some(Box::new(current)),
+        }
+    }
+}
+impl ReadRegisteredEvaluationControl {
+    pub fn validate(&self) -> Result<()> {
+        match &self.current {
+            Some(current) => current.validate(),
+            None => self.common.validate(),
+        }
+    }
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        fingerprint(self)
+    }
+    pub(crate) fn current(&self) -> Result<&RegisteredEvaluationControlV3> {
+        self.validate()?;
+        self.current
+            .as_deref()
+            .ok_or_else(|| Error::Conflict("legacy registered control is not Current input".into()))
+    }
+    fn frozen_configuration(&self) -> Result<FrozenFixedSampleConfiguration> {
+        self.current()?.frozen_configuration()
+    }
+}
+impl Serialize for ReadRegisteredEvaluationControl {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match &self.current {
+            Some(current) => current.serialize(serializer),
+            None => self.common.serialize(serializer),
+        }
+    }
+}
+pub(crate) enum ControlRegistrationWire {
+    Legacy(Box<RegisteredEvaluationControl>),
+    Current(Box<RegisteredEvaluationControlV3>),
+}
+impl<'de> Deserialize<'de> for ControlRegistrationWire {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct ControlVisitor;
+        impl<'de> Visitor<'de> for ControlVisitor {
+            type Value = ControlRegistrationWire;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a versioned registered control object")
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut schema_version: Option<String> = None;
+                let mut id: Option<String> = None;
+                let mut v1_plan_snapshot: Option<ExperimentPlan> = None;
+                let mut max_regression: Option<FixedRegressionThreshold> = None;
+                let mut formal_plan: Option<FormalExperimentPlanV41> = None;
+                let mut alpha_plan: Option<ResearchFamilyAlphaPlan> = None;
+                let mut optimizer_comparison: Option<OptimizerComparisonContract> = None;
+                let mut optimization_budget: Option<OptimizationBudgetPlan> = None;
+                let mut early_stop_plan: Option<Option<EarlyStopPlan>> = None;
+                let mut anchor_matrix: Option<AnchorCoverageMatrix> = None;
+                let mut attempt_id: Option<String> = None;
+                let mut fixed_sample_claim_id: Option<String> = None;
+                let mut billing_scope: Option<String> = None;
+                let mut executor_actor: Option<String> = None;
+                let mut evaluator_actor: Option<String> = None;
+                let mut proposer_actor: Option<String> = None;
+                let mut approver_actor: Option<String> = None;
+                let mut oracle_digest: Option<String> = None;
+                let mut grader_digest: Option<String> = None;
+                let mut fixed_grader: Option<FixedGraderSpec> = None;
+                let mut evidence_scope: Option<EvaluationEvidenceScope> = None;
+                let mut created_at_unix_seconds: Option<i64> = None;
+                let mut seen = BTreeSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key.clone()) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate control field {key}"
+                        )));
+                    }
+                    match key.as_str() {
+                        "schema_version" => schema_version = Some(map.next_value()?),
+                        "id" => id = Some(map.next_value()?),
+                        "v1_plan_snapshot" => v1_plan_snapshot = Some(map.next_value()?),
+                        "max_regression" => max_regression = Some(map.next_value()?),
+                        "formal_plan" => formal_plan = Some(map.next_value()?),
+                        "alpha_plan" => alpha_plan = Some(map.next_value()?),
+                        "optimizer_comparison" => optimizer_comparison = Some(map.next_value()?),
+                        "optimization_budget" => optimization_budget = Some(map.next_value()?),
+                        "early_stop_plan" => early_stop_plan = Some(map.next_value()?),
+                        "anchor_matrix" => anchor_matrix = Some(map.next_value()?),
+                        "attempt_id" => attempt_id = Some(map.next_value()?),
+                        "fixed_sample_claim_id" => fixed_sample_claim_id = Some(map.next_value()?),
+                        "billing_scope" => billing_scope = Some(map.next_value()?),
+                        "executor_actor" => executor_actor = Some(map.next_value()?),
+                        "evaluator_actor" => evaluator_actor = Some(map.next_value()?),
+                        "proposer_actor" => proposer_actor = Some(map.next_value()?),
+                        "approver_actor" => approver_actor = Some(map.next_value()?),
+                        "oracle_digest" => oracle_digest = Some(map.next_value()?),
+                        "grader_digest" => grader_digest = Some(map.next_value()?),
+                        "fixed_grader" => fixed_grader = Some(map.next_value()?),
+                        "evidence_scope" => evidence_scope = Some(map.next_value()?),
+                        "created_at_unix_seconds" => {
+                            created_at_unix_seconds = Some(map.next_value()?)
+                        }
+                        _ => {
+                            return Err(serde::de::Error::custom(format!(
+                                "unknown control field {key}"
+                            )));
+                        }
+                    }
+                }
+                let schema_version = schema_version
+                    .ok_or_else(|| serde::de::Error::missing_field("schema_version"))?;
+                match schema_version.as_str() {
+                    RegisteredEvaluationControlV3::SCHEMA => Ok(ControlRegistrationWire::Current(
+                        Box::new(RegisteredEvaluationControlV3 {
+                            schema_version,
+                            id: id.ok_or_else(|| serde::de::Error::missing_field("id"))?,
+                            v1_plan_snapshot: v1_plan_snapshot.ok_or_else(|| {
+                                serde::de::Error::missing_field("v1_plan_snapshot")
+                            })?,
+                            max_regression: max_regression
+                                .ok_or_else(|| serde::de::Error::missing_field("max_regression"))?,
+                            formal_plan: formal_plan
+                                .ok_or_else(|| serde::de::Error::missing_field("formal_plan"))?,
+                            alpha_plan: alpha_plan
+                                .ok_or_else(|| serde::de::Error::missing_field("alpha_plan"))?,
+                            optimizer_comparison: optimizer_comparison.ok_or_else(|| {
+                                serde::de::Error::missing_field("optimizer_comparison")
+                            })?,
+                            optimization_budget: optimization_budget.ok_or_else(|| {
+                                serde::de::Error::missing_field("optimization_budget")
+                            })?,
+                            early_stop_plan: early_stop_plan.unwrap_or(None),
+                            anchor_matrix: anchor_matrix
+                                .ok_or_else(|| serde::de::Error::missing_field("anchor_matrix"))?,
+                            attempt_id: attempt_id
+                                .ok_or_else(|| serde::de::Error::missing_field("attempt_id"))?,
+                            fixed_sample_claim_id: fixed_sample_claim_id.ok_or_else(|| {
+                                serde::de::Error::missing_field("fixed_sample_claim_id")
+                            })?,
+                            billing_scope: billing_scope
+                                .ok_or_else(|| serde::de::Error::missing_field("billing_scope"))?,
+                            executor_actor: executor_actor
+                                .ok_or_else(|| serde::de::Error::missing_field("executor_actor"))?,
+                            evaluator_actor: evaluator_actor.ok_or_else(|| {
+                                serde::de::Error::missing_field("evaluator_actor")
+                            })?,
+                            proposer_actor: proposer_actor
+                                .ok_or_else(|| serde::de::Error::missing_field("proposer_actor"))?,
+                            approver_actor: approver_actor
+                                .ok_or_else(|| serde::de::Error::missing_field("approver_actor"))?,
+                            oracle_digest: oracle_digest
+                                .ok_or_else(|| serde::de::Error::missing_field("oracle_digest"))?,
+                            grader_digest: grader_digest
+                                .ok_or_else(|| serde::de::Error::missing_field("grader_digest"))?,
+                            fixed_grader: fixed_grader
+                                .ok_or_else(|| serde::de::Error::missing_field("fixed_grader"))?,
+                            evidence_scope: evidence_scope
+                                .ok_or_else(|| serde::de::Error::missing_field("evidence_scope"))?,
+                            created_at_unix_seconds: created_at_unix_seconds.ok_or_else(|| {
+                                serde::de::Error::missing_field("created_at_unix_seconds")
+                            })?,
+                        }),
+                    )),
+                    RegisteredEvaluationControl::SCHEMA
+                    | RegisteredEvaluationControl::SCHEMA_V1 => {
+                        if max_regression.is_some() {
+                            return Err(serde::de::Error::custom(
+                                "legacy control cannot carry max_regression",
+                            ));
+                        }
+                        Ok(ControlRegistrationWire::Legacy(Box::new(
+                            RegisteredEvaluationControl {
+                                schema_version,
+                                id: id.ok_or_else(|| serde::de::Error::missing_field("id"))?,
+                                v1_plan_snapshot: v1_plan_snapshot.ok_or_else(|| {
+                                    serde::de::Error::missing_field("v1_plan_snapshot")
+                                })?,
+                                formal_plan: formal_plan.ok_or_else(|| {
+                                    serde::de::Error::missing_field("formal_plan")
+                                })?,
+                                alpha_plan: alpha_plan
+                                    .ok_or_else(|| serde::de::Error::missing_field("alpha_plan"))?,
+                                optimizer_comparison: optimizer_comparison.ok_or_else(|| {
+                                    serde::de::Error::missing_field("optimizer_comparison")
+                                })?,
+                                optimization_budget: optimization_budget.ok_or_else(|| {
+                                    serde::de::Error::missing_field("optimization_budget")
+                                })?,
+                                early_stop_plan: early_stop_plan.unwrap_or(None),
+                                anchor_matrix: anchor_matrix.ok_or_else(|| {
+                                    serde::de::Error::missing_field("anchor_matrix")
+                                })?,
+                                attempt_id: attempt_id
+                                    .ok_or_else(|| serde::de::Error::missing_field("attempt_id"))?,
+                                fixed_sample_claim_id: fixed_sample_claim_id.ok_or_else(|| {
+                                    serde::de::Error::missing_field("fixed_sample_claim_id")
+                                })?,
+                                billing_scope: billing_scope.ok_or_else(|| {
+                                    serde::de::Error::missing_field("billing_scope")
+                                })?,
+                                executor_actor: executor_actor.ok_or_else(|| {
+                                    serde::de::Error::missing_field("executor_actor")
+                                })?,
+                                evaluator_actor: evaluator_actor.ok_or_else(|| {
+                                    serde::de::Error::missing_field("evaluator_actor")
+                                })?,
+                                proposer_actor: proposer_actor.ok_or_else(|| {
+                                    serde::de::Error::missing_field("proposer_actor")
+                                })?,
+                                approver_actor: approver_actor.ok_or_else(|| {
+                                    serde::de::Error::missing_field("approver_actor")
+                                })?,
+                                oracle_digest: oracle_digest.ok_or_else(|| {
+                                    serde::de::Error::missing_field("oracle_digest")
+                                })?,
+                                grader_digest: grader_digest.ok_or_else(|| {
+                                    serde::de::Error::missing_field("grader_digest")
+                                })?,
+                                fixed_grader: fixed_grader.ok_or_else(|| {
+                                    serde::de::Error::missing_field("fixed_grader")
+                                })?,
+                                evidence_scope: evidence_scope.ok_or_else(|| {
+                                    serde::de::Error::missing_field("evidence_scope")
+                                })?,
+                                created_at_unix_seconds: created_at_unix_seconds.ok_or_else(
+                                    || serde::de::Error::missing_field("created_at_unix_seconds"),
+                                )?,
+                            },
+                        )))
+                    }
+                    _ => Err(serde::de::Error::custom(
+                        "unsupported registered-control schema",
+                    )),
+                }
+            }
+        }
+        deserializer.deserialize_map(ControlVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for ReadRegisteredEvaluationControl {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        match ControlRegistrationWire::deserialize(deserializer)? {
+            ControlRegistrationWire::Current(value) => Ok(Self {
+                common: Box::new(value.common_fields()),
+                current: Some(value),
+            }),
+            ControlRegistrationWire::Legacy(value) => Ok(Self {
+                common: value,
+                current: None,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FixedGraderMethod {
@@ -385,6 +750,148 @@ impl ProtectedHoldoutRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtectedHoldoutRecordV2 {
+    pub schema_version: String,
+    pub id: String,
+    pub registration_id: String,
+    pub frozen_configuration_digest: String,
+    pub pair: FrozenCandidatePair,
+    pub manifest: HoldoutManifest,
+    pub candidate_bundle_digest: String,
+    pub baseline_bundle_digest: String,
+    pub rotating_inputs: Vec<ProtectedInputRef>,
+    pub anchor_inputs: Vec<ProtectedInputRef>,
+    pub oracle_entries: Vec<FrozenOracleEntry>,
+    pub oracle_payload_digest: String,
+}
+
+impl ProtectedHoldoutRecordV2 {
+    pub const SCHEMA: &'static str = "rsia.protected_holdout_record.v2";
+    fn common_fields(&self) -> ProtectedHoldoutRecord {
+        ProtectedHoldoutRecord {
+            schema_version: self.schema_version.clone(),
+            id: self.id.clone(),
+            registration_id: self.registration_id.clone(),
+            pair: self.pair.clone(),
+            manifest: self.manifest.clone(),
+            candidate_bundle_digest: self.candidate_bundle_digest.clone(),
+            baseline_bundle_digest: self.baseline_bundle_digest.clone(),
+            rotating_inputs: self.rotating_inputs.clone(),
+            anchor_inputs: self.anchor_inputs.clone(),
+            oracle_entries: self.oracle_entries.clone(),
+            oracle_payload_digest: self.oracle_payload_digest.clone(),
+        }
+    }
+    pub fn validate_against(&self, control: &RegisteredEvaluationControlV3) -> Result<()> {
+        if self.schema_version != Self::SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported protected-holdout schema".into(),
+            ));
+        }
+        control.validate()?;
+        let mut common = self.common_fields();
+        common.schema_version = ProtectedHoldoutRecord::SCHEMA.into();
+        let mut common_control = control.common_fields();
+        common_control.schema_version = RegisteredEvaluationControl::SCHEMA.into();
+        common.validate_against(&common_control)?;
+        digest(
+            &self.frozen_configuration_digest,
+            "frozen_configuration_digest",
+        )?;
+        if self.frozen_configuration_digest != control.frozen_configuration()?.digest()? {
+            return Err(Error::Conflict(
+                "holdout frozen configuration digest mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn digest(&self, control: &RegisteredEvaluationControlV3) -> Result<String> {
+        self.validate_against(control)?;
+        fingerprint(self)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadProtectedHoldoutRecord {
+    common: ProtectedHoldoutRecord,
+    current: Option<ProtectedHoldoutRecordV2>,
+}
+impl std::ops::Deref for ReadProtectedHoldoutRecord {
+    type Target = ProtectedHoldoutRecord;
+    fn deref(&self) -> &Self::Target {
+        &self.common
+    }
+}
+impl From<ProtectedHoldoutRecord> for ReadProtectedHoldoutRecord {
+    fn from(common: ProtectedHoldoutRecord) -> Self {
+        Self {
+            common,
+            current: None,
+        }
+    }
+}
+impl From<ProtectedHoldoutRecordV2> for ReadProtectedHoldoutRecord {
+    fn from(current: ProtectedHoldoutRecordV2) -> Self {
+        Self {
+            common: current.common_fields(),
+            current: Some(current),
+        }
+    }
+}
+impl ReadProtectedHoldoutRecord {
+    pub fn validate_against(&self, control: &ReadRegisteredEvaluationControl) -> Result<()> {
+        match (&self.current, &control.current) {
+            (Some(holdout), Some(control)) => holdout.validate_against(control),
+            (None, None) => self.common.validate_against(control),
+            (None, Some(current)) => self.common.validate_against(&current.common_fields()),
+            (Some(_), None) => Err(Error::Conflict(
+                "legacy registered control is not Current input".into(),
+            )),
+        }
+    }
+    pub fn digest(&self, control: &ReadRegisteredEvaluationControl) -> Result<String> {
+        self.validate_against(control)?;
+        fingerprint(self)
+    }
+    fn current(&self) -> Result<&ProtectedHoldoutRecordV2> {
+        self.current
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("legacy protected holdout is not Current input".into()))
+    }
+}
+impl Serialize for ReadProtectedHoldoutRecord {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        match &self.current {
+            Some(current) => current.serialize(serializer),
+            None => self.common.serialize(serializer),
+        }
+    }
+}
+impl<'de> Deserialize<'de> for ReadProtectedHoldoutRecord {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Current(ProtectedHoldoutRecordV2),
+            Legacy(ProtectedHoldoutRecord),
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::Current(value) if value.schema_version == ProtectedHoldoutRecordV2::SCHEMA => {
+                Ok(value.into())
+            }
+            Wire::Legacy(value) if value.schema_version == ProtectedHoldoutRecord::SCHEMA => {
+                Ok(value.into())
+            }
+            _ => Err(D::Error::custom("unsupported protected-holdout schema")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
 pub enum EvaluationTargetKind {
     Rotating { cluster_id: String },
@@ -524,6 +1031,117 @@ impl TicketSourcePlanBinding {
             &self.candidate_record_digest,
             "source candidate_record_digest",
         )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketSourcePlanBindingV2 {
+    pub schema_version: String,
+    pub namespace: String,
+    pub logical_ticket_id: String,
+    pub plan_id: String,
+    pub plan_digest: String,
+    pub candidate_record_digest: String,
+}
+impl TicketSourcePlanBindingV2 {
+    pub const SCHEMA: &'static str = "rsia.evaluation_ticket_source_plan_binding.v2";
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != Self::SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported ticket source-plan binding schema".into(),
+            ));
+        }
+        for value in [&self.namespace, &self.logical_ticket_id, &self.plan_id] {
+            identifier(value)?;
+        }
+        digest(&self.plan_digest, "source plan_digest")?;
+        digest(
+            &self.candidate_record_digest,
+            "source candidate_record_digest",
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReadTicketSourcePlanBinding(TicketSourcePlanBinding);
+// A read carrier compares the original complete wire fields. These data-only
+// comparisons preserve old public V3 readers without projecting a new binding
+// into a legacy version or supplying a missing configuration value.
+impl PartialEq<ReadTicketSourcePlanBinding> for TicketSourcePlanBinding {
+    fn eq(&self, other: &ReadTicketSourcePlanBinding) -> bool {
+        self == &other.0
+    }
+}
+impl PartialEq<TicketSourcePlanBinding> for ReadTicketSourcePlanBinding {
+    fn eq(&self, other: &TicketSourcePlanBinding) -> bool {
+        &self.0 == other
+    }
+}
+impl PartialEq<ReadTicketSourcePlanBinding> for TicketSourcePlanBindingV2 {
+    fn eq(&self, other: &ReadTicketSourcePlanBinding) -> bool {
+        self.schema_version == other.schema_version
+            && self.namespace == other.namespace
+            && self.logical_ticket_id == other.logical_ticket_id
+            && self.plan_id == other.plan_id
+            && self.plan_digest == other.plan_digest
+            && self.candidate_record_digest == other.candidate_record_digest
+    }
+}
+impl PartialEq<TicketSourcePlanBindingV2> for ReadTicketSourcePlanBinding {
+    fn eq(&self, other: &TicketSourcePlanBindingV2) -> bool {
+        other == self
+    }
+}
+impl std::ops::Deref for ReadTicketSourcePlanBinding {
+    type Target = TicketSourcePlanBinding;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for ReadTicketSourcePlanBinding {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl From<TicketSourcePlanBinding> for ReadTicketSourcePlanBinding {
+    fn from(value: TicketSourcePlanBinding) -> Self {
+        Self(value)
+    }
+}
+impl From<TicketSourcePlanBindingV2> for ReadTicketSourcePlanBinding {
+    fn from(value: TicketSourcePlanBindingV2) -> Self {
+        Self(TicketSourcePlanBinding {
+            schema_version: value.schema_version,
+            namespace: value.namespace,
+            logical_ticket_id: value.logical_ticket_id,
+            plan_id: value.plan_id,
+            plan_digest: value.plan_digest,
+            candidate_record_digest: value.candidate_record_digest,
+        })
+    }
+}
+impl ReadTicketSourcePlanBinding {
+    fn v2(&self) -> TicketSourcePlanBindingV2 {
+        let value = self.0.clone();
+        TicketSourcePlanBindingV2 {
+            schema_version: value.schema_version,
+            namespace: value.namespace,
+            logical_ticket_id: value.logical_ticket_id,
+            plan_id: value.plan_id,
+            plan_digest: value.plan_digest,
+            candidate_record_digest: value.candidate_record_digest,
+        }
+    }
+    fn validate(&self) -> Result<()> {
+        match self.schema_version.as_str() {
+            TicketSourcePlanBinding::SCHEMA => self.0.validate(),
+            TicketSourcePlanBindingV2::SCHEMA => self.v2().validate(),
+            _ => Err(Error::Invalid(
+                "unsupported ticket source-plan binding schema".into(),
+            )),
+        }
     }
 }
 
@@ -728,6 +1346,57 @@ pub struct EvaluationTicketV3 {
     pub source_plan_binding: TicketSourcePlanBinding,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvaluationTicketV4 {
+    pub schema_version: String,
+    pub id: String,
+    pub registration_id: String,
+    pub registration_digest: String,
+    pub holdout_id: String,
+    pub manifest_digest: String,
+    pub v1_plan_snapshot_digest: String,
+    pub bound_v1_plan_digest: String,
+    pub formal_plan_digest: String,
+    pub profile: evo_core::evaluation::ProfileKind,
+    pub n_planned: u32,
+    pub research_family_id: String,
+    pub alpha_plan_digest: String,
+    pub candidate_digest: String,
+    pub baseline_digest: String,
+    pub candidate_bundle_digest: String,
+    pub baseline_bundle_digest: String,
+    pub environment_digest: String,
+    pub proposer_actor: String,
+    pub evaluator_actor: String,
+    pub executor_actor: String,
+    pub approver_actor: String,
+    pub issue_receipt_digest: String,
+    pub evidence_scope: EvaluationEvidenceScope,
+    pub attempt_id: String,
+    pub targets: Vec<EvaluationTarget>,
+    pub lifecycle: TicketLifecycle,
+    pub next_sequence: u64,
+    pub pending_certificate: Option<EarlyStopCertificate>,
+    pub stop_member_terminal_digest: Option<String>,
+    pub late_execution_receipt_ids: Vec<String>,
+    pub late_grader_receipt_ids: Vec<String>,
+    pub unattributed_budget_call_ids: Vec<String>,
+    pub invalid_reasons: Vec<String>,
+    pub issued_at_unix_seconds: i64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_candidate_binding"
+    )]
+    pub candidate_dependency_binding: Option<FormalCandidateDependencyBinding>,
+    pub source_plan_binding: TicketSourcePlanBindingV2,
+}
+
+impl EvaluationTicketV4 {
+    pub const SCHEMA: &'static str = "rsia.evaluation_ticket.v4";
+}
+
 #[derive(Debug, Clone)]
 pub struct ReadEvaluationTicket {
     pub schema_version: String,
@@ -766,14 +1435,61 @@ pub struct ReadEvaluationTicket {
     pub invalid_reasons: Vec<String>,
     pub issued_at_unix_seconds: i64,
     pub candidate_dependency_binding: Option<FormalCandidateDependencyBinding>,
-    pub source_plan_binding: Option<TicketSourcePlanBinding>,
+    pub source_plan_binding: Option<ReadTicketSourcePlanBinding>,
 }
 
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum EvaluationTicketWire {
-    Current(EvaluationTicketV3),
-    Legacy(EvaluationTicketV2),
+    Current(#[serde(deserialize_with = "deserialize_current_ticket_wire")] EvaluationTicketV4),
+    SourceBoundLegacy(
+        #[serde(deserialize_with = "deserialize_source_bound_legacy_ticket_wire")]
+        EvaluationTicketV3,
+    ),
+    Legacy(#[serde(deserialize_with = "deserialize_legacy_ticket_wire")] EvaluationTicketV2),
+}
+
+// Same-shaped versions must reject a foreign schema before an untagged variant
+// succeeds. Deserialize each original DTO directly so duplicate and unknown
+// fields remain visible to its closed-field visitor.
+fn deserialize_current_ticket_wire<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<EvaluationTicketV4, D::Error> {
+    let value = EvaluationTicketV4::deserialize(deserializer)?;
+    if value.schema_version != EvaluationTicketV4::SCHEMA
+        || value.source_plan_binding.schema_version != TicketSourcePlanBindingV2::SCHEMA
+    {
+        return Err(D::Error::custom(
+            "evaluation ticket wire/schema version mismatch",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_source_bound_legacy_ticket_wire<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<EvaluationTicketV3, D::Error> {
+    let value = EvaluationTicketV3::deserialize(deserializer)?;
+    if value.schema_version != EvaluationTicketV3::SCHEMA
+        || value.source_plan_binding.schema_version != TicketSourcePlanBinding::SCHEMA
+    {
+        return Err(D::Error::custom(
+            "evaluation ticket wire/schema version mismatch",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_legacy_ticket_wire<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<EvaluationTicketV2, D::Error> {
+    let value = EvaluationTicketV2::deserialize(deserializer)?;
+    if value.schema_version != EvaluationTicketV2::SCHEMA {
+        return Err(D::Error::custom(
+            "evaluation ticket wire/schema version mismatch",
+        ));
+    }
+    Ok(value)
 }
 impl From<EvaluationTicketV2> for ReadEvaluationTicket {
     fn from(value: EvaluationTicketV2) -> Self {
@@ -857,7 +1573,50 @@ impl From<EvaluationTicketV3> for ReadEvaluationTicket {
             invalid_reasons: value.invalid_reasons,
             issued_at_unix_seconds: value.issued_at_unix_seconds,
             candidate_dependency_binding: value.candidate_dependency_binding,
-            source_plan_binding: Some(value.source_plan_binding),
+            source_plan_binding: Some(value.source_plan_binding.into()),
+        }
+    }
+}
+impl From<EvaluationTicketV4> for ReadEvaluationTicket {
+    fn from(value: EvaluationTicketV4) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            id: value.id,
+            registration_id: value.registration_id,
+            registration_digest: value.registration_digest,
+            holdout_id: value.holdout_id,
+            manifest_digest: value.manifest_digest,
+            v1_plan_snapshot_digest: value.v1_plan_snapshot_digest,
+            bound_v1_plan_digest: value.bound_v1_plan_digest,
+            formal_plan_digest: value.formal_plan_digest,
+            profile: value.profile,
+            n_planned: value.n_planned,
+            research_family_id: value.research_family_id,
+            alpha_plan_digest: value.alpha_plan_digest,
+            candidate_digest: value.candidate_digest,
+            baseline_digest: value.baseline_digest,
+            candidate_bundle_digest: value.candidate_bundle_digest,
+            baseline_bundle_digest: value.baseline_bundle_digest,
+            environment_digest: value.environment_digest,
+            proposer_actor: value.proposer_actor,
+            evaluator_actor: value.evaluator_actor,
+            executor_actor: value.executor_actor,
+            approver_actor: value.approver_actor,
+            issue_receipt_digest: value.issue_receipt_digest,
+            evidence_scope: value.evidence_scope,
+            attempt_id: value.attempt_id,
+            targets: value.targets,
+            lifecycle: value.lifecycle,
+            next_sequence: value.next_sequence,
+            pending_certificate: value.pending_certificate,
+            stop_member_terminal_digest: value.stop_member_terminal_digest,
+            late_execution_receipt_ids: value.late_execution_receipt_ids,
+            late_grader_receipt_ids: value.late_grader_receipt_ids,
+            unattributed_budget_call_ids: value.unattributed_budget_call_ids,
+            invalid_reasons: value.invalid_reasons,
+            issued_at_unix_seconds: value.issued_at_unix_seconds,
+            candidate_dependency_binding: value.candidate_dependency_binding,
+            source_plan_binding: Some(value.source_plan_binding.into()),
         }
     }
 }
@@ -869,6 +1628,48 @@ impl Serialize for ReadEvaluationTicket {
         self.validate_source_plan_binding_shape()
             .map_err(serde::ser::Error::custom)?;
         match &self.source_plan_binding {
+            Some(source) if self.schema_version == EvaluationTicketV4::SCHEMA => {
+                EvaluationTicketV4 {
+                    schema_version: self.schema_version.clone(),
+                    id: self.id.clone(),
+                    registration_id: self.registration_id.clone(),
+                    registration_digest: self.registration_digest.clone(),
+                    holdout_id: self.holdout_id.clone(),
+                    manifest_digest: self.manifest_digest.clone(),
+                    v1_plan_snapshot_digest: self.v1_plan_snapshot_digest.clone(),
+                    bound_v1_plan_digest: self.bound_v1_plan_digest.clone(),
+                    formal_plan_digest: self.formal_plan_digest.clone(),
+                    profile: self.profile,
+                    n_planned: self.n_planned,
+                    research_family_id: self.research_family_id.clone(),
+                    alpha_plan_digest: self.alpha_plan_digest.clone(),
+                    candidate_digest: self.candidate_digest.clone(),
+                    baseline_digest: self.baseline_digest.clone(),
+                    candidate_bundle_digest: self.candidate_bundle_digest.clone(),
+                    baseline_bundle_digest: self.baseline_bundle_digest.clone(),
+                    environment_digest: self.environment_digest.clone(),
+                    proposer_actor: self.proposer_actor.clone(),
+                    evaluator_actor: self.evaluator_actor.clone(),
+                    executor_actor: self.executor_actor.clone(),
+                    approver_actor: self.approver_actor.clone(),
+                    issue_receipt_digest: self.issue_receipt_digest.clone(),
+                    evidence_scope: self.evidence_scope,
+                    attempt_id: self.attempt_id.clone(),
+                    targets: self.targets.clone(),
+                    lifecycle: self.lifecycle,
+                    next_sequence: self.next_sequence,
+                    pending_certificate: self.pending_certificate.clone(),
+                    stop_member_terminal_digest: self.stop_member_terminal_digest.clone(),
+                    late_execution_receipt_ids: self.late_execution_receipt_ids.clone(),
+                    late_grader_receipt_ids: self.late_grader_receipt_ids.clone(),
+                    unattributed_budget_call_ids: self.unattributed_budget_call_ids.clone(),
+                    invalid_reasons: self.invalid_reasons.clone(),
+                    issued_at_unix_seconds: self.issued_at_unix_seconds,
+                    candidate_dependency_binding: self.candidate_dependency_binding.clone(),
+                    source_plan_binding: source.v2(),
+                }
+                .serialize(serializer)
+            }
             Some(source) => EvaluationTicketV3 {
                 schema_version: self.schema_version.clone(),
                 id: self.id.clone(),
@@ -906,7 +1707,7 @@ impl Serialize for ReadEvaluationTicket {
                 invalid_reasons: self.invalid_reasons.clone(),
                 issued_at_unix_seconds: self.issued_at_unix_seconds,
                 candidate_dependency_binding: self.candidate_dependency_binding.clone(),
-                source_plan_binding: source.clone(),
+                source_plan_binding: source.0.clone(),
             }
             .serialize(serializer),
             None => EvaluationTicketV2 {
@@ -955,6 +1756,13 @@ impl<'de> Deserialize<'de> for ReadEvaluationTicket {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
         let ticket: Self = match EvaluationTicketWire::deserialize(deserializer)? {
             EvaluationTicketWire::Current(value)
+                if value.schema_version == EvaluationTicketV4::SCHEMA =>
+            {
+                let current: Self = value.into();
+                current.validate().map_err(D::Error::custom)?;
+                current
+            }
+            EvaluationTicketWire::SourceBoundLegacy(value)
                 if value.schema_version == EvaluationTicketV3::SCHEMA =>
             {
                 let current: Self = value.into();
@@ -986,14 +1794,15 @@ impl EvaluationTicketV3 {
 impl ReadEvaluationTicket {
     pub const SCHEMA: &'static str = "rsia.evaluation_ticket.v2";
     pub const SCHEMA_V3: &'static str = "rsia.evaluation_ticket.v3";
+    pub const SCHEMA_V4: &'static str = "rsia.evaluation_ticket.v4";
 
     fn supports_schema(schema: &str) -> bool {
-        matches!(schema, Self::SCHEMA | Self::SCHEMA_V3)
+        matches!(schema, Self::SCHEMA | Self::SCHEMA_V3 | Self::SCHEMA_V4)
     }
 
-    fn require_current_new_use(&self) -> Result<()> {
+    pub(crate) fn require_current_new_use(&self) -> Result<()> {
         self.validate()?;
-        if self.schema_version != EvaluationTicketV3::SCHEMA {
+        if self.schema_version != EvaluationTicketV4::SCHEMA {
             return Err(Error::Conflict(
                 "legacy evaluation ticket is not Current input".into(),
             ));
@@ -1004,12 +1813,27 @@ impl ReadEvaluationTicket {
     fn validate_source_plan_binding_shape(&self) -> Result<()> {
         match (self.schema_version.as_str(), &self.source_plan_binding) {
             (Self::SCHEMA, None) => Ok(()),
-            (Self::SCHEMA_V3, Some(binding)) => binding.validate(),
+            (Self::SCHEMA_V3, Some(binding))
+                if binding.schema_version == TicketSourcePlanBinding::SCHEMA =>
+            {
+                binding.validate()
+            }
+            (Self::SCHEMA_V4, Some(binding))
+                if binding.schema_version == TicketSourcePlanBindingV2::SCHEMA =>
+            {
+                binding.validate()
+            }
             (Self::SCHEMA, Some(_)) => Err(Error::Invalid(
                 "v2 ticket cannot carry a source-plan binding".into(),
             )),
             (Self::SCHEMA_V3, None) => Err(Error::Invalid(
                 "v3 ticket requires a source-plan binding".into(),
+            )),
+            (Self::SCHEMA_V4, None) => Err(Error::Invalid(
+                "v4 ticket requires a source-plan binding".into(),
+            )),
+            (Self::SCHEMA_V3 | Self::SCHEMA_V4, Some(_)) => Err(Error::Invalid(
+                "ticket/source-plan versions do not form a supported pair".into(),
             )),
             _ => Err(Error::Invalid(
                 "unsupported evaluation-ticket schema".into(),
@@ -1367,6 +2191,68 @@ impl FormalEvaluationV2 {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FormalEvaluationV3 {
+    pub schema_version: String,
+    pub decision_version: String,
+    pub result: FormalEvaluationV2,
+}
+impl FormalEvaluationV3 {
+    pub const SCHEMA: &'static str = "rsia.formal_evaluation.v3";
+    pub const DECISION: &'static str = "rsia.fixed_sample_regression.v1";
+    fn validate(&self) -> Result<()> {
+        if self.schema_version != Self::SCHEMA || self.decision_version != Self::DECISION {
+            return Err(Error::Invalid(
+                "unsupported formal evaluation or decision version".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ReadFormalEvaluation {
+    Current(FormalEvaluationV3),
+    Legacy(FormalEvaluationV2),
+}
+impl ReadFormalEvaluation {
+    fn from_result(ticket: &ReadEvaluationTicket, result: FormalEvaluationV2) -> Result<Self> {
+        ticket.validate_source_plan_binding_shape()?;
+        Ok(if ticket.schema_version == EvaluationTicketV4::SCHEMA {
+            Self::Current(FormalEvaluationV3 {
+                schema_version: FormalEvaluationV3::SCHEMA.into(),
+                decision_version: FormalEvaluationV3::DECISION.into(),
+                result,
+            })
+        } else {
+            Self::Legacy(result)
+        })
+    }
+    pub(crate) fn result(&self) -> &FormalEvaluationV2 {
+        match self {
+            Self::Current(value) => &value.result,
+            Self::Legacy(value) => value,
+        }
+    }
+    fn into_result(self) -> FormalEvaluationV2 {
+        match self {
+            Self::Current(value) => value.result,
+            Self::Legacy(value) => value,
+        }
+    }
+    pub(crate) fn validate_against(&self, ticket: &ReadEvaluationTicket) -> Result<()> {
+        match (self, ticket.schema_version.as_str()) {
+            (Self::Current(value), EvaluationTicketV4::SCHEMA) => value.validate(),
+            (Self::Legacy(_), EvaluationTicketV2::SCHEMA | EvaluationTicketV3::SCHEMA) => Ok(()),
+            _ => Err(Error::Conflict(
+                "formal report/ticket versions do not form a supported pair".into(),
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct IssueTicketRequest {
     pub ticket_id: String,
@@ -1439,10 +2325,25 @@ pub struct VerifiedFormalReportView {
 /// Read-only provenance of the original report; no stored wire or authority
 /// capability is constructed by this carrier. Original legacy bytes remain in
 /// `VerifiedFormalReportView`, with a separate explicit consumption decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormalEvaluationLineage {
+    pub control_schema: String,
+    pub plan_schema: String,
+    pub plan_id: String,
+    pub ticket_schema: String,
+    pub ticket_id: String,
+    /// Physical report identity, derived by the unchanged FORMAL_KIND rule.
+    pub report_id: String,
+    pub deterministically_derived: bool,
+    pub ticket_present: bool,
+    pub report_present: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct VerifiedFormalReportReadV1 {
     state: evo_storage::PersistentContractState,
     original: VerifiedFormalReportView,
+    lineage: Vec<FormalEvaluationLineage>,
 }
 impl VerifiedFormalReportReadV1 {
     pub const SCHEMA: &'static str = "rsia.verified_formal_report_read.v1";
@@ -1452,6 +2353,12 @@ impl VerifiedFormalReportReadV1 {
     pub fn historical_view(&self) -> &VerifiedFormalReportView {
         &self.original
     }
+    /// Derived identities describe content lineage, never new-use authority.
+    /// A legacy record without an explicit m has no implied Current successor.
+    pub fn lineage(&self) -> &[FormalEvaluationLineage] {
+        &self.lineage
+    }
+
     pub fn current_view(&self) -> Result<&VerifiedFormalReportView> {
         if self.state != evo_storage::PersistentContractState::CurrentVerified {
             return Err(Error::Conflict(
@@ -1528,7 +2435,7 @@ pub(crate) async fn live_task_candidate_in_session(
         &[("artifact".into(), candidate.id.clone())],
     )
     .await?;
-    let control: RegisteredEvaluationControl =
+    let control: ReadRegisteredEvaluationControl =
         need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
     if control.evidence_scope == EvaluationEvidenceScope::RegisteredExternalHost {
         let inputs = crate::formal_authority::resolve_read_bundle_in_session(
@@ -1549,7 +2456,7 @@ pub(crate) async fn live_task_candidate_in_session(
         )
         .await?;
     }
-    Ok((candidate, control.billing_scope))
+    Ok((candidate, control.billing_scope.clone()))
 }
 
 pub struct IndependentEvaluationControl;
@@ -1572,11 +2479,15 @@ impl IndependentEvaluationControl {
         identifier(control_id)?;
         identifier(holdout_id)?;
         let mut session = store.session().await?;
-        let control =
-            get_record::<RegisteredEvaluationControl>(&mut session, ctx, CONTROL_KIND, control_id)
-                .await?;
+        let control = get_record::<ReadRegisteredEvaluationControl>(
+            &mut session,
+            ctx,
+            CONTROL_KIND,
+            control_id,
+        )
+        .await?;
         let holdout =
-            get_record::<ProtectedHoldoutRecord>(&mut session, ctx, HOLDOUT_KIND, holdout_id)
+            get_record::<ReadProtectedHoldoutRecord>(&mut session, ctx, HOLDOUT_KIND, holdout_id)
                 .await?;
         let progress = match (control, holdout) {
             (None, None) => RegistrationProgress {
@@ -1627,11 +2538,49 @@ impl IndependentEvaluationControl {
         if control.evaluator_actor != ctx.actor() {
             return Err(Error::Forbidden);
         }
+        let control: ReadRegisteredEvaluationControl = control.into();
         validate_root_budget(ctx, store, &control).await?;
         let mut session = store.session().await?;
-        if get_record::<RegisteredEvaluationControl>(&mut session, ctx, CONTROL_KIND, &control.id)
-            .await?
-            .is_some()
+        if get_record::<ReadRegisteredEvaluationControl>(
+            &mut session,
+            ctx,
+            CONTROL_KIND,
+            &control.id,
+        )
+        .await?
+        .is_some()
+        {
+            return Err(Error::Conflict(
+                "evaluation control already registered".into(),
+            ));
+        }
+        Err(Error::Conflict(
+            "legacy registered control is not Current input".into(),
+        ))
+    }
+
+    pub async fn register_current_control(
+        ctx: &Context,
+        store: &Store,
+        control: RegisteredEvaluationControlV3,
+    ) -> Result<String> {
+        ctx.require(&[Role::Evaluator])?;
+        control.validate()?;
+        crate::formal_authority::authenticate_current_control_registration(ctx, &control)?;
+        if control.evaluator_actor != ctx.actor() {
+            return Err(Error::Forbidden);
+        }
+        let control: ReadRegisteredEvaluationControl = control.into();
+        validate_root_budget(ctx, store, &control).await?;
+        let mut session = store.session().await?;
+        if get_record::<ReadRegisteredEvaluationControl>(
+            &mut session,
+            ctx,
+            CONTROL_KIND,
+            &control.id,
+        )
+        .await?
+        .is_some()
         {
             return Err(Error::Conflict(
                 "evaluation control already registered".into(),
@@ -1662,19 +2611,62 @@ impl IndependentEvaluationControl {
     ) -> Result<String> {
         ctx.require(&[Role::Evaluator])?;
         let mut session = store.session().await?;
-        let control: RegisteredEvaluationControl =
+        let control: ReadRegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &holdout.registration_id).await?;
+        control.validate()?;
         if control.evaluator_actor != ctx.actor() {
             return Err(Error::Forbidden);
         }
         holdout.validate_against(&control)?;
-        if get_record::<ProtectedHoldoutRecord>(&mut session, ctx, HOLDOUT_KIND, &holdout.id)
+        if get_record::<ReadProtectedHoldoutRecord>(&mut session, ctx, HOLDOUT_KIND, &holdout.id)
             .await?
             .is_some()
         {
             return Err(Error::Conflict("holdout already registered".into()));
         }
-        let digest = holdout.digest(&control)?;
+        control.current()?;
+        Err(Error::Conflict(
+            "legacy protected holdout is not Current input".into(),
+        ))
+    }
+
+    pub async fn register_current_holdout(
+        ctx: &Context,
+        store: &Store,
+        holdout: ProtectedHoldoutRecordV2,
+    ) -> Result<String> {
+        ctx.require(&[Role::Evaluator])?;
+        let mut session = store.session().await?;
+        let control: ReadRegisteredEvaluationControl =
+            need_record(&mut session, ctx, CONTROL_KIND, &holdout.registration_id).await?;
+        control.validate()?;
+        if control.evaluator_actor != ctx.actor() {
+            return Err(Error::Forbidden);
+        }
+        if holdout.schema_version != ProtectedHoldoutRecordV2::SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported protected-holdout schema".into(),
+            ));
+        }
+        if let Some(current) = &control.current {
+            holdout.validate_against(current)?;
+        } else {
+            let mut common = holdout.common_fields();
+            common.schema_version = ProtectedHoldoutRecord::SCHEMA.into();
+            common.validate_against(&control)?;
+            digest(
+                &holdout.frozen_configuration_digest,
+                "frozen_configuration_digest",
+            )?;
+        }
+        if get_record::<ReadProtectedHoldoutRecord>(&mut session, ctx, HOLDOUT_KIND, &holdout.id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Conflict("holdout already registered".into()));
+        }
+        control.current()?;
+        let digest = fingerprint(&holdout)?;
         put_record(
             &mut session,
             ctx,
@@ -1711,9 +2703,9 @@ impl IndependentEvaluationControl {
         identifier(&request.holdout_id)?;
         valid_time(request.issued_at_unix_seconds)?;
         let mut session = store.session().await?;
-        let control: RegisteredEvaluationControl =
+        let control: ReadRegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &request.registration_id).await?;
-        let holdout: ProtectedHoldoutRecord =
+        let holdout: ReadProtectedHoldoutRecord =
             need_record(&mut session, ctx, HOLDOUT_KIND, &request.holdout_id).await?;
         if control.evaluator_actor != ctx.actor() {
             return Err(Error::Forbidden);
@@ -1736,9 +2728,9 @@ impl IndependentEvaluationControl {
         session.commit().await?;
         validate_root_budget(ctx, store, &control).await?;
         let mut session = store.session().await?;
-        let control: RegisteredEvaluationControl =
+        let control: ReadRegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &request.registration_id).await?;
-        let holdout: ProtectedHoldoutRecord =
+        let holdout: ReadProtectedHoldoutRecord =
             need_record(&mut session, ctx, HOLDOUT_KIND, &request.holdout_id).await?;
         control.validate()?;
         holdout.validate_against(&control)?;
@@ -1757,13 +2749,15 @@ impl IndependentEvaluationControl {
         else {
             return Err(Error::Conflict(CANDIDATE_RECORD_MISSING.into()));
         };
-        let source_plan_binding = source_plan_binding_from_candidate(
+        control.current()?;
+        holdout.current()?;
+        let source_plan_binding = current_source_plan_binding_from_candidate(
             ctx.namespace(),
             &request.ticket_id,
             &control,
             &candidate,
         )?;
-        let ticket_id = source_bound_ticket_id(
+        let ticket_id = current_source_bound_ticket_id(
             ctx.namespace(),
             &control,
             &holdout,
@@ -1901,7 +2895,7 @@ impl IndependentEvaluationControl {
             state: TargetState::Planned,
         });
         let ticket = ReadEvaluationTicket {
-            schema_version: ReadEvaluationTicket::SCHEMA_V3.into(),
+            schema_version: ReadEvaluationTicket::SCHEMA_V4.into(),
             id: ticket_id.clone(),
             registration_id: control.id.clone(),
             registration_digest,
@@ -1937,7 +2931,7 @@ impl IndependentEvaluationControl {
             invalid_reasons: Vec::new(),
             issued_at_unix_seconds: request.issued_at_unix_seconds,
             candidate_dependency_binding,
-            source_plan_binding: Some(source_plan_binding),
+            source_plan_binding: Some(source_plan_binding.into()),
         };
         ticket.validate()?;
         put_record(
@@ -2031,7 +3025,7 @@ impl IndependentEvaluationControl {
         let mut session = store.session().await?;
         let mut ticket: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, &request.ticket_id).await?;
-        let control: RegisteredEvaluationControl =
+        let control: ReadRegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
         if ticket.executor_actor != ctx.actor() || is_stopping(ticket.lifecycle) {
             return Err(Error::Forbidden);
@@ -2373,9 +3367,9 @@ impl IndependentEvaluationControl {
         let mut session = store.session().await?;
         let mut ticket: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, &request.ticket_id).await?;
-        let control: RegisteredEvaluationControl =
+        let control: ReadRegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-        let holdout: ProtectedHoldoutRecord =
+        let holdout: ReadProtectedHoldoutRecord =
             need_record(&mut session, ctx, HOLDOUT_KIND, &ticket.holdout_id).await?;
         if ticket.evaluator_actor != ctx.actor()
             || ctx.actor() == ticket.proposer_actor
@@ -2707,7 +3701,7 @@ impl IndependentEvaluationControl {
         ctx.require(&[Role::Evaluator])?;
         valid_time(now)?;
         let ticket: ReadEvaluationTicket = load(store, ctx, TICKET_KIND, ticket_id).await?;
-        let control: RegisteredEvaluationControl =
+        let control: ReadRegisteredEvaluationControl =
             load(store, ctx, CONTROL_KIND, &ticket.registration_id).await?;
         if ticket.evaluator_actor != ctx.actor()
             || ticket.lifecycle != TicketLifecycle::ReadyForFinal
@@ -2806,7 +3800,6 @@ impl IndependentEvaluationControl {
                 _ => None,
             })
             .collect();
-        let report = derive_complete_report(&ticket, &control, &rows, cost_ratio, p95_ratio)?;
         let anchor_evidence_digest = anchor_evidence_digest(&ticket)?;
         let resource_evidence = ResourceEvidenceRecord {
             schema_version: "rsia.evaluation_resource_evidence.v1".into(),
@@ -2824,7 +3817,7 @@ impl IndependentEvaluationControl {
         {
             return Err(Error::Conflict("ticket changed during finalization".into()));
         }
-        let latest_control: RegisteredEvaluationControl =
+        let latest_control: ReadRegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &latest.registration_id).await?;
         if latest_control.digest()? != registration_digest {
             return Err(Error::Conflict(
@@ -2834,8 +3827,28 @@ impl IndependentEvaluationControl {
         // Revalidate actual facts after external cost/statistical precomputation,
         // before stop, settlement, resource, ticket or formal writes.
         validate_status_closure(&mut session, ctx, &latest, None).await?;
-        let latest_holdout: ProtectedHoldoutRecord =
+        let latest_holdout: ReadProtectedHoldoutRecord =
             need_record(&mut session, ctx, HOLDOUT_KIND, &latest.holdout_id).await?;
+        let current_plan = if latest.schema_version == EvaluationTicketV4::SCHEMA {
+            let candidate: ReadCandidate = session
+                .need(ctx, "artifact", &latest.candidate_digest)
+                .await?;
+            Some(ExperimentPlanV3::from_typed_candidate(
+                &latest_control.frozen_configuration()?,
+                &candidate.id,
+                &candidate,
+            )?)
+        } else {
+            None
+        };
+        let report = derive_complete_report(
+            &ticket,
+            &control,
+            current_plan.as_ref(),
+            &rows,
+            cost_ratio,
+            p95_ratio,
+        )?;
         for target in &latest.targets {
             validate_completed_target_evidence(
                 &mut session,
@@ -2982,13 +3995,14 @@ impl IndependentEvaluationControl {
             resource_evidence_digest,
             stored_dependency_binding,
         };
+        let raw_formal = ReadFormalEvaluation::from_result(&latest, formal.clone())?;
         put_record(
             &mut session,
             ctx,
             FORMAL_KIND,
             ticket_id,
             ctx.actor(),
-            &formal,
+            &raw_formal,
         )
         .await?;
         if latest.candidate_dependency_binding.is_some() {
@@ -3012,7 +4026,7 @@ impl IndependentEvaluationControl {
                 ctx,
                 &latest,
                 &control,
-                &formal,
+                &raw_formal,
             )
             .await?;
         }
@@ -3033,7 +4047,7 @@ impl IndependentEvaluationControl {
         let mut session = store.session().await?;
         let mut ticket: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
-        let control: RegisteredEvaluationControl =
+        let control: ReadRegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
         if ticket.evaluator_actor != ctx.actor() {
             return Err(Error::Forbidden);
@@ -3059,7 +4073,7 @@ impl IndependentEvaluationControl {
         if ticket.lifecycle != TicketLifecycle::Draining {
             return Self::status(ctx, store, ticket_id).await;
         }
-        let control: RegisteredEvaluationControl =
+        let control: ReadRegisteredEvaluationControl =
             load(store, ctx, CONTROL_KIND, &ticket.registration_id).await?;
         for target in &ticket.targets {
             if let TargetState::RunningUsageUnknown {
@@ -3165,10 +4179,10 @@ impl IndependentEvaluationControl {
         let ticket: ReadEvaluationTicket =
             need_record(&mut session, ctx, TICKET_KIND, ticket_id).await?;
         let formal =
-            get_record::<FormalEvaluationV2>(&mut session, ctx, FORMAL_KIND, ticket_id).await?;
+            get_record::<ReadFormalEvaluation>(&mut session, ctx, FORMAL_KIND, ticket_id).await?;
         validate_status_closure(&mut session, ctx, &ticket, formal.as_ref()).await?;
         if matches!(
-            &formal,
+            formal.as_ref().map(ReadFormalEvaluation::result),
             Some(FormalEvaluationV2::CompleteBatch {
                 evidence_scope: EvaluationEvidenceScope::RegisteredExternalHost,
                 ..
@@ -3186,7 +4200,10 @@ impl IndependentEvaluationControl {
             .await?;
         }
         session.commit().await?;
-        Ok(StreamingEvaluationStatus { ticket, formal })
+        Ok(StreamingEvaluationStatus {
+            ticket,
+            formal: formal.map(ReadFormalEvaluation::into_result),
+        })
     }
 
     pub async fn verified_report_view(
@@ -3239,7 +4256,7 @@ async fn read_verified_formal_report_core(
 ) -> Result<VerifiedFormalReportReadV1> {
     identifier(report_id)?;
     let ticket: ReadEvaluationTicket = need_record(session, ctx, TICKET_KIND, report_id).await?;
-    let formal: FormalEvaluationV2 = need_record(session, ctx, FORMAL_KIND, report_id).await?;
+    let formal: ReadFormalEvaluation = need_record(session, ctx, FORMAL_KIND, report_id).await?;
     validate_status_closure(session, ctx, &ticket, Some(&formal)).await?;
     let revoke_watermark = session.watermark(ctx).await?;
     let (
@@ -3250,7 +4267,7 @@ async fn read_verified_formal_report_core(
         anchor_status,
         evidence_scope,
         cost_evidence_scope,
-    ) = match &formal {
+    ) = match formal.result() {
         FormalEvaluationV2::CompleteBatch {
             evidence_scope,
             cost_evidence_scope,
@@ -3352,14 +4369,105 @@ async fn read_verified_formal_report_core(
                 .retain(|reason| reason == "formal_verdict_not_approvable");
         }
     }
-    let state = if ticket.schema_version == ReadEvaluationTicket::SCHEMA {
-        evo_storage::PersistentContractState::Legacy
-    } else {
-        evo_storage::PersistentContractState::CurrentVerified
+    let state = match ticket.schema_version.as_str() {
+        EvaluationTicketV2::SCHEMA | EvaluationTicketV3::SCHEMA => {
+            evo_storage::PersistentContractState::Legacy
+        }
+        EvaluationTicketV4::SCHEMA => evo_storage::PersistentContractState::CurrentVerified,
+        _ => {
+            return Err(Error::Invalid(
+                "unsupported evaluation-ticket schema".into(),
+            ));
+        }
     };
+    let control: ReadRegisteredEvaluationControl =
+        need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
+    let holdout: ReadProtectedHoldoutRecord =
+        need_record(session, ctx, HOLDOUT_KIND, &ticket.holdout_id).await?;
+    let (plan_schema, plan_id) = match &ticket.source_plan_binding {
+        Some(binding) => (
+            if ticket.schema_version == EvaluationTicketV4::SCHEMA {
+                evo_core::evaluation::PLAN_SCHEMA_V3
+            } else {
+                evo_core::evaluation::PLAN_SCHEMA_V2
+            },
+            binding.plan_id.clone(),
+        ),
+        None => (
+            evo_core::evaluation::PLAN_SCHEMA,
+            control.v1_plan_snapshot.id.clone(),
+        ),
+    };
+    let mut lineage = vec![FormalEvaluationLineage {
+        control_schema: control.schema_version.clone(),
+        plan_schema: plan_schema.into(),
+        plan_id,
+        ticket_schema: ticket.schema_version.clone(),
+        ticket_id: ticket.id.clone(),
+        report_id: storage_id(FORMAL_KIND, &ticket.id)?,
+        deterministically_derived: false,
+        ticket_present: true,
+        report_present: true,
+    }];
+    if ticket.schema_version == EvaluationTicketV4::SCHEMA {
+        // All originals were authenticated in this Session above. The explicit
+        // Current configuration permits pure historical projections; the reverse
+        // projection is unavailable for legacy inputs that do not contain m.
+        let candidate: ReadCandidate = session
+            .need(ctx, "artifact", &ticket.candidate_digest)
+            .await?;
+        let actual_control = control.current()?;
+        let actual_holdout = holdout.current()?;
+        let source = ticket
+            .source_plan_binding
+            .as_ref()
+            .ok_or_else(|| Error::Invalid("v4 ticket requires a source-plan binding".into()))?;
+        for schema in [
+            RegisteredEvaluationControl::SCHEMA_V1,
+            RegisteredEvaluationControl::SCHEMA,
+        ] {
+            let mut old_control = actual_control.common_fields();
+            old_control.schema_version = schema.into();
+            let old_control: ReadRegisteredEvaluationControl = old_control.into();
+            let mut old_holdout = actual_holdout.common_fields();
+            old_holdout.schema_version = ProtectedHoldoutRecord::SCHEMA.into();
+            let old_holdout: ReadProtectedHoldoutRecord = old_holdout.into();
+            let binding = source_plan_binding_from_candidate(
+                ctx.namespace(),
+                &source.logical_ticket_id,
+                &old_control,
+                &candidate,
+            )?;
+            let id = source_bound_ticket_id(
+                ctx.namespace(),
+                &old_control,
+                &old_holdout,
+                &binding,
+                ticket.issued_at_unix_seconds,
+            )?;
+            let ticket_present = get_record::<ReadEvaluationTicket>(session, ctx, TICKET_KIND, &id)
+                .await?
+                .is_some();
+            let report_present = get_record::<ReadFormalEvaluation>(session, ctx, FORMAL_KIND, &id)
+                .await?
+                .is_some();
+            lineage.push(FormalEvaluationLineage {
+                control_schema: schema.into(),
+                plan_schema: evo_core::evaluation::PLAN_SCHEMA_V2.into(),
+                plan_id: binding.plan_id,
+                ticket_schema: EvaluationTicketV3::SCHEMA.into(),
+                report_id: storage_id(FORMAL_KIND, &id)?,
+                ticket_id: id,
+                deterministically_derived: true,
+                ticket_present,
+                report_present,
+            });
+        }
+    }
     Ok(VerifiedFormalReportReadV1 {
         state,
         original: view,
+        lineage,
     })
 }
 
@@ -3369,7 +4477,7 @@ fn validate_status_closure<'a>(
     session: &'a mut Session,
     ctx: &'a Context,
     ticket: &'a ReadEvaluationTicket,
-    formal: Option<&'a FormalEvaluationV2>,
+    formal: Option<&'a ReadFormalEvaluation>,
 ) -> crate::optimization::StepFuture<'a, ()> {
     Box::pin(validate_status_closure_unboxed(
         session, ctx, ticket, formal,
@@ -3380,12 +4488,12 @@ async fn validate_status_closure_unboxed(
     session: &mut Session,
     ctx: &Context,
     ticket: &ReadEvaluationTicket,
-    formal: Option<&FormalEvaluationV2>,
+    formal: Option<&ReadFormalEvaluation>,
 ) -> Result<()> {
     ticket.validate()?;
-    let control: RegisteredEvaluationControl =
+    let control: ReadRegisteredEvaluationControl =
         need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-    let holdout: ProtectedHoldoutRecord =
+    let holdout: ReadProtectedHoldoutRecord =
         need_record(session, ctx, HOLDOUT_KIND, &ticket.holdout_id).await?;
     validate_candidate_binding_in_session(session, ctx, ticket, &control, &holdout).await?;
     if ticket.candidate_dependency_binding.is_some() && formal.is_some() {
@@ -3473,7 +4581,10 @@ async fn validate_status_closure_unboxed(
         collect_dependency_nodes(session, ctx, vec![artifact_edge(TICKET_KIND, &ticket.id)?])
             .await?;
     }
-    match formal {
+    if let Some(formal) = formal {
+        formal.validate_against(ticket)?;
+    }
+    match formal.map(ReadFormalEvaluation::result) {
         Some(FormalEvaluationV2::EarlyStopped {
             evidence_scope,
             ticket_id,
@@ -3723,7 +4834,8 @@ async fn validate_status_closure_unboxed(
 
 fn derive_complete_report(
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
+    control: &ReadRegisteredEvaluationControl,
+    current_plan: Option<&ExperimentPlanV3>,
     rows: &[ClusterObservation],
     cost_ratio: f64,
     p95_ratio: f64,
@@ -3746,11 +4858,26 @@ fn derive_complete_report(
     if bound_v1_plan.digest()? != ticket.bound_v1_plan_digest {
         return Err(Error::Conflict("bound v1 plan digest mismatch".into()));
     }
-    postprocess_complete_report(
-        &control.schema_version,
-        ticket.profile,
-        decide(&bound_v1_plan, raw, cost_ratio, p95_ratio, true)?,
-    )
+    if ticket.schema_version == EvaluationTicketV4::SCHEMA {
+        let plan = current_plan
+            .ok_or_else(|| Error::Conflict("current fixed-sample plan unavailable".into()))?;
+        let mut report = decide_fixed_sample_v45(plan, raw, cost_ratio, p95_ratio, true)?;
+        if report.verdict == Verdict::Noninferior {
+            report.verdict = Verdict::Inconclusive;
+            report
+                .reasons
+                .push("cost_savings_statistical_proof_unsupported".into());
+            report.reasons.sort();
+            report.reasons.dedup();
+        }
+        Ok(report)
+    } else {
+        postprocess_complete_report(
+            &control.schema_version,
+            ticket.profile,
+            decide(&bound_v1_plan, raw, cost_ratio, p95_ratio, true)?,
+        )
+    }
 }
 
 // The caller first validates the full candidate/content/dependency closure.
@@ -3760,8 +4887,8 @@ async fn recompute_bound_complete_report_in_session(
     session: &mut Session,
     ctx: &Context,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
     calls: &[BudgetCallRecord],
 ) -> Result<BernsteinReportWire> {
     ticket.validate()?;
@@ -3936,9 +5063,22 @@ async fn recompute_bound_complete_report_in_session(
     if baseline_p95 == 0 {
         return Err(changed());
     }
+    let current_plan = if ticket.schema_version == EvaluationTicketV4::SCHEMA {
+        let candidate: ReadCandidate = session
+            .need(ctx, "artifact", &ticket.candidate_digest)
+            .await?;
+        Some(ExperimentPlanV3::from_typed_candidate(
+            &control.frozen_configuration()?,
+            &candidate.id,
+            &candidate,
+        )?)
+    } else {
+        None
+    };
     let report = derive_complete_report(
         ticket,
         control,
+        current_plan.as_ref(),
         &rows,
         candidate_cost as f64 / baseline_cost as f64,
         candidate_p95 as f64 / baseline_p95 as f64,
@@ -3953,8 +5093,8 @@ async fn validate_completed_target_evidence(
     session: &mut Session,
     ctx: &Context,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
     target: &EvaluationTarget,
 ) -> Result<IndependentGraderReceiptV2> {
     let TargetState::Completed {
@@ -4054,8 +5194,8 @@ async fn validate_bound_early_certificate_in_session(
     session: &mut Session,
     ctx: &Context,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
     certificate: &EarlyStopCertificate,
 ) -> Result<()> {
     let changed = || Error::Conflict(EARLY_CERTIFICATE_CHANGED.into());
@@ -4491,31 +5631,34 @@ pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
     let p = &envelope.payload;
     let (payload_id, schema) = match envelope.record_kind.as_str() {
         CONTROL_KIND => {
-            let v: RegisteredEvaluationControl =
+            let v: ReadRegisteredEvaluationControl =
                 serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
             v.validate()?;
-            (v.id, v.schema_version)
+            (v.id.clone(), v.schema_version.clone())
         }
         HOLDOUT_KIND => {
-            let v: ProtectedHoldoutRecord =
+            let v: ReadProtectedHoldoutRecord =
                 serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
-            (v.id, v.schema_version)
+            (v.id.clone(), v.schema_version.clone())
         }
         TICKET_KIND => {
             let v: ReadEvaluationTicket =
                 serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
             v.validate()?;
-            (v.id, v.schema_version)
+            (v.id.clone(), v.schema_version.clone())
         }
         FORMAL_KIND => {
-            let v: FormalEvaluationV2 =
+            let v: ReadFormalEvaluation =
                 serde_json::from_value(p.clone()).map_err(|_| Error::Forbidden)?;
-            let ticket = match v {
+            if let ReadFormalEvaluation::Current(current) = &v {
+                current.validate()?;
+            }
+            let ticket = match v.result() {
                 FormalEvaluationV2::CompleteBatch { ticket_id, .. }
                 | FormalEvaluationV2::EarlyStopped { ticket_id, .. }
                 | FormalEvaluationV2::Invalid { ticket_id, .. } => ticket_id,
             };
-            if storage_id(FORMAL_KIND, &ticket)? != id {
+            if storage_id(FORMAL_KIND, ticket)? != id {
                 return Err(Error::Forbidden);
             }
             return Ok(());
@@ -4536,7 +5679,7 @@ pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
             if hash(v.output_utf8.as_bytes()) != v.output_digest {
                 return Err(Error::Forbidden);
             }
-            (v.id, v.schema_version)
+            (v.id.clone(), v.schema_version.clone())
         }
         LEDGER_KIND => {
             let v: ExposureLedger =
@@ -4567,9 +5710,14 @@ pub(crate) fn validate_content_envelope(id: &str, body: &Value) -> Result<()> {
     let supported = match envelope.record_kind.as_str() {
         CONTROL_KIND => matches!(
             schema.as_str(),
-            RegisteredEvaluationControl::SCHEMA | RegisteredEvaluationControl::SCHEMA_V1
+            RegisteredEvaluationControl::SCHEMA
+                | RegisteredEvaluationControl::SCHEMA_V1
+                | RegisteredEvaluationControlV3::SCHEMA
         ),
-        HOLDOUT_KIND => schema == ProtectedHoldoutRecord::SCHEMA,
+        HOLDOUT_KIND => matches!(
+            schema.as_str(),
+            ProtectedHoldoutRecord::SCHEMA | ProtectedHoldoutRecordV2::SCHEMA
+        ),
         TICKET_KIND => ReadEvaluationTicket::supports_schema(&schema),
         EXECUTION_RECEIPT_KIND => schema == "rsia.execution_receipt.v2",
         GRADER_RECEIPT_KIND => schema == "rsia.independent_grader_receipt.v2",
@@ -4631,10 +5779,20 @@ async fn get_record<T: DeserializeOwned>(
             .await?;
         }
     }
-    let envelope: Option<TypedArtifactEnvelope<T>> = raw
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|_| Error::Conflict("typed envelope is unreadable".into()))?;
+    let envelope: Option<TypedArtifactEnvelope<T>> =
+        if matches!(record_kind, CONTROL_KIND | HOLDOUT_KIND) {
+            // Keep the content-witness check above, then decode these exact
+            // stored bytes in this same Session. A Value round-trip would
+            // otherwise erase duplicate nested configuration or version keys.
+            session
+                .get(ctx, "artifact", &storage_id)
+                .await
+                .map_err(|_| Error::Conflict("typed envelope is unreadable".into()))?
+        } else {
+            raw.map(serde_json::from_value)
+                .transpose()
+                .map_err(|_| Error::Conflict("typed envelope is unreadable".into()))?
+        };
     match envelope {
         Some(envelope)
             if envelope.schema_version == ENVELOPE_SCHEMA
@@ -4921,9 +6079,9 @@ fn deserialize_stored_binding<'de, D: Deserializer<'de>>(
 
 fn dependency_record_schema(kind: &str) -> Option<&'static str> {
     match kind {
-        CONTROL_KIND => Some(RegisteredEvaluationControl::SCHEMA),
-        HOLDOUT_KIND => Some(ProtectedHoldoutRecord::SCHEMA),
-        TICKET_KIND => Some(ReadEvaluationTicket::SCHEMA),
+        CONTROL_KIND => Some(RegisteredEvaluationControlV3::SCHEMA),
+        HOLDOUT_KIND => Some(ProtectedHoldoutRecordV2::SCHEMA),
+        TICKET_KIND => Some(ReadEvaluationTicket::SCHEMA_V4),
         TICKET_RECEIPT_KIND => Some("rsia.evaluation_ticket_issue_receipt.v1"),
         ALPHA_USE_KIND => Some("rsia.alpha_claim_reservation.v1"),
         EXECUTION_RECEIPT_KIND => Some("rsia.execution_receipt.v2"),
@@ -5150,8 +6308,16 @@ async fn dependency_node_identity(
     let actual_schema = payload.get("schema_version").and_then(Value::as_str);
     if actual_schema != Some(expected_schema)
         && !(record_kind == CONTROL_KIND
-            && actual_schema == Some(RegisteredEvaluationControl::SCHEMA_V1))
-        && !(record_kind == TICKET_KIND && actual_schema == Some(ReadEvaluationTicket::SCHEMA_V3))
+            && matches!(
+                actual_schema,
+                Some(RegisteredEvaluationControl::SCHEMA_V1 | RegisteredEvaluationControl::SCHEMA)
+            ))
+        && !(record_kind == HOLDOUT_KIND && actual_schema == Some(ProtectedHoldoutRecord::SCHEMA))
+        && !(record_kind == TICKET_KIND
+            && matches!(
+                actual_schema,
+                Some(EvaluationTicketV2::SCHEMA | EvaluationTicketV3::SCHEMA)
+            ))
     {
         return Err(Error::Invalid(
             "unsupported formal dependency inner schema".into(),
@@ -5184,10 +6350,10 @@ async fn dependency_node_identity(
     };
     let content = match record_kind {
         CONTROL_KIND => {
-            let control: RegisteredEvaluationControl =
+            let control: ReadRegisteredEvaluationControl =
                 need_record(session, ctx, CONTROL_KIND, &logical_id).await?;
             control.validate()?;
-            typed_node_fingerprint::<RegisteredEvaluationControl>(
+            typed_node_fingerprint::<ReadRegisteredEvaluationControl>(
                 session,
                 ctx,
                 id,
@@ -5197,12 +6363,12 @@ async fn dependency_node_identity(
             .await?
         }
         HOLDOUT_KIND => {
-            let holdout: ProtectedHoldoutRecord =
+            let holdout: ReadProtectedHoldoutRecord =
                 need_record(session, ctx, HOLDOUT_KIND, &logical_id).await?;
-            let control: RegisteredEvaluationControl =
+            let control: ReadRegisteredEvaluationControl =
                 need_record(session, ctx, CONTROL_KIND, &holdout.registration_id).await?;
             holdout.validate_against(&control)?;
-            typed_node_fingerprint::<ProtectedHoldoutRecord>(
+            typed_node_fingerprint::<ReadProtectedHoldoutRecord>(
                 session,
                 ctx,
                 id,
@@ -5375,8 +6541,8 @@ async fn collect_dependency_nodes(
 
 fn candidate_matches_frozen(
     candidate: &ReadCandidate,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
 ) -> Result<()> {
     if candidate.id != holdout.pair.candidate_digest
         || candidate.bundle_digest != holdout.candidate_bundle_digest
@@ -5415,8 +6581,8 @@ impl TicketIdentityV3<'_> {
 
 fn source_bound_ticket_id(
     namespace: &str,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
     binding: &TicketSourcePlanBinding,
     issued_at_unix_seconds: i64,
 ) -> Result<String> {
@@ -5443,13 +6609,65 @@ fn source_bound_ticket_id(
     .content_id()
 }
 
+#[derive(Serialize)]
+struct TicketIdentityV4<'a> {
+    domain: &'static str,
+    schema_version: &'static str,
+    namespace: &'a str,
+    logical_ticket_id: &'a str,
+    registration_id: &'a str,
+    registration_digest: String,
+    holdout_id: &'a str,
+    holdout_record_digest: String,
+    manifest_digest: String,
+    source_plan_binding: &'a TicketSourcePlanBindingV2,
+    evaluator_actor: &'a str,
+    issued_at_unix_seconds: i64,
+}
+
+impl TicketIdentityV4<'_> {
+    fn content_id(&self) -> Result<String> {
+        Ok(format!("evaluation-ticket-v4-{}", fingerprint(self)?))
+    }
+}
+
+fn current_source_bound_ticket_id(
+    namespace: &str,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
+    binding: &TicketSourcePlanBindingV2,
+    issued_at_unix_seconds: i64,
+) -> Result<String> {
+    binding.validate()?;
+    if binding.namespace != namespace {
+        return Err(Error::Conflict(
+            "ticket source-plan namespace mismatch".into(),
+        ));
+    }
+    TicketIdentityV4 {
+        domain: "rsia.evaluation_ticket.identity.v4",
+        schema_version: ReadEvaluationTicket::SCHEMA_V4,
+        namespace,
+        logical_ticket_id: &binding.logical_ticket_id,
+        registration_id: &control.id,
+        registration_digest: control.digest()?,
+        holdout_id: &holdout.id,
+        holdout_record_digest: fingerprint(holdout)?,
+        manifest_digest: holdout.manifest.digest()?,
+        source_plan_binding: binding,
+        evaluator_actor: &control.evaluator_actor,
+        issued_at_unix_seconds,
+    }
+    .content_id()
+}
+
 // The only production callers have just authenticated this complete loaded
 // ReadCandidate through bind_candidate_record_in_session. This helper performs
 // content math, not source authorization, and retains no raw candidate bytes.
 fn source_plan_binding_from_candidate(
     namespace: &str,
     logical_ticket_id: &str,
-    control: &RegisteredEvaluationControl,
+    control: &ReadRegisteredEvaluationControl,
     candidate: &ReadCandidate,
 ) -> Result<TicketSourcePlanBinding> {
     candidate.current()?;
@@ -5471,24 +6689,72 @@ fn source_plan_binding_from_candidate(
     Ok(binding)
 }
 
+fn current_source_plan_binding_from_candidate(
+    namespace: &str,
+    logical_ticket_id: &str,
+    control: &ReadRegisteredEvaluationControl,
+    candidate: &ReadCandidate,
+) -> Result<TicketSourcePlanBindingV2> {
+    candidate.current()?;
+    let plan = ExperimentPlanV3::from_typed_candidate(
+        &control.frozen_configuration()?,
+        &candidate.id,
+        candidate,
+    )?;
+    let plan_digest = plan.digest_against(&candidate.id, candidate)?;
+    let binding = TicketSourcePlanBindingV2 {
+        schema_version: TicketSourcePlanBindingV2::SCHEMA.into(),
+        namespace: namespace.into(),
+        logical_ticket_id: logical_ticket_id.into(),
+        plan_id: plan.id,
+        plan_digest,
+        candidate_record_digest: plan.candidate_record_digest,
+    };
+    binding.validate()?;
+    Ok(binding)
+}
+
 fn validate_source_plan_binding_from_candidate(
     namespace: &str,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
     candidate: &ReadCandidate,
 ) -> Result<()> {
     ticket.validate_source_plan_binding_shape()?;
     let Some(stored) = &ticket.source_plan_binding else {
         return Ok(()); // The old v2 byte interpretation remains historical.
     };
+    if ticket.schema_version == EvaluationTicketV4::SCHEMA {
+        let actual = current_source_plan_binding_from_candidate(
+            namespace,
+            &stored.logical_ticket_id,
+            control,
+            candidate,
+        )?;
+        if stored.v2() != actual
+            || ticket.id
+                != current_source_bound_ticket_id(
+                    namespace,
+                    control,
+                    holdout,
+                    &actual,
+                    ticket.issued_at_unix_seconds,
+                )?
+        {
+            return Err(Error::Conflict(
+                "ticket source-plan original changed".into(),
+            ));
+        }
+        return Ok(());
+    }
     let actual = source_plan_binding_from_candidate(
         namespace,
         &stored.logical_ticket_id,
         control,
         candidate,
     )?;
-    if stored != &actual
+    if stored.0 != actual
         || ticket.id
             != source_bound_ticket_id(
                 namespace,
@@ -5508,8 +6774,8 @@ fn validate_source_plan_binding_from_candidate(
 async fn bind_candidate_record_in_session(
     session: &mut Session,
     ctx: &Context,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
 ) -> Result<Option<(ReadCandidate, FormalCandidateDependencyBinding)>> {
     // Presence is decided once at issue, never by a subsequent read of an old
     // unbound ticket. A malformed present candidate cannot become legacy None.
@@ -5528,8 +6794,8 @@ async fn bind_candidate_record_in_session(
 async fn rebuild_candidate_binding_in_session(
     session: &mut Session,
     ctx: &Context,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
     candidate: ReadCandidate,
 ) -> Result<(ReadCandidate, FormalCandidateDependencyBinding)> {
     candidate.validate_content()?;
@@ -5589,7 +6855,8 @@ fn validate_ticket_candidate_versions(
     candidate: &ReadCandidate,
 ) -> Result<()> {
     match (ticket.schema_version.as_str(), candidate.is_current()) {
-        (ReadEvaluationTicket::SCHEMA, false) | (ReadEvaluationTicket::SCHEMA_V3, true) => Ok(()),
+        (ReadEvaluationTicket::SCHEMA, false)
+        | (ReadEvaluationTicket::SCHEMA_V3 | ReadEvaluationTicket::SCHEMA_V4, true) => Ok(()),
         _ => Err(Error::Conflict(
             "ticket/candidate versions do not form a supported pair".into(),
         )),
@@ -5600,8 +6867,8 @@ async fn validate_candidate_binding_in_session(
     session: &mut Session,
     ctx: &Context,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
 ) -> Result<()> {
     let Some(binding) = &ticket.candidate_dependency_binding else {
         return Ok(());
@@ -5673,7 +6940,7 @@ async fn bound_complete_report_edges(
     session: &mut Session,
     ctx: &Context,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
+    control: &ReadRegisteredEvaluationControl,
 ) -> Result<Vec<(String, String)>> {
     let mut edges = vec![
         artifact_edge(TICKET_KIND, &ticket.id)?,
@@ -5731,7 +6998,7 @@ async fn required_ticket_edges(
     session: &mut Session,
     ctx: &Context,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
+    control: &ReadRegisteredEvaluationControl,
 ) -> Result<Vec<(String, String)>> {
     let mut edges = vec![
         ("artifact".into(), ticket.candidate_digest.clone()),
@@ -5802,7 +7069,7 @@ async fn validate_bound_fact_edges(
     session: &mut Session,
     ctx: &Context,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
+    control: &ReadRegisteredEvaluationControl,
 ) -> Result<()> {
     if ticket.candidate_dependency_binding.is_none() {
         return Ok(());
@@ -6149,7 +7416,7 @@ async fn execution_receipt_billing_scope(
             .budget_call_scopes_for_group(ctx, &ticket.id)
             .await?
     } else {
-        let control: RegisteredEvaluationControl =
+        let control: ReadRegisteredEvaluationControl =
             historical_typed_payload(&control_row, CONTROL_KIND, &ticket.registration_id)?;
         control
             .validate()
@@ -6160,7 +7427,7 @@ async fn execution_receipt_billing_scope(
         {
             return Err(execution_receipt_history_conflict());
         }
-        vec![control.billing_scope]
+        vec![control.billing_scope.clone()]
     };
     let mut matched = None;
     for scope in scopes {
@@ -6201,7 +7468,7 @@ async fn require_unreceipted_execution_call(
     }
     // Keep the original current-content witness gate, then decode the same
     // physical row strictly and check its SQL owner and logical payload ID.
-    let _: RegisteredEvaluationControl =
+    let _: ReadRegisteredEvaluationControl =
         need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
     let control_row = session
         .object_row(
@@ -6211,7 +7478,7 @@ async fn require_unreceipted_execution_call(
         )
         .await?
         .ok_or_else(execution_receipt_history_conflict)?;
-    let control: RegisteredEvaluationControl =
+    let control: ReadRegisteredEvaluationControl =
         historical_typed_payload(&control_row, CONTROL_KIND, &ticket.registration_id)?;
     if control_row.owner != ticket.evaluator_actor
         || control.id != ticket.registration_id
@@ -6305,15 +7572,15 @@ async fn control_billing_scope(
     ctx: &Context,
     ticket: &ReadEvaluationTicket,
 ) -> Result<String> {
-    let control: RegisteredEvaluationControl =
+    let control: ReadRegisteredEvaluationControl =
         load(store, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-    Ok(control.billing_scope)
+    Ok(control.billing_scope.clone())
 }
 
 async fn validate_root_budget(
     ctx: &Context,
     store: &Store,
-    control: &RegisteredEvaluationControl,
+    control: &ReadRegisteredEvaluationControl,
 ) -> Result<()> {
     if control.billing_scope != control.optimization_budget.root_budget_scope_id {
         return Err(Error::Invalid(
@@ -6984,7 +8251,7 @@ async fn settle_exposure_money(
 async fn close_execution_slots(
     session: &mut Session,
     ctx: &Context,
-    control: &RegisteredEvaluationControl,
+    control: &ReadRegisteredEvaluationControl,
     ticket: &mut ReadEvaluationTicket,
     reason: &str,
     now: i64,
@@ -7169,7 +8436,7 @@ fn call_fence(call: &BudgetCallRecord, now: i64) -> BudgetCallFence {
 async fn stop_ticket(
     session: &mut Session,
     ctx: &Context,
-    control: &RegisteredEvaluationControl,
+    control: &ReadRegisteredEvaluationControl,
     ticket: &mut ReadEvaluationTicket,
     decision: EarlyStopDecision,
     issuer: &IndependentGraderReceiptV2,
@@ -7240,7 +8507,7 @@ async fn stop_ticket(
 async fn invalidate_in_session(
     session: &mut Session,
     ctx: &Context,
-    control: &RegisteredEvaluationControl,
+    control: &ReadRegisteredEvaluationControl,
     ticket: &mut ReadEvaluationTicket,
     reason: &str,
     now: i64,
@@ -7264,14 +8531,23 @@ async fn invalidate_in_session(
         reasons: ticket.invalid_reasons.clone(),
     };
     put_record(session, ctx, TICKET_KIND, &ticket.id, ctx.actor(), ticket).await?;
-    put_record(session, ctx, FORMAL_KIND, &ticket.id, ctx.actor(), &formal).await?;
+    let raw_formal = ReadFormalEvaluation::from_result(ticket, formal.clone())?;
+    put_record(
+        session,
+        ctx,
+        FORMAL_KIND,
+        &ticket.id,
+        ctx.actor(),
+        &raw_formal,
+    )
+    .await?;
     Ok(formal)
 }
 
 async fn load_slice_id(session: &mut Session, ctx: &Context, holdout_id: &str) -> Result<String> {
-    let holdout: ProtectedHoldoutRecord =
+    let holdout: ReadProtectedHoldoutRecord =
         need_record(session, ctx, HOLDOUT_KIND, holdout_id).await?;
-    Ok(holdout.manifest.slice_id)
+    Ok(holdout.manifest.slice_id.clone())
 }
 
 async fn maybe_store_early_formal(
@@ -7285,9 +8561,9 @@ async fn maybe_store_early_formal(
             .clone()
             .ok_or_else(|| Error::Invalid("early-stopped ticket lacks certificate".into()))?;
         if ticket.candidate_dependency_binding.is_some() {
-            let control: RegisteredEvaluationControl =
+            let control: ReadRegisteredEvaluationControl =
                 need_record(session, ctx, CONTROL_KIND, &ticket.registration_id).await?;
-            let holdout: ProtectedHoldoutRecord =
+            let holdout: ReadProtectedHoldoutRecord =
                 need_record(session, ctx, HOLDOUT_KIND, &ticket.holdout_id).await?;
             validate_bound_early_certificate_in_session(
                 session,
@@ -7305,6 +8581,7 @@ async fn maybe_store_early_formal(
             ticket_digest: fingerprint(ticket)?,
             certificate,
         };
+        let raw_formal = ReadFormalEvaluation::from_result(ticket, formal)?;
         // The ticket's evaluator owns its report, also when a late execution
         // receipt re-derives it; every other caller is that evaluator.
         put_record(
@@ -7313,7 +8590,7 @@ async fn maybe_store_early_formal(
             FORMAL_KIND,
             &ticket.id,
             ticket.evaluator_actor.as_str(),
-            &formal,
+            &raw_formal,
         )
         .await?;
     }
@@ -7511,8 +8788,16 @@ fn ga18_node_identity(
     let actual_schema = payload["schema_version"].as_str();
     if actual_schema != Some(expected_schema)
         && !(record_kind == CONTROL_KIND
-            && actual_schema == Some(RegisteredEvaluationControl::SCHEMA_V1))
-        && !(record_kind == TICKET_KIND && actual_schema == Some(EvaluationTicketV3::SCHEMA))
+            && matches!(
+                actual_schema,
+                Some(RegisteredEvaluationControl::SCHEMA_V1 | RegisteredEvaluationControl::SCHEMA)
+            ))
+        && !(record_kind == HOLDOUT_KIND && actual_schema == Some(ProtectedHoldoutRecord::SCHEMA))
+        && !(record_kind == TICKET_KIND
+            && matches!(
+                actual_schema,
+                Some(EvaluationTicketV2::SCHEMA | EvaluationTicketV3::SCHEMA)
+            ))
     {
         return Err(ga18_cycle_error());
     }
@@ -7537,8 +8822,8 @@ fn ga18_node_identity(
         return Err(ga18_cycle_error());
     }
     let content = match record_kind {
-        CONTROL_KIND => typed::<RegisteredEvaluationControl>(value)?,
-        HOLDOUT_KIND => typed::<ProtectedHoldoutRecord>(value)?,
+        CONTROL_KIND => typed::<ReadRegisteredEvaluationControl>(value)?,
+        HOLDOUT_KIND => typed::<ReadProtectedHoldoutRecord>(value)?,
         TICKET_KIND => typed::<ReadEvaluationTicket>(value)?,
         TICKET_RECEIPT_KIND => typed::<TicketIssueReceipt>(value)?,
         ALPHA_USE_KIND => typed::<AlphaClaimReservation>(value)?,
@@ -7560,8 +8845,8 @@ async fn ga18_candidate_binding(
     session: &mut Session,
     ctx: &Context,
     ticket: &ReadEvaluationTicket,
-    control: &RegisteredEvaluationControl,
-    holdout: &ProtectedHoldoutRecord,
+    control: &ReadRegisteredEvaluationControl,
+    holdout: &ReadProtectedHoldoutRecord,
     bodies: &BTreeMap<Ga18Key, Value>,
     outgoing: &BTreeMap<Ga18Key, Vec<Ga18Key>>,
 ) -> Result<()> {
@@ -7648,7 +8933,7 @@ async fn ga18_execution(
     ctx: &Context,
     bodies: &BTreeMap<Ga18Key, Value>,
     outgoing: &BTreeMap<Ga18Key, Vec<Ga18Key>>,
-    binding: (&ReadEvaluationTicket, &RegisteredEvaluationControl),
+    binding: (&ReadEvaluationTicket, &ReadRegisteredEvaluationControl),
     id: &str,
     side: ExecutionSide,
 ) -> Result<ExecutionReceiptV2> {
@@ -7760,7 +9045,7 @@ pub(crate) async fn ga18_qualified_cycle_edges(
         let ticket: ReadEvaluationTicket =
             ga18_owned_record(session, ctx, bodies, TICKET_KIND, &ticket_id, &evaluator).await?;
         ticket.validate()?;
-        let control: RegisteredEvaluationControl = ga18_owned_record(
+        let control: ReadRegisteredEvaluationControl = ga18_owned_record(
             session,
             ctx,
             bodies,
@@ -7769,7 +9054,7 @@ pub(crate) async fn ga18_qualified_cycle_edges(
             &ticket.evaluator_actor,
         )
         .await?;
-        let holdout: ProtectedHoldoutRecord = ga18_owned_record(
+        let holdout: ReadProtectedHoldoutRecord = ga18_owned_record(
             session,
             ctx,
             bodies,
@@ -8155,14 +9440,23 @@ mod source_plan_ticket_tests {
             ],
         });
         ticket.schema_version = ReadEvaluationTicket::SCHEMA_V3.into();
-        ticket.source_plan_binding = Some(TicketSourcePlanBinding {
-            schema_version: TicketSourcePlanBinding::SCHEMA.into(),
-            namespace: "ns".into(),
-            logical_ticket_id: "logical-ticket".into(),
-            plan_id: "plan-content-identity".into(),
-            plan_digest: hash(b"Complete frozen plan content data original."),
-            candidate_record_digest: candidate_digest,
-        });
+        ticket.source_plan_binding = Some(
+            TicketSourcePlanBinding {
+                schema_version: TicketSourcePlanBinding::SCHEMA.into(),
+                namespace: "ns".into(),
+                logical_ticket_id: "logical-ticket".into(),
+                plan_id: "plan-content-identity".into(),
+                plan_digest: hash(b"Complete frozen plan content data original."),
+                candidate_record_digest: candidate_digest,
+            }
+            .into(),
+        );
+        let stored: EvaluationTicketV3 =
+            serde_json::from_slice(&serde_json::to_vec(&ticket).unwrap()).unwrap();
+        assert_eq!(
+            stored.source_plan_binding,
+            *ticket.source_plan_binding.as_ref().unwrap()
+        );
         ticket
     }
 

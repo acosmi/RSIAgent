@@ -510,6 +510,281 @@ impl ExperimentPlanV2 {
     }
 }
 
+/// A positive finite regression magnitude, checked at its construction boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct FixedRegressionThreshold(f64);
+
+impl FixedRegressionThreshold {
+    pub fn new(value: f64) -> Result<Self> {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(Error::Invalid(
+                "max_regression must be positive and finite".into(),
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    pub fn value(self) -> f64 {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for FixedRegressionThreshold {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Self::new(f64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Complete pre-candidate configuration. Neither a locator nor its digest can
+/// replace this original when binding a current candidate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenFixedSampleConfiguration {
+    pub plan: ExperimentPlan,
+    pub max_regression: FixedRegressionThreshold,
+}
+
+impl FrozenFixedSampleConfiguration {
+    pub const DOMAIN: &'static str = "rsia.fixed_sample_configuration.v1";
+
+    pub fn new(plan: ExperimentPlan, max_regression: FixedRegressionThreshold) -> Result<Self> {
+        let configuration = Self {
+            plan,
+            max_regression,
+        };
+        configuration.validate()?;
+        Ok(configuration)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.plan.validate()?;
+        if !self.plan.frozen
+            || self.plan.frozen_at.is_none()
+            || self.plan.candidate_digest.is_some()
+        {
+            return Err(Error::Conflict(
+                "fixed-sample configuration requires a frozen unbound plan".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_early_stop(
+        &self,
+        early: Option<&crate::sequential::EarlyStopPlan>,
+    ) -> Result<()> {
+        if let Some(early) = early
+            && self.max_regression.value() != f64::from(early.max_regression_micros) / 1_000_000.0
+        {
+            return Err(Error::Invalid(
+                "fixed and sequential max_regression differ".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        fingerprint(&(Self::DOMAIN, self))
+    }
+}
+
+pub const PLAN_SCHEMA_V3: &str = "rsia.experiment_plan.v3";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentPlanV3 {
+    pub schema_version: String,
+    pub id: String,
+    pub frozen_configuration: FrozenFixedSampleConfiguration,
+    pub candidate_locator: String,
+    pub candidate_record_digest: String,
+    pub candidate_record_utf8: String,
+}
+
+#[derive(Serialize)]
+struct ExperimentPlanIdentityV3<'a> {
+    schema_version: &'static str,
+    frozen_configuration: &'a FrozenFixedSampleConfiguration,
+    candidate_locator: &'a str,
+    candidate_record_digest: &'a str,
+}
+
+impl ExperimentPlanV3 {
+    /// Content binding only; the engine independently authenticates the actual
+    /// complete candidate in the same Session before supplying it here.
+    pub fn from_typed_candidate<T: Serialize>(
+        frozen_configuration: &FrozenFixedSampleConfiguration,
+        candidate_locator: &str,
+        complete_candidate_record: &T,
+    ) -> Result<Self> {
+        frozen_configuration.validate()?;
+        identifier(candidate_locator)?;
+        let candidate_record_utf8 =
+            ExperimentPlanV2::typed_candidate_utf8(complete_candidate_record)?;
+        let candidate_record_digest = crate::hash(candidate_record_utf8.as_bytes());
+        let mut plan = Self {
+            schema_version: PLAN_SCHEMA_V3.into(),
+            id: String::new(),
+            frozen_configuration: frozen_configuration.clone(),
+            candidate_locator: candidate_locator.into(),
+            candidate_record_digest,
+            candidate_record_utf8,
+        };
+        plan.id = plan.expected_id()?;
+        Ok(plan)
+    }
+
+    fn expected_id(&self) -> Result<String> {
+        Ok(format!(
+            "experiment-plan-v3-{}",
+            fingerprint(&ExperimentPlanIdentityV3 {
+                schema_version: PLAN_SCHEMA_V3,
+                frozen_configuration: &self.frozen_configuration,
+                candidate_locator: &self.candidate_locator,
+                candidate_record_digest: &self.candidate_record_digest,
+            })?
+        ))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != PLAN_SCHEMA_V3 {
+            return Err(Error::Invalid(
+                "unsupported experiment plan v3 schema".into(),
+            ));
+        }
+        self.frozen_configuration.validate()?;
+        identifier(&self.candidate_locator)?;
+        validate_sha256_digest(&self.candidate_record_digest, "candidate_record_digest")?;
+        if crate::hash(self.candidate_record_utf8.as_bytes()) != self.candidate_record_digest {
+            return Err(Error::Conflict(
+                "experiment plan stored candidate digest mismatch".into(),
+            ));
+        }
+        if self.id != self.expected_id()? {
+            return Err(Error::Conflict(
+                "experiment plan v3 identity mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn verify_candidate_content<T: Serialize>(
+        &self,
+        actual_candidate_locator: &str,
+        actual_complete_candidate_record: &T,
+    ) -> Result<()> {
+        self.validate()?;
+        identifier(actual_candidate_locator)?;
+        if self.candidate_locator != actual_candidate_locator {
+            return Err(Error::Conflict(
+                "experiment plan candidate locator mismatch".into(),
+            ));
+        }
+        let actual_utf8 = ExperimentPlanV2::typed_candidate_utf8(actual_complete_candidate_record)?;
+        if self.candidate_record_utf8.as_bytes() != actual_utf8.as_bytes()
+            || self.candidate_record_digest != crate::hash(actual_utf8.as_bytes())
+        {
+            return Err(Error::Conflict(
+                "experiment plan candidate content mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn digest_against<T: Serialize>(
+        &self,
+        actual_candidate_locator: &str,
+        actual_complete_candidate_record: &T,
+    ) -> Result<String> {
+        self.verify_candidate_content(actual_candidate_locator, actual_complete_candidate_record)?;
+        fingerprint(self)
+    }
+}
+
+/// Current fixed-sample semantics. The raw Bernstein radius and the allocation
+/// used for this fixed-sample claim are retained without a second alpha spend.
+pub fn decide_fixed_sample_v45(
+    plan: &ExperimentPlanV3,
+    report: BernsteinReport,
+    cost_ratio: f64,
+    p95_ratio: f64,
+    safety_ok: bool,
+) -> Result<BernsteinReport> {
+    plan.validate()?;
+    let configuration = &plan.frozen_configuration;
+    let plan = &configuration.plan;
+    if plan.stats_version != STATS_BERNSTEIN_V2 {
+        return Err(Error::Invalid(
+            "v2 decision requires empirical_bernstein.v2".into(),
+        ));
+    }
+    let mut out = report;
+    if out.verdict == Verdict::Invalid {
+        return Ok(out);
+    }
+    if !safety_ok {
+        out.verdict = Verdict::Regressed;
+        out.reasons.push("safety_failed".into());
+        return Ok(out);
+    }
+    if !cost_ratio.is_finite() || !p95_ratio.is_finite() {
+        out.verdict = Verdict::Invalid;
+        out.reasons.push("cost_or_latency_not_finite".into());
+        return Ok(out);
+    }
+    if cost_ratio == 0.0 {
+        out.verdict = Verdict::Invalid;
+        out.reasons
+            .push("baseline_cost_zero_forbids_ratio_savings".into());
+        return Ok(out);
+    }
+    if p95_ratio > plan.max_p95_latency_ratio {
+        out.reasons.push("p95_over_limit".into());
+    }
+    if plan.profile == ProfileKind::QualityGain && cost_ratio > plan.max_cost_ratio {
+        out.reasons.push("cost_over_limit".into());
+    }
+    if out.mean + out.radius < -configuration.max_regression.value() {
+        out.verdict = Verdict::Regressed;
+        out.reasons
+            .push("fixed_sample_regression_ucb_below_negative_max_regression".into());
+    } else {
+        match plan.profile {
+            ProfileKind::QualityGain => {
+                if out.lcb > plan.min_effect && out.reasons.is_empty() {
+                    out.verdict = Verdict::Improved;
+                } else {
+                    out.verdict = Verdict::Inconclusive;
+                    if out.lcb <= plan.min_effect {
+                        out.reasons.push("gain_not_demonstrated".into());
+                    }
+                }
+            }
+            ProfileKind::NoninferiorSavings => {
+                let saved = 1.0 - cost_ratio;
+                if out.lcb < plan.noninferior_bound {
+                    out.verdict = Verdict::Inconclusive;
+                    out.reasons.push("noninferiority_not_demonstrated".into());
+                } else if saved + 1e-12 < plan.savings_ratio {
+                    out.verdict = Verdict::Inconclusive;
+                    out.reasons.push("savings_not_demonstrated".into());
+                } else if out.reasons.is_empty() {
+                    out.verdict = Verdict::Noninferior;
+                } else {
+                    out.verdict = Verdict::Inconclusive;
+                }
+            }
+        }
+    }
+    out.reasons.sort();
+    out.reasons.dedup();
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterObservation {
@@ -3324,3 +3599,139 @@ impl ControlledTaskProfileV1 {
 
 pub mod config_precedence_generator;
 pub mod config_precedence_oracle;
+
+#[cfg(test)]
+mod fixed_regression_tests {
+    use super::*;
+    fn plan(profile: ProfileKind) -> ExperimentPlanV3 {
+        let mut old = ExperimentPlan::first_low_risk("regression-module", 64).unwrap();
+        old.profile = profile;
+        old.noninferior_bound = -0.875;
+        old.freeze(1).unwrap();
+        ExperimentPlanV3::from_typed_candidate(
+            &FrozenFixedSampleConfiguration::new(
+                old,
+                FixedRegressionThreshold::new(0.125).unwrap(),
+            )
+            .unwrap(),
+            "candidate",
+            &serde_json::json!({"id":"candidate","body":"complete original"}),
+        )
+        .unwrap()
+    }
+    fn rows() -> Vec<ClusterObservation> {
+        (0..64)
+            .map(|i| ClusterObservation {
+                cluster_id: format!("c{i}"),
+                d: -0.5,
+                weight: 1.0,
+            })
+            .collect()
+    }
+    #[test]
+    fn legacy_decide_keeps_frozen_results() {
+        for profile in [ProfileKind::QualityGain, ProfileKind::NoninferiorSavings] {
+            let current = plan(profile);
+            let mut legacy = current.frozen_configuration.plan.clone();
+            legacy.bind_candidate("candidate").unwrap();
+            let raw = empirical_bernstein(&rows(), 0.05).unwrap();
+            let original = decide(&legacy, raw.clone(), 0.8, 1.0, true).unwrap();
+            match profile {
+                ProfileKind::QualityGain => {
+                    assert_eq!(original.verdict, Verdict::Regressed);
+                    assert_eq!(original.reasons, ["negative_lcb"]);
+                }
+                ProfileKind::NoninferiorSavings => {
+                    assert_eq!(original.verdict, Verdict::Noninferior);
+                    assert!(original.reasons.is_empty());
+                }
+            }
+            let current = decide_fixed_sample_v45(&current, raw, 0.8, 1.0, true).unwrap();
+            assert_eq!(current.verdict, Verdict::Regressed);
+            assert_eq!(
+                current.reasons,
+                ["fixed_sample_regression_ucb_below_negative_max_regression"]
+            );
+        }
+    }
+    #[test]
+    fn fixed_regression_preserves_bernstein_goldens() {
+        let raw = empirical_bernstein(&rows(), 0.05).unwrap();
+        let original = serde_json::to_vec(&raw).unwrap();
+        let current =
+            decide_fixed_sample_v45(&plan(ProfileKind::QualityGain), raw.clone(), 1.0, 1.0, true)
+                .unwrap();
+        assert_eq!(raw.mean, -0.5);
+        assert_eq!(raw.variance, 0.0);
+        for (before, after) in [
+            (raw.mean, current.mean),
+            (raw.variance, current.variance),
+            (raw.radius, current.radius),
+            (raw.lcb, current.lcb),
+            (raw.alpha_i, current.alpha_i),
+        ] {
+            assert_eq!(before.to_bits(), after.to_bits());
+        }
+        assert_eq!(
+            serde_json::to_vec(&empirical_bernstein(&rows(), 0.05).unwrap()).unwrap(),
+            original
+        );
+    }
+    #[test]
+    fn current_decision_preserves_safety_and_resource_priority() {
+        for profile in [ProfileKind::QualityGain, ProfileKind::NoninferiorSavings] {
+            let plan = plan(profile);
+            let raw = empirical_bernstein(&rows(), 0.05).unwrap();
+            let safety = decide_fixed_sample_v45(&plan, raw.clone(), f64::NAN, 1.0, false).unwrap();
+            assert_eq!(safety.verdict, Verdict::Regressed);
+            assert_eq!(safety.reasons, ["safety_failed"]);
+            for cost in [f64::NAN, f64::INFINITY, 0.0] {
+                let invalid = decide_fixed_sample_v45(&plan, raw.clone(), cost, 1.0, true).unwrap();
+                assert_eq!(invalid.verdict, Verdict::Invalid);
+                assert_eq!(
+                    invalid.reasons,
+                    [if cost == 0.0 {
+                        "baseline_cost_zero_forbids_ratio_savings"
+                    } else {
+                        "cost_or_latency_not_finite"
+                    }]
+                );
+            }
+            let mut invalid = raw.clone();
+            invalid.verdict = Verdict::Invalid;
+            invalid.reasons = vec!["original_invalid".into()];
+            assert_eq!(
+                decide_fixed_sample_v45(&plan, invalid, 0.0, f64::NAN, false)
+                    .unwrap()
+                    .reasons,
+                ["original_invalid"]
+            );
+            let resource = decide_fixed_sample_v45(&plan, raw, 1.3, 1.4, true).unwrap();
+            assert_eq!(resource.verdict, Verdict::Regressed);
+            assert!(resource.reasons.iter().any(|v| v == "p95_over_limit"));
+            assert_eq!(
+                resource.reasons.iter().any(|v| v == "cost_over_limit"),
+                profile == ProfileKind::QualityGain
+            );
+        }
+    }
+    #[test]
+    fn fixed_alpha_is_not_sequential_alpha() {
+        let fixed = empirical_bernstein(&rows(), 0.05).unwrap();
+        let sequential_allocation = empirical_bernstein(&rows(), 0.01).unwrap();
+        assert_ne!(
+            fixed.radius.to_bits(),
+            sequential_allocation.radius.to_bits()
+        );
+        let current = decide_fixed_sample_v45(
+            &plan(ProfileKind::QualityGain),
+            fixed.clone(),
+            1.0,
+            1.0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(current.alpha_i.to_bits(), fixed.alpha_i.to_bits());
+        assert_eq!(current.radius.to_bits(), fixed.radius.to_bits());
+    }
+}

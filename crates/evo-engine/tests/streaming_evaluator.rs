@@ -16,9 +16,9 @@ use evo_core::sequential::{
 };
 use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_engine::dispatch::{
-    EvaluationStartRequest, EvaluationStatusRequest, ExperimentRegisterRequest,
-    IssueTicketRequestWire, ManagementDispatcher, ManagementJob, ManagementJobState,
-    ManagementResult,
+    EvaluationStartRequest, EvaluationStatusRequest,
+    ExperimentRegisterRequestV2 as ExperimentRegisterRequest, IssueTicketRequestWire,
+    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::release_store::{
@@ -28,9 +28,10 @@ use evo_engine::release_store::{
 use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, ExecutionReceiptRequest, ExecutionReceiptV2, ExecutionSide,
     FixedGraderMethod, FixedGraderSpec, FormalEvaluationV2, FrozenOracleEntry,
-    GraderReceiptRequest, IndependentEvaluationControl, IssueTicketRequest, ProtectedHoldoutRecord,
-    ProtectedInputRef, RegisteredEvaluationControl, StartExecutionRequest, TargetState,
-    TicketLifecycle, verified_report_view_in_session,
+    GraderReceiptRequest, IndependentEvaluationControl, IssueTicketRequest,
+    ProtectedHoldoutRecordV2 as ProtectedHoldoutRecord, ProtectedInputRef,
+    RegisteredEvaluationControlV3 as RegisteredEvaluationControl, StartExecutionRequest,
+    TargetState, TicketLifecycle, verified_report_view_in_session,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -238,7 +239,32 @@ async fn fixture(n: u32, sequential: bool) -> Fixture {
         .await
         .unwrap();
 
-    let candidate = stage_fixture_candidate(&store).await;
+    let host = Context::new("n", "host", Role::Host).unwrap();
+    let body = "trusted streaming fixture source";
+    let source = StoredTraceAuthority {
+        schema_version: "rsia.optimization.source.v1".into(),
+        record: StoredRunRecord {
+            id: "streaming-fixture-source".into(),
+            body: body.as_bytes().to_vec(),
+            parent_family: "streaming-fixture-family".into(),
+            task_origin: TaskOrigin::TrustedRun,
+            execution_attestation: ExecutionAttestation::TrustedHost,
+            purpose: Purpose::Development,
+        },
+        trace: OptimizationTrace {
+            run_id: "streaming-fixture-source".into(),
+            parent_family: "streaming-fixture-family".into(),
+            source_digest: hash(body.as_bytes()),
+            purpose: Purpose::Development,
+            outcome: TraceOutcome::Success,
+            diagnosis: None,
+            excerpt: body.into(),
+            seed: 1,
+        },
+        excerpt_start: 0,
+        excerpt_end: body.len(),
+    };
+    store_trace_authority(&store, &host, &source).await.unwrap();
 
     let mut v1 = ExperimentPlan::first_low_risk("formal-e05", 60).unwrap();
     v1.n_planned = n as usize;
@@ -331,6 +357,12 @@ async fn fixture(n: u32, sequential: bool) -> Fixture {
         schema_version: RegisteredEvaluationControl::SCHEMA.into(),
         id: "control-1".into(),
         v1_plan_snapshot: v1.clone(),
+        max_regression: evo_core::evaluation::FixedRegressionThreshold::new(if sequential {
+            0.01
+        } else {
+            0.125
+        })
+        .unwrap(),
         formal_plan: formal,
         alpha_plan: alpha.clone(),
         optimizer_comparison: comparison,
@@ -350,9 +382,23 @@ async fn fixture(n: u32, sequential: bool) -> Fixture {
         evidence_scope: EvaluationEvidenceScope::ProgramFixture,
         created_at_unix_seconds: 2,
     };
-    IndependentEvaluationControl::register_control(&evaluator, &store, control.clone())
+    IndependentEvaluationControl::register_current_control(&evaluator, &store, control.clone())
         .await
         .unwrap();
+
+    let progress = IndependentEvaluationControl::registration_progress(
+        &evaluator,
+        &store,
+        &control.id,
+        "holdout-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        progress.control_digest.as_deref(),
+        Some(control.digest().unwrap().as_str())
+    );
+    let candidate = stage_fixture_candidate(&store).await;
 
     // The candidate pair binds the actual E01 snapshot, not an arbitrary label.
     let pair = FrozenCandidatePair::new(
@@ -422,6 +468,7 @@ async fn fixture(n: u32, sequential: bool) -> Fixture {
         schema_version: ProtectedHoldoutRecord::SCHEMA.into(),
         id: "holdout-1".into(),
         registration_id: "control-1".into(),
+        frozen_configuration_digest: control.frozen_configuration().unwrap().digest().unwrap(),
         pair,
         manifest,
         candidate_bundle_digest: candidate.bundle_digest,
@@ -431,7 +478,7 @@ async fn fixture(n: u32, sequential: bool) -> Fixture {
         oracle_payload_digest: evo_core::fingerprint(&oracle_entries).unwrap(),
         oracle_entries,
     };
-    IndependentEvaluationControl::register_holdout(&evaluator, &store, holdout.clone())
+    IndependentEvaluationControl::register_current_holdout(&evaluator, &store, holdout.clone())
         .await
         .unwrap();
     let ticket = IndependentEvaluationControl::issue_ticket(
@@ -1074,9 +1121,13 @@ async fn new_epoch_does_not_refund_query_or_alpha_claim() {
     second.manifest.epoch_id = "epoch-2".into();
     second.manifest.slice_id = "slice-2".into();
     second.manifest.issued_at_unix_ms = 6;
-    IndependentEvaluationControl::register_holdout(&fixture.evaluator, &fixture.store, second)
-        .await
-        .unwrap();
+    IndependentEvaluationControl::register_current_holdout(
+        &fixture.evaluator,
+        &fixture.store,
+        second,
+    )
+    .await
+    .unwrap();
     let issue = IndependentEvaluationControl::issue_ticket(
         &fixture.evaluator,
         &fixture.store,
@@ -1102,7 +1153,8 @@ async fn another_authorized_namespace_cannot_reset_the_research_family() {
     control.proposer_actor = "other-proposer".into();
     control.approver_actor = "other-approver".into();
     assert!(matches!(
-        IndependentEvaluationControl::register_control(&other, &fixture.store, control).await,
+        IndependentEvaluationControl::register_current_control(&other, &fixture.store, control)
+            .await,
         Err(Error::Forbidden)
     ));
 }
@@ -1530,7 +1582,7 @@ async fn management_dispatch_recovers_registered_inputs_and_existing_ticket_with
             &fixture.evaluator,
             "experiment.register",
             serde_json::to_value(ExperimentRegisterRequest {
-                schema_version: "rsia.management.experiment_register.v1".into(),
+                schema_version: "rsia.management.experiment_register.v2".into(),
                 request_key: "register-recover".into(),
                 control: fixture.control.clone(),
                 holdout: fixture.holdout.clone(),

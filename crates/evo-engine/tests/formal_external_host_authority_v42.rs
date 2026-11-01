@@ -37,9 +37,9 @@ use evo_engine::streaming_evaluator::{
     AnchorEvidenceStatus, CostEvidenceScope, DependencyEvidenceStatus, EvaluationEvidenceScope,
     ExecutionSide, FixedGraderMethod, FixedGraderSpec, FrozenOracleEntry,
     IndependentEvaluationControl, IndependentGraderReceiptV2, IssueTicketRequest,
-    ProtectedHoldoutRecord, ProtectedInputRef, ReadEvaluationTicket as EvaluationTicketV2,
-    RegisteredEvaluationControl, StartExecutionRequest, TargetState, TicketLifecycle,
-    VerifiedReportVariant, verified_report_view_in_session,
+    ProtectedInputRef, ReadEvaluationTicket as EvaluationTicketV2, RegisteredEvaluationControl,
+    StartExecutionRequest, TargetState, TicketLifecycle, VerifiedReportVariant,
+    verified_report_view_in_session,
 };
 use evo_storage::budget::{
     BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization, UsageCharge,
@@ -68,7 +68,6 @@ const GRADER_SECRET: &str = "ag095-grader-private-fixture-credential-32-bytes";
 /// The fixed-sample empirical-Bernstein radius at alpha 0.04 needs 20 clusters
 /// before an all-improved batch can clear the frozen minimum effect.
 const ROTATING: u32 = 20;
-const ENVELOPE_SCHEMA: &str = "rsia.typed_artifact_envelope.v1";
 const CONTROL_KIND: &str = "registered_evaluation_control_v41";
 const TICKET_KIND: &str = "evaluation_ticket_v2";
 const FORMAL_KIND: &str = "formal_evaluation_v2";
@@ -135,15 +134,6 @@ fn principal(uid: u32, actor: &str, secret: &str) -> RegisteredPrincipal {
         principal: hash(secret.as_bytes()),
         credential_digest: hash(secret.as_bytes()),
     }
-}
-
-/// The product's typed artifact envelope, serialized in its declared order.
-#[derive(Serialize)]
-struct Envelope<'a, T> {
-    schema_version: &'a str,
-    id: &'a str,
-    record_kind: &'a str,
-    payload: &'a T,
 }
 
 /// One registered role's content witness over a stored body, in the
@@ -476,10 +466,10 @@ async fn request_ticket(store: &Store) -> Result<EvaluationTicketV2, Error> {
 async fn assert_issue_refused_before_stage(
     store: &Store,
     db: &Path,
-    holdout: ProtectedHoldoutRecord,
+    holdout: evo_engine::streaming_evaluator::ProtectedHoldoutRecordV2,
 ) {
     let grader = ctx(Role::Evaluator, GRADER);
-    IndependentEvaluationControl::register_holdout(&grader, store, holdout)
+    IndependentEvaluationControl::register_current_holdout(&grader, store, holdout)
         .await
         .unwrap();
     let before = catalog(db);
@@ -508,6 +498,103 @@ struct IngressFx {
     workspace: PathBuf,
     host: RegisteredFormalHost,
     set: RegisteredPrincipalSet,
+}
+
+fn current_ingress_control(
+    old: &RegisteredEvaluationControl,
+) -> evo_engine::streaming_evaluator::RegisteredEvaluationControlV3 {
+    evo_engine::streaming_evaluator::RegisteredEvaluationControlV3 {
+        schema_version: evo_engine::streaming_evaluator::RegisteredEvaluationControlV3::SCHEMA
+            .into(),
+        id: old.id.clone(),
+        v1_plan_snapshot: old.v1_plan_snapshot.clone(),
+        formal_plan: old.formal_plan.clone(),
+        alpha_plan: old.alpha_plan.clone(),
+        optimizer_comparison: old.optimizer_comparison.clone(),
+        optimization_budget: old.optimization_budget.clone(),
+        early_stop_plan: old.early_stop_plan.clone(),
+        anchor_matrix: old.anchor_matrix.clone(),
+        attempt_id: old.attempt_id.clone(),
+        fixed_sample_claim_id: old.fixed_sample_claim_id.clone(),
+        billing_scope: old.billing_scope.clone(),
+        executor_actor: old.executor_actor.clone(),
+        evaluator_actor: old.evaluator_actor.clone(),
+        proposer_actor: old.proposer_actor.clone(),
+        approver_actor: old.approver_actor.clone(),
+        oracle_digest: old.oracle_digest.clone(),
+        grader_digest: old.grader_digest.clone(),
+        fixed_grader: old.fixed_grader.clone(),
+        evidence_scope: old.evidence_scope,
+        created_at_unix_seconds: old.created_at_unix_seconds,
+        max_regression: evo_core::evaluation::FixedRegressionThreshold::new(0.125).unwrap(),
+    }
+}
+async fn register_current_ingress(
+    fx: &IngressFx,
+    control: &evo_engine::streaming_evaluator::RegisteredEvaluationControlV3,
+) {
+    std::fs::set_permissions(&fx.db, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let socket_dir = tempfile::Builder::new()
+        .prefix("ag192-ingress-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = std::fs::canonicalize(socket_dir.path())
+        .unwrap()
+        .join("authority.sock");
+    let mut authority = spawn_grader_command(
+        fx,
+        json!({"operation":"authority","database":fx.db,"host":fx.host,"principals":fx.set,"socket":socket,"connections":1}),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !socket.exists() {
+        if let Some(status) = authority.try_wait().unwrap() {
+            let output = authority.wait_with_output().unwrap();
+            panic!(
+                "authority setup failed {status}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "authority socket setup timeout"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let command = FormalOperatorCommand::RegisterControlCurrent {
+        control: Box::new(control.clone()),
+    };
+    let operator = spawn_grader_command(
+        fx,
+        json!({"operation":"operator","socket":socket,"expected_authority_uid":fx.host.grader_uid,"credential_environment_key":GRADER_KEY,"command":command}),
+    );
+    let response = operator.wait_with_output().unwrap();
+    let serving = authority.wait_with_output().unwrap();
+    assert!(
+        response.status.success(),
+        "{}",
+        String::from_utf8_lossy(&response.stderr)
+    );
+    assert!(
+        serving.status.success(),
+        "{}",
+        String::from_utf8_lossy(&serving.stderr)
+    );
+    let response: Value = serde_json::from_slice(&response.stdout).unwrap();
+    assert_eq!(response["status"], "complete");
+    // The response follows the writer's commit. Reload the complete stored
+    // control through its public reader before any candidate is constructed.
+    let store = Store::open(&fx.db).await.unwrap();
+    let progress = IndependentEvaluationControl::registration_progress(
+        &ctx(Role::Evaluator, GRADER),
+        &store,
+        &control.id,
+        HOLDOUT_ID,
+    )
+    .await
+    .unwrap();
+    assert_eq!(progress.control_digest, Some(control.digest().unwrap()));
+    assert_eq!(progress.holdout_digest, None);
+    store.close().await;
 }
 
 // This producer stops before staging. It creates no candidate, ticket, model
@@ -599,38 +686,6 @@ async fn prepare_control_ingress(order: TicketOrder) -> Option<IngressFx> {
         parent_digest: root.digest().unwrap(),
         baseline_digest: frozen.baseline_digest().unwrap(),
     };
-    let candidate_bundle = compile(
-        &profile,
-        &root.skill,
-        &root.strategy,
-        &frozen,
-        &SkillPatch {
-            content: PatchOp::Set {
-                value: "ag095 candidate skill".into(),
-            },
-            ..Default::default()
-        },
-        &ImproverPatch::default(),
-    );
-    let baseline_bundle = compile(
-        &profile,
-        &root.skill,
-        &root.strategy,
-        &frozen,
-        &SkillPatch {
-            content: PatchOp::ResetToBaseline,
-            applicability: PatchOp::ResetToBaseline,
-            counterexample: PatchOp::ResetToBaseline,
-            required_capabilities: PatchOp::ResetToBaseline,
-            dependencies: PatchOp::ResetToBaseline,
-        },
-        &ImproverPatch {
-            instruction: PatchOp::ResetToBaseline,
-            max_candidates: PatchOp::ResetToBaseline,
-            max_rounds: PatchOp::ResetToBaseline,
-        },
-    );
-
     let store = Store::open(&db).await.unwrap();
     let admin = ctx(Role::Admin, ADMIN);
     FormalRegistry::register_host(&admin, &store, host.clone())
@@ -781,96 +836,7 @@ async fn prepare_control_ingress(order: TicketOrder) -> Option<IngressFx> {
         created_at_unix_seconds: 2,
     };
     control.validate().unwrap();
-    let control_storage_id = storage_id(CONTROL_KIND, CONTROL_ID);
-    let mut s = store.session().await.unwrap();
-    put_witnessed(
-        &mut s,
-        Role::Evaluator,
-        GRADER,
-        "artifact",
-        &control_storage_id,
-        &Envelope {
-            schema_version: ENVELOPE_SCHEMA,
-            id: &control_storage_id,
-            record_kind: CONTROL_KIND,
-            payload: &control,
-        },
-    )
-    .await;
-    s.commit().await.unwrap();
-
-    let ordered_clusters: Vec<_> = (0..ROTATING).map(|i| format!("cluster-{i}")).collect();
-    let pair = FrozenCandidatePair::new(
-        v1.digest().unwrap(),
-        candidate_id.clone(),
-        candidate_bundle.parent_digest.clone(),
-        3,
-    )
-    .unwrap();
-    let manifest = HoldoutManifest::issue_after_candidates_frozen(
-        &pair,
-        "family-e05",
-        alpha.digest().unwrap(),
-        SequentialMode::Disabled,
-        "epoch-1",
-        "slice-1",
-        ordered_clusters.clone(),
-        ordered_clusters
-            .iter()
-            .map(|id| d(&format!("source-{id}")))
-            .collect(),
-        "sampler-v1",
-        d("oracle-version"),
-        anchors.digest().unwrap(),
-        control.grader_digest.clone(),
-        d("environment"),
-        d("private-seed"),
-        4,
-    )
-    .unwrap();
-    let rotating_inputs: Vec<_> = ordered_clusters
-        .iter()
-        .enumerate()
-        .map(|(index, cluster)| ProtectedInputRef {
-            target_id: format!("r{index}"),
-            cluster_or_anchor_id: cluster.clone(),
-            input_artifact_id: format!("input-r{index}"),
-            input_digest: hash(task_input(&format!("r{index}")).as_bytes()),
-        })
-        .collect();
-    let anchor_inputs = vec![ProtectedInputRef {
-        target_id: "a0".into(),
-        cluster_or_anchor_id: "anchor-1".into(),
-        input_artifact_id: "input-a0".into(),
-        input_digest: hash(task_input("a0").as_bytes()),
-    }];
-    let oracle_entries: Vec<_> = rotating_inputs
-        .iter()
-        .chain(anchor_inputs.iter())
-        .map(|input| FrozenOracleEntry {
-            target_id: input.target_id.clone(),
-            expected_answer_json: json!("ok").to_string(),
-        })
-        .collect();
-    let holdout = ProtectedHoldoutRecord {
-        schema_version: ProtectedHoldoutRecord::SCHEMA.into(),
-        id: HOLDOUT_ID.into(),
-        registration_id: CONTROL_ID.into(),
-        pair,
-        manifest,
-        candidate_bundle_digest: candidate_bundle.digest.clone(),
-        baseline_bundle_digest: baseline_bundle.digest.clone(),
-        rotating_inputs,
-        anchor_inputs,
-        oracle_payload_digest: fingerprint(&oracle_entries).unwrap(),
-        oracle_entries,
-    };
-    if order != TicketOrder::StagedBeforeIssue {
-        assert_issue_refused_before_stage(&store, &db, holdout).await;
-        store.close().await;
-        return None;
-    }
-
+    let current = current_ingress_control(&control);
     // Bootstrap observation of the four registered principals, plus the
     // Administrator/Worker/grader principal actions over the records they
     // authored.
@@ -931,27 +897,125 @@ async fn prepare_control_ingress(order: TicketOrder) -> Option<IngressFx> {
         )
         .await;
     }
-    principal_action(
-        &mut s,
-        &host,
-        &set,
-        Role::Evaluator,
-        "artifact",
-        &control_storage_id,
-        content_digest(&control).unwrap(),
-        "register_control",
-    )
-    .await;
     s.commit().await.unwrap();
     store.close().await;
-    Some(IngressFx {
+    let ingress = IngressFx {
         _db_dir: db_dir,
-        db,
+        db: db.clone(),
         _workspace: workspace_dir,
-        workspace,
-        host,
-        set,
-    })
+        workspace: workspace.clone(),
+        host: host.clone(),
+        set: set.clone(),
+    };
+    register_current_ingress(&ingress, &current).await;
+    let store = Store::open(&db).await.unwrap();
+    let candidate_bundle = compile(
+        &profile,
+        &root.skill,
+        &root.strategy,
+        &frozen,
+        &SkillPatch {
+            content: PatchOp::Set {
+                value: "ag095 candidate skill".into(),
+            },
+            ..Default::default()
+        },
+        &ImproverPatch::default(),
+    );
+    let baseline_bundle = compile(
+        &profile,
+        &root.skill,
+        &root.strategy,
+        &frozen,
+        &SkillPatch {
+            content: PatchOp::ResetToBaseline,
+            applicability: PatchOp::ResetToBaseline,
+            counterexample: PatchOp::ResetToBaseline,
+            required_capabilities: PatchOp::ResetToBaseline,
+            dependencies: PatchOp::ResetToBaseline,
+        },
+        &ImproverPatch {
+            instruction: PatchOp::ResetToBaseline,
+            max_candidates: PatchOp::ResetToBaseline,
+            max_rounds: PatchOp::ResetToBaseline,
+        },
+    );
+
+    let ordered_clusters: Vec<_> = (0..ROTATING).map(|i| format!("cluster-{i}")).collect();
+    let pair = FrozenCandidatePair::new(
+        v1.digest().unwrap(),
+        candidate_id.clone(),
+        candidate_bundle.parent_digest.clone(),
+        3,
+    )
+    .unwrap();
+    let manifest = HoldoutManifest::issue_after_candidates_frozen(
+        &pair,
+        "family-e05",
+        alpha.digest().unwrap(),
+        SequentialMode::Disabled,
+        "epoch-1",
+        "slice-1",
+        ordered_clusters.clone(),
+        ordered_clusters
+            .iter()
+            .map(|id| d(&format!("source-{id}")))
+            .collect(),
+        "sampler-v1",
+        d("oracle-version"),
+        anchors.digest().unwrap(),
+        control.grader_digest.clone(),
+        d("environment"),
+        d("private-seed"),
+        4,
+    )
+    .unwrap();
+    let rotating_inputs: Vec<_> = ordered_clusters
+        .iter()
+        .enumerate()
+        .map(|(index, cluster)| ProtectedInputRef {
+            target_id: format!("r{index}"),
+            cluster_or_anchor_id: cluster.clone(),
+            input_artifact_id: format!("input-r{index}"),
+            input_digest: hash(task_input(&format!("r{index}")).as_bytes()),
+        })
+        .collect();
+    let anchor_inputs = vec![ProtectedInputRef {
+        target_id: "a0".into(),
+        cluster_or_anchor_id: "anchor-1".into(),
+        input_artifact_id: "input-a0".into(),
+        input_digest: hash(task_input("a0").as_bytes()),
+    }];
+    let oracle_entries: Vec<_> = rotating_inputs
+        .iter()
+        .chain(anchor_inputs.iter())
+        .map(|input| FrozenOracleEntry {
+            target_id: input.target_id.clone(),
+            expected_answer_json: json!("ok").to_string(),
+        })
+        .collect();
+    let holdout = evo_engine::streaming_evaluator::ProtectedHoldoutRecordV2 {
+        schema_version: evo_engine::streaming_evaluator::ProtectedHoldoutRecordV2::SCHEMA.into(),
+        id: HOLDOUT_ID.into(),
+        registration_id: CONTROL_ID.into(),
+        frozen_configuration_digest: current.frozen_configuration().unwrap().digest().unwrap(),
+        pair,
+        manifest,
+        candidate_bundle_digest: candidate_bundle.digest.clone(),
+        baseline_bundle_digest: baseline_bundle.digest.clone(),
+        rotating_inputs,
+        anchor_inputs,
+        oracle_payload_digest: fingerprint(&oracle_entries).unwrap(),
+        oracle_entries,
+    };
+    if order != TicketOrder::StagedBeforeIssue {
+        assert_issue_refused_before_stage(&store, &db, holdout).await;
+        store.close().await;
+        return None;
+    }
+
+    store.close().await;
+    Some(ingress)
 }
 
 async fn prepare_in(order: TicketOrder) -> Fx {
@@ -1078,7 +1142,7 @@ async fn audit_f02_real_evaluator_ingress_records_request_peer_and_service_separ
         .need(&grader, "artifact", &storage_id(CONTROL_KIND, CONTROL_ID))
         .await
         .unwrap();
-    let mut control: RegisteredEvaluationControl =
+    let mut control: evo_engine::streaming_evaluator::RegisteredEvaluationControlV3 =
         serde_json::from_value(stored["payload"].clone()).unwrap();
     control.id = "audit-f02-real-ingress".into();
     control.validate().unwrap();
@@ -1120,7 +1184,7 @@ async fn audit_f02_real_evaluator_ingress_records_request_peer_and_service_separ
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let command = FormalOperatorCommand::RegisterControl {
+    let command = FormalOperatorCommand::RegisterControlCurrent {
         control: Box::new(control.clone()),
     };
     let operator = spawn_grader_command(
@@ -2748,7 +2812,12 @@ async fn owned_authority_refused_connection_drains_after_caller_cancellation() {
     host.credential_binding_digest = set.binding_digest().unwrap();
     set.validate(&host).unwrap();
     let database = workspace.join("data").join("authority.sqlite3");
-    let socket = workspace.join("s");
+    let socket_dir = tempfile::Builder::new()
+        .prefix("f02-owned-drain-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = std::fs::canonicalize(socket_dir.path()).unwrap().join("s");
     // Dropping the calling future cancels its wait, not the owned finite run.
     let mut call = Box::pin(PrincipalAuthorityService::serve_owned(
         database.clone(),

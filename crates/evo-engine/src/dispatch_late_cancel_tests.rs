@@ -719,7 +719,32 @@ async fn setup_evaluation(store: &Store) {
         .await
         .unwrap();
 
-    let candidate = stage_fixture_candidate(store).await;
+    let host = Context::new("n", "host", Role::Host).unwrap();
+    let body = "trusted streaming fixture source";
+    let source = StoredTraceAuthority {
+        schema_version: "rsia.optimization.source.v1".into(),
+        record: StoredRunRecord {
+            id: "streaming-fixture-source".into(),
+            body: body.as_bytes().to_vec(),
+            parent_family: "streaming-fixture-family".into(),
+            task_origin: TaskOrigin::TrustedRun,
+            execution_attestation: ExecutionAttestation::TrustedHost,
+            purpose: Purpose::Development,
+        },
+        trace: OptimizationTrace {
+            run_id: "streaming-fixture-source".into(),
+            parent_family: "streaming-fixture-family".into(),
+            source_digest: hash(body.as_bytes()),
+            purpose: Purpose::Development,
+            outcome: TraceOutcome::Success,
+            diagnosis: None,
+            excerpt: body.into(),
+            seed: 1,
+        },
+        excerpt_start: 0,
+        excerpt_end: body.len(),
+    };
+    store_trace_authority(store, &host, &source).await.unwrap();
 
     let mut v1 = ExperimentPlan::first_low_risk("formal-e05", 60).unwrap();
     v1.n_planned = n as usize;
@@ -790,10 +815,11 @@ async fn setup_evaluation(store: &Store) {
         version: "exact-json-v1".into(),
         method: FixedGraderMethod::ExactJsonAnswerV1,
     };
-    let control = RegisteredEvaluationControl {
-        schema_version: RegisteredEvaluationControl::SCHEMA.into(),
+    let control = crate::streaming_evaluator::RegisteredEvaluationControlV3 {
+        schema_version: crate::streaming_evaluator::RegisteredEvaluationControlV3::SCHEMA.into(),
         id: "control-1".into(),
         v1_plan_snapshot: v1.clone(),
+        max_regression: evo_core::evaluation::FixedRegressionThreshold::new(0.125).unwrap(),
         formal_plan: formal,
         alpha_plan: alpha.clone(),
         optimizer_comparison: comparison,
@@ -813,9 +839,24 @@ async fn setup_evaluation(store: &Store) {
         evidence_scope: EvaluationEvidenceScope::ProgramFixture,
         created_at_unix_seconds: 2,
     };
-    IndependentEvaluationControl::register_control(&evaluator, store, control.clone())
+    IndependentEvaluationControl::register_current_control(&evaluator, store, control.clone())
         .await
         .unwrap();
+
+    // Registration has committed before the first candidate construction and compile.
+    let progress = IndependentEvaluationControl::registration_progress(
+        &evaluator,
+        store,
+        &control.id,
+        "holdout-1",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        progress.control_digest.as_deref(),
+        Some(control.digest().unwrap().as_str())
+    );
+    let candidate = stage_fixture_candidate(store).await;
 
     // The candidate pair binds the actual E01 snapshot, not an arbitrary label.
     let pair = FrozenCandidatePair::new(
@@ -875,10 +916,11 @@ async fn setup_evaluation(store: &Store) {
             expected_answer_json: json!("ok").to_string(),
         })
         .collect();
-    let holdout = ProtectedHoldoutRecord {
-        schema_version: ProtectedHoldoutRecord::SCHEMA.into(),
+    let holdout = crate::streaming_evaluator::ProtectedHoldoutRecordV2 {
+        schema_version: crate::streaming_evaluator::ProtectedHoldoutRecordV2::SCHEMA.into(),
         id: "holdout-1".into(),
         registration_id: "control-1".into(),
+        frozen_configuration_digest: control.frozen_configuration().unwrap().digest().unwrap(),
         pair,
         manifest,
         candidate_bundle_digest: candidate.bundle_digest,
@@ -888,7 +930,7 @@ async fn setup_evaluation(store: &Store) {
         oracle_payload_digest: evo_core::fingerprint(&oracle_entries).unwrap(),
         oracle_entries,
     };
-    IndependentEvaluationControl::register_holdout(&evaluator, store, holdout.clone())
+    IndependentEvaluationControl::register_current_holdout(&evaluator, store, holdout.clone())
         .await
         .unwrap();
 }
