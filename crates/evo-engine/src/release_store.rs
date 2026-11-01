@@ -1095,8 +1095,10 @@ impl ReleaseStore {
                 Self::validate_run_snapshot_live_in_session(ctx, &mut session, &request.run_id)
                     .await?;
             require_current_run_source(&mut session, ctx, &existing).await?;
-            Self::validate_run_capability_for_new_use_in_session(ctx, &mut session, &existing)
-                .await?;
+            if !matches!(&existing.wire, RunApplicationWire::Legacy(_)) {
+                Self::validate_run_capability_for_new_use_in_session(ctx, &mut session, &existing)
+                    .await?;
+            }
             session.commit().await?;
             return Ok(existing);
         }
