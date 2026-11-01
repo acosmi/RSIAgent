@@ -307,6 +307,13 @@ impl StoreOptimizationJournal {
 }
 #[async_trait]
 impl OptimizationJournal for StoreOptimizationJournal {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> evo_core::Result<Vec<StageFact>> {
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &CompilerInputRequest,

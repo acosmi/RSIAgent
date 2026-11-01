@@ -848,6 +848,23 @@ impl RecordingJournal {
 
 #[async_trait]
 impl OptimizationJournal for RecordingJournal {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> evo_core::Result<Vec<StageFact>> {
+        for (fact, inputs) in intent.members() {
+            let mut fact = fact.clone();
+            fact.dependencies
+                .push(dep("artifact", &inputs.artifact_id()?));
+            fact.dependencies
+                .sort_by(|a, b| (&a.kind, &a.id).cmp(&(&b.kind, &b.id)));
+            fact.dependencies
+                .dedup_by(|a, b| a.kind == b.kind && a.id == b.id);
+            self.given.lock().unwrap().push(fact);
+        }
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,
@@ -1112,9 +1129,13 @@ async fn stage_fact_bodies(store: &Store) -> Vec<Value> {
     bodies
         .into_iter()
         .filter(|body| {
-            body["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+            (body["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                || body["schema_version"]
+                    == evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
                 || (body["schema_version"] == REDACTED
-                    && body["original_schema"] == OPTIMIZATION_STAGE_FACT_SCHEMA)
+                    && (body["original_schema"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                        || body["original_schema"]
+                            == evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2))
         })
         .collect()
 }
@@ -1123,7 +1144,11 @@ async fn plaintext_stage_facts(store: &Store) -> Vec<String> {
     stage_fact_bodies(store)
         .await
         .into_iter()
-        .filter(|body| body["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA)
+        .filter(|body| {
+            body["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                || body["schema_version"]
+                    == evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+        })
         .map(|body| body["artifact_id"].as_str().unwrap_or("?").to_owned())
         .collect()
 }
@@ -1148,7 +1173,7 @@ async fn defects_of_redaction(store: &Store, original: &StageFact) -> Vec<String
         ("id", json!(original.artifact_id)),
         ("state", json!("source_revoked")),
         ("original_kind", json!("artifact")),
-        ("original_schema", json!(OPTIMIZATION_STAGE_FACT_SCHEMA)),
+        ("original_schema", json!(original.schema_version)),
         (
             "original_digest",
             json!(hash(serde_json::to_string(original).unwrap().as_bytes())),
