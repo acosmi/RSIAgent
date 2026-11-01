@@ -2664,3 +2664,284 @@ async fn budget_reference_requires_canonical_identity_real_edges_and_all_declare
         assert_eq!(catalog(&fixture.db_path), before);
     }
 }
+
+// AG163 append-only prepared tests. The software fixture proves no provider,
+// paid-effect, independent-process or promotion authority.
+#[cfg(unix)]
+struct Ag163History {
+    store: Store,
+    path: std::path::PathBuf,
+    original: serde_json::Value,
+    _dir: tempfile::TempDir,
+}
+
+#[cfg(unix)]
+async fn ag163_history() -> Ag163History {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let capture = include_bytes!("fixtures/ag135b_legacy_issuers.json");
+    assert_eq!(
+        evo_core::hash(capture),
+        "52c1d5af30e4b781fee3217e61784ceef7ebcb3e0864606f259f57dd62e8fa59"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let private = dir.path().join("private");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&private)
+        .unwrap();
+    let path = private.join("ag163.sqlite3");
+    drop(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap(),
+    );
+    let initial = Store::open(&path).await.unwrap();
+    initial.close().await;
+    let frozen = trusted_compiler_inputs::restore_frozen_issuer_rows(&path, "late-final-inflight")
+        .await
+        .unwrap();
+    assert_eq!(
+        frozen["original_snapshot_sha256"],
+        "1e6805a1a02b89b4e75be8d04691924321098614429fc0037bc85afa872d0326"
+    );
+    let rows = frozen["tables"]["objects"]["rows"].as_array().unwrap();
+    let original_formal_body = rows
+        .iter()
+        .find_map(|row| {
+            let body = row[4]["text"].as_str()?;
+            let outer: Value = serde_json::from_str(body).ok()?;
+            (outer["record_kind"] == "formal_evaluation_v2").then(|| body.to_owned())
+        })
+        .unwrap();
+    let ticket: Value = rows
+        .iter()
+        .find_map(|row| {
+            let outer: Value = serde_json::from_str(row[4]["text"].as_str()?).ok()?;
+            (outer["record_kind"] == "evaluation_ticket_v2").then(|| outer["payload"].clone())
+        })
+        .unwrap();
+    let original = json!({
+        "namespace":"late-grader-final-fixture", "evaluator_actor":ticket["evaluator_actor"],
+        "ticket_id":ticket["id"], "registration_id":ticket["registration_id"],
+        "original_formal_body_sha256":hash(original_formal_body.as_bytes())
+    });
+    let store = Store::open(&path).await.unwrap();
+    assert_eq!(store.integrity().await.unwrap(), "ok");
+    Ag163History {
+        _dir: dir,
+        path,
+        store,
+        original,
+    }
+}
+
+#[cfg(unix)]
+fn ag163_sid(kind: &str, id: &str) -> String {
+    format!("e05-{}", evo_core::fingerprint(&(kind, id)).unwrap())
+}
+
+#[cfg(unix)]
+async fn ag163_body(store: &Store, context: &Context, kind: &str, id: &str) -> String {
+    let mut session = store.session().await.unwrap();
+    let row = session
+        .object_row(context, kind, id)
+        .await
+        .unwrap()
+        .unwrap();
+    session.commit().await.unwrap();
+    row.body
+}
+
+#[cfg(unix)]
+fn ag163_image(path: &std::path::Path) -> serde_json::Value {
+    let program = r#"
+import json,sqlite3,struct,sys,urllib.parse
+def qi(s):return '"'+s.replace('"','""')+'"'
+def cell(k,v):
+ if k==b'null':return ['null']
+ if k==b'integer':return ['integer',str(v)]
+ if k==b'real':return ['real',struct.pack('>d',v).hex()]
+ if k in (b'text',b'blob'):return [k.decode(),v.hex()]
+ raise AssertionError(k)
+c=sqlite3.connect('file:'+urllib.parse.quote(sys.argv[1],safe='/')+'?mode=ro',uri=True,isolation_level=None);c.text_factory=bytes
+c.execute('PRAGMA query_only=ON');c.execute('BEGIN');assert c.execute('PRAGMA integrity_check').fetchall()==[(b'ok',)]
+schema=c.execute('SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type COLLATE BINARY,name COLLATE BINARY').fetchall();tables=[]
+for typ,n,_,_,ddl in schema:
+ if typ!=b'table':continue
+ name=n.decode();info=c.execute('PRAGMA table_xinfo('+qi(name)+')').fetchall();cols=[x[1].decode() for x in info if x[6]!=1]
+ rowid=b'WITHOUT ROWID' not in (ddl or b'').upper();fields=['_rowid_'] if rowid else []
+ for col in cols:fields.extend(['typeof('+qi(col)+')',qi(col)])
+ rows=[]
+ for v in c.execute('SELECT '+','.join(fields)+' FROM '+qi(name)):
+  off=1 if rowid else 0;rows.append([str(v[0]) if rowid else None,[cell(v[off+2*i],v[off+2*i+1]) for i in range(len(cols))]])
+ rows.sort(key=lambda v:json.dumps(v,separators=(',',':')));tables.append({'name':name,'columns':cols,'rowid':rowid,'rows':rows})
+calls=c.execute('SELECT state,actual_cost_micros,execution_closed FROM root_budget_calls ORDER BY billing_scope,call_id').fetchall()
+c.execute('ROLLBACK');c.close();print(json.dumps({'schema':[[a.hex(),b.hex(),d.hex(),p,None if sql is None else sql.hex()] for a,b,d,p,sql in schema],'tables':tables,'calls':[[s.decode(),a,x] for s,a,x in calls]},sort_keys=True,separators=(',',':')))
+"#;
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-B", "-c", program])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "owned readonly full database image failed"
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[cfg(unix)]
+async fn ag163_legacy_health(fx: &Ag163History, evaluator: &Context) {
+    let before = ag163_image(&fx.path);
+    let ticket = fx.original["ticket_id"].as_str().unwrap();
+    let body = ag163_body(
+        &fx.store,
+        evaluator,
+        "artifact",
+        &ag163_sid("formal_evaluation_v2", ticket),
+    )
+    .await;
+    assert_eq!(
+        evo_core::hash(body.as_bytes()),
+        fx.original["original_formal_body_sha256"].as_str().unwrap()
+    );
+    let mut session = fx.store.session().await.unwrap();
+    let read = evo_engine::streaming_evaluator::read_verified_formal_report_in_session(
+        evaluator,
+        &mut session,
+        ticket,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read.state(), evo_storage::PersistentContractState::Legacy);
+    assert!(!read.historical_view().promotion_eligible);
+    assert!(
+        matches!(read.current_view(), Err(Error::Conflict(reason)) if reason == "source_legacy: formal report is not Current input")
+    );
+    session.commit().await.unwrap();
+    assert!(
+        ag163_image(&fx.path) == before,
+        "AG163 healthy public Legacy reader changed full database"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn historical_formal_review_discloses_legacy_without_hiding_material_errors() {
+    let fx = ag163_history().await;
+    let namespace = fx.original["namespace"].as_str().unwrap();
+    let evaluator = Context::new(
+        namespace,
+        fx.original["evaluator_actor"].as_str().unwrap(),
+        Role::Evaluator,
+    )
+    .unwrap();
+    let admin = Context::new(namespace, "admin", Role::Admin).unwrap();
+    ag163_legacy_health(&fx, &evaluator).await;
+    let ticket = fx.original["ticket_id"].as_str().unwrap();
+    let before = ag163_image(&fx.path);
+    let response = review_stored(
+        &admin,
+        &fx.store,
+        ReviewRequest {
+            kind: ReviewKind::FormalReport,
+            id: ticket.into(),
+            detail: ReviewDetail::Exact,
+        },
+    )
+    .await
+    .unwrap();
+    let value = serde_json::to_value(&response).unwrap();
+    assert_eq!(value["payload"]["type"], "formal_report");
+    let materials = &value["payload"]["materials"];
+    assert_eq!(materials["variant"], "invalid");
+    assert_eq!(materials["promotion_eligible"], false);
+    assert!(
+        materials["ineligibility_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "source_legacy"),
+        "healthy historical review hid the actual Legacy limitation"
+    );
+    assert!(!response.gaps.contains(&ReviewGap::UnsupportedSchema));
+    assert!(!response.gaps.contains(&ReviewGap::MaterialInvalid));
+    assert!(
+        !response.diff_complete
+            && response.trusted_tokens.is_none()
+            && response.total_cost.is_none()
+    );
+    let printed = value.to_string();
+    for hidden in [
+        "oracle_entries",
+        "expected_answer_json",
+        "output_utf8",
+        "lease_token",
+        "private-seed",
+    ] {
+        assert!(
+            !printed.contains(hidden),
+            "historical review leaked protected material"
+        );
+    }
+    assert!(
+        ag163_image(&fx.path) == before,
+        "healthy historical review changed original full database"
+    );
+    fx.store.close().await;
+
+    // One actual missing source on this owned, previously healthy image. It is
+    // a material error; neither source_legacy nor metadata may hide that error.
+    let program = "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1]);c.execute('PRAGMA foreign_keys=OFF');c.execute('DELETE FROM objects WHERE namespace=? AND kind=? AND id=?',(sys.argv[2],'artifact',sys.argv[3]));assert c.total_changes==1;c.commit();c.close()";
+    let output = Command::new("python3")
+        .args(["-I", "-B", "-c", program])
+        .arg(&fx.path)
+        .arg(namespace)
+        .arg(ag163_sid(
+            "registered_evaluation_control_v41",
+            fx.original["registration_id"].as_str().unwrap(),
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "owned missing-control fault failed"
+    );
+    let damaged = Store::open(&fx.path).await.unwrap();
+    let damaged_before = ag163_image(&fx.path);
+    let mut session = damaged.session().await.unwrap();
+    assert!(matches!(
+        evo_engine::streaming_evaluator::read_verified_formal_report_in_session(
+            &evaluator,
+            &mut session,
+            ticket
+        )
+        .await,
+        Err(Error::NotFound)
+    ));
+    session.commit().await.unwrap();
+    let response = review_stored(
+        &admin,
+        &damaged,
+        ReviewRequest {
+            kind: ReviewKind::FormalReport,
+            id: ticket.into(),
+            detail: ReviewDetail::Metadata,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        response.payload.is_none(),
+        "missing actual material was presented as healthy Legacy"
+    );
+    assert!(response.gaps.contains(&ReviewGap::ReferenceUnavailable));
+    assert!(!response.gaps.contains(&ReviewGap::UnsupportedSchema));
+    assert!(
+        ag163_image(&fx.path) == damaged_before,
+        "material-error review repaired or rewrote original history"
+    );
+}
