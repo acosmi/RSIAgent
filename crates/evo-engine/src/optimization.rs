@@ -868,15 +868,17 @@ async fn verified_development_projection_in_session(
     if report.provenance == DevelopmentExecutionProvenance::Fixture {
         return Err(Error::Forbidden);
     }
-    let (outcomes, candidate_consumption, projection_inputs) =
+    // Keep the receipt verifier's state out of the shared gate's inline future.
+    let (outcomes, candidate_consumption, projection_inputs) = Box::pin(
         crate::development::verify_observed_report_with_consumption_in_session(
             ctx,
             session,
             &observed_fact,
             &request,
             &report,
-        )
-        .await?;
+        ),
+    )
+    .await?;
     if outcomes.len() != report.results.len() {
         return Err(Error::Internal);
     }
