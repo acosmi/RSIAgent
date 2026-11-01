@@ -3534,7 +3534,7 @@ async fn ensure_import_source_id_is_free(
         return Err(Error::Forbidden);
     }
     if session
-        .qualified_revocable_source(ctx, evo_core::evidence::RevocableSourceKind::TrustedRun, id)
+        .registered_revocable_source(ctx, evo_core::evidence::RevocableSourceKind::TrustedRun, id)
         .await?
     {
         return Err(Error::Conflict(format!(

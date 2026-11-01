@@ -343,8 +343,8 @@ async fn a_trusted_run_cannot_be_stored_under_the_id_of_an_import_source() {
 #[tokio::test]
 async fn an_artifact_that_is_not_an_import_source_does_not_block_a_run_of_the_same_id() {
     // AG-032: an object of another kind that shares a run's id is a different
-    // object, unless it is a qualified revocation source of its own. An E16
-    // import_source needs its complete physical identity, not a schema label.
+    // object, unless it has a registered revocation identity of its own. An E16
+    // import_source needs its strict outer identity, not a schema label.
     let (_dir, store) = open().await;
     for (id, schema) in [
         ("shared-with-a-pool-row", "rsia.replay_pool.fixture.v1"),
@@ -643,7 +643,7 @@ async fn q03_claimed_source_schema_without_complete_identity_is_not_authority() 
     let mut session = store.session().await.unwrap();
     assert!(
         !session
-            .qualified_revocable_source(
+            .registered_revocable_source(
                 &admin(),
                 evo_core::evidence::RevocableSourceKind::ImportSource,
                 "claimed-import"
@@ -656,11 +656,33 @@ async fn q03_claimed_source_schema_without_complete_identity_is_not_authority() 
     let request = registration(dir.path(), "claimed-run", &["one"]);
     let source = derived_source_id(&request, "one");
     raw_put(&store, "run", &source, &json!({"id":source,"schema_version":"rsia.optimization.source.v1","task_origin":"trusted_run","execution_attestation":"trusted_host"})).await;
-    let selection = PersistentImportService::new(store.clone())
-        .register(&admin(), request)
-        .await
-        .unwrap();
-    assert_eq!(selection.payload.import_source_ids, [source]);
+    let before = snapshot(&store).await;
+    expect_conflict(
+        PersistentImportService::new(store.clone())
+            .register(&admin(), request.clone())
+            .await,
+        "an existing run identity reserves its id even when it cannot be consumed",
+    );
+    assert_eq!(snapshot(&store).await, before);
+    assert_no_registration_trace(&store, &request, std::slice::from_ref(&source)).await;
+    // Revocation only removes authority: this legacy run body can be blocked
+    // even though it cannot authorize a new content-dependent budget write.
+    LifecycleStore::begin_revoke(
+        &admin(),
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: source.clone(),
+        },
+        "legacy source control",
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        raw(&store, "tombstone", &source).await.unwrap()["source_kind"],
+        "run"
+    );
 }
 
 #[tokio::test]
@@ -690,6 +712,18 @@ async fn q03_stored_qualified_collision_isolates_only_its_namespace() {
         matches!(error, Error::Conflict(ref message) if message.contains("isolates namespace n") && message.contains(id))
     );
     assert_eq!(snapshot(&store).await, before);
+    // Older stored bodies still reserve both identities. No Current content
+    // eligibility is needed to quarantine or revoke the pair.
+    raw_put(&store, "run", id, &json!({"id":id})).await;
+    let mut imported = raw(&store, "artifact", id).await.unwrap();
+    imported["payload"] = json!({});
+    raw_put(&store, "artifact", id, &imported).await;
+    let before = snapshot(&store).await;
+    expect_conflict(
+        store_run(&store, "legacy-isolated-namespace").await,
+        "stored revocable identities isolate a namespace independently of consumability",
+    );
+    assert_eq!(snapshot(&store).await, before);
     let mut session = store.session().await.unwrap();
     assert!(
         !session
@@ -703,6 +737,22 @@ async fn q03_stored_qualified_collision_isolates_only_its_namespace() {
     store_trace_authority(&store, &other, &authority("same-host-other-namespace"))
         .await
         .unwrap();
+    LifecycleStore::begin_revoke(
+        &admin(),
+        &store,
+        TypedObjectRef {
+            kind: "artifact".into(),
+            id: id.clone(),
+        },
+        "legacy import control",
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        raw(&store, "tombstone", id).await.unwrap()["source_kind"],
+        "artifact"
+    );
 }
 
 #[tokio::test]

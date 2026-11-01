@@ -329,7 +329,10 @@ async fn put_run(store: &Store, namespace: &str, id: &str) {
         "run",
         id,
         &json!({
-            "id":id, "schema_version":"rsia.optimization.source.v1", "body":"fixture-run-body"
+            "schema_version":"rsia.optimization.source.v1",
+            "record":{"id":id,"body":id.as_bytes().to_vec(),"parent_family":format!("family-{id}"),"task_origin":"trusted_run","execution_attestation":"trusted_host","purpose":"development"},
+            "trace":{"run_id":id,"parent_family":format!("family-{id}"),"source_digest":hash(id.as_bytes()),"purpose":"development","outcome":"success","diagnosis":null,"excerpt":id,"seed":1},
+            "excerpt_start":0,"excerpt_end":id.len(),
         }),
     )
     .await;
@@ -358,6 +361,28 @@ async fn begin(store: &Store, namespace: &str, kind: &str, id: &str) -> String {
 async fn gate_edges(store: &Store, namespace: &str, edges: &[(&str, &str, &str, &str)]) {
     let mut session = store.session().await.unwrap();
     for (src_kind, src_id, dst_kind, dst_id) in edges {
+        let ctx = context(namespace, Role::Admin);
+        for (kind, id) in [(*src_kind, *src_id), (*dst_kind, *dst_id)] {
+            if matches!(kind, "artifact" | "candidate")
+                && session
+                    .get::<Value>(&ctx, kind, id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            {
+                session
+                    .put(
+                        &ctx,
+                        kind,
+                        id,
+                        ctx.actor(),
+                        &json!({"id":id,"schema_version":"fixture.live.v1"}),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
         session
             .put_edge(
                 &context(namespace, Role::Admin),
@@ -520,8 +545,19 @@ async fn live_cycle_and_unstored_source_keep_existing_cache_behavior() {
             ],
         )
         .await;
+        if sources == ["unstored-run"] {
+            put_run(&fixture.store, NS, "unstored-run").await;
+        }
         let request = request("live-or-unstored", &sources);
         let response = fixture.complete(&request).await;
+        if sources == ["unstored-run"] {
+            let mut session = fixture.store.session().await.unwrap();
+            session
+                .delete(&context(NS, Role::Admin), "run", "unstored-run")
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+        }
         let before = sqlite_snapshot(&fixture.path);
         assert_same_response(
             &fixture.broker().dispatch(request).await.unwrap(),

@@ -191,24 +191,37 @@ async fn broker_store() -> (tempfile::TempDir, Store) {
         .await
         .unwrap();
     let host = broker_host();
-    let mut session = store.session().await.unwrap();
     for id in [RUN, LIVE] {
-        session
-            .put(
-                &host,
-                "run",
-                id,
-                host.actor(),
-                &serde_json::json!({
-                    "id": id,
-                    "schema_version": "rsia.optimization.source.v1",
-                    "body": "run-body",
-                }),
-            )
-            .await
-            .unwrap();
+        store_trace_authority(
+            &store,
+            &host,
+            &StoredTraceAuthority {
+                schema_version: "rsia.optimization.source.v1".into(),
+                record: StoredRunRecord {
+                    id: id.into(),
+                    body: id.as_bytes().to_vec(),
+                    parent_family: format!("family-{id}"),
+                    task_origin: TaskOrigin::TrustedRun,
+                    execution_attestation: ExecutionAttestation::TrustedHost,
+                    purpose: Purpose::Development,
+                },
+                trace: OptimizationTrace {
+                    run_id: id.into(),
+                    parent_family: format!("family-{id}"),
+                    source_digest: hash(id.as_bytes()),
+                    purpose: Purpose::Development,
+                    outcome: TraceOutcome::Success,
+                    diagnosis: None,
+                    excerpt: id.into(),
+                    seed: 1,
+                },
+                excerpt_start: 0,
+                excerpt_end: id.len(),
+            },
+        )
+        .await
+        .unwrap();
     }
-    session.commit().await.unwrap();
     (dir, store)
 }
 
@@ -855,12 +868,6 @@ async fn q03_source_graph() -> (tempfile::TempDir, Store, String) {
         ImportSourceSpec, PersistentImportService, SourceFormat,
     };
     let (dir, store) = broker_store().await;
-    let mut session = store.session().await.unwrap();
-    session.delete(&broker_admin(), "run", RUN).await.unwrap();
-    session.commit().await.unwrap();
-    store_trace_authority(&store, &broker_host(), &authority(RUN, "q03-family"))
-        .await
-        .unwrap();
     let bytes = b"{\"type\":\"user\",\"message\":{\"content\":\"local fixture\"}}\n";
     let path = dir.path().join("q03-history.jsonl");
     tokio::fs::write(&path, bytes).await.unwrap();
@@ -893,7 +900,7 @@ async fn q03_source_graph() -> (tempfile::TempDir, Store, String) {
         .unwrap();
     assert!(
         session
-            .qualified_revocable_source(
+            .registered_revocable_source(
                 &broker_admin(),
                 evo_core::evidence::RevocableSourceKind::TrustedRun,
                 RUN
@@ -903,7 +910,7 @@ async fn q03_source_graph() -> (tempfile::TempDir, Store, String) {
     );
     assert!(
         session
-            .qualified_revocable_source(
+            .registered_revocable_source(
                 &broker_admin(),
                 evo_core::evidence::RevocableSourceKind::ImportSource,
                 &upstream
@@ -974,6 +981,125 @@ async fn q03_legacy_reserve_refuses_revoked_transitive_source_without_writes() {
         .release_undispatched_budget_call(&broker_host(), &q03_fence(&healthy), "healthy-control")
         .await
         .unwrap();
+    // Full authority is required even when no tombstone exists.
+    for source in ["q03-missing-run", "q03-bare-run", "q03-claimed-run"] {
+        if source != "q03-missing-run" {
+            let value = if source == "q03-bare-run" {
+                serde_json::json!({"id":source})
+            } else {
+                serde_json::json!({"id":source,"schema_version":"rsia.optimization.source.v1","task_origin":"trusted_run","execution_attestation":"trusted_host"})
+            };
+            let mut session = store.session().await.unwrap();
+            session
+                .put(
+                    &broker_admin(),
+                    "run",
+                    source,
+                    broker_admin().actor(),
+                    &value,
+                )
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+        }
+        let mut request = q03_reservation(&format!("call-{source}"));
+        let model = model_request(&request.call_id, &[source]);
+        request.actual_input_digest = model.cache_key_digest.clone();
+        request.request_artifact =
+            Some(BudgetArtifact::from_serializable(MODEL_REQUEST_SCHEMA, &model).unwrap());
+        let path = dir.path().join("rsia.sqlite3");
+        let before = q03_lossless_snapshot(&path);
+        assert!(matches!(
+            store
+                .reserve_budget_call_with_sources(&broker_host(), &request, &[source.into()])
+                .await,
+            Err(Error::Forbidden)
+        ));
+        let mut session = store.session().await.unwrap();
+        assert_eq!(
+            session
+                .reserve_budget_call_with_sources_typed(&broker_host(), &request, &[source.into()])
+                .await
+                .unwrap(),
+            Err(evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked)
+        );
+        session.commit().await.unwrap();
+        assert_eq!(q03_lossless_snapshot(&path), before);
+    }
+    for kind in ["run", "artifact"] {
+        let (fault_dir, fault_store, _) = q03_source_graph().await;
+        let admin = broker_admin();
+        let mut session = fault_store.session().await.unwrap();
+        if kind == "artifact" {
+            session
+                .put(
+                    &admin,
+                    "artifact",
+                    "ordinary-upstream",
+                    admin.actor(),
+                    &serde_json::json!({"id":"ordinary-upstream"}),
+                )
+                .await
+                .unwrap();
+            session
+                .put_edge(&admin, "run", RUN, "artifact", "ordinary-upstream")
+                .await
+                .unwrap();
+        }
+        session.commit().await.unwrap();
+        let control = fault_store
+            .reserve_budget_call_with_sources(
+                &broker_host(),
+                &q03_reservation("q03-upstream-health"),
+                &[RUN.into()],
+            )
+            .await
+            .unwrap();
+        fault_store
+            .release_undispatched_budget_call(
+                &broker_host(),
+                &q03_fence(&control),
+                "healthy-control",
+            )
+            .await
+            .unwrap();
+        let mut session = fault_store.session().await.unwrap();
+        if kind == "run" {
+            session
+                .put(
+                    &admin,
+                    "run",
+                    "incomplete-upstream",
+                    admin.actor(),
+                    &serde_json::json!({"id":"incomplete-upstream"}),
+                )
+                .await
+                .unwrap();
+            session
+                .put_edge(&admin, "run", RUN, "run", "incomplete-upstream")
+                .await
+                .unwrap();
+        } else {
+            session
+                .delete(&admin, "artifact", "ordinary-upstream")
+                .await
+                .unwrap();
+        }
+        session.commit().await.unwrap();
+        let path = fault_dir.path().join("rsia.sqlite3");
+        let before = q03_lossless_snapshot(&path);
+        assert!(matches!(
+            fault_store
+                .reserve_budget_call_with_sources(
+                    &broker_host(),
+                    &q03_reservation("q03-incomplete-upstream"),
+                    &[RUN.into()]
+                )
+                .await,
+            Err(Error::Forbidden)
+        ));
+        assert_eq!(q03_lossless_snapshot(&path), before);
+    }
     q03_revoke_upstream(&store, &upstream).await;
     let path = dir.path().join("rsia.sqlite3");
     let before = q03_lossless_snapshot(&path);
@@ -1008,6 +1134,54 @@ async fn q03_legacy_dispatch_refuses_revoked_transitive_source_without_release()
         )
         .await
         .unwrap();
+    let mut session = store.session().await.unwrap();
+    let original: serde_json::Value = session.need(&broker_admin(), "run", RUN).await.unwrap();
+    session.commit().await.unwrap();
+    for replacement in [
+        None,
+        Some(serde_json::json!({"id":RUN,"schema_version":"rsia.optimization.source.v1"})),
+    ] {
+        let mut session = store.session().await.unwrap();
+        session.delete(&broker_admin(), "run", RUN).await.unwrap();
+        if let Some(value) = replacement {
+            session
+                .put(&broker_admin(), "run", RUN, broker_admin().actor(), &value)
+                .await
+                .unwrap();
+        }
+        session.commit().await.unwrap();
+        let path = dir.path().join("rsia.sqlite3");
+        let before = q03_lossless_snapshot(&path);
+        assert!(matches!(
+            store
+                .begin_budget_dispatch(&broker_host(), &q03_fence(&call))
+                .await,
+            Err(Error::Cancelled)
+        ));
+        let mut session = store.session().await.unwrap();
+        assert_eq!(
+            session
+                .begin_budget_dispatch_typed(&broker_host(), &q03_fence(&call))
+                .await
+                .unwrap(),
+            Err(evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked)
+        );
+        session.commit().await.unwrap();
+        assert_eq!(q03_lossless_snapshot(&path), before);
+        assert_eq!(broker_call(&store, &call.call_id).await.unwrap(), call);
+    }
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &broker_admin(),
+            "run",
+            RUN,
+            broker_admin().actor(),
+            &original,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
     q03_revoke_upstream(&store, &upstream).await;
     let path = dir.path().join("rsia.sqlite3");
     let before = q03_lossless_snapshot(&path);
@@ -1039,6 +1213,20 @@ async fn q03_existing_call_missing_ref_cannot_repair_over_revoked_closure() {
         .reserve_budget_call_with_sources(&broker_host(), &request, &[RUN.into()])
         .await
         .unwrap();
+    let mut session = store.session().await.unwrap();
+    let original: serde_json::Value = session.need(&broker_admin(), "run", RUN).await.unwrap();
+    session.delete(&broker_admin(), "run", RUN).await.unwrap();
+    session.commit().await.unwrap();
+    let path = dir.path().join("rsia.sqlite3");
+    let before = q03_lossless_snapshot(&path);
+    assert_eq!(
+        store
+            .reserve_budget_call_with_sources(&broker_host(), &request, &[RUN.into()])
+            .await
+            .unwrap(),
+        call
+    );
+    assert_eq!(q03_lossless_snapshot(&path), before);
     let digest = fingerprint(&(
         "rsia.budget_call_ref.v1",
         BROKER_NAMESPACE,
@@ -1052,6 +1240,26 @@ async fn q03_existing_call_missing_ref_cannot_repair_over_revoked_closure() {
             &broker_admin(),
             "artifact",
             &format!("budget-ref-{}", &digest[..32]),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let before = q03_lossless_snapshot(&path);
+    assert!(matches!(
+        store
+            .reserve_budget_call_with_sources(&broker_host(), &request, &[RUN.into()])
+            .await,
+        Err(Error::Forbidden)
+    ));
+    assert_eq!(q03_lossless_snapshot(&path), before);
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &broker_admin(),
+            "run",
+            RUN,
+            broker_admin().actor(),
+            &original,
         )
         .await
         .unwrap();

@@ -3863,8 +3863,36 @@ async fn any_run_source_revoked(
     namespace: &str,
     source_ids: &[String],
 ) -> Result<bool> {
+    if crate::revocation::namespace_collision_in_tx(tx, namespace)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
     let roots: Vec<(&str, &str)> = source_ids.iter().map(|id| ("run", id.as_str())).collect();
-    Ok(!crate::revocation::dependencies_live_in_tx(tx, namespace, &roots, false).await?)
+    let Some(nodes) = crate::upstream_rows_in_tx(
+        tx,
+        namespace,
+        &roots,
+        crate::revocation::MAX_UPSTREAM_CLOSURE_NODES,
+        true,
+    )
+    .await?
+    else {
+        return Ok(true);
+    };
+    for node in nodes {
+        if !node.exists
+            || (node.kind == "run"
+                && !crate::revocation::qualified_run_in_tx(tx, namespace, &node.id).await?)
+        {
+            return Ok(true);
+        }
+        if crate::revocation::judge_node(node).is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// What the budget call reference of a legacy call registers as its source

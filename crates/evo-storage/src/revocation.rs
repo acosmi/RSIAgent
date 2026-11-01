@@ -54,7 +54,7 @@ fn valid_digest(digest: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn judge_node(node: RawUpstreamNode) -> Option<RevocationFinding> {
+pub(crate) fn judge_node(node: RawUpstreamNode) -> Option<RevocationFinding> {
     let cause = if let Some(body) = node.tombstone {
         match strict_tombstone(&body, &node.id) {
             Some(tombstone) if tombstone.source_kind == node.kind => Some(RevocationCause::Revoked),
@@ -73,31 +73,71 @@ fn judge_node(node: RawUpstreamNode) -> Option<RevocationFinding> {
         })
 }
 
-pub(crate) async fn qualified_source_in_tx(
+pub(crate) async fn qualified_run_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    namespace: &str,
+    id: &str,
+) -> Result<bool> {
+    let body: Option<String> =
+        sqlx::query_scalar("SELECT body FROM objects WHERE namespace=? AND kind='run' AND id=?")
+            .bind(namespace)
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(internal)?;
+    let Some(body) = body else { return Ok(false) };
+    let Ok(value) = parse_strict_json(&body) else {
+        return Ok(false);
+    };
+    Ok(crate::lifecycle::valid_native_trace_authority(
+        &crate::lifecycle::TypedObjectRef {
+            kind: "run".into(),
+            id: id.into(),
+        },
+        &value,
+    ))
+}
+
+pub(crate) async fn registered_source_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     namespace: &str,
     kind: RevocableSourceKind,
     id: &str,
 ) -> Result<bool> {
-    let row = sqlx::query("SELECT owner,body FROM objects WHERE namespace=? AND kind=? AND id=?")
+    if kind == RevocableSourceKind::TrustedRun {
+        let present: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM objects WHERE namespace=? AND kind='run' AND id=?)",
+        )
         .bind(namespace)
-        .bind(kind.physical_kind())
         .bind(id)
-        .fetch_optional(&mut **tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(internal)?;
-    let Some(row) = row else { return Ok(false) };
-    let body: String = row.try_get("body").map_err(internal)?;
-    let owner: String = row.try_get("owner").map_err(internal)?;
+        return Ok(present != 0);
+    }
+    let body: Option<String> = sqlx::query_scalar(
+        "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+    )
+    .bind(namespace)
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    let Some(body) = body else { return Ok(false) };
     let Ok(value) = parse_strict_json(&body) else {
         return Ok(false);
     };
-    Ok(crate::lifecycle::qualified_revocable_source(
-        namespace, &owner, kind, id, &value,
+    Ok(crate::lifecycle::registered_import_source(
+        namespace,
+        &crate::lifecycle::TypedObjectRef {
+            kind: "artifact".into(),
+            id: id.into(),
+        },
+        &value,
     ))
 }
 
-async fn namespace_collision_in_tx(
+pub(crate) async fn namespace_collision_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     namespace: &str,
 ) -> Result<Option<RevocationFinding>> {
@@ -111,9 +151,7 @@ async fn namespace_collision_in_tx(
     .await
     .map_err(internal)?;
     for id in ids {
-        if qualified_source_in_tx(tx, namespace, RevocableSourceKind::TrustedRun, &id).await?
-            && qualified_source_in_tx(tx, namespace, RevocableSourceKind::ImportSource, &id).await?
-        {
+        if registered_source_in_tx(tx, namespace, RevocableSourceKind::ImportSource, &id).await? {
             return Ok(Some(RevocationFinding {
                 kind: "namespace".into(),
                 id,
@@ -175,16 +213,16 @@ impl Session {
         dependencies_live_in_tx(&mut self.tx, ctx.namespace(), &seeds, false).await
     }
 
-    /// Qualification is read from complete physical bytes, never a schema label.
+    /// Registered revocation identity, not permission to consume its content.
     #[doc(hidden)]
-    pub async fn qualified_revocable_source(
+    pub async fn registered_revocable_source(
         &mut self,
         ctx: &Context,
         kind: RevocableSourceKind,
         id: &str,
     ) -> Result<bool> {
         identifier(id)?;
-        qualified_source_in_tx(&mut self.tx, ctx.namespace(), kind, id).await
+        registered_source_in_tx(&mut self.tx, ctx.namespace(), kind, id).await
     }
 
     /// A conflict isolates new content in this namespace without a new persisted

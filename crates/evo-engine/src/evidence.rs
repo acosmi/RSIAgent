@@ -418,7 +418,7 @@ pub async fn store_trace_authority(
         return Err(Error::Forbidden);
     }
     if session
-        .qualified_revocable_source(
+        .registered_revocable_source(
             context,
             evo_core::evidence::RevocableSourceKind::ImportSource,
             &authority.record.id,
