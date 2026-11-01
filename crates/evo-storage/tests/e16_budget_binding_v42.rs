@@ -61,6 +61,25 @@ fn source(id: &str) -> Value {
     })
 }
 
+// 完整软件来源 fixture；legacy 预算仍只绑定物理 run。
+fn run_source(id: &str) -> Value {
+    serde_json::json!({
+        "schema_version": "rsia.optimization.source.v1",
+        "record": {
+            "id": id, "body": id.as_bytes().to_vec(),
+            "parent_family": format!("family-{id}"),
+            "task_origin": "trusted_run", "execution_attestation": "trusted_host",
+            "purpose": "development"
+        },
+        "trace": {
+            "run_id": id, "parent_family": format!("family-{id}"),
+            "source_digest": hash(id.as_bytes()), "purpose": "development",
+            "outcome": "success", "diagnosis": null, "excerpt": id, "seed": 1
+        },
+        "excerpt_start": 0, "excerpt_end": id.len()
+    })
+}
+
 fn reservation(call_id: &str, source_id: &str) -> BudgetCallReservation {
     BudgetCallReservation {
         billing_scope: "scope-1".into(), call_id: call_id.into(),
@@ -138,14 +157,40 @@ fn charge(call_id: &str, amount: i64) -> UsageCharge {
 
 #[tokio::test]
 async fn baseline_artifact_id_on_legacy_run_only_is_not_an_artifact_gate() {
-    let (_dir, store) = database().await;
-    put(&store, "artifact", "source-a", &source("source-a")).await;
+    let (dir, store) = database().await;
+    put(&store, "run", "source-a", &run_source("source-a")).await;
+    put(
+        &store,
+        "artifact",
+        "source-a",
+        &json!({"id":"source-a", "schema_version":"test.ordinary.v1", "body":"ordinary"}),
+    )
+    .await;
     let request = reservation("legacy-artifact", "source-a");
     let call = store
         .reserve_budget_call_with_sources(&host(), &request, &["source-a".into()])
         .await
         .unwrap();
-    revoke(&store, "artifact", "source-a").await;
+    // 普通 artifact 不能铸撤销墓碑，也不改变同 id 合法 run 的 legacy 绑定。
+    let before = e16_mode::all_rows(&dir).await;
+    let error = LifecycleStore::begin_revoke(
+        &admin(),
+        &store,
+        TypedObjectRef {
+            kind: "artifact".into(),
+            id: "source-a".into(),
+        },
+        "test revocation",
+        5,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&error, evo_core::Error::Invalid(message)
+            if message == "only a strict E16 import_source artifact is a revocable source"),
+        "{error:?}"
+    );
+    assert_eq!(e16_mode::all_rows(&dir).await, before);
     let decision = store
         .begin_budget_dispatch(&host(), &fence(&call, 6))
         .await
@@ -189,13 +234,7 @@ async fn baseline_artifact_id_on_legacy_run_only_is_not_an_artifact_gate() {
 #[tokio::test]
 async fn deleted_legacy_ref_still_blocks_revoked_late_output_and_books_its_cost() {
     let (_dir, store) = database().await;
-    put(
-        &store,
-        "run",
-        "run-b",
-        &json!({"id":"run-b", "schema_version":"rsia.optimization.source.v1", "body":"run"}),
-    )
-    .await;
+    put(&store, "run", "run-b", &run_source("run-b")).await;
     let call = store
         .reserve_budget_call_with_sources(
             &host(),
@@ -361,7 +400,7 @@ mod e16_mode {
             .unwrap();
         session.commit().await.unwrap();
     }
-    async fn all_rows(dir: &tempfile::TempDir) -> BTreeMap<String, Vec<String>> {
+    pub(super) async fn all_rows(dir: &tempfile::TempDir) -> BTreeMap<String, Vec<String>> {
         let options = sqlx::sqlite::SqliteConnectOptions::new()
             .filename(dir.path().join("rsia.sqlite3"))
             .read_only(true);

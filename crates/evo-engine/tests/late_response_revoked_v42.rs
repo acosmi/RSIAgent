@@ -30,15 +30,17 @@
 //! the originals are untouched.
 
 use async_trait::async_trait;
-use evo_core::evidence::Purpose;
+use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{
     ModelInputPart, ModelInputRole, ModelRequest, ModelRequestContext, ModelStage,
+    OptimizationTrace, TraceOutcome,
 };
 use evo_core::skill_edit::EvidenceRef;
 use evo_core::{Context, Result, Role, hash};
 use evo_engine::broker::{
     BrokerConfig, ModelTransport, PersistentModelBroker, TransportCompletion,
 };
+use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::lifecycle::LifecycleCoordinator;
 use evo_engine::model::{
     ModelExecutionProvenance, ModelExecutionReceipt, ModelPort, ModelRejectionKind, ModelResponse,
@@ -241,24 +243,38 @@ async fn broker_store() -> (tempfile::TempDir, PathBuf, Store) {
         .await
         .unwrap();
     let host = host();
-    let mut session = store.session().await.unwrap();
+    // 软件 transport 的完整来源，正文摘要与 model_request 的 EvidenceRef 一致。
     for id in [RUN, LIVE] {
-        session
-            .put(
-                &host,
-                "run",
-                id,
-                host.actor(),
-                &serde_json::json!({
-                    "id": id,
-                    "schema_version": "rsia.optimization.source.v1",
-                    "body": "run-body",
-                }),
-            )
-            .await
-            .unwrap();
+        store_trace_authority(
+            &store,
+            &host,
+            &StoredTraceAuthority {
+                schema_version: "rsia.optimization.source.v1".into(),
+                record: StoredRunRecord {
+                    id: id.into(),
+                    body: id.as_bytes().to_vec(),
+                    parent_family: format!("family-{id}"),
+                    task_origin: TaskOrigin::TrustedRun,
+                    execution_attestation: ExecutionAttestation::TrustedHost,
+                    purpose: Purpose::Development,
+                },
+                trace: OptimizationTrace {
+                    run_id: id.into(),
+                    parent_family: format!("family-{id}"),
+                    source_digest: hash(id.as_bytes()),
+                    purpose: Purpose::Development,
+                    outcome: TraceOutcome::Success,
+                    diagnosis: None,
+                    excerpt: id.into(),
+                    seed: 1,
+                },
+                excerpt_start: 0,
+                excerpt_end: id.len(),
+            },
+        )
+        .await
+        .unwrap();
     }
-    session.commit().await.unwrap();
     (dir, path, store)
 }
 
