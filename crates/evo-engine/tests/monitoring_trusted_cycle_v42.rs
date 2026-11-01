@@ -17,6 +17,9 @@
 //! and no cycle is a fixture) is therefore `ProgramFixture` here; what these tests
 //! pin is the cycle-level input of that rule, `DevelopmentCycleRecord::provenance`
 //! (the derivation matrix itself is unit-tested in `monitoring.rs`).
+//!
+//! AG-187 (§11.5 Q-58, V121.e): a consolidation does not start on cycles whose runner
+//! contract declares `identity_only`; the last test pins that admission refusal.
 
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
@@ -2312,5 +2315,154 @@ async fn revoking_a_source_cleans_trusted_cycles_to_complete() {
             .close_and_trigger(&first.observed_fact_id)
             .await
             .is_err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AG-187: identity-only cycles support no consolidation
+// ---------------------------------------------------------------------------
+
+/// Counts every use of the registered runner it wraps, its budget binding included.
+struct CountingRunner {
+    inner: RegisteredDevelopmentRunner,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl DevRunner for CountingRunner {
+    async fn run(&self, request: DevelopmentRunRequest) -> evo_core::Result<DevelopmentRunReport> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.run(request).await
+    }
+}
+
+#[async_trait]
+impl ConsolidationDevRunner for CountingRunner {
+    async fn trusted_budget_binding(&self, namespace: &str) -> evo_core::Result<BudgetPortBinding> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.trusted_budget_binding(namespace).await
+    }
+}
+
+/// Closes the registered-runner cycle of `staged` and rewrites it, with the report fact
+/// behind it, into one with a contrast: task-a scores 500000 for the parent and 600000
+/// for the candidate, both passing. The registered runner executes both sides alike, so
+/// it never closes a contrast itself; these stored records are what a claim on
+/// identity-only cycles would rest on. The fact keeps its sealed id, and the cycle stays
+/// exactly what the rewritten report makes of it.
+async fn close_with_forged_contrast(fixture: &Fixture, staged: &Staged) {
+    let closed = fixture.close(&staged.observed_fact_id).await.unwrap();
+    assert_eq!(
+        closed.provenance,
+        DevelopmentExecutionProvenance::RegisteredPureFunction
+    );
+    assert!(!closed.has_contrast, "both sides were executed alike");
+    let mut report = staged.report.clone();
+    let result = &mut report.results[0];
+    assert!(result.parent_passed && result.candidate_passed);
+    result.parent_score_micros = 500_000;
+    result.candidate_score_micros = 600_000;
+    let mut fact: StageFact = serde_json::from_value(
+        value(
+            &fixture.store,
+            &fixture.worker,
+            "artifact",
+            &staged.observed_fact_id,
+        )
+        .await,
+    )
+    .unwrap();
+    fact.payload = serde_json::to_value(&report).unwrap();
+    let fact = fact.seal().unwrap();
+    assert_eq!(fact.artifact_id, staged.observed_fact_id);
+    put_artifact(
+        &fixture.store,
+        &fixture.worker,
+        &fact.artifact_id,
+        &serde_json::to_value(&fact).unwrap(),
+    )
+    .await;
+    let mut cycle = serde_json::to_value(&closed).unwrap();
+    cycle["report_digest"] = json!(fingerprint(&report).unwrap());
+    cycle["pairs"][0]["parent_score_micros"] = json!(500_000);
+    cycle["pairs"][0]["candidate_score_micros"] = json!(600_000);
+    cycle["has_contrast"] = json!(true);
+    put_artifact(&fixture.store, &fixture.worker, &closed.id, &cycle).await;
+}
+
+/// AG-187 (§11.5 Q-58, V121.e): cycles closed on identity-only evidence cannot start a
+/// consolidation. Two registered-runner cycles with a contrast make a dispatchable
+/// claim, but the runner contract of their control declares `identity_only`, so
+/// `run_consolidation` refuses before it writes anything or reaches a port, and the
+/// claim stays claimed.
+#[tokio::test]
+async fn identity_contrast_cycles_cannot_start_a_consolidation() {
+    // Every stored object of the tenant, the billing root and the audit chain length.
+    async fn stored(fixture: &Fixture) -> (Vec<Value>, Option<RootBudgetRecord>, usize) {
+        let mut session = fixture.store.session().await.unwrap();
+        let objects: Vec<Value> = session.list(&fixture.admin, "artifact").await.unwrap();
+        session.commit().await.unwrap();
+        (
+            objects,
+            fixture
+                .store
+                .root_budget(&fixture.admin, SCOPE)
+                .await
+                .unwrap(),
+            fixture.store.verify_audit(&fixture.admin).await.unwrap(),
+        )
+    }
+
+    let fixture = Fixture::new().await;
+    for n in 1..=2 {
+        let staged = fixture.stage_trusted(n).await;
+        close_with_forged_contrast(&fixture, &staged).await;
+    }
+    let ClaimOutcome::Claimed(claim) = MonitoringCoordinator::claim_consolidation(
+        &fixture.worker,
+        &fixture.store,
+        &fixture.scope_id().await,
+    )
+    .await
+    .unwrap() else {
+        panic!("the contrast cycles were not claimed")
+    };
+    assert_eq!(claim.state, ConsolidationClaimState::Claimed);
+
+    // Everything the request borrows is written before the snapshot.
+    let material = StepMaterial::new(&fixture).await;
+    let model = EditingModelPort {
+        calls: AtomicUsize::new(0),
+    };
+    let runner = CountingRunner {
+        inner: fixture.runner(),
+        calls: AtomicUsize::new(0),
+    };
+    let journal = fixture.journal();
+    let before = stored(&fixture).await;
+    match MonitoringCoordinator::run_consolidation(
+        &fixture.worker,
+        &fixture.store,
+        &claim.id,
+        Some(&model),
+        Some(&runner),
+        Some(&journal),
+        material.request(&fixture, &claim.id, 1),
+    )
+    .await
+    {
+        Err(Error::Conflict(message)) => assert_eq!(
+            message,
+            "identity_only development evidence cannot support Skill content"
+        ),
+        other => panic!("identity-only cycles started a consolidation: {other:?}"),
+    }
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0, "no model call");
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 0, "no runner use");
+    assert_eq!(stored(&fixture).await, before, "the refusal wrote nothing");
+    assert_eq!(
+        fixture.claim(&claim.id).await,
+        claim,
+        "the claim stays claimed"
     );
 }

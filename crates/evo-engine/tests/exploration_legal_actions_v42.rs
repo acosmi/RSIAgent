@@ -21,11 +21,18 @@
 //!   `decide_next` and `status` would fail for good. The gains a node carries stay
 //!   relative to its parent's own quality, as the replay computes them.
 //!
-//! The trusted path uses `ContrastRunner`, which writes honest E03 evidence with chosen
+//! The verified path uses `ContrastRunner`, which writes honest E03 evidence with chosen
 //! outputs (the budget rows, settlements, execution and grader receipts through the
 //! public issuing functions, the run receipt as a typed envelope), as
 //! `exploration_trust_v42` does. A candidate answers either every task (quality
 //! 1000000) or `task-a` only (500000) over the two registered tasks.
+//!
+//! Since AG-187 (§6.7.4 Q-29) the gate's verified comparison of an identity-only runner
+//! supports no Skill content, so no step derives a trusted valid node: a verified
+//! candidate is a terminal `HardFailure` labelled `EvidenceRejected`. The assertions that
+//! rest on a trusted valid node seed one with `seed_trusted_template`, the node the build
+//! before AG-187 stored for the same candidate (a derived structure template; such a
+//! stored record keeps its label, §5.1.1).
 //!
 //! Not covered (and not claimed): the error paths after a paid step (a failure between
 //! the paid step and the node's write leaves the dispatch claimed), the recovery end to
@@ -102,7 +109,8 @@ const NODE: &str = "exploration_node_v1";
 const DISPATCH: &str = "exploration_dispatch_v1";
 /// An answer the grader scores 0 for every registered task.
 const WRONG_ANSWER: &str = "{\"answer\":{\"clamped\":12345}}";
-const OBSERVED_REASON: &str = "candidate_observed";
+/// The fixed code of a verified candidate refused as identity-only Skill content.
+const REJECTED_REASON: &str = "development_evidence_rejected";
 
 fn d(label: &str) -> String {
     hash(label.as_bytes())
@@ -1310,6 +1318,67 @@ fn answers_task_a(task: &str) -> bool {
     task == "task-a"
 }
 
+/// Derived structure template (AG-187): rewrites node `node_seq` of `world`, the content
+/// refusal of a candidate the gate verified, into the trusted valid node the build before
+/// AG-187 stored for the same candidate. Its quality is the mean of the candidate's
+/// scores (1000000 for each task `candidate_correct` answers), and its best valid ancestor
+/// and gains are what that build derived from the stored parent (the baseline for a
+/// root), so every later node and decision is derived from it as before. It is the
+/// structure the legal-action and prefix assertions rest on, not evidence of content.
+async fn seed_trusted_template(
+    env: &Env,
+    world: &str,
+    node_seq: u32,
+    candidate_correct: fn(&str) -> bool,
+) {
+    let node_id = format!("node-{world}-{node_seq}");
+    let stored = payload(&env.store, NODE, &node_id).await;
+    assert_eq!(
+        stored["evidence"], "evidence_rejected",
+        "{node_id}: only a refused candidate is templated"
+    );
+    let tasks = tasks();
+    let correct = tasks
+        .iter()
+        .filter(|task| candidate_correct(&task.task_id))
+        .count();
+    let quality = i64::from(FULL) * correct as i64 / tasks.len() as i64;
+    // What the gain is measured against: the parent's own quality (its best valid
+    // ancestor when it is not valid), the baseline for a root.
+    let previous = match stored["node"]["search_parent_seq"].as_u64() {
+        Some(parent_seq) => {
+            let parent = env.node(world, u32::try_from(parent_seq).unwrap()).await;
+            parent["node"]["status"]["quality_micros"]
+                .as_i64()
+                .or_else(|| parent["node"]["best_valid_ancestor_micros"].as_i64())
+                .unwrap()
+        }
+        None => payload(&env.store, WORLD, world).await["initial_baseline_quality_micros"]
+            .as_i64()
+            .unwrap(),
+    };
+    rewrite_node(&env.store, &node_id, |node| {
+        let mut gains = node["node"]["recent_valid_gains_micros"]
+            .as_array()
+            .unwrap()
+            .clone();
+        gains.push(json!(quality - previous));
+        if gains.len() > 2 {
+            gains.remove(0);
+        }
+        let best = node["node"]["best_valid_ancestor_micros"]
+            .as_i64()
+            .unwrap()
+            .max(quality);
+        node["node"]["status"] = json!({"status": "valid", "quality_micros": quality});
+        node["node"]["best_valid_ancestor_micros"] = json!(best);
+        node["node"]["recent_valid_gains_micros"] = json!(gains);
+        node["evidence"] = json!("trusted");
+        node["terminal_class"] = json!({"class": "candidate_observed"});
+    })
+    .await;
+}
+
 /// Counts the runs of the runner it wraps: a recovered step must not reach it.
 struct CallCounting<R> {
     inner: R,
@@ -1337,9 +1406,10 @@ impl<R: DevRunner> DevRunner for CallCounting<R> {
     }
 }
 
-/// What the step that derives a node ends in: a trusted valid candidate (the
-/// half-answering runner makes it 500000), a plain failure (the model suggests
-/// nothing) or an uncertain outcome (the model fails once the dispatch was claimed).
+/// What the step that derives a node ends in: a candidate the gate verifies (the
+/// half-answering runner scores it 500000), which AG-187 refuses as identity-only Skill
+/// content, a plain failure (the model suggests nothing) or an uncertain outcome (the
+/// model fails once the dispatch was claimed).
 #[derive(Clone, Copy)]
 enum Child {
     Valid,
@@ -1366,11 +1436,11 @@ impl Child {
         }
     }
 
-    /// The status the node is stored with.
+    /// The status the node is stored with: the refused candidate is a hard failure,
+    /// like a step without one.
     fn status(self) -> Value {
         match self {
-            Self::Valid => json!({"status": "valid", "quality_micros": HALF}),
-            Self::HardFailure => json!({"status": "hard_failure"}),
+            Self::Valid | Self::HardFailure => json!({"status": "hard_failure"}),
             Self::Uncertain => json!({"status": "usage_uncertain"}),
         }
     }
@@ -1482,9 +1552,10 @@ fn dispatched_seqs(action: &BatchActionV1) -> Vec<u32> {
 type Round = (u32, String);
 
 /// Runs `world` round by round, the runner of each round chosen by `script`, until
-/// the decision is Stop. Returns what each round dispatched and the reason it
-/// stopped. A round that cannot dispatch what was decided is a world that can
-/// neither advance nor stop.
+/// the decision is Stop. Each round's refused candidate is seeded as the trusted valid
+/// node the build before AG-187 stored for it (`seed_trusted_template`). Returns what
+/// each round dispatched and the reason it stopped. A round that cannot dispatch what
+/// was decided is a world that can neither advance nor stop.
 async fn run_to_stop(
     env: &Env,
     world: &str,
@@ -1516,6 +1587,7 @@ async fn run_to_stop(
                  {reason:?} ({error:?}); dispatched so far {rounds:?}"
             );
         }
+        seed_trusted_template(env, world, round, script(round)).await;
         rounds.push((action_seq, reason));
     }
     panic!("{world} did not stop within {MAX_ROUNDS} rounds: {rounds:?}");
@@ -1749,14 +1821,15 @@ async fn a_valid_node_is_deepened_only_when_its_evidence_is_trusted() {
     for (case, label) in LABELS {
         let id = format!("world-gate-{case}");
         env.register(world(&id, &[1], HALF)).await;
-        // A genuine trusted valid node (1000000 over the 500000 baseline) whose label
-        // is rewritten to what the row under test carries: the label is the only
-        // difference between the cases.
+        // A trusted valid node (1000000 over the 500000 baseline; seeded as the build
+        // before AG-187 stored it) whose label is rewritten to what the row under test
+        // carries: the label is the only difference between the cases.
         let first = env
             .step(&id, &env.model, &env.runner(answers_all))
             .await
             .unwrap();
         let node_id = first.node_id.clone().unwrap();
+        seed_trusted_template(&env, &id, 1, answers_all).await;
         relabel(&env, &node_id, label).await;
         assert_eq!(
             payload(&env.store, NODE, &node_id).await["node"]["status"],
@@ -1808,6 +1881,7 @@ async fn a_valid_row_without_trusted_evidence_leaves_the_other_root_offered() {
             .await
             .unwrap();
         assert_eq!(dispatched_seqs(&first.decision.action), vec![1], "{case}");
+        seed_trusted_template(&env, &id, 1, answers_all).await;
         relabel(&env, first.node_id.as_deref().unwrap(), *label).await;
 
         // The row drives nothing: the world goes on with the other root.
@@ -1830,6 +1904,7 @@ async fn a_deepen_that_was_dispatched_is_not_offered_again_so_the_world_stops() 
         env.step(&id, &env.model, &env.runner(answers_all))
             .await
             .unwrap();
+        seed_trusted_template(&env, &id, 1, answers_all).await;
         assert_offered(&env, &id, &[deepen(1, 1, 1)]).await;
 
         // The root's Deepen is the only opportunity left, and its step ends without a
@@ -1873,12 +1948,14 @@ async fn each_node_of_a_chain_is_offered_one_successor_up_to_the_depth_cap() {
     let id = "world-chain";
     env.register(world(id, &[1], HALF)).await;
     assert_offered(&env, id, &[widen(1)]).await;
-    // Every node is trusted and valid, so each is offered a Deepen; once that was
-    // dispatched only the newest node's is left, and at the depth cap (4) none.
+    // Every node is trusted and valid (seeded as the build before AG-187 stored it),
+    // so each is offered a Deepen; once that was dispatched only the newest node's is
+    // left, and at the depth cap (4) none.
     for depth in 1..=4u8 {
         env.step(id, &env.model, &env.runner(answers_all))
             .await
             .unwrap();
+        seed_trusted_template(&env, id, u32::from(depth), answers_all).await;
         if depth < 4 {
             assert_offered(&env, id, &[deepen(u32::from(depth), 1, depth)]).await;
         } else {
@@ -1949,6 +2026,7 @@ async fn a_trusted_root_below_the_baseline_can_be_deepened_without_bricking_the_
         env.step(&id, &env.model, &env.runner(answers_task_a))
             .await
             .unwrap();
+        seed_trusted_template(&env, &id, 1, answers_task_a).await;
         let root = env.node(&id, 1).await;
         assert_eq!(root["evidence"], "trusted", "{id}");
         assert_eq!(
@@ -1970,17 +2048,21 @@ async fn a_trusted_root_below_the_baseline_can_be_deepened_without_bricking_the_
         assert_world_reads(&env, &id).await;
         let node = env.node(&id, 2).await;
         assert_eq!(node["node"]["status"], child.status(), "{id}");
+        if matches!(child, Child::Valid) {
+            // AG-187: the verified candidate is refused as identity-only Skill content.
+            assert_eq!(node["evidence"], "evidence_rejected", "{id}");
+        }
         assert_eq!(
             node["node"]["best_valid_ancestor_micros"], root["node"]["best_valid_ancestor_micros"],
             "{id}: the child's best valid ancestor is its parent's"
         );
         // The gains stay relative to the parent's own quality, as the replay computes
-        // them: a valid child adds `500000 - 500000`, any other child adds nothing.
-        let gains = match child {
-            Child::Valid => json!([-400_000, 0]),
-            Child::HardFailure | Child::Uncertain => json!([-400_000]),
-        };
-        assert_eq!(node["node"]["recent_valid_gains_micros"], gains, "{id}");
+        // them, and only a valid child adds one: none of these is valid.
+        assert_eq!(
+            node["node"]["recent_valid_gains_micros"],
+            json!([-400_000]),
+            "{id}"
+        );
     }
 }
 
@@ -1989,16 +2071,19 @@ async fn a_regressing_parent_does_not_brick_its_children() {
     let env = Env::new().await;
     for child in Child::ALL {
         let id = format!("world-regress-{}", child.name());
-        // Grandparent: 1000000 over the 500000 baseline.
+        // Grandparent: 1000000 over the 500000 baseline (seeded as the build before
+        // AG-187 stored it, as is the parent).
         env.register(world(&id, &[1], HALF)).await;
         env.step(&id, &env.model, &env.runner(answers_all))
             .await
             .unwrap();
+        seed_trusted_template(&env, &id, 1, answers_all).await;
         // Parent: deepens the grandparent and regresses to 500000, below the best
         // valid ancestor it inherits (1000000).
         env.step(&id, &env.model, &env.runner(answers_task_a))
             .await
             .unwrap();
+        seed_trusted_template(&env, &id, 2, answers_task_a).await;
         let parent = env.node(&id, 2).await;
         assert_eq!(
             parent["node"]["status"],
@@ -2026,17 +2111,19 @@ async fn a_regressing_parent_does_not_brick_its_children() {
         assert_world_reads(&env, &id).await;
         let grandchild = env.node(&id, 3).await;
         assert_eq!(grandchild["node"]["status"], child.status(), "{id}");
+        if matches!(child, Child::Valid) {
+            // AG-187: the verified candidate is refused as identity-only Skill content.
+            assert_eq!(grandchild["evidence"], "evidence_rejected", "{id}");
+        }
         assert_eq!(
             grandchild["node"]["best_valid_ancestor_micros"],
             parent["node"]["best_valid_ancestor_micros"],
             "{id}: the child's best valid ancestor is its parent's"
         );
-        let gains = match child {
-            Child::Valid => json!([-500_000, 0]),
-            Child::HardFailure | Child::Uncertain => json!([500_000, -500_000]),
-        };
+        // Only a valid child adds a gain: none of these is valid.
         assert_eq!(
-            grandchild["node"]["recent_valid_gains_micros"], gains,
+            grandchild["node"]["recent_valid_gains_micros"],
+            json!([500_000, -500_000]),
             "{id}"
         );
     }
@@ -2052,10 +2139,12 @@ async fn the_legal_actions_of_a_world_without_old_nodes_are_what_they_were() {
     // A fresh world offers its roots in registration order.
     env.register(world("world-fresh", &[2, 1], HALF)).await;
     assert_offered(&env, "world-fresh", &[widen(2), widen(1)]).await;
-    // A trusted first root offers its Deepen after the roots still open.
+    // A trusted first root (seeded as the build before AG-187 stored it) offers its
+    // Deepen after the roots still open.
     env.step("world-fresh", &env.model, &env.runner(answers_all))
         .await
         .unwrap();
+    seed_trusted_template(&env, "world-fresh", 1, answers_all).await;
     assert_offered(&env, "world-fresh", &[widen(2), deepen(1, 1, 1)]).await;
     // A root that failed offers no successor.
     for child in [Child::HardFailure, Child::Uncertain] {
@@ -2140,6 +2229,7 @@ async fn a_claimed_deepen_stays_legal_and_resumes_without_paying_again() {
     env.step(id, &env.model, &env.runner(answers_all))
         .await
         .unwrap();
+    seed_trusted_template(&env, id, 1, answers_all).await;
     let before = env.coordinator.decide_next(id).await.unwrap();
     assert_eq!(dispatched_seqs(&before.action), vec![1_000_002]);
 
@@ -2192,7 +2282,8 @@ async fn a_claimed_deepen_stays_legal_and_resumes_without_paying_again() {
         .unwrap();
     assert_eq!(replay.calls(), 0, "the recovery journal replays the report");
     assert_eq!(env.model.calls(), model_calls);
-    assert_eq!(finished.outcome, OBSERVED_REASON);
+    // Its one terminal state: the content refusal of the identity-only candidate.
+    assert_eq!(finished.outcome, REJECTED_REASON);
     assert_eq!(finished.dispatch_id.as_deref(), claimed["id"].as_str());
 
     // The resumed step wrote the node the claimed Deepen was to derive, and the
@@ -2200,11 +2291,8 @@ async fn a_claimed_deepen_stays_legal_and_resumes_without_paying_again() {
     let child = env.node(id, 2).await;
     assert_eq!(child["node"]["search_parent_seq"], 1);
     assert_eq!(child["node"]["depth"], 2);
-    assert_eq!(
-        child["node"]["status"],
-        json!({"status": "valid", "quality_micros": FULL})
-    );
-    assert_eq!(child["evidence"], "trusted");
+    assert_eq!(child["node"]["status"], json!({"status": "hard_failure"}));
+    assert_eq!(child["evidence"], "evidence_rejected");
     let consumed = payload(&env.store, DISPATCH, dispatch_ids[1].as_str().unwrap()).await;
     assert_eq!(consumed["state"], "observed");
     assert_eq!(consumed["node_id"], finished.node_id.clone().unwrap());

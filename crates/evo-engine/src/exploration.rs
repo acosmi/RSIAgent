@@ -4,6 +4,7 @@
 use crate::capacity::{
     CapacityField, CapacityLimits, V41CapacityUsage, admit_field, unix_now_secs,
 };
+use crate::development::CandidateConsumption;
 use crate::evidence::validate_stored_sources;
 use crate::model::ModelPort;
 use crate::optimization::{
@@ -358,7 +359,11 @@ impl ExplorationWorldV1 {
 pub enum ExplorationEvidenceV1 {
     /// The development report passed the observation gate: its receipts, budget
     /// rows and scores were reloaded and the node's quality is the server-recomputed
-    /// one. The only label a `Valid` node written by `run_next` can carry.
+    /// one; and its runner contract declares `projection_consumed` (§6.7.4 Q-29), as
+    /// only such a comparison is Skill content evidence. A verified report of an
+    /// identity-only runner is `EvidenceRejected`. The only label a `Valid` node
+    /// written by `run_next` can carry; a record written before the declaration was
+    /// required keeps the label it was written with.
     Trusted,
     /// The report declared Fixture provenance. That is honest, and it can never be
     /// a trusted observation; the gate was not asked.
@@ -2019,6 +2024,14 @@ async fn judge_candidate_evidence(
     )
     .await
     {
+        // §6.7.4 Q-29 (V121.a): a verified comparison is Skill content evidence only
+        // when its runner consumed the candidate's projection. An identity-only (or
+        // undeclared legacy) runner proves the receipt chain, never the content.
+        Ok(view)
+            if view.candidate_consumption != Some(CandidateConsumption::ProjectionConsumed) =>
+        {
+            CandidateVerdict::Rejected
+        }
         Ok(view) => CandidateVerdict::Trusted {
             quality_micros: mean_quality_micros(
                 view.outcomes

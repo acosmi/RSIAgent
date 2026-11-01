@@ -31,6 +31,9 @@
 //!   node. The two differ only when one episode has failures on two nodes (the history
 //!   `replay_v41` pins), and a test pins exactly that difference.
 //!
+//! Since AG-187 (§6.7.4 Q-29) a candidate the gate verifies is refused as identity-only
+//! Skill content: a `Valid` repair is a terminal `HardFailure` labelled `EvidenceRejected`.
+//!
 //! No step produces a repairable failure yet (B4b), so the failures here are written by
 //! hand: a failed root is rewritten into one, as `exploration_legal_actions_v42` does. Not
 //! covered (and not claimed): a repairable failure produced by a step, the end to end
@@ -119,7 +122,8 @@ const NODE: &str = "exploration_node_v1";
 const DISPATCH: &str = "exploration_dispatch_v1";
 /// An answer the grader scores 0 for every registered task.
 const WRONG_ANSWER: &str = "{\"answer\":{\"clamped\":12345}}";
-const OBSERVED_REASON: &str = "candidate_observed";
+/// The fixed code of a verified candidate refused as identity-only Skill content.
+const REJECTED_REASON: &str = "development_evidence_rejected";
 
 fn d(label: &str) -> String {
     hash(label.as_bytes())
@@ -1359,7 +1363,8 @@ impl<R: DevRunner> DevRunner for CallCounting<R> {
 /// What the step that repairs a failure ends in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Repair {
-    /// A trusted valid candidate (the runner answers every task).
+    /// A candidate the gate verifies (the runner answers every task), which AG-187
+    /// refuses as identity-only Skill content.
     Valid,
     /// The model suggests nothing: a plain failure.
     HardFailure,
@@ -1391,8 +1396,7 @@ impl Repair {
     /// The status the node of the dispatch is stored with.
     fn status(self) -> Value {
         match self {
-            Self::Valid => json!({"status": "valid", "quality_micros": FULL}),
-            Self::HardFailure => json!({"status": "hard_failure"}),
+            Self::Valid | Self::HardFailure => json!({"status": "hard_failure"}),
             Self::Uncertain | Self::TargetGone => json!({"status": "usage_uncertain"}),
         }
     }
@@ -1408,7 +1412,7 @@ impl Repair {
     /// The label the gate gives the node.
     fn evidence(self) -> &'static str {
         match self {
-            Self::Valid => "trusted",
+            Self::Valid => "evidence_rejected",
             Self::HardFailure | Self::Uncertain | Self::TargetGone => "not_observed",
         }
     }
@@ -2495,12 +2499,9 @@ async fn assert_repair_settled(repair: Repair) {
     // reads, registers and is served by `status`.
     assert_world_reads(&env, &id, &job).await;
     assert_still_registered(&env, &registered, &job, &id).await;
-    // The repair is spent: only a valid repair has a successor.
-    let expected = match repair {
-        Repair::Valid => vec![deepen(2, 1, 2)],
-        _ => vec![],
-    };
-    assert_offered(&env, &id, &expected).await;
+    // The repair is spent, and only a valid repair would have a successor: none of
+    // these is valid (AG-187 refuses the verified candidate as identity-only content).
+    assert_offered(&env, &id, &[]).await;
 }
 
 #[tokio::test]
@@ -2581,7 +2582,8 @@ async fn historical_two_repairs_are_counted_but_replay_rejects_the_second() {
     let mut history = original.clone();
     // The first node is a repairable failure of the first episode; the second, written as
     // the repair of it, is a repairable failure of another episode; the third, written as
-    // the repair of that, is the valid and trusted one the third root produced.
+    // the repair of that, is the node the third root produced (since AG-187 the content
+    // refusal of its verified candidate; only the counts below depend on it).
     history.nodes[0]["payload"]["node"]["status"] = repairable_status(EPISODE, "compile", true, 0);
     history.nodes[1]["payload"]["node"]["status"] =
         repairable_status("episode-2", "compile", true, 0);
@@ -2925,7 +2927,8 @@ async fn a_claimed_recover_stays_legal_and_resumes_without_paying_again() {
 
     // A new `run_next` of the same request finishes the claimed dispatch: the saved
     // report and the model answers are replayed, nothing is paid for again, and the step
-    // is recorded as observed, not as a claim whose inputs changed.
+    // ends in its one terminal state, the content refusal of the identity-only candidate
+    // (AG-187), not a claim whose inputs changed.
     let model_calls = env.model.calls();
     let replay = CallCounting::new(env.runner(answers_all));
     let finished = env
@@ -2940,7 +2943,7 @@ async fn a_claimed_recover_stays_legal_and_resumes_without_paying_again() {
         .unwrap();
     assert_eq!(replay.calls(), 0, "the recovery journal replays the report");
     assert_eq!(env.model.calls(), model_calls);
-    assert_eq!(finished.outcome, OBSERVED_REASON);
+    assert_eq!(finished.outcome, REJECTED_REASON);
     assert_eq!(finished.dispatch_id.as_deref(), claimed["id"].as_str());
 
     // The resumed step wrote the node the claimed Recover was to derive, and the dispatch
@@ -2948,18 +2951,15 @@ async fn a_claimed_recover_stays_legal_and_resumes_without_paying_again() {
     let child = env.node(id, 2).await;
     assert_eq!(child["node"]["search_parent_seq"], 1);
     assert_eq!(child["node"]["depth"], 2);
-    assert_eq!(
-        child["node"]["status"],
-        json!({"status": "valid", "quality_micros": FULL})
-    );
-    assert_eq!(child["evidence"], "trusted");
+    assert_eq!(child["node"]["status"], json!({"status": "hard_failure"}));
+    assert_eq!(child["evidence"], "evidence_rejected");
     assert_eq!(child["node"]["repair_failures_dispatched"], 0);
     let consumed = payload(&env.store, DISPATCH, dispatch_ids[1].as_str().unwrap()).await;
     assert_eq!(consumed["state"], "observed");
     assert_eq!(consumed["node_id"], finished.node_id.clone().unwrap());
 
-    // Now the repair is spent, and the valid repair has its Deepen.
-    assert_offered(&env, id, &[deepen(2, 1, 2)]).await;
+    // Now the repair is spent, and the refused repair has no successor.
+    assert_offered(&env, id, &[]).await;
     assert_world_reads(&env, id, &job).await;
     assert_still_registered(&env, &registered, &job, id).await;
 }
@@ -3206,6 +3206,19 @@ async fn a_world_without_a_repairable_failure_does_not_depend_on_its_dispatch_fa
             .step(&id, repair.model(), &env.runner(answers_all))
             .await
             .unwrap();
+        if repair == Repair::Valid {
+            // Derived structure template (AG-187): the trusted valid root the build
+            // before AG-187 stored for this candidate (such a record keeps its label),
+            // so the world holds a valid node offered a Deepen.
+            rewrite_node(&env.store, &node_id(&id, 1), |node| {
+                node["node"]["status"] = json!({"status": "valid", "quality_micros": FULL});
+                node["node"]["best_valid_ancestor_micros"] = json!(FULL);
+                node["node"]["recent_valid_gains_micros"] = json!([FULL - HALF]);
+                node["evidence"] = json!("trusted");
+                node["terminal_class"] = json!({"class": "candidate_observed"});
+            })
+            .await;
+        }
         let dispatch_id = step.dispatch_id.clone().unwrap();
         let decision = env.coordinator.decide_next(&id).await.unwrap();
         let original = raw_record(&env.store, DISPATCH, &dispatch_id).await;

@@ -752,6 +752,10 @@ pub struct VerifiedDevelopmentObservationView {
     pub environment_digest: String,
     pub grader_digest: String,
     pub outcomes: Vec<VerifiedDevelopmentTaskOutcome>,
+    /// What the runner contract behind the receipts declares about the candidate
+    /// (§6.7.4): `None` for the frozen v1 contract, which declares nothing. The
+    /// verified chain is Skill content evidence only when it is `ProjectionConsumed`.
+    pub candidate_consumption: Option<crate::development::CandidateConsumption>,
 }
 
 /// E03 observation gate shared by E12 (`record_cycle`) and other consumers.
@@ -843,14 +847,15 @@ pub(crate) async fn verified_development_observation_in_session(
     if report.provenance == DevelopmentExecutionProvenance::Fixture {
         return Err(Error::Forbidden);
     }
-    let outcomes = crate::development::verify_observed_report_in_session(
-        ctx,
-        session,
-        &observed_fact,
-        &request,
-        &report,
-    )
-    .await?;
+    let (outcomes, candidate_consumption) =
+        crate::development::verify_observed_report_with_consumption_in_session(
+            ctx,
+            session,
+            &observed_fact,
+            &request,
+            &report,
+        )
+        .await?;
     if outcomes.len() != report.results.len() {
         return Err(Error::Internal);
     }
@@ -863,6 +868,7 @@ pub(crate) async fn verified_development_observation_in_session(
         environment_digest: request.environment_digest,
         grader_digest: request.grader_digest,
         outcomes,
+        candidate_consumption,
     })
 }
 
