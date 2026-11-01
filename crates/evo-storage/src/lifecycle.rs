@@ -196,6 +196,130 @@ fn valid_native_trace_authority(node: &TypedObjectRef, value: &serde_json::Value
         && identifier(&record.parent_family).is_ok()
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevocableImportEnvelope {
+    schema_version: String,
+    id: String,
+    namespace: String,
+    owner_actor: String,
+    request_key: String,
+    input_digest: String,
+    created_at: i64,
+    updated_at: i64,
+    source_refs: Vec<RevocableImportRef>,
+    revoke_watermark: u64,
+    payload: RevocableImportPayload,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevocableImportRef {
+    kind: String,
+    id: String,
+    content_digest: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevocableImportPayload {
+    selection_id: String,
+    logical_source_id: String,
+    authorized_path: String,
+    reader: String,
+    reader_version: String,
+    raw_digest: String,
+    observed_digest: Option<String>,
+    raw_blob_digest: String,
+    blob_published: bool,
+    byte_len: u64,
+    status: String,
+    task_origin: evo_core::evidence::TaskOrigin,
+    execution_attestation: evo_core::evidence::ExecutionAttestation,
+    purpose: evo_core::evidence::Purpose,
+}
+
+pub(crate) fn qualified_revocable_source(
+    namespace: &str,
+    owner: &str,
+    kind: evo_core::evidence::RevocableSourceKind,
+    id: &str,
+    value: &serde_json::Value,
+) -> bool {
+    use evo_core::evidence::RevocableSourceKind;
+    if kind == RevocableSourceKind::TrustedRun {
+        return valid_native_trace_authority(
+            &TypedObjectRef {
+                kind: "run".into(),
+                id: id.into(),
+            },
+            value,
+        );
+    }
+    let Ok(envelope) = serde_json::from_value::<RevocableImportEnvelope>(value.clone()) else {
+        return false;
+    };
+    let p = &envelope.payload;
+    let valid_digest = |digest: &str| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if envelope.schema_version != "rsia.e16.import_source.v1"
+        || envelope.id != id
+        || envelope.namespace != namespace
+        || envelope.owner_actor != owner
+        || identifier(owner).is_err()
+        || identifier(&envelope.request_key).is_err()
+        || !valid_digest(&envelope.input_digest)
+        || envelope.created_at < 0
+        || envelope.updated_at < envelope.created_at
+        || identifier(&p.selection_id).is_err()
+        || identifier(&p.logical_source_id).is_err()
+        || p.authorized_path.is_empty()
+        || !matches!(
+            p.reader.as_str(),
+            "rsia_trace_v1" | "rsih_pi_fixture" | "claude_fixture"
+        )
+        || p.reader_version.is_empty()
+        || !valid_digest(&p.raw_digest)
+        || p.raw_blob_digest != p.raw_digest
+        || p.observed_digest
+            .as_deref()
+            .is_some_and(|digest| !valid_digest(digest))
+        || p.task_origin != evo_core::evidence::TaskOrigin::ImportedHistory
+        || p.execution_attestation != evo_core::evidence::ExecutionAttestation::UnverifiedImport
+        || envelope.source_refs.len() != 1
+        || envelope.source_refs[0].kind != "blob"
+        || envelope.source_refs[0].id != p.raw_blob_digest
+        || envelope.source_refs[0].content_digest != p.raw_digest
+    {
+        return false;
+    }
+    // These are identity fields, not permission to use imported content.
+    let _identity = (envelope.revoke_watermark, p.purpose);
+    match p.status.as_str() {
+        "prepared" => !p.blob_published && p.observed_digest.is_none() && p.byte_len == 0,
+        "ready" => {
+            p.blob_published
+                && p.byte_len > 0
+                && p.byte_len <= evo_core::evidence::MAX_TOTAL_READ_BYTES as u64
+                && p.observed_digest.as_deref() == Some(p.raw_digest.as_str())
+        }
+        "source_changed" => {
+            !p.blob_published && p.observed_digest.as_deref() != Some(p.raw_digest.as_str())
+        }
+        "zero_records" => {
+            !p.blob_published
+                && p.byte_len == 0
+                && p.observed_digest.as_deref() == Some(evo_core::hash(b"").as_str())
+        }
+        "missing" | "permission_denied" | "invalid_file" | "too_large" => !p.blob_published,
+        _ => false,
+    }
+}
+
 impl LifecycleStore {
     pub async fn begin_revoke(
         ctx: &Context,
@@ -213,8 +337,16 @@ impl LifecycleStore {
             .get::<serde_json::Value>(ctx, &source.kind, &source.id)
             .await?;
         let existing_tombstone = session
-            .get::<RevokeTombstone>(ctx, "tombstone", &source.id)
-            .await?;
+            .object_row(ctx, "tombstone", &source.id)
+            .await?
+            .map(|row| {
+                parse_strict_json(&row.body)
+                    .map_err(internal)
+                    .and_then(|value| {
+                        serde_json::from_value::<RevokeTombstone>(value).map_err(internal)
+                    })
+            })
+            .transpose()?;
         if existing_source.is_none() && existing_tombstone.is_none() {
             return Err(Error::NotFound);
         }
@@ -243,6 +375,9 @@ impl LifecycleStore {
                     source.kind, source.id
                 )));
             }
+            if !crate::revocation::valid_tombstone(&tombstone, &source.id) {
+                return Err(Error::Internal);
+            }
             let status = load_status_by_source(
                 &mut session.tx,
                 ctx.namespace(),
@@ -264,6 +399,7 @@ impl LifecycleStore {
                 ));
             }
         }
+        session.ensure_revocation_namespace_live(ctx).await?;
         let watermark_digest = fingerprint(&(
             "rsia.revoke_watermark.v1",
             ctx.namespace(),

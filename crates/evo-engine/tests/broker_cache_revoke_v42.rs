@@ -1294,3 +1294,74 @@ async fn redacted_open_execution_without_provenance_closes_and_keeps_uncertain_f
     next_call_on_same_root_dispatches(&fixture).await;
     assert_only_recovery_close(&before, &after, &legacy);
 }
+
+#[tokio::test]
+async fn q03_upstream_legacy_replay_changes_only_d4_close_set() {
+    let fixture = Fixture::new().await;
+    let ctx = context(NS, Role::Host);
+    let mut session = fixture.store.session().await.unwrap();
+    for id in [A, B, U] {
+        session.delete(&ctx, "run", id).await.unwrap();
+    }
+    session.commit().await.unwrap();
+    for id in [A, B, U] {
+        let family = format!("family-{id}");
+        evo_engine::evidence::store_trace_authority(
+            &fixture.store,
+            &ctx,
+            &evo_engine::evidence::StoredTraceAuthority {
+                schema_version: "rsia.optimization.source.v1".into(),
+                record: evo_engine::evidence::StoredRunRecord {
+                    id: id.into(),
+                    body: id.as_bytes().to_vec(),
+                    parent_family: family.clone(),
+                    task_origin: evo_core::evidence::TaskOrigin::TrustedRun,
+                    execution_attestation: evo_core::evidence::ExecutionAttestation::TrustedHost,
+                    purpose: Purpose::Development,
+                },
+                trace: evo_core::optimization::OptimizationTrace {
+                    run_id: id.into(),
+                    parent_family: family,
+                    source_digest: hash(id.as_bytes()),
+                    purpose: Purpose::Development,
+                    outcome: evo_core::optimization::TraceOutcome::Success,
+                    diagnosis: None,
+                    excerpt: id.into(),
+                    seed: 1,
+                },
+                excerpt_start: 0,
+                excerpt_end: id.len(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    gate_edges(
+        &fixture.store,
+        NS,
+        &[
+            ("run", B, "candidate", "q03-middle"),
+            ("candidate", "q03-middle", "run", U),
+        ],
+    )
+    .await;
+    let refused = request("q03-upstream-open-root", &[A, B]);
+    let completed = settle_open(&fixture, &refused, true, false).await;
+    begin(&fixture.store, NS, "run", U).await;
+    let settled = fixture.call(&refused).await;
+    assert_usable(&settled, false);
+    let before = sqlite_snapshot(&fixture.path);
+    assert_unavailable(fixture.broker().dispatch(refused.clone()).await);
+    let after = sqlite_snapshot(&fixture.path);
+    next_call_on_same_root_dispatches(&fixture).await;
+    assert_only_recovery_close(&before, &after, &settled);
+    assert_usable(&fixture.call(&refused).await, true);
+    let before_repeat = sqlite_snapshot(&fixture.path);
+    assert_unavailable(fixture.broker().dispatch(refused.clone()).await);
+    assert_eq!(sqlite_snapshot(&fixture.path), before_repeat);
+    fixture
+        .broker()
+        .verify_receipt(&refused, receipt(&completed))
+        .await
+        .unwrap();
+}

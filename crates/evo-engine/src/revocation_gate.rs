@@ -24,31 +24,11 @@
 
 use evo_core::{Context, Error, Result};
 use evo_storage::Session;
-use serde_json::Value;
+use evo_storage::revocation::RevocationCause as Cause;
 
-/// Schema of the tombstone the revocation cleanup leaves in place of a record whose
-/// source was revoked (plan §11.5, E08).
-const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
-
-/// Nodes the upstream closure of a new request's dependencies may hold before the
-/// request is refused for its size (plan §11: a derivation beyond the scale is
-/// refused, never silently cut short; `capacity` has the same rule). The closure of
-/// a real request is a few dozen nodes.
-pub(crate) const MAX_UPSTREAM_CLOSURE_NODES: usize = 10_000;
-
-/// How a run or an artifact was found revoked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Cause {
-    /// The node carries a tombstone `begin_revoke` wrote for its own kind of source.
-    Revoked,
-    /// The node carries a tombstone `begin_revoke` never writes (it does not decode,
-    /// or its source kind is neither `run` nor `artifact`). It cannot be matched to
-    /// anything, so the node is treated as revoked: fail closed.
-    Unreadable,
-    /// The node is an artifact whose body the cleanup already replaced with an
-    /// `rsia.redacted.v1` tombstone.
-    Redacted,
-}
+/// The same complete-closure bound used by storage and budget consumers.
+pub(crate) const MAX_UPSTREAM_CLOSURE_NODES: usize =
+    evo_storage::revocation::MAX_UPSTREAM_CLOSURE_NODES;
 
 /// The first run or artifact judged revoked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +72,9 @@ impl Revoked {
                 "whose revocation tombstone cannot be read; the source is treated as revoked"
             }
             Cause::Redacted => "which was redacted because its source was revoked",
+            Cause::NamespaceConflict => {
+                "whose qualified source id conflicts and isolates its namespace"
+            }
         };
         Error::Conflict(format!("{lead}{reason}"))
     }
@@ -122,33 +105,10 @@ pub(crate) async fn judge_dependency(
     kind: &str,
     id: &str,
 ) -> Result<Option<Revoked>> {
-    if matches!(kind, "run" | "artifact")
-        && let Some(body) = session.get::<Value>(ctx, "tombstone", id).await?
-    {
-        match tombstone_source_kind(body) {
-            Some(source_kind) if source_kind == kind => {
-                return Ok(Some(Revoked::new(kind, id, Cause::Revoked, false)));
-            }
-            // The tombstone belongs to a source of the other kind that shares this
-            // id; this dependency is a different object.
-            Some(_) => {}
-            None => return Ok(Some(Revoked::new(kind, id, Cause::Unreadable, false))),
-        }
-    }
-    // The cleanup deletes a revoked run instead of redacting it, and a run body can be
-    // large: for a run only the tombstone matters.
-    if kind == "run" {
-        return Ok(None);
-    }
-    if session
-        .get::<Value>(ctx, kind, id)
+    Ok(session
+        .revocation_dependency(ctx, kind, id)
         .await?
-        .as_ref()
-        .is_some_and(is_redacted)
-    {
-        return Ok(Some(Revoked::new(kind, id, Cause::Redacted, false)));
-    }
-    Ok(None)
+        .map(|finding| Revoked::new(&finding.kind, &finding.id, finding.cause, false)))
 }
 
 /// Whether anything above the dependencies is revoked: the second stage of the
@@ -169,27 +129,10 @@ pub(crate) async fn judge_upstream(
     session: &mut Session,
     dependencies: &[(String, String)],
 ) -> Result<Option<Revoked>> {
-    let closure = session
-        .upstream_closure(ctx, dependencies, MAX_UPSTREAM_CLOSURE_NODES)
-        .await?;
-    for node in closure {
-        let (kind, id) = (node.kind, node.id);
-        if let Some(body) = node.tombstone {
-            match tombstone_source_kind(body) {
-                Some(source_kind) if source_kind == kind => {
-                    return Ok(Some(Revoked::new(&kind, &id, Cause::Revoked, true)));
-                }
-                // The tombstone belongs to a source of the other kind that shares
-                // this id; this node is a different object.
-                Some(_) => {}
-                None => return Ok(Some(Revoked::new(&kind, &id, Cause::Unreadable, true))),
-            }
-        }
-        if node.redacted {
-            return Ok(Some(Revoked::new(&kind, &id, Cause::Redacted, true)));
-        }
-    }
-    Ok(None)
+    Ok(session
+        .revocation_upstream(ctx, dependencies, MAX_UPSTREAM_CLOSURE_NODES)
+        .await?
+        .map(|finding| Revoked::new(&finding.kind, &finding.id, finding.cause, true)))
 }
 
 /// `Conflict` naming the first thing a new `subject` depends on whose source was
@@ -229,18 +172,4 @@ async fn ensure_upstream_closure_live(
         Some(revoked) => Err(revoked.conflict(subject)),
         None => Ok(()),
     }
-}
-
-/// The kind of source (`run` or `artifact`) a stored tombstone says it was written
-/// for; `None` for a body `begin_revoke` never writes (it does not decode, or its
-/// source kind is neither).
-pub(crate) fn tombstone_source_kind(body: Value) -> Option<String> {
-    serde_json::from_value::<evo_storage::lifecycle::RevokeTombstone>(body)
-        .ok()
-        .map(|tombstone| tombstone.source_kind)
-        .filter(|source_kind| matches!(source_kind.as_str(), "run" | "artifact"))
-}
-
-fn is_redacted(body: &Value) -> bool {
-    body.get("schema_version").and_then(Value::as_str) == Some(REDACTED_SCHEMA)
 }

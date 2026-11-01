@@ -851,6 +851,10 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
     ) -> Result<std::result::Result<BudgetDispatchDecision, ModelResponse>> {
         match self.store.begin_budget_dispatch_typed(ctx, fence).await? {
             Ok(decision) => Ok(Ok(decision)),
+            Err(BudgetPreDispatchRefusal::SourceRevoked) => Ok(Err(pre_dispatch_refusal(
+                request,
+                &BudgetPreDispatchRefusal::SourceRevoked,
+            ))),
             Err(refusal) => Ok(Err(self
                 .release_pre_dispatch(ctx, request, root, fence, refusal.code())
                 .await?)),
@@ -1233,6 +1237,14 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         } else {
             match session.begin_budget_dispatch_typed(&ctx, &fence).await? {
                 Ok(decision) => decision,
+                Err(BudgetPreDispatchRefusal::SourceRevoked) => {
+                    // Drop this session, including a reservation/refence made in
+                    // it. A revoked refusal is not a cancellation or a refund.
+                    return Ok(pre_dispatch_refusal(
+                        &request,
+                        &BudgetPreDispatchRefusal::SourceRevoked,
+                    ));
+                }
                 Err(refusal) => {
                     let released = session
                         .release_undispatched_budget_call(
@@ -1972,6 +1984,109 @@ mod pre_dispatch_tests {
             }
             other => panic!("expected pre-dispatch refusal, got {other:?}"),
         }
+    }
+
+    struct Q03ClockTransport;
+
+    #[async_trait::async_trait]
+    impl ModelTransport for Q03ClockTransport {
+        fn provenance(&self) -> Option<ModelExecutionProvenance> {
+            Some(ModelExecutionProvenance::Fixture)
+        }
+        async fn execute(
+            &self,
+            _request: &ModelRequest,
+            _dispatch_id: &str,
+        ) -> Result<TransportCompletion> {
+            panic!("the clock refusal must precede provider dispatch")
+        }
+    }
+
+    #[tokio::test]
+    async fn q03_current_clock_refusal_stays_zero_write_before_source_gate() {
+        let fixture = GateFixture::new().await;
+        let authority = crate::evidence::StoredTraceAuthority {
+            schema_version: "rsia.optimization.source.v1".into(),
+            record: crate::evidence::StoredRunRecord {
+                id: "source".into(),
+                body: b"source".to_vec(),
+                parent_family: "family".into(),
+                task_origin: evo_core::evidence::TaskOrigin::TrustedRun,
+                execution_attestation: evo_core::evidence::ExecutionAttestation::TrustedHost,
+                purpose: Purpose::Development,
+            },
+            trace: evo_core::optimization::OptimizationTrace {
+                run_id: "source".into(),
+                parent_family: "family".into(),
+                source_digest: hash(b"source"),
+                purpose: Purpose::Development,
+                outcome: evo_core::optimization::TraceOutcome::Success,
+                diagnosis: None,
+                excerpt: "source".into(),
+                seed: 1,
+            },
+            excerpt_start: 0,
+            excerpt_end: 6,
+        };
+        crate::evidence::store_trace_authority(&fixture.broker.store, &fixture.ctx, &authority)
+            .await
+            .unwrap();
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        evo_storage::lifecycle::LifecycleStore::begin_revoke(
+            &admin,
+            &fixture.broker.store,
+            evo_storage::lifecycle::TypedObjectRef {
+                kind: "run".into(),
+                id: "source".into(),
+            },
+            "q03 fixture",
+            11,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fixture.broker.now().unwrap(), 10);
+        let broker = PersistentModelBroker {
+            store: fixture.broker.store.clone(),
+            transport: Q03ClockTransport,
+            config: fixture.broker.config.clone(),
+            clock: Arc::new(|| Err(Error::ClockRegressed)),
+        };
+        let call = broker
+            .store
+            .budget_call(&fixture.ctx, "scope", "request")
+            .await
+            .unwrap()
+            .unwrap();
+        let root = broker
+            .store
+            .root_budget(&fixture.ctx, "scope")
+            .await
+            .unwrap()
+            .unwrap();
+        let audit = broker.store.verify_audit(&admin).await.unwrap();
+        assert!(matches!(
+            broker.dispatch(fixture.request.clone()).await,
+            Err(Error::ClockRegressed)
+        ));
+        assert_eq!(
+            broker
+                .store
+                .budget_call(&fixture.ctx, "scope", "request")
+                .await
+                .unwrap()
+                .unwrap(),
+            call
+        );
+        assert_eq!(
+            broker
+                .store
+                .root_budget(&fixture.ctx, "scope")
+                .await
+                .unwrap()
+                .unwrap(),
+            root
+        );
+        assert_eq!(broker.store.verify_audit(&admin).await.unwrap(), audit);
     }
 
     #[tokio::test]

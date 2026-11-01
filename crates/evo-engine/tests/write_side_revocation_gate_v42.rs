@@ -42,11 +42,11 @@
 //! Not covered here (and not claimed): writes after the cleanup is `Complete` other
 //! than these; physical residue; whether a granted run exists or is trustworthy (the
 //! consumer, `StoreOptimizationJournal::verify_sources`, still decides that);
-//! production callers (there are none for any of the three). The storage-layer check
-//! at blob publication is unchanged and keeps its own rule, a tombstone under any id
-//! of the closure whatever its kind: where it refuses what the gate accepts, the
-//! writer still fails late, after its first commit (the `known_boundary_` tests pin
-//! the places where that shows).
+//! production provider or host effects. Storage publication now uses the same
+//! raw kind-exact judgement inside the request's blob lock and write-intent
+//! transaction. The historical `known_boundary_` names are retained; their current
+//! assertions require successful ordinary-artifact publication and no Prepared
+//! residue when a tombstone belongs to the other kind.
 //!
 //! The fixtures below are copied from `tests/submit_upstream_gate_v42.rs` (the
 //! synthetic graph and the `curriculum.step` request), `tests/packages_v41.rs` (the
@@ -2818,32 +2818,30 @@ async fn known_boundary_a_manifest_dependency_with_another_kind_tombstone_still_
         ),
     )
     .await;
-    assert!(matches!(result, Err(Error::Forbidden)), "{result:?}");
+    let staged = result.unwrap();
+    assert_eq!(staged.payload.state, StagedAssetState::Staged);
+    let read = PersistentPackageStore::read_staged(&admin, &fx.store, &staged.id)
+        .await
+        .unwrap();
+    assert_eq!(fingerprint(&read).unwrap(), fingerprint(&staged).unwrap());
     let after = manifest_shape(&fx, &admin, &nodes).await;
-    assert_eq!(prepared_staged(&fx).await, 1);
+    assert_eq!(prepared_staged(&fx).await, 0);
     assert_eq!(
         before.0.changes(&after.0),
-        "artifact objects 2 -> 3, edges into node 0 0 -> 1, edges into node 1 0 -> 1, audit rows 0 -> 1"
+        "artifact objects 2 -> 3, edges into node 0 0 -> 1, edges into node 1 0 -> 1, audit rows 0 -> 2, files 0 -> 1"
     );
-    assert_eq!(before.1, after.1);
+    assert_ne!(before.1, after.1);
+    assert_eq!(fx.files().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
-// Known boundary: storage's id-only check can still refuse another kind late
+// Historical boundary: ordinary artifacts now publish under another kind's tombstone
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn known_boundary_a_tombstone_of_the_other_kind_still_stops_a_new_stage_or_install_late() {
-    // The gate no longer takes a tombstone of the other kind for a refusal (the
-    // grant and the two reads above), so a new `stage_package` or `install` over
-    // such a source gets through the first transaction. The storage check at blob
-    // publication then refuses it by the id alone, whatever the kind the tombstone
-    // was written for: `Forbidden`, after the `Prepared` envelope was committed. The
-    // answer is the same as before this change; the refusal comes later, and leaves
-    // the envelope behind (before, the id-only tombstone check of `verify_sources`
-    // refused it first). In production no such pair exists: the creators of a run
-    // and of an import source refuse each other's ids (AG-036). Making the storage
-    // check kind-exact is the storage change this card leaves out.
+    // Ordinary artifacts remain valid when a tombstone belongs to a run of
+    // the same id. Publication and install now keep that exact-kind decision.
     let admin = admin();
     for entry in [Entry::Stage, Entry::Install] {
         let fx = Fx::open("boundary-kind.sqlite3").await;
@@ -2859,20 +2857,36 @@ async fn known_boundary_a_tombstone_of_the_other_kind_still_stops_a_new_stage_or
                 stage_request("boundary-stage", vec![source]),
             )
             .await
-            .map(|_| ()),
+            .map(|staged| serde_json::to_value(staged).unwrap()),
             _ => PersistentSeedStore::install_current(
                 &admin,
                 &fx.store,
                 install_request("boundary-install", "boundary-seed", vec![source]),
             )
             .await
-            .map(|comparison| comparison.install)
-            .map(|_| ()),
+            .map(|comparison| serde_json::to_value(comparison.install).unwrap()),
         };
-        assert!(
-            matches!(result, Err(Error::Forbidden)),
-            "{entry:?}: {result:?}"
-        );
+        let published = result.unwrap();
+        let id = published["id"].as_str().unwrap();
+        let read = if entry == Entry::Stage {
+            assert_eq!(published["payload"]["state"], "staged");
+            serde_json::to_value(
+                PersistentPackageStore::read_staged(&admin, &fx.store, id)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        } else {
+            assert_eq!(published["payload"]["status"], "installed");
+            serde_json::to_value(
+                PersistentSeedStore::read_install(&admin, &fx.store, id)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(read, published);
+        assert!(!fx.files().is_empty());
         let left = if entry == Entry::Stage {
             prepared_staged(&fx).await
         } else {
@@ -2882,6 +2896,236 @@ async fn known_boundary_a_tombstone_of_the_other_kind_still_stops_a_new_stage_or
                 .filter(|body| body["payload"]["status"] == "prepared")
                 .count()
         };
-        assert_eq!(left, 1, "{entry:?}");
+        assert_eq!(left, 0, "{entry:?}");
     }
+}
+
+fn q03_sql(fx: &Fx, sql: &str) {
+    let path = std::fs::read_dir(fx.dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "sqlite3")
+        })
+        .unwrap();
+    let output = std::process::Command::new("python3").arg("-c")
+        .arg("import sqlite3,sys\nc=sqlite3.connect(sys.argv[1]);c.executescript(sys.argv[2]);c.close()")
+        .arg(path).arg(sql).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn q03_stage_revoke_winner_precedes_prepared_and_first_fs() {
+    for primitive in ["sql", "fs"] {
+        let fx = Fx::open("q03-stage.sqlite3").await;
+        let admin = admin();
+        store_run(&fx, "q03-stage-source").await;
+        let source = source_ref(&fx, &admin, "run", "q03-stage-source").await;
+        let trigger = "CREATE TRIGGER q03_first_insert BEFORE INSERT ON objects BEGIN SELECT RAISE(FAIL,'q03-first-dml'); END;";
+        if primitive == "sql" {
+            q03_sql(&fx, trigger);
+        } else {
+            std::fs::write(fx.dir.path().join(".blob-staging"), b"q03-first-fs").unwrap();
+        }
+        let healthy = PersistentPackageStore::stage_package(
+            &admin,
+            &fx.store,
+            stage_request("q03-stage-health", vec![source.clone()]),
+        )
+        .await;
+        assert!(
+            matches!(healthy, Err(Error::Internal)),
+            "{primitive}: healthy control {healthy:?}"
+        );
+        assert_eq!(prepared_staged(&fx).await, 0);
+        assert_eq!(fx.store.integrity().await.unwrap(), "ok");
+        if primitive == "sql" {
+            q03_sql(&fx, "DROP TRIGGER q03_first_insert;");
+        }
+        LifecycleStore::begin_revoke(
+            &admin,
+            &fx.store,
+            TypedObjectRef {
+                kind: "run".into(),
+                id: "q03-stage-source".into(),
+            },
+            "q03 fixture",
+            10,
+        )
+        .await
+        .unwrap();
+        if primitive == "sql" {
+            q03_sql(&fx, trigger);
+        }
+        let before = manifest_shape(&fx, &admin, &[("run", "q03-stage-source")]).await;
+        let before_all = q03_write_snapshot(&fx);
+        let refused = PersistentPackageStore::stage_package(
+            &admin,
+            &fx.store,
+            stage_request("q03-stage-refused", vec![source]),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err(Error::Forbidden)),
+            "{primitive}: {refused:?}"
+        );
+        let after = manifest_shape(&fx, &admin, &[("run", "q03-stage-source")]).await;
+        assert_eq!(q03_write_snapshot(&fx), before_all);
+        assert_eq!(before.0.changes(&after.0), "");
+        assert_eq!(before.1, after.1);
+        assert_eq!(prepared_staged(&fx).await, 0);
+        if primitive == "fs" {
+            assert_eq!(
+                std::fs::read(fx.dir.path().join(".blob-staging")).unwrap(),
+                b"q03-first-fs"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn q03_install_all_blobs_share_one_revocation_boundary() {
+    let fx = Fx::open("q03-install.sqlite3").await;
+    let admin = admin();
+    store_run(&fx, "q03-install-source").await;
+    let source = source_ref(&fx, &admin, "run", "q03-install-source").await;
+    // This is reached only after all three distinct blobs have been published.
+    // A failure here must roll back the same request's Prepared rows and audits.
+    q03_sql(
+        &fx,
+        "CREATE TRIGGER q03_finalize BEFORE UPDATE OF body ON objects WHEN json_extract(NEW.body,'$.schema_version')='rsia.e16.seed_install.v2' AND json_extract(NEW.body,'$.payload.status')='installed' BEGIN SELECT RAISE(FAIL,'q03-finalize'); END;",
+    );
+    let result = PersistentSeedStore::install_current(
+        &admin,
+        &fx.store,
+        install_request("q03-install", "q03-seed", vec![source.clone()]),
+    )
+    .await;
+    assert!(matches!(result, Err(Error::Internal)), "{result:?}");
+    assert!(
+        fx.artifacts_of(&admin, "rsia.e16.seed_install.v2")
+            .await
+            .is_empty()
+    );
+    assert_eq!(fx.files().len(), 3);
+    assert_eq!(fx.store.integrity().await.unwrap(), "ok");
+    q03_sql(&fx, "DROP TRIGGER q03_finalize;");
+    let healthy = PersistentSeedStore::install_current(
+        &admin,
+        &fx.store,
+        install_request("q03-install", "q03-seed", vec![source.clone()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        healthy.install.payload.status,
+        evo_engine::seeds::SeedStatus::Installed
+    );
+    assert_eq!(fx.files().len(), 3);
+    LifecycleStore::begin_revoke(
+        &admin,
+        &fx.store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "q03-install-source".into(),
+        },
+        "q03 fixture",
+        10,
+    )
+    .await
+    .unwrap();
+    q03_sql(
+        &fx,
+        "CREATE TRIGGER q03_no_write BEFORE INSERT ON objects BEGIN SELECT RAISE(FAIL,'q03-first-dml'); END;",
+    );
+    std::fs::remove_dir_all(fx.dir.path().join(".blob-staging")).unwrap();
+    std::fs::write(fx.dir.path().join(".blob-staging"), b"q03-first-fs").unwrap();
+    let before = manifest_shape(&fx, &admin, &[("run", "q03-install-source")]).await;
+    let before_all = q03_write_snapshot(&fx);
+    let refused = PersistentSeedStore::install_current(
+        &admin,
+        &fx.store,
+        install_request("q03-revoked-install", "q03-other-seed", vec![source]),
+    )
+    .await;
+    assert!(matches!(refused, Err(Error::Forbidden)), "{refused:?}");
+    let after = manifest_shape(&fx, &admin, &[("run", "q03-install-source")]).await;
+    assert_eq!(q03_write_snapshot(&fx), before_all);
+    assert_eq!(before.0.changes(&after.0), "");
+    assert_eq!(before.1, after.1);
+}
+
+fn q03_write_snapshot(fx: &Fx) -> Value {
+    let path = std::fs::read_dir(fx.dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "sqlite3")
+        })
+        .unwrap();
+    let output = std::process::Command::new("python3").arg("-c").arg(r#"
+import json,sqlite3,struct,sys
+c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+def cell(v):
+    if v is None:return ['null']
+    if isinstance(v,int):return ['integer',str(v)]
+    if isinstance(v,float):return ['real',struct.pack('>d',v).hex()]
+    if isinstance(v,bytes):return ['blob',v.hex()]
+    return ['text',v.encode('utf-8').hex()]
+out={}
+for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    rows=[[cell(v) for v in r] for r in c.execute('SELECT * FROM "'+name.replace('"','""')+'"')]
+    out[name]=sorted(rows,key=lambda r:json.dumps(r,separators=(',',':')))
+print(json.dumps(out,separators=(',',':')))
+"#).arg(path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn q03_installed_seed_new_comparison_stages_without_republishing_baseline() {
+    let fx = Fx::open("q03-installed-stage.sqlite3").await;
+    let admin = admin();
+    store_run(&fx, "q03-seed-source").await;
+    let source = source_ref(&fx, &admin, "run", "q03-seed-source").await;
+    let first = PersistentSeedStore::install_current(
+        &admin,
+        &fx.store,
+        install_request("q03-first-install", "q03-existing", vec![source.clone()]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        first.install.payload.status,
+        evo_engine::seeds::SeedStatus::Installed
+    );
+    assert!(first.staged.is_none());
+    let files = manifest_shape(&fx, &admin, &[]).await.1;
+    let mut update = install_request("q03-new-comparison", "q03-existing", vec![source]);
+    update.local_bytes = update.baseline_bytes.clone();
+    let next = PersistentSeedStore::install_current(&admin, &fx.store, update)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&next.install).unwrap(),
+        serde_json::to_value(&first.install).unwrap()
+    );
+    let staged = next.staged.unwrap();
+    assert_eq!(staged.payload.state, StagedAssetState::Staged);
+    let read = PersistentPackageStore::read_staged(&admin, &fx.store, &staged.id)
+        .await
+        .unwrap();
+    assert_eq!(fingerprint(&read).unwrap(), fingerprint(&staged).unwrap());
+    assert_eq!(manifest_shape(&fx, &admin, &[]).await.1, files);
+    assert_eq!(prepared_staged(&fx).await, 0);
 }

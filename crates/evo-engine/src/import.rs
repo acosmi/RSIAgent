@@ -2381,14 +2381,16 @@ impl PersistentImportService {
             .await?;
         if current.input_digest != expected.input_digest
             || current.revoke_watermark != current_watermark(&mut session, ctx).await?
-            || session
-                .get::<Value>(ctx, "tombstone", &current.id)
-                .await?
-                .is_some()
-            || session
-                .get::<Value>(ctx, "tombstone", &current.payload.selection_id)
-                .await?
-                .is_some()
+            || crate::revocation_gate::judge_upstream(
+                ctx,
+                &mut session,
+                &[
+                    ("artifact".to_string(), current.id.clone()),
+                    ("artifact".to_string(), current.payload.selection_id.clone()),
+                ],
+            )
+            .await?
+            .is_some()
             || session
                 .get::<Value>(ctx, IMPORT_ARTIFACT_KIND, &current.payload.selection_id)
                 .await?
@@ -3527,10 +3529,14 @@ async fn ensure_import_source_id_is_free(
     ctx: &Context,
     id: &str,
 ) -> Result<()> {
+    session.ensure_revocation_namespace_live(ctx).await?;
     if session.get::<Value>(ctx, "tombstone", id).await?.is_some() {
         return Err(Error::Forbidden);
     }
-    if session.get::<Value>(ctx, "run", id).await?.is_some() {
+    if session
+        .qualified_revocable_source(ctx, evo_core::evidence::RevocableSourceKind::TrustedRun, id)
+        .await?
+    {
         return Err(Error::Conflict(format!(
             "import source {id} cannot be created: a run already has this id \
              (a revocation tombstone is keyed by id)"
@@ -3595,12 +3601,23 @@ async fn validate_live_import_sources(
     if current_watermark(session, ctx).await? != selection.revoke_watermark {
         return Err(Error::Conflict("source revoke watermark changed".into()));
     }
-    for id in std::iter::once(selection.id.as_str())
-        .chain(sources.iter().map(|source| source.id.as_str()))
-    {
-        if session.get::<Value>(ctx, "tombstone", id).await?.is_some() {
+    let roots: Vec<_> = std::iter::once(selection.id.clone())
+        .chain(sources.iter().map(|source| source.id.clone()))
+        .map(|id| ("artifact".to_string(), id))
+        .collect();
+    for (kind, id) in &roots {
+        if crate::revocation_gate::judge_dependency(ctx, session, kind, id)
+            .await?
+            .is_some()
+        {
             return Err(Error::Forbidden);
         }
+    }
+    if crate::revocation_gate::judge_upstream(ctx, session, &roots)
+        .await?
+        .is_some()
+    {
+        return Err(Error::Forbidden);
     }
     Ok(())
 }
@@ -4164,6 +4181,87 @@ mod local_material_boundary_tests {
                     &serde_json::json!({"id":upstream,"source_kind":"run"}),
                 )
                 .await?;
+            session.commit().await
+        };
+        assert!(matches!(
+            service
+                .read_local_material_at_boundary(&admin, &request, boundary)
+                .await,
+            Err(Error::Forbidden)
+        ));
+    }
+    #[tokio::test]
+    async fn q03_import_live_read_blocks_transitive_source() {
+        let (_directory, store, admin, service, selection, _result, request) = fixture().await;
+        let host = Context::new(admin.namespace(), "q03-host", Role::Host).unwrap();
+        let id = "q03-upstream";
+        crate::evidence::store_trace_authority(
+            &store,
+            &host,
+            &crate::evidence::StoredTraceAuthority {
+                schema_version: "rsia.optimization.source.v1".into(),
+                record: crate::evidence::StoredRunRecord {
+                    id: id.into(),
+                    body: id.as_bytes().to_vec(),
+                    parent_family: "family".into(),
+                    task_origin: TaskOrigin::TrustedRun,
+                    execution_attestation: ExecutionAttestation::TrustedHost,
+                    purpose: Purpose::Development,
+                },
+                trace: evo_core::optimization::OptimizationTrace {
+                    run_id: id.into(),
+                    parent_family: "family".into(),
+                    source_digest: hash(id.as_bytes()),
+                    purpose: Purpose::Development,
+                    outcome: evo_core::optimization::TraceOutcome::Success,
+                    diagnosis: None,
+                    excerpt: id.into(),
+                    seed: 1,
+                },
+                excerpt_start: 0,
+                excerpt_end: id.len(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .put(
+                &admin,
+                "artifact",
+                "q03-middle",
+                admin.actor(),
+                &serde_json::json!({"id":"q03-middle"}),
+            )
+            .await
+            .unwrap();
+        session
+            .put_edge(
+                &admin,
+                "artifact",
+                &selection.payload.import_source_ids[0],
+                "artifact",
+                "q03-middle",
+            )
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", "q03-middle", "run", id)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        service
+            .read_local_development_material(&admin, &request)
+            .await
+            .unwrap();
+        let boundary = async {
+            let mut session = store.session().await?;
+            // Deliberately corrupt, committed raw tombstone: the other physical
+            // kind does not excuse an invalid identity or skip its upstream graph.
+            session.put(&admin, "tombstone", id, admin.actor(), &serde_json::json!({
+                "id":id,"schema_version":"rsia.revoke_tombstone.v1","source_kind":"artifact",
+                "reason":"q03-corrupt-fixture","watermark_seq":0,"watermark_digest":hash(b"watermark"),"created_at":1,
+            })).await?;
             session.commit().await
         };
         assert!(matches!(

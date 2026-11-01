@@ -1314,3 +1314,83 @@ async fn current_model_preimage_refusal_preserves_dispatched_accounting() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn q03_upstream_bound_replay_changes_only_d4_close_set() {
+    let world = World::new().await;
+    let upstream = "q03-upstream-trusted";
+    store_trace_authority(
+        &world.store,
+        &host(),
+        &StoredTraceAuthority {
+            schema_version: "rsia.optimization.source.v1".into(),
+            record: StoredRunRecord {
+                id: upstream.into(),
+                body: upstream.as_bytes().to_vec(),
+                parent_family: "family-u".into(),
+                task_origin: TaskOrigin::TrustedRun,
+                execution_attestation: ExecutionAttestation::TrustedHost,
+                purpose: Purpose::Development,
+            },
+            trace: trace(upstream, "family-u", TraceOutcome::Success),
+            excerpt_start: 0,
+            excerpt_end: upstream.len(),
+        },
+    )
+    .await
+    .unwrap();
+    let mut session = world.store.session().await.unwrap();
+    session
+        .put_edge(&admin(), "run", RUNS[1], "candidate", "q03-middle")
+        .await
+        .unwrap();
+    session
+        .put_edge(&admin(), "candidate", "q03-middle", "run", upstream)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let inputs = current_compiler_use(&world.store, 1).await;
+    let bound = current_bound_request("source-revoked", 1, &RUNS, "software fixture", &inputs);
+    let completed = settle_open(&world, &bound).await;
+    let status = LifecycleStore::begin_revoke(
+        &admin(),
+        &world.store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: upstream.into(),
+        },
+        "fixture source revoked",
+        30,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status.state, CleanupState::Pending);
+    assert_eq!(status.watermark_seq, 2);
+    let expected = current_refusal(&world.store, &bound).await;
+    assert_conflict(&expected, BINDING_MISMATCH);
+    let settled = world.call(&bound).await;
+    assert_current_settled_open(&settled);
+    let before = world.snapshot();
+    assert_same_error(world.replay(&bound).await, &expected);
+    let after = world.snapshot();
+    let replayed = world.call(&bound).await;
+    let next = next_call(&world, status.watermark_seq, &RUNS[..1]).await;
+    assert!(
+        replayed.execution_closed,
+        "the refused replay left the settled call open on its root \
+         (execution_closed=0); the next call on that root got {next:?}"
+    );
+    assert_only_recovery_close(&before, &after, &settled);
+    assert_dispatched(&next);
+    assert_eq!(world.provider_calls(), 2);
+    assert_eq!(world.totals().await, (0, 2 * COST));
+    world
+        .broker()
+        .verify_receipt(&bound.request, receipt(&completed))
+        .await
+        .unwrap();
+    let before_repeat = world.snapshot();
+    assert_same_error(world.replay(&bound).await, &expected);
+    assert_eq!(world.snapshot(), before_repeat);
+    assert_eq!(world.provider_calls(), 2);
+}

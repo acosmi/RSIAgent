@@ -418,6 +418,20 @@ pub async fn store_trace_authority(
         return Err(Error::Forbidden);
     }
     if session
+        .qualified_revocable_source(
+            context,
+            evo_core::evidence::RevocableSourceKind::ImportSource,
+            &authority.record.id,
+        )
+        .await?
+    {
+        return Err(Error::Conflict(format!(
+            "run {} cannot be stored: an E16 import_source artifact already has this id \
+             (a revocation tombstone is keyed by id)",
+            authority.record.id
+        )));
+    }
+    if session
         .get::<serde_json::Value>(context, "run", &authority.record.id)
         .await?
         .is_some()
@@ -434,20 +448,13 @@ pub async fn store_trace_authority(
         // import source is derived from its selection, the id of a run is chosen by
         // the caller, so refuse here, before anything is written. An object of any
         // other kind with this id is a different object and does not matter.
-        if session
-            .get::<serde_json::Value>(context, "artifact", &authority.record.id)
-            .await?
-            .is_some_and(|body| {
-                body.get("schema_version").and_then(|value| value.as_str())
-                    == Some(crate::import::IMPORT_SOURCE_SCHEMA)
-            })
-        {
-            return Err(Error::Conflict(format!(
-                "run {} cannot be stored: an E16 import_source artifact already has this id \
-                 (a revocation tombstone is keyed by id)",
-                authority.record.id
-            )));
-        }
+        crate::revocation_gate::ensure_dependencies_live(
+            context,
+            &mut session,
+            &[("run".to_string(), authority.record.id.clone())],
+            "source authority",
+        )
+        .await?;
         // Cache tombstones prevent a deleted source from being silently reintroduced.
         if session
             .cached::<StoredTraceAuthority, _>(
@@ -553,14 +560,23 @@ pub async fn validate_stored_sources(
         return Err(Error::Conflict("source revoke watermark changed".into()));
     }
     for id in source_ids {
-        if session
-            .get::<serde_json::Value>(context, "tombstone", id)
+        if crate::revocation_gate::judge_dependency(context, session, "run", id)
             .await?
             .is_some()
         {
             return Err(Error::Forbidden);
         }
         load_stored_source(session, context, id).await?;
+    }
+    let roots: Vec<_> = source_ids
+        .iter()
+        .map(|id| ("run".to_string(), id.clone()))
+        .collect();
+    if crate::revocation_gate::judge_upstream(context, session, &roots)
+        .await?
+        .is_some()
+    {
+        return Err(Error::Forbidden);
     }
     Ok(())
 }
@@ -593,4 +609,87 @@ pub async fn read_persisted_imported_development_material(
     crate::import::PersistentImportService::new(store.clone())
         .read_local_development_material(context, request)
         .await
+}
+
+#[cfg(test)]
+mod q03_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn q03_evidence_validation_blocks_transitive_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = evo_storage::Store::open(&dir.path().join("q03.sqlite3"))
+            .await
+            .unwrap();
+        let host = evo_core::Context::new("n", "host", evo_core::Role::Host).unwrap();
+        let admin = evo_core::Context::new("n", "admin", evo_core::Role::Admin).unwrap();
+        for id in ["q03-root", "q03-upstream"] {
+            let authority = StoredTraceAuthority {
+                schema_version: "rsia.optimization.source.v1".into(),
+                record: StoredRunRecord {
+                    id: id.into(),
+                    body: id.as_bytes().to_vec(),
+                    parent_family: id.into(),
+                    task_origin: TaskOrigin::TrustedRun,
+                    execution_attestation: ExecutionAttestation::TrustedHost,
+                    purpose: Purpose::Development,
+                },
+                trace: evo_core::optimization::OptimizationTrace {
+                    run_id: id.into(),
+                    parent_family: id.into(),
+                    source_digest: evo_core::hash(id.as_bytes()),
+                    purpose: Purpose::Development,
+                    outcome: evo_core::optimization::TraceOutcome::Success,
+                    diagnosis: None,
+                    excerpt: id.into(),
+                    seed: 1,
+                },
+                excerpt_start: 0,
+                excerpt_end: id.len(),
+            };
+            store_trace_authority(&store, &host, &authority)
+                .await
+                .unwrap();
+        }
+        let mut session = store.session().await.unwrap();
+        session.bump_watermark(&admin, "q03-initial").await.unwrap();
+        session
+            .put_edge(&admin, "run", "q03-root", "candidate", "q03-middle")
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "candidate", "q03-middle", "run", "q03-upstream")
+            .await
+            .unwrap();
+        validate_stored_sources(&mut session, &host, &["q03-root".into()], 1)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let revoked = evo_storage::lifecycle::LifecycleStore::begin_revoke(
+            &admin,
+            &store,
+            evo_storage::lifecycle::TypedObjectRef {
+                kind: "run".into(),
+                id: "q03-upstream".into(),
+            },
+            "q03 fixture",
+            10,
+        )
+        .await
+        .unwrap();
+        let mut session = store.session().await.unwrap();
+        let before: Vec<serde_json::Value> = session.list(&host, "run").await.unwrap();
+        assert!(matches!(
+            validate_stored_sources(
+                &mut session,
+                &host,
+                &["q03-root".into()],
+                revoked.watermark_seq
+            )
+            .await,
+            Err(Error::Forbidden)
+        ));
+        let after: Vec<serde_json::Value> = session.list(&host, "run").await.unwrap();
+        assert_eq!(before, after);
+    }
 }

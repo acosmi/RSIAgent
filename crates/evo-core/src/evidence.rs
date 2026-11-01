@@ -12,6 +12,31 @@ pub const MAX_TOTAL_READ_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_EVENT_BYTES: usize = 256 * 1024;
 pub const MAX_TOTAL_EXCERPT_BYTES: usize = 128 * 1024;
 
+/// The registered revocation sources (§11.3.1). Registration names the physical
+/// wire kind; the storage boundary still verifies the complete source identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevocableSourceKind {
+    TrustedRun,
+    ImportSource,
+}
+
+impl RevocableSourceKind {
+    pub const fn physical_kind(self) -> &'static str {
+        match self {
+            Self::TrustedRun => "run",
+            Self::ImportSource => "artifact",
+        }
+    }
+
+    pub fn from_physical_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "run" => Some(Self::TrustedRun),
+            "artifact" => Some(Self::ImportSource),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskOrigin {
@@ -898,6 +923,27 @@ impl ImportedDevelopmentMaterial {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn q03_registered_revocable_kinds_keep_existing_physical_wire() {
+        use super::RevocableSourceKind;
+        assert_eq!(RevocableSourceKind::TrustedRun.physical_kind(), "run");
+        assert_eq!(
+            RevocableSourceKind::ImportSource.physical_kind(),
+            "artifact"
+        );
+        for kind in ["run", "artifact"] {
+            assert_eq!(
+                RevocableSourceKind::from_physical_kind(kind)
+                    .unwrap()
+                    .physical_kind(),
+                kind
+            );
+        }
+        for kind in ["import_source", "candidate", "unknown"] {
+            assert_eq!(RevocableSourceKind::from_physical_kind(kind), None);
+        }
+    }
+
     use super::*;
 
     fn member(id: &str, origin: TaskOrigin, att: ExecutionAttestation) -> EvidenceMember {

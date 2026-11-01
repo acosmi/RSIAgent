@@ -13,9 +13,9 @@
 //! broker and the registered development runner, with a counting transport (the
 //! provider is never real) and the real SQLite store.
 //!
-//! What is deliberately not asserted: whether the output of a call that was
-//! already in flight when its source was revoked is usable, and whether it is
-//! redacted at settlement. That is a separate change; only the accounting is.
+//! The Q03 cases also register a real strict E16 upstream source, compare
+//! lossless whole-database snapshots on refusal, and keep late charges while
+//! refusing and redacting the revoked output.
 
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
@@ -352,11 +352,14 @@ async fn a_revoke_between_the_reservation_and_the_dispatch_releases_the_quota_an
         );
     }
     let call = broker_call(&store, "request-1").await.unwrap();
-    assert_eq!(call.state, BudgetCallState::Released);
+    assert_eq!(call.state, BudgetCallState::Reserved);
     assert_eq!(call.dispatch_id, None);
     assert_eq!(call.dispatched_at, None);
-    // the reservation is released and nothing was spent
-    assert_eq!(micros(&store, BROKER_SCOPE, &broker_admin()).await, (0, 0));
+    assert_eq!(call.terminal_reason, None);
+    assert_eq!(call.actual_cost_micros, None);
+    assert_eq!(call.request_artifact, reserved.request_artifact);
+    // A revocation refusal preserves the original reservation and all paid facts.
+    assert_eq!(micros(&store, BROKER_SCOPE, &broker_admin()).await, (20, 0));
 }
 
 /// The revocation lands while the provider request is in flight. The call was
@@ -789,8 +792,8 @@ async fn a_revoke_after_the_start_check_is_refused_at_the_reservation() {
 }
 
 /// The revocation lands after the reservation and before the dispatch. The
-/// dispatch is refused (`Cancelled`), its undispatched 1 micro is released with
-/// the source-revoked reason, and no receipt is issued. The in-process target may
+/// dispatch is refused (`Cancelled`), its original 1 micro remains reserved,
+/// and no receipt or release event is issued. The in-process target may
 /// already have executed before begin; no budget dispatch or settlement occurs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_revoke_after_the_reservation_is_refused_at_the_dispatch() {
@@ -813,13 +816,333 @@ async fn a_revoke_after_the_reservation_is_refused_at_the_dispatch() {
     let expected =
         execution_budget_call_id(&request.request_id, "task-a", DevelopmentSide::Parent).unwrap();
     assert_eq!(calls[0].call_id, expected);
-    assert_eq!(calls[0].state, BudgetCallState::Released);
-    assert_eq!(
-        calls[0].terminal_reason.as_deref(),
-        Some("development_pre_dispatch_v1.source_revoked")
-    );
-    assert_eq!(micros(&fixture.store, SCOPE, &fixture.admin).await, (0, 0));
+    assert_eq!(calls[0].state, BudgetCallState::Reserved);
+    assert_eq!(calls[0].terminal_reason.as_deref(), None);
+    assert_eq!(micros(&fixture.store, SCOPE, &fixture.admin).await, (1, 0));
     assert_eq!(calls[0].dispatch_id, None, "the call was dispatched");
     assert_eq!(calls[0].actual_cost_micros, None);
     fixture.assert_no_execution_receipt(&request).await;
+}
+
+fn q03_lossless_snapshot(path: &std::path::Path) -> serde_json::Value {
+    let output = std::process::Command::new("python3").arg("-c").arg(r#"
+import json,sqlite3,struct,sys
+c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+def cell(v):
+    if v is None: return ['null']
+    if isinstance(v,int): return ['integer',str(v)]
+    if isinstance(v,float): return ['real',struct.pack('>d',v).hex()]
+    if isinstance(v,bytes): return ['blob',v.hex()]
+    return ['text',v.encode('utf-8').hex()]
+out={}
+for (name,) in c.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall():
+    q='"'+name.replace('"','""')+'"'
+    rows=[[cell(v) for v in r] for r in c.execute('SELECT * FROM '+q)]
+    out[name]=sorted(rows,key=lambda r:json.dumps(r,separators=(',',':')))
+print(json.dumps(out,separators=(',',':')))
+"#).arg(path).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+async fn q03_source_graph() -> (tempfile::TempDir, Store, String) {
+    use evo_engine::import::{
+        IMPORT_REGISTRATION_SCHEMA, ImportRegistrationRequest, ImportRetentionScope,
+        ImportSourceSpec, PersistentImportService, SourceFormat,
+    };
+    let (dir, store) = broker_store().await;
+    let mut session = store.session().await.unwrap();
+    session.delete(&broker_admin(), "run", RUN).await.unwrap();
+    session.commit().await.unwrap();
+    store_trace_authority(&store, &broker_host(), &authority(RUN, "q03-family"))
+        .await
+        .unwrap();
+    let bytes = b"{\"type\":\"user\",\"message\":{\"content\":\"local fixture\"}}\n";
+    let path = dir.path().join("q03-history.jsonl");
+    tokio::fs::write(&path, bytes).await.unwrap();
+    let selection = PersistentImportService::new(store.clone())
+        .register(
+            &broker_admin(),
+            ImportRegistrationRequest {
+                schema_version: IMPORT_REGISTRATION_SCHEMA.into(),
+                request_key: "q03-upstream".into(),
+                roots: vec![dir.path().to_string_lossy().into_owned()],
+                purpose: Purpose::Development,
+                allow_model_excerpts: false,
+                outbound_authorized: false,
+                retention_scope: ImportRetentionScope::LocalPrivate,
+                sources: vec![ImportSourceSpec {
+                    source_id: "q03-history".into(),
+                    path: path.to_string_lossy().into_owned(),
+                    reader: SourceFormat::ClaudeFixture,
+                    expected_digest: hash(bytes),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let upstream = selection.payload.import_source_ids[0].clone();
+    let mut session = store.session().await.unwrap();
+    session
+        .put_edge(&broker_admin(), "run", RUN, "artifact", &upstream)
+        .await
+        .unwrap();
+    assert!(
+        session
+            .qualified_revocable_source(
+                &broker_admin(),
+                evo_core::evidence::RevocableSourceKind::TrustedRun,
+                RUN
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        session
+            .qualified_revocable_source(
+                &broker_admin(),
+                evo_core::evidence::RevocableSourceKind::ImportSource,
+                &upstream
+            )
+            .await
+            .unwrap()
+    );
+    session.commit().await.unwrap();
+    (dir, store, upstream)
+}
+
+fn q03_reservation(id: &str) -> BudgetCallReservation {
+    let request = model_request(id, &[RUN]);
+    BudgetCallReservation {
+        billing_scope: BROKER_SCOPE.into(),
+        call_id: id.into(),
+        dispatch_group_id: request.episode_id.clone(),
+        stage: BudgetStage::Reflection,
+        actual_input_digest: request.cache_key_digest.clone(),
+        request_artifact: Some(
+            BudgetArtifact::from_serializable(MODEL_REQUEST_SCHEMA, &request).unwrap(),
+        ),
+        max_cost_micros: 20,
+        lease_token: format!("q03-lease-{id}"),
+        lease_until: 70,
+        now: 10,
+    }
+}
+
+fn q03_fence(call: &BudgetCallRecord) -> evo_storage::budget::BudgetCallFence {
+    evo_storage::budget::BudgetCallFence {
+        billing_scope: call.billing_scope.clone(),
+        call_id: call.call_id.clone(),
+        actual_input_digest: call.actual_input_digest.clone(),
+        lease_token: call.lease_token.clone(),
+        lease_epoch: call.lease_epoch,
+        now: 12,
+    }
+}
+
+async fn q03_revoke_upstream(store: &Store, id: &str) {
+    evo_storage::lifecycle::LifecycleStore::begin_revoke(
+        &broker_admin(),
+        store,
+        evo_storage::lifecycle::TypedObjectRef {
+            kind: "artifact".into(),
+            id: id.into(),
+        },
+        "q03 fixture",
+        11,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn q03_legacy_reserve_refuses_revoked_transitive_source_without_writes() {
+    let (dir, store, upstream) = q03_source_graph().await;
+    let healthy = store
+        .reserve_budget_call_with_sources(
+            &broker_host(),
+            &q03_reservation("q03-health"),
+            &[RUN.into()],
+        )
+        .await
+        .unwrap();
+    store
+        .release_undispatched_budget_call(&broker_host(), &q03_fence(&healthy), "healthy-control")
+        .await
+        .unwrap();
+    q03_revoke_upstream(&store, &upstream).await;
+    let path = dir.path().join("rsia.sqlite3");
+    let before = q03_lossless_snapshot(&path);
+    let request = q03_reservation("q03-refused-reserve");
+    assert!(matches!(
+        store
+            .reserve_budget_call_with_sources(&broker_host(), &request, &[RUN.into()])
+            .await,
+        Err(Error::Forbidden)
+    ));
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session
+            .reserve_budget_call_with_sources_typed(&broker_host(), &request, &[RUN.into()])
+            .await
+            .unwrap(),
+        Err(evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked)
+    );
+    session.commit().await.unwrap();
+    assert_eq!(q03_lossless_snapshot(&path), before);
+    assert_eq!(micros(&store, BROKER_SCOPE, &broker_admin()).await, (0, 0));
+}
+
+#[tokio::test]
+async fn q03_legacy_dispatch_refuses_revoked_transitive_source_without_release() {
+    let (dir, store, upstream) = q03_source_graph().await;
+    let call = store
+        .reserve_budget_call_with_sources(
+            &broker_host(),
+            &q03_reservation("q03-dispatch"),
+            &[RUN.into()],
+        )
+        .await
+        .unwrap();
+    q03_revoke_upstream(&store, &upstream).await;
+    let path = dir.path().join("rsia.sqlite3");
+    let before = q03_lossless_snapshot(&path);
+    assert!(matches!(
+        store
+            .begin_budget_dispatch(&broker_host(), &q03_fence(&call))
+            .await,
+        Err(Error::Cancelled)
+    ));
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session
+            .begin_budget_dispatch_typed(&broker_host(), &q03_fence(&call))
+            .await
+            .unwrap(),
+        Err(evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked)
+    );
+    session.commit().await.unwrap();
+    assert_eq!(q03_lossless_snapshot(&path), before);
+    assert_eq!(broker_call(&store, &call.call_id).await.unwrap(), call);
+    assert_eq!(micros(&store, BROKER_SCOPE, &broker_admin()).await, (20, 0));
+}
+
+#[tokio::test]
+async fn q03_existing_call_missing_ref_cannot_repair_over_revoked_closure() {
+    let (dir, store, upstream) = q03_source_graph().await;
+    let request = q03_reservation("q03-existing");
+    let call = store
+        .reserve_budget_call_with_sources(&broker_host(), &request, &[RUN.into()])
+        .await
+        .unwrap();
+    let digest = fingerprint(&(
+        "rsia.budget_call_ref.v1",
+        BROKER_NAMESPACE,
+        BROKER_SCOPE,
+        &call.call_id,
+    ))
+    .unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .delete(
+            &broker_admin(),
+            "artifact",
+            &format!("budget-ref-{}", &digest[..32]),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    q03_revoke_upstream(&store, &upstream).await;
+    let path = dir.path().join("rsia.sqlite3");
+    let before = q03_lossless_snapshot(&path);
+    assert!(matches!(
+        store
+            .reserve_budget_call_with_sources(&broker_host(), &request, &[RUN.into()])
+            .await,
+        Err(Error::Forbidden)
+    ));
+    assert_eq!(q03_lossless_snapshot(&path), before);
+    assert_eq!(broker_call(&store, &call.call_id).await.unwrap(), call);
+}
+
+#[tokio::test]
+async fn q03_late_transitive_revocation_settlement_keeps_charge_and_redacts_content() {
+    use evo_storage::budget::{
+        BudgetExecutionProvenance, ModelCallSettlementEvidence, UsageCharge,
+    };
+    let (_dir, store, upstream) = q03_source_graph().await;
+    let call = store
+        .reserve_budget_call_with_sources(
+            &broker_host(),
+            &q03_reservation("q03-paid"),
+            &[RUN.into()],
+        )
+        .await
+        .unwrap();
+    let dispatched = store
+        .begin_budget_dispatch(&broker_host(), &q03_fence(&call))
+        .await
+        .unwrap();
+    assert!(dispatched.new_dispatch);
+    q03_revoke_upstream(&store, &upstream).await;
+    let output = "q03-late-private-output";
+    let transport = BudgetArtifact::from_serializable(
+        "rsia.model_transport.artifact.v1",
+        &serde_json::json!({"output":output}),
+    )
+    .unwrap();
+    let evidence = ModelCallSettlementEvidence {
+        provenance: BudgetExecutionProvenance::Fixture,
+        actual_model_digest: Some(hash(b"model")),
+        transport_artifact: transport.clone(),
+        usable_response: Some(
+            BudgetArtifact::from_serializable(
+                "rsia.model_response.artifact.v1",
+                &serde_json::json!({"output":output}),
+            )
+            .unwrap(),
+        ),
+        blocked_response: BudgetArtifact::from_serializable(
+            "rsia.model_response.artifact.v1",
+            &serde_json::json!({"reason":"blocked"}),
+        )
+        .unwrap(),
+        forced_block_reason: None,
+    };
+    let charge = UsageCharge {
+        amount_micros: 10,
+        currency: "USD".into(),
+        pricing_version: "price-v1".into(),
+        provider_request_id: "q03-provider".into(),
+        usage_record_id: "q03-usage".into(),
+        output_digest: hash(output.as_bytes()),
+    };
+    let settled = store
+        .settle_model_budget_call(&broker_host(), &q03_fence(&call), &charge, &evidence)
+        .await
+        .unwrap();
+    assert!(!settled.response_usable);
+    assert_eq!(
+        settled.response_block_reason.as_deref(),
+        Some("source_revoked")
+    );
+    assert_eq!(settled.call.actual_cost_micros, Some(10));
+    assert_eq!(settled.call.dispatch_id, dispatched.call.dispatch_id);
+    assert_eq!(
+        settled.call.provider_request_id.as_deref(),
+        Some("q03-provider")
+    );
+    assert_eq!(settled.call.usage_record_id.as_deref(), Some("q03-usage"));
+    assert_eq!(micros(&store, BROKER_SCOPE, &broker_admin()).await, (0, 10));
+    let redacted = settled.call.transport_artifact.unwrap();
+    assert_eq!(redacted.schema_version, "rsia.redacted.v1");
+    let body: serde_json::Value = serde_json::from_str(&redacted.body).unwrap();
+    assert_eq!(body.as_object().unwrap().len(), 5);
+    assert_eq!(body["original_schema"], transport.schema_version);
+    assert_eq!(body["original_digest"], transport.digest);
+    assert!(!redacted.body.contains(output));
 }
