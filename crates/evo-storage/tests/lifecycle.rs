@@ -22,6 +22,8 @@ use evo_storage::replay::{
     put_current_replay_report, put_replay_report, register_replay_pool, seal_replay_world,
 };
 use serde_json::json;
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::process::Command;
 
 fn ctx(actor: &str, role: Role) -> Context {
@@ -1304,7 +1306,10 @@ async fn backup_manifest_and_restore_reject_incomplete_old_or_overwrite_cases() 
 }
 
 fn copy_dir(source: &std::path::Path, destination: &std::path::Path) {
-    std::fs::create_dir(destination).unwrap();
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.recursive(true).create(destination).unwrap();
     for entry in std::fs::read_dir(source).unwrap() {
         let entry = entry.unwrap();
         let target = destination.join(entry.file_name());

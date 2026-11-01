@@ -25,6 +25,340 @@ use std::{
 };
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::os::unix::fs::MetadataExt as _;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+
+pub enum LocalPermissionTarget<'a> {
+    Database(&'a std::path::Path),
+    BackupPublication(&'a std::path::Path),
+    IndependentAnchor(&'a std::path::Path),
+}
+
+#[derive(Debug)]
+pub enum LocalPermissionError {
+    Insecure,
+    Unsupported,
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for LocalPermissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Insecure => f.write_str("data_directory_insecure"),
+            Self::Unsupported => f.write_str("unsupported"),
+            Self::Io(error) => std::fmt::Display::fmt(error, f),
+        }
+    }
+}
+impl std::error::Error for LocalPermissionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl From<std::io::Error> for LocalPermissionError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+pub fn local_data_directory(database: &std::path::Path) -> std::path::PathBuf {
+    match database.parent().filter(|p| !p.as_os_str().is_empty()) {
+        // Preserve the existing public path spelling and diagnostics.
+        Some(parent) => parent.to_path_buf(),
+        None => std::path::PathBuf::from("."),
+    }
+}
+
+pub fn initialize_private_process_umask() -> std::result::Result<(), LocalPermissionError> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let _ = rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        Err(LocalPermissionError::Unsupported)
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn permission_private_rule(owner: u32, mode: u32, euid: u32) -> bool {
+    owner == euid && mode & 0o077 == 0
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn permission_ancestor_rule(owner: u32, mode: u32, euid: u32) -> bool {
+    (owner == 0 || owner == euid) && (mode & 0o022 == 0 || (owner == 0 && mode & 0o1000 != 0))
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn permission_publish_parent_rule(owner: u32, mode: u32, euid: u32) -> bool {
+    (owner == 0 || owner == euid) && mode & 0o022 == 0
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn permission_private_metadata(
+    info: &std::fs::Metadata,
+    euid: u32,
+) -> std::result::Result<(), LocalPermissionError> {
+    if permission_private_rule(info.uid(), info.mode(), euid) {
+        Ok(())
+    } else {
+        Err(LocalPermissionError::Insecure)
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn permission_existing(
+    path: &std::path::Path,
+) -> std::result::Result<Option<std::fs::Metadata>, LocalPermissionError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(info) => Ok(Some(info)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(LocalPermissionError::Io(error)),
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn permission_directory(
+    info: &std::fs::Metadata,
+    euid: u32,
+) -> std::result::Result<(), LocalPermissionError> {
+    if !info.is_dir() {
+        return Err(LocalPermissionError::Insecure);
+    }
+    permission_private_metadata(info, euid)
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn permission_optional_file(
+    path: &std::path::Path,
+    euid: u32,
+) -> std::result::Result<Option<std::fs::Metadata>, LocalPermissionError> {
+    let info = permission_existing(path)?;
+    if let Some(info) = &info {
+        if !info.is_file() {
+            return Err(LocalPermissionError::Insecure);
+        }
+        permission_private_metadata(info, euid)?;
+    }
+    Ok(info)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn permission_unlinked_components(
+    path: &std::path::Path,
+) -> std::result::Result<(), LocalPermissionError> {
+    // Left-to-right lstat also identifies a dangling ancestor link before
+    // following that link could become an unrelated NotFound IO error.
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut prefix = std::path::PathBuf::new();
+    for part in absolute.components() {
+        prefix.push(part.as_os_str());
+        if std::fs::symlink_metadata(&prefix)?.file_type().is_symlink() {
+            return Err(LocalPermissionError::Insecure);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn permission_real_ancestors(
+    real_directory: &std::path::Path,
+    euid: u32,
+) -> std::result::Result<(), LocalPermissionError> {
+    // The caller canonicalizes once; walk that one real chain only.
+    for directory in real_directory.ancestors() {
+        let info = std::fs::metadata(directory)?;
+        if !info.is_dir() || !permission_ancestor_rule(info.uid(), info.mode(), euid) {
+            return Err(LocalPermissionError::Insecure);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn permission_private_tree(
+    directory: &std::path::Path,
+    euid: u32,
+) -> std::result::Result<(), LocalPermissionError> {
+    // The caller already checked this directory. Only its descendants follow.
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        let info = std::fs::symlink_metadata(&path)?;
+        if !info.is_dir() && !info.is_file() {
+            return Err(LocalPermissionError::Insecure);
+        }
+        permission_private_metadata(&info, euid)?;
+        if info.is_dir() {
+            permission_private_tree(&path, euid)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn check_local_permissions(
+    target: LocalPermissionTarget<'_>,
+) -> std::result::Result<(), LocalPermissionError> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = target;
+        Err(LocalPermissionError::Unsupported)
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let euid = rustix::process::geteuid().as_raw();
+        match target {
+            LocalPermissionTarget::Database(database) => {
+                // Normalize only the checker-local D spelling before lstat.
+                // Components remove a final '.', never collapse '..'.
+                let directory: std::path::PathBuf =
+                    local_data_directory(database).components().collect();
+                let Some(info) = permission_existing(&directory)? else {
+                    // Missing direct parents stay actual IO errors, with no
+                    // recursive creation and no reclassification as Insecure.
+                    let parent = directory
+                        .parent()
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .unwrap_or(std::path::Path::new("."));
+                    return permission_real_ancestors(&std::fs::canonicalize(parent)?, euid);
+                };
+                permission_directory(&info, euid)?;
+                if let Some(info) = permission_optional_file(database, euid)? {
+                    if info.nlink() != 1 {
+                        return Err(LocalPermissionError::Insecure);
+                    }
+                }
+                for suffix in ["-wal", "-shm"] {
+                    let mut name = database.as_os_str().to_os_string();
+                    name.push(suffix);
+                    permission_optional_file(std::path::Path::new(&name), euid)?;
+                }
+                if let Some(info) = permission_optional_file(&directory.join(".rsia.lock"), euid)? {
+                    if info.nlink() != 1 {
+                        return Err(LocalPermissionError::Insecure);
+                    }
+                }
+                for name in [
+                    "restore.json",
+                    "restore.admission.json",
+                    "restore.migrations.json",
+                ] {
+                    permission_optional_file(&directory.join(name), euid)?;
+                }
+                // Only this controlled root prefix is a software admission record.
+                // Unknown root names, including sockets, are not treated as files.
+                for entry in std::fs::read_dir(&directory)? {
+                    let entry = entry?;
+                    if entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(b".restore.admission.json.tmp-")
+                    {
+                        permission_optional_file(&entry.path(), euid)?;
+                    }
+                }
+                for name in ["blobs", ".blob-staging"] {
+                    let root = directory.join(name);
+                    if let Some(info) = permission_existing(&root)? {
+                        permission_directory(&info, euid)?;
+                        for namespace in std::fs::read_dir(&root)? {
+                            let namespace = namespace?.path();
+                            permission_directory(&std::fs::symlink_metadata(&namespace)?, euid)?;
+                            for member in std::fs::read_dir(namespace)? {
+                                permission_optional_file(&member?.path(), euid)?;
+                            }
+                        }
+                    }
+                }
+                for name in ["exports", ".export-staging"] {
+                    let root = directory.join(name);
+                    if let Some(info) = permission_existing(&root)? {
+                        permission_directory(&info, euid)?;
+                        for namespace in std::fs::read_dir(&root)? {
+                            let namespace = namespace?.path();
+                            permission_directory(&std::fs::symlink_metadata(&namespace)?, euid)?;
+                            for export in std::fs::read_dir(namespace)? {
+                                let export = export?.path();
+                                permission_directory(&std::fs::symlink_metadata(&export)?, euid)?;
+                                permission_private_tree(&export, euid)?;
+                            }
+                        }
+                    }
+                }
+                let real = std::fs::canonicalize(&directory)?;
+                if let Some(parent) = real.parent() {
+                    permission_real_ancestors(parent, euid)?;
+                }
+                Ok(())
+            }
+            LocalPermissionTarget::BackupPublication(destination) => {
+                // The caller retains its original existing-target Conflict
+                // and platform priority before invoking this metadata check.
+                let parent = destination
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(std::path::Path::new("."));
+                permission_unlinked_components(parent)?;
+                let real = std::fs::canonicalize(parent)?;
+                let info = std::fs::metadata(&real)?;
+                if !info.is_dir() || !permission_publish_parent_rule(info.uid(), info.mode(), euid)
+                {
+                    return Err(LocalPermissionError::Insecure);
+                }
+                if let Some(ancestor) = real.parent() {
+                    permission_real_ancestors(ancestor, euid)?;
+                }
+                Ok(())
+            }
+            LocalPermissionTarget::IndependentAnchor(anchor) => {
+                permission_unlinked_components(anchor)?;
+                let info = std::fs::symlink_metadata(anchor)?;
+                if !info.is_file() {
+                    return Err(LocalPermissionError::Insecure);
+                }
+                permission_private_metadata(&info, euid)?;
+                if info.nlink() != 1 {
+                    return Err(LocalPermissionError::Insecure);
+                }
+                for suffix in ["-wal", "-shm"] {
+                    let mut name = anchor.as_os_str().to_os_string();
+                    name.push(suffix);
+                    permission_optional_file(std::path::Path::new(&name), euid)?;
+                }
+                let parent = anchor
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(std::path::Path::new("."));
+                permission_real_ancestors(&std::fs::canonicalize(parent)?, euid)
+                // Shape/independence/live-lock/receipt/facts stay in startup_gate.
+            }
+        }
+    }
+}
+
+// Test-only observation facts. Ordinary builds contain neither slots
+// nor the two producer call sites. No callback, registry, or input override.
+#[cfg(test)]
+std::thread_local! {
+    static AG157_EXPORT_STAGING_FACT: std::cell::RefCell<
+        Option<(std::path::PathBuf, std::fs::Metadata)>
+    > = const { std::cell::RefCell::new(None) };
+    static AG157_BACKUP_VACUUM_FACT: std::cell::RefCell<
+        Option<(std::path::PathBuf, std::io::Result<std::fs::Metadata>)>
+    > = const { std::cell::RefCell::new(None) };
+}
+// Export call site: clone the existing real FD metadata after write/fsync,
+// before its normal 0400 transition; keep the latest member's path/metadata.
+// Backup call site: after the new 0600 File is closed, record the actual lstat
+// result immediately before the original VACUUM. Recording an IO result does
+// not branch, retry, or change the business Result; the test takes and checks it.
+// Each test clears its own slot before the operation, then only takes the fact.
+
 pub const MVP_MAX_RUNS: u64 = 1_000;
 /// Storage-side mirrors of the E16.5 MVP capacity bounds enforced inside this
 /// crate (`Session::put_world`, `Store::reserve_budget_call_with_sources`).
@@ -1071,12 +1405,11 @@ fn validate_registered_blob_field(schema: &str, field: &str) -> Result<()> {
 }
 
 async fn write_synced_temp(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut file = tokio::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(path)
-        .await
-        .map_err(internal)?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).await.map_err(internal)?;
     file.write_all(bytes).await.map_err(internal)?;
     file.sync_all().await.map_err(internal)
 }
@@ -1424,16 +1757,29 @@ async fn write_local_export_staging(root: &Path, files: &[LocalExportFile]) -> R
     for member in files {
         let target = root.join(&member.path);
         let parent = target.parent().ok_or(Error::Internal)?;
-        tokio::fs::create_dir_all(parent).await.map_err(internal)?;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&target)
-            .await
-            .map_err(internal)?;
+        let mut directories = tokio::fs::DirBuilder::new();
+        directories.recursive(true);
+        #[cfg(unix)]
+        directories.mode(0o700);
+        directories.create(parent).await.map_err(internal)?;
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&target).await.map_err(internal)?;
         file.write_all(&member.bytes).await.map_err(internal)?;
         file.sync_all().await.map_err(internal)?;
-        let mut permissions = file.metadata().await.map_err(internal)?.permissions();
+        let metadata = file.metadata().await.map_err(internal)?;
+        #[cfg(test)]
+        AG157_EXPORT_STAGING_FACT
+            .with(|fact| *fact.borrow_mut() = Some((target.clone(), metadata.clone())));
+        let mut permissions = metadata.permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            permissions.set_mode(0o400);
+        }
+        #[cfg(not(unix))]
         permissions.set_readonly(true);
         tokio::fs::set_permissions(&target, permissions)
             .await
@@ -1453,7 +1799,10 @@ async fn ensure_unlinked_directory(path: &Path) -> Result<()> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            tokio::fs::create_dir(path).await.map_err(internal)?;
+            let mut directory = tokio::fs::DirBuilder::new();
+            #[cfg(unix)]
+            directory.mode(0o700);
+            directory.create(path).await.map_err(internal)?;
         }
         Err(error) => return Err(internal(error)),
     }
@@ -1880,13 +2229,31 @@ pub(crate) async fn upstream_rows_in_tx(
 
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
-        let root = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        tokio::fs::create_dir_all(&root).await.map_err(internal)?;
+        check_local_permissions(LocalPermissionTarget::Database(path)).map_err(
+            |error| match error {
+                LocalPermissionError::Io(error) => internal(error),
+                other => Error::Invalid(other.to_string()),
+            },
+        )?;
+        let root = local_data_directory(path);
+        if !root.try_exists().map_err(internal)? {
+            let mut directory = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            directory.mode(0o700);
+            directory.create(&root).map_err(internal)?;
+        }
+        if !path.try_exists().map_err(internal)? {
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            drop(options.open(path).map_err(internal)?);
+        }
         cleanup_private_blob_staging(&root).await?;
         cleanup_private_export_staging(&root).await?;
         let opts = SqliteConnectOptions::new()
             .filename(path)
-            .create_if_missing(true)
+            .create_if_missing(false)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Full)
@@ -1947,7 +2314,11 @@ impl Store {
             .root
             .join("blobs")
             .join(hash(ctx.namespace().as_bytes()));
-        tokio::fs::create_dir_all(&dir).await.map_err(internal)?;
+        let mut directories = tokio::fs::DirBuilder::new();
+        directories.recursive(true);
+        #[cfg(unix)]
+        directories.mode(0o700);
+        directories.create(&dir).await.map_err(internal)?;
         let final_path = dir.join(&digest);
         let existing_preverified = match tokio::fs::symlink_metadata(&final_path).await {
             Ok(_) => {
@@ -2084,18 +2455,22 @@ impl Store {
         let dependencies = plan.dependencies;
         let namespace_hash = hash(ctx.namespace().as_bytes());
         let staging_dir = self.root.join(".blob-staging").join(&namespace_hash);
-        tokio::fs::create_dir_all(&staging_dir)
-            .await
-            .map_err(internal)?;
+        let mut directories = tokio::fs::DirBuilder::new();
+        directories.recursive(true);
+        #[cfg(unix)]
+        directories.mode(0o700);
+        directories.create(&staging_dir).await.map_err(internal)?;
         let temp_path = staging_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
         let mut staged = PrivateStagedBlob::new(temp_path);
         write_synced_temp(staged.path(), bytes).await?;
 
         verify_blob_file(staged.path(), &digest, max_bytes).await?;
         let final_dir = self.root.join("blobs").join(namespace_hash);
-        tokio::fs::create_dir_all(&final_dir)
-            .await
-            .map_err(internal)?;
+        let mut directories = tokio::fs::DirBuilder::new();
+        directories.recursive(true);
+        #[cfg(unix)]
+        directories.mode(0o700);
+        directories.create(&final_dir).await.map_err(internal)?;
         let final_path = final_dir.join(&digest);
 
         let _guard = self.blob_lock.write().await;
@@ -2300,9 +2675,10 @@ impl Store {
         ensure_unlinked_directory(&staging_parent).await?;
         let staging_path = staging_parent.join(uuid::Uuid::new_v4().to_string());
         let mut staging = PrivateStagedDirectory::new(staging_path.clone());
-        tokio::fs::create_dir(&staging_path)
-            .await
-            .map_err(internal)?;
+        let mut directory = tokio::fs::DirBuilder::new();
+        #[cfg(unix)]
+        directory.mode(0o700);
+        directory.create(&staging_path).await.map_err(internal)?;
         write_local_export_staging(staging.path(), files).await?;
         if verify_local_export_directory(staging.path(), files).await?
             != (tree_digest.clone(), delivered_bytes)
@@ -3830,6 +4206,853 @@ mod tests {
         (d, s)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[derive(Debug, PartialEq, Eq)]
+    struct Ag157FsFact {
+        name: PathBuf,
+        kind: &'static str,
+        bytes: Vec<u8>,
+        link: Option<PathBuf>,
+        mode: u32,
+        uid: u32,
+        nlink: u64,
+        dev: u64,
+        ino: u64,
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn ag157_snapshot(root: &Path) -> Vec<Ag157FsFact> {
+        fn visit(root: &Path, path: &Path, facts: &mut Vec<Ag157FsFact>) {
+            let info = std::fs::symlink_metadata(path).unwrap();
+            let kind = if info.is_file() {
+                "file"
+            } else if info.is_dir() {
+                "dir"
+            } else if info.file_type().is_symlink() {
+                "link"
+            } else {
+                "special"
+            };
+            facts.push(Ag157FsFact {
+                name: path.strip_prefix(root).unwrap().to_path_buf(),
+                kind,
+                bytes: if info.is_file() {
+                    std::fs::read(path).unwrap()
+                } else {
+                    Vec::new()
+                },
+                link: info
+                    .file_type()
+                    .is_symlink()
+                    .then(|| std::fs::read_link(path).unwrap()),
+                mode: info.mode(),
+                uid: info.uid(),
+                nlink: info.nlink(),
+                dev: info.dev(),
+                ino: info.ino(),
+            });
+            if info.is_dir() {
+                let mut children: Vec<_> = std::fs::read_dir(path)
+                    .unwrap()
+                    .map(|v| v.unwrap().path())
+                    .collect();
+                children.sort();
+                for child in children {
+                    visit(root, &child, facts);
+                }
+            }
+        }
+        let mut facts = Vec::new();
+        visit(root, root, &mut facts);
+        facts
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn ag157_private_file(path: &Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn ag157_mode(path: &Path, mode: u32, directory: bool) -> std::fs::Metadata {
+        let info = std::fs::symlink_metadata(path).unwrap();
+        assert_eq!(info.is_dir(), directory, "{}", path.display());
+        assert_eq!(info.is_file(), !directory, "{}", path.display());
+        assert_eq!(info.mode() & 0o777, mode, "{}", path.display());
+        assert_eq!(info.uid(), rustix::process::geteuid().as_raw());
+        if !directory {
+            assert_eq!(info.nlink(), 1);
+        }
+        info
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn ag157_loose_umask_child(name: &str) -> bool {
+        const KEY: &str = "RSIA_AG157_ISOLATED_PERMISSION_TEST";
+        if std::env::var(KEY).ok().as_deref() == Some(name) {
+            rustix::process::umask(rustix::fs::Mode::empty());
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("tests::{name}"), "--nocapture"])
+            .env(KEY, name)
+            .output()
+            .unwrap();
+        for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+            let encoded: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            println!("AG157_CHILD_{name}_{stream}_HEX={encoded}");
+        }
+        assert!(output.status.success(), "child {}", output.status);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored;"),
+            "{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("AG157_REAL_OBSERVATION={name}")),
+            "{stdout}"
+        );
+        true
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn store_open_checks_permissions_before_cleanup_and_migrations() {
+        let (directory, store) = db().await;
+        store.close().await;
+        let staging = directory.path().join(".blob-staging").join(hash(b"n"));
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&staging)
+            .unwrap();
+        ag157_private_file(&staging.join("orphan.tmp"), b"must survive refusal");
+        let database = directory.path().join("db.sqlite3");
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = ag157_snapshot(directory.path());
+        let error = Store::open(&database).await.err().unwrap();
+        assert!(
+            matches!(&error, Error::Invalid(reason) if reason == "data_directory_insecure"),
+            "{error}"
+        );
+        assert_eq!(ag157_snapshot(directory.path()), before);
+        assert!(!directory.path().join(".rsia.lock").exists());
+        assert_eq!(
+            std::fs::read(staging.join("orphan.tmp")).unwrap(),
+            b"must survive refusal"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn sqlite_database_and_live_sidecars_are_private_under_loose_umask() {
+        const NAME: &str = "sqlite_database_and_live_sidecars_are_private_under_loose_umask";
+        if ag157_loose_umask_child(NAME) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("sidecars.sqlite3");
+        let wal = directory.path().join("sidecars.sqlite3-wal");
+        let shm = directory.path().join("sidecars.sqlite3-shm");
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        for cycle in 0..2 {
+            let store = Store::open(&database).await.unwrap();
+            let mut session = store.session().await.unwrap();
+            session
+                .put(
+                    &admin,
+                    "run",
+                    "sqlite-mode",
+                    admin.actor(),
+                    &json!({"id":"sqlite-mode","cycle":cycle}),
+                )
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+            let row = sqlx::query("SELECT sqlite_version(), sqlite_source_id()")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+            let version: String = row.get(0);
+            let source_id: String = row.get(1);
+            let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+            assert!(!version.is_empty() && source_id.len() >= 40);
+            assert_eq!(journal, "wal");
+            ag157_mode(directory.path(), 0o700, true);
+            ag157_mode(&database, 0o600, false);
+            let live_wal = ag157_mode(&wal, 0o600, false);
+            assert!(live_wal.len() > 0);
+            let live_shm = ag157_mode(&shm, 0o600, false);
+            assert!(live_shm.len() > 0);
+            println!(
+                "AG157_SQLX_ACTUAL={}",
+                json!({"cycle":cycle,"version":version,"source_id":source_id,
+                "journal_mode":journal,"wal_len":live_wal.len(),"wal_dev":live_wal.dev(),"wal_ino":live_wal.ino(),
+                "shm_len":live_shm.len(),"shm_dev":live_shm.dev(),"shm_ino":live_shm.ino(),
+                "SQLX_SQLITE_BUNDLED":std::env::var("SQLX_SQLITE_BUNDLED").ok(),
+                "SQLX_SQLITE_UNBUNDLED":std::env::var("SQLX_SQLITE_UNBUNDLED").ok()})
+            );
+            store.close().await;
+            assert!(
+                !wal.exists() && !shm.exists(),
+                "default close must allow a real cold sidecar rebuild"
+            );
+        }
+        println!("AG157_REAL_OBSERVATION={NAME}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn blob_directories_staging_and_members_have_explicit_private_modes() {
+        const NAME: &str = "blob_directories_staging_and_members_have_explicit_private_modes";
+        if ag157_loose_umask_child(NAME) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("blob.sqlite3"))
+            .await
+            .unwrap();
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let bytes = b"actual registered private blob".to_vec();
+        let digest = hash(&bytes);
+        let mut session = store.session().await.unwrap();
+        session
+            .bump_watermark(&admin, &hash(b"private-blob-watermark"))
+            .await
+            .unwrap();
+        session.put(&admin, "artifact", "private-producer", admin.actor(), &json!({
+            "schema_version":"rsia.e16.staged_asset.v1","id":"private-producer","namespace":"n","owner_actor":"admin",
+            "request_key":"private-request","input_digest":hash(b"private-input"),"created_at":1,"updated_at":1,
+            "source_refs":[],"revoke_watermark":1,"payload":{"state":"prepared","content_blob_digest":digest}
+        })).await.unwrap();
+        session.commit().await.unwrap();
+        let guard = store.blob_lock.write().await;
+        let task_store = store.clone();
+        let task_admin = admin.clone();
+        let task_bytes = bytes.clone();
+        let task = tokio::spawn(async move {
+            task_store
+                .publish_registered_blob(
+                    &task_admin,
+                    "private-producer",
+                    "rsia.e16.staged_asset.v1",
+                    "content_blob_digest",
+                    &task_bytes,
+                    1024,
+                )
+                .await
+        });
+        let staging = directory.path().join(".blob-staging").join(hash(b"n"));
+        let mut observed = None;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if let Ok(entries) = std::fs::read_dir(&staging) {
+                for entry in entries {
+                    let path = entry.unwrap().path();
+                    if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+                        observed = Some(path);
+                    }
+                }
+            }
+            if observed.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let staged = observed.expect("actual complete staging bytes before publication");
+        ag157_mode(&staging, 0o700, true);
+        ag157_mode(staging.parent().unwrap(), 0o700, true);
+        ag157_mode(&staged, 0o600, false);
+        assert_eq!(hash(&std::fs::read(&staged).unwrap()), digest);
+        drop(guard);
+        assert_eq!(task.await.unwrap().unwrap(), digest);
+        let published = directory
+            .path()
+            .join("blobs")
+            .join(hash(b"n"))
+            .join(&digest);
+        ag157_mode(&published, 0o600, false);
+        ag157_mode(published.parent().unwrap(), 0o700, true);
+        ag157_mode(published.parent().unwrap().parent().unwrap(), 0o700, true);
+        assert_eq!(store.read_blob(&admin, &digest, 1024).await.unwrap(), bytes);
+        assert!(!staged.exists());
+        store.close().await;
+        println!("AG157_REAL_OBSERVATION={NAME}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn completed_export_members_are_0400_and_directories_stay_0700() {
+        const NAME: &str = "completed_export_members_are_0400_and_directories_stay_0700";
+        if ag157_loose_umask_child(NAME) {
+            return;
+        }
+        AG157_EXPORT_STAGING_FACT.with(|fact| {
+            fact.borrow_mut().take();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("local-export.sqlite3"))
+            .await
+            .unwrap();
+        let admin = Context::new("tenant", "admin", Role::Admin).unwrap();
+        let source = json!({"schema_version":"fixture.source.v1","id":"source-1"});
+        let source_digest = fingerprint(&source).unwrap();
+        let projection = b"registered projection";
+        let projection_digest = store.put_blob(&admin, projection).await.unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .put(&admin, "artifact", "source-1", admin.actor(), &source)
+            .await
+            .unwrap();
+        let watermark = session
+            .bump_watermark(&admin, "export-watermark")
+            .await
+            .unwrap() as u64;
+        let export_id = "local-export-1".to_string();
+        let files = vec![
+            LocalExportFile {
+                path: "manifest.json".into(),
+                bytes: b"{}".to_vec(),
+            },
+            LocalExportFile {
+                path: "nested/member.txt".into(),
+                bytes: b"member bytes".to_vec(),
+            },
+        ];
+        let (tree_digest, delivered_bytes) = local_export_tree_digest(&files).unwrap();
+        let receipt =
+            local_export_receipt(admin.namespace(), &export_id, &tree_digest, delivered_bytes)
+                .unwrap();
+        let source_refs = json!([{
+            "kind":"artifact",
+            "id":"source-1",
+            "digest":source_digest,
+        }]);
+        let attempt = json!({
+            "schema_version":"rsia.e16.export_attempt.v2",
+            "id":export_id,
+            "namespace":admin.namespace(),
+            "owner_actor":admin.actor(),
+            "request_key":"export-key",
+            "input_digest":hash(b"input"),
+            "created_at":1,
+            "updated_at":1,
+            "source_refs":source_refs,
+            "revoke_watermark":watermark,
+            "payload":{
+                "publisher":"org.rsia",
+                "asset_id":"asset",
+                "staged_asset_id":"staged-1",
+                "manifest_digest":hash(b"manifest"),
+                "projection_blob_bytes":projection.len(),
+                "state":"prepared",
+                "destination_scope":"local_namespace",
+                "delivery_kind":"local_directory_v1",
+                "local_export_ref":receipt.local_export_ref,
+                "package_tree_digest":tree_digest,
+                "delivered_bytes":delivered_bytes,
+                "projection_blob_digest":projection_digest,
+                "delivery_audit_id":null,
+                "completion_receipt_digest":null,
+                "budget_ref":null,
+                "error":null,
+            }
+        });
+        session
+            .put(&admin, "artifact", &export_id, admin.actor(), &attempt)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", &export_id, "artifact", "source-1")
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", &export_id, "blob", &projection_digest)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+
+        let audit_id = "delivery-audit-1";
+        let mut completed = attempt.clone();
+        completed["payload"]["state"] = json!("completed");
+        completed["payload"]["delivery_audit_id"] = json!(audit_id);
+        completed["payload"]["completion_receipt_digest"] =
+            json!(receipt.completion_receipt_digest);
+        let audit = json!({
+            "schema_version":"rsia.e16.delivery_audit.v2",
+            "id":audit_id,
+            "namespace":admin.namespace(),
+            "owner_actor":admin.actor(),
+            "request_key":"export-key",
+            "input_digest":hash(b"audit"),
+            "created_at":2,
+            "updated_at":2,
+            "source_refs":attempt["source_refs"],
+            "revoke_watermark":watermark,
+            "payload":{
+                "export_attempt_id":export_id,
+                "package_id":"org.rsia:asset",
+                "projection_blob_digest":attempt["payload"]["projection_blob_digest"],
+                "delivery_kind":"local_directory_v1",
+                "local_export_ref":receipt.local_export_ref,
+                "package_tree_digest":receipt.package_tree_digest,
+                "delivered_bytes":receipt.delivered_bytes,
+                "completion_receipt_digest":receipt.completion_receipt_digest,
+                "delivered_to":"local_namespace",
+                "delivered_at":2,
+                "watermark_at_delivery":watermark,
+                "revoked":false,
+                "revocation_notice_sent":false,
+                "remote_erasure_disclaimer":"local only",
+            }
+        });
+        let plan = store
+            .snapshot_local_export_dependencies(&admin, &export_id)
+            .await
+            .unwrap();
+        let dependencies = store
+            .prevalidate_local_export_dependency_blobs(&admin, plan)
+            .await
+            .unwrap();
+        let receipt = store
+            .publish_registered_local_export(
+                &admin,
+                &export_id,
+                &files,
+                &completed,
+                &audit,
+                &dependencies,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .verify_registered_local_export(&admin, &export_id, &files)
+                .await
+                .unwrap(),
+            receipt
+        );
+        let (staged_path, staged_info) = AG157_EXPORT_STAGING_FACT
+            .with(|fact| fact.borrow_mut().take())
+            .unwrap();
+        assert!(staged_path.ends_with("nested/member.txt"));
+        assert_eq!(staged_info.mode() & 0o777, 0o600);
+        assert_eq!(staged_info.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(staged_info.nlink(), 1);
+        assert!(staged_info.is_file());
+        let published = store.local_export_directory(&admin, &export_id).unwrap();
+        for entry in ag157_snapshot(&published) {
+            assert_eq!(entry.uid, rustix::process::geteuid().as_raw());
+            assert_eq!(
+                entry.mode & 0o777,
+                if entry.kind == "dir" { 0o700 } else { 0o400 }
+            );
+        }
+        for member in &files {
+            assert_eq!(
+                std::fs::read(published.join(&member.path)).unwrap(),
+                member.bytes
+            );
+        }
+        let final_info = ag157_mode(&published.join("nested/member.txt"), 0o400, false);
+        assert_eq!(
+            (staged_info.dev(), staged_info.ino()),
+            (final_info.dev(), final_info.ino())
+        );
+        assert_eq!(
+            std::fs::read(published.join("manifest.json")).unwrap(),
+            b"{}"
+        );
+        ag157_mode(directory.path(), 0o700, true);
+        store.close().await;
+        println!("AG157_REAL_OBSERVATION={NAME}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn consistent_backup_database_manifest_and_blob_members_are_0600() {
+        use crate::budget::{
+            BudgetArtifact, BudgetCallFence, BudgetCallReservation, BudgetExecutionProvenance,
+            BudgetStage, ModelCallSettlementEvidence, RootBudgetAuthorization, UsageCharge,
+        };
+        const NAME: &str = "consistent_backup_database_manifest_and_blob_members_are_0600";
+        if ag157_loose_umask_child(NAME) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("source.sqlite3");
+        let store = Store::open(&database).await.unwrap();
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let host = Context::new("n", "host", Role::Host).unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .put(
+                &admin,
+                "run",
+                "run-1",
+                admin.actor(),
+                &json!({"id":"run-1","marker":"source"}),
+            )
+            .await
+            .unwrap();
+        session
+            .put(
+                &admin,
+                "artifact",
+                "data",
+                admin.actor(),
+                &json!({"id":"data","payload":"full backup data"}),
+            )
+            .await
+            .unwrap();
+        session.audit(&admin, "ag157-backup", "data").await.unwrap();
+        session
+            .bump_watermark(&admin, &hash(b"ag157-backup-watermark"))
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let blob = store
+            .put_blob(&admin, b"complete backup blob")
+            .await
+            .unwrap();
+        let call_id = "call-1";
+        let marker = "ag157-five-micros";
+        store
+            .authorize_root_budget(
+                &admin,
+                &RootBudgetAuthorization {
+                    root_budget_id: "root-1".into(),
+                    billing_scope: "scope-1".into(),
+                    allowed_namespaces: vec!["n".into()],
+                    currency: "USD".into(),
+                    pricing_version: "pricing-v1".into(),
+                    payment_subject: "payer".into(),
+                    authorization_receipt_digest: hash(b"authorization"),
+                    per_call_cap_micros: 100,
+                    total_limit_micros: 1_000,
+                    created_at: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let request = BudgetCallReservation {
+            billing_scope: "scope-1".into(),
+            call_id: call_id.into(),
+            dispatch_group_id: "group-1".into(),
+            stage: BudgetStage::Reflection,
+            actual_input_digest: hash(format!("input-{call_id}").as_bytes()),
+            request_artifact: Some(
+                BudgetArtifact::from_serializable(
+                    "rsia.model_request.artifact.v1",
+                    &json!({
+                        "request_id":call_id,
+                        "source_closure":[{"id":"run-1","digest":hash(b"source")}],
+                        "input":[{"content":marker}],
+                    }),
+                )
+                .unwrap(),
+            ),
+            max_cost_micros: 20,
+            lease_token: format!("lease-{call_id}"),
+            lease_until: 100,
+            now: 1,
+        };
+        let call = store.reserve_budget_call(&host, &request).await.unwrap();
+        let fence = BudgetCallFence {
+            billing_scope: call.billing_scope.clone(),
+            call_id: call.call_id.clone(),
+            actual_input_digest: call.actual_input_digest.clone(),
+            lease_token: call.lease_token.clone(),
+            lease_epoch: call.lease_epoch,
+            now: 2,
+        };
+        let dispatched = store
+            .begin_budget_dispatch(&host, &fence)
+            .await
+            .unwrap()
+            .call;
+        let response = BudgetArtifact::from_serializable(
+            "test.response.v1",
+            &json!({"status":"completed","output":marker}),
+        )
+        .unwrap();
+        store
+            .settle_model_budget_call(
+                &host,
+                &fence,
+                &UsageCharge {
+                    amount_micros: 5,
+                    currency: "USD".into(),
+                    pricing_version: "pricing-v1".into(),
+                    provider_request_id: "provider-1".into(),
+                    usage_record_id: "usage-1".into(),
+                    output_digest: hash(marker.as_bytes()),
+                },
+                &ModelCallSettlementEvidence {
+                    provenance: BudgetExecutionProvenance::Fixture,
+                    actual_model_digest: Some(hash(b"model")),
+                    transport_artifact: BudgetArtifact::from_serializable(
+                        "test.transport.v1",
+                        &json!({"raw":marker}),
+                    )
+                    .unwrap(),
+                    usable_response: Some(response.clone()),
+                    blocked_response: BudgetArtifact::from_serializable(
+                        "test.response.v1",
+                        &json!({"status":"blocked"}),
+                    )
+                    .unwrap(),
+                    forced_block_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .close_budget_call_execution(
+                &host,
+                "scope-1",
+                "call-1",
+                dispatched.dispatch_id.as_deref().unwrap(),
+                "complete",
+                3,
+            )
+            .await
+            .unwrap();
+
+        let expected_call = store
+            .budget_call(&host, "scope-1", "call-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(expected_call.actual_cost_micros, Some(5));
+        assert!(expected_call.execution_closed);
+        let expected_root = store.root_budget(&admin, "scope-1").await.unwrap().unwrap();
+        assert_eq!(expected_root.spent_micros, 5);
+        assert_eq!(expected_root.reserved_micros, 0);
+        let expected_migrations: Vec<(i64,String)> = sqlx::query_as(
+            "SELECT version, lower(hex(checksum)) FROM _sqlx_migrations WHERE success=1 ORDER BY version")
+            .fetch_all(&store.pool).await.unwrap();
+        let expected_audit = store.verify_audit(&admin).await.unwrap();
+        assert!(expected_audit >= 1);
+        AG157_BACKUP_VACUUM_FACT.with(|fact| {
+            fact.borrow_mut().take();
+        });
+        let backup = directory.path().join("backup");
+        store.backup(&backup).await.unwrap();
+        let (empty_path, empty_info) = AG157_BACKUP_VACUUM_FACT
+            .with(|fact| fact.borrow_mut().take())
+            .unwrap();
+        assert!(empty_path.ends_with("rsia.sqlite3"));
+        let empty_info = empty_info.unwrap();
+        assert!(empty_info.is_file());
+        assert_eq!(empty_info.len(), 0);
+        assert_eq!(empty_info.mode() & 0o777, 0o600);
+        assert_eq!(empty_info.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(empty_info.nlink(), 1);
+        let published = ag157_mode(&backup.join("rsia.sqlite3"), 0o600, false);
+        assert_eq!(
+            (empty_info.dev(), empty_info.ino()),
+            (published.dev(), published.ino())
+        );
+        assert!(!empty_path.exists());
+        for entry in ag157_snapshot(&backup) {
+            assert_eq!(
+                entry.mode & 0o777,
+                if entry.kind == "dir" { 0o700 } else { 0o600 }
+            );
+            assert_eq!(entry.uid, rustix::process::geteuid().as_raw());
+        }
+        let manifest_bytes = std::fs::read(backup.join("backup-manifest.json")).unwrap();
+        let manifest: lifecycle::BackupManifest = serde_json::from_slice(&manifest_bytes).unwrap();
+        assert!(manifest.complete);
+        assert_eq!(manifest.schema_version, lifecycle::BACKUP_SCHEMA);
+        assert_eq!(manifest.migrations.len(), expected_migrations.len());
+        for entry in std::iter::once(&manifest.database).chain(manifest.blobs.iter()) {
+            let bytes = std::fs::read(backup.join(&entry.path)).unwrap();
+            assert_eq!(hash(&bytes), entry.sha256);
+            assert_eq!(bytes.len() as u64, entry.bytes);
+        }
+        assert!(manifest.blobs.iter().any(|entry| entry.sha256 == blob));
+        let backup_snapshot = ag157_snapshot(&backup);
+        assert!(
+            matches!(store.backup(&backup).await,Err(Error::Conflict(reason)) if reason == "backup destination already exists")
+        );
+        assert_eq!(ag157_snapshot(&backup), backup_snapshot);
+        store.close().await;
+        let anchor_directory = tempfile::tempdir().unwrap();
+        let anchor = anchor_directory.path().join("current-anchor.sqlite3");
+        ag157_private_file(&anchor, &std::fs::read(&database).unwrap());
+        let delta = directory.path().join("delta.json");
+        let namespaces: Vec<_> = manifest.watermarks.iter().map(|watermark| json!({
+            "namespace":watermark.namespace,"base_seq":watermark.seq,"base_digest":watermark.digest,
+            "events":[],"latest_seq":watermark.seq,"latest_digest":watermark.digest
+        })).collect();
+        ag157_private_file(
+            &delta,
+            &serde_json::to_vec(&json!({"schema_version":"rsia.revoke_delta.v1",
+            "base_manifest_sha256":hash(&manifest_bytes),"namespaces":namespaces}))
+            .unwrap(),
+        );
+        let destination = directory.path().join("restored");
+        let python_identity = std::process::Command::new("python3").args(["-B", "-c",
+            "import json,sqlite3; c=sqlite3.connect(':memory:'); print(json.dumps({'version':sqlite3.sqlite_version,'source_id':c.execute('select sqlite_source_id()').fetchone()[0]})); c.close()"])
+            .output().unwrap();
+        assert!(
+            python_identity.status.success(),
+            "{}",
+            String::from_utf8_lossy(&python_identity.stderr)
+        );
+        let python_sqlite: Value = serde_json::from_slice(&python_identity.stdout).unwrap();
+        assert!(!python_sqlite["version"].as_str().unwrap().is_empty());
+        assert!(python_sqlite["source_id"].as_str().unwrap().len() >= 40);
+        println!("AG157_PYTHON_SQLITE_ACTUAL={python_sqlite}");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/restore_backup.py");
+        let output = std::process::Command::new("python3")
+            .arg("-B")
+            .arg(script)
+            .arg("--backup")
+            .arg(backup.canonicalize().unwrap())
+            .arg("--dest")
+            .arg(&destination)
+            .arg("--revoke-delta")
+            .arg(&delta)
+            .arg("--trusted-revocations-db")
+            .arg(anchor.canonicalize().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "restore {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let receipt: Value =
+            serde_json::from_slice(&std::fs::read(destination.join("restore.json")).unwrap())
+                .unwrap();
+        assert_eq!(receipt["receipt_scope"], "local_only_not_for_export");
+        let restored = Store::open(&destination.join("rsia.sqlite3"))
+            .await
+            .unwrap();
+        assert_eq!(restored.integrity().await.unwrap(), "ok");
+        assert_eq!(restored.verify_audit(&admin).await.unwrap(), expected_audit);
+        assert_eq!(
+            restored
+                .budget_call(&host, "scope-1", "call-1")
+                .await
+                .unwrap()
+                .unwrap(),
+            expected_call
+        );
+        assert_eq!(
+            restored
+                .root_budget(&admin, "scope-1")
+                .await
+                .unwrap()
+                .unwrap(),
+            expected_root
+        );
+        let actual_migrations: Vec<(i64,String)> = sqlx::query_as(
+            "SELECT version, lower(hex(checksum)) FROM _sqlx_migrations WHERE success=1 ORDER BY version")
+            .fetch_all(&restored.pool).await.unwrap();
+        assert_eq!(actual_migrations, expected_migrations);
+        for watermark in &manifest.watermarks {
+            let actual: (i64, String) =
+                sqlx::query_as("SELECT seq,digest FROM revoke_watermark WHERE namespace=?")
+                    .bind(&watermark.namespace)
+                    .fetch_one(&restored.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(actual, (watermark.seq, watermark.digest.clone()));
+        }
+        let mut session = restored.session().await.unwrap();
+        let value: Value = session.need(&admin, "artifact", "data").await.unwrap();
+        assert_eq!(value, json!({"id":"data","payload":"full backup data"}));
+        session.commit().await.unwrap();
+        assert_eq!(
+            restored.read_blob(&admin, &blob, 1024).await.unwrap(),
+            b"complete backup blob"
+        );
+        restored.close().await;
+        println!("AG157_REAL_OBSERVATION={NAME}");
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[tokio::test]
+    async fn insecure_backup_parent_refuses_before_temp_creation() {
+        let (directory, store) = db().await;
+        let good = directory.path().join("healthy-backup");
+        store.backup(&good).await.unwrap();
+        let bad_parent = directory.path().join("bad-publish-parent");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&bad_parent)
+            .unwrap();
+        std::fs::set_permissions(&bad_parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let held = store.pool.acquire().await.unwrap();
+        let before = ag157_snapshot(directory.path());
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            store.backup(&bad_parent.join("must-not-exist")),
+        )
+        .await
+        .expect("permission refusal before the held single pool connection")
+        .unwrap_err();
+        assert!(
+            matches!(&error,Error::Invalid(reason) if reason == "data_directory_insecure"),
+            "{error}"
+        );
+        assert_eq!(ag157_snapshot(directory.path()), before);
+        assert_eq!(std::fs::read_dir(&bad_parent).unwrap().count(), 0);
+        drop(held);
+        store.close().await;
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn effective_uid_owner_rule_private_metadata_cases() {
+        for mode in [0o400, 0o600, 0o700] {
+            assert!(permission_private_rule(1001, mode, 1001));
+        }
+        for (owner, mode) in [
+            (1002, 0o600),
+            (0, 0o600),
+            (1001, 0o640),
+            (1001, 0o604),
+            (1001, 0o750),
+        ] {
+            assert!(
+                !permission_private_rule(owner, mode, 1001),
+                "owner={owner} mode={mode:o}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn sticky_ancestor_rule_private_metadata_cases() {
+        assert!(permission_ancestor_rule(0, 0o1777, 1001));
+        assert!(!permission_ancestor_rule(1001, 0o1777, 1001));
+        assert!(!permission_ancestor_rule(1002, 0o700, 1001));
+        assert!(permission_ancestor_rule(0, 0o755, 1001));
+        assert!(permission_ancestor_rule(1001, 0o755, 1001));
+        assert!(!permission_publish_parent_rule(0, 0o1777, 1001));
+        assert!(permission_publish_parent_rule(0, 0o755, 1001));
+    }
+
     // Graph construction stays outside the progress handler's measured region.
     async fn snapshot_blob_chain(session: &mut Session, ctx: &Context, root: &str, nodes: i64) {
         sqlx::query(
@@ -4326,8 +5549,23 @@ mod tests {
     async fn restart_cleans_unpublished_private_blob_staging() {
         let (dir, store) = db().await;
         let staging = dir.path().join(".blob-staging").join(hash(b"n"));
-        std::fs::create_dir_all(&staging).unwrap();
-        std::fs::write(staging.join("orphan.tmp"), b"secret").unwrap();
+        let mut directories = std::fs::DirBuilder::new();
+        directories.recursive(true);
+        #[cfg(unix)]
+        directories.mode(0o700);
+        directories.create(&staging).unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        {
+            use std::io::Write as _;
+            options
+                .open(staging.join("orphan.tmp"))
+                .unwrap()
+                .write_all(b"secret")
+                .unwrap();
+        }
         store.close().await;
         let reopened = Store::open(&dir.path().join("db.sqlite3")).await.unwrap();
         assert!(!dir.path().join(".blob-staging").exists());

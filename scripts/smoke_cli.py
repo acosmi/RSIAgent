@@ -74,6 +74,18 @@ def start_process(*args: Any, **kwargs: Any) -> subprocess.Popen[Any]:
     return subprocess.Popen(*args, **kwargs)
 
 
+def fixture_write_private(path: Path, data: bytes) -> None:
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as writer:
+        writer.write(data)
+
+
+def fixture_copy_private(source: Path, destination: Path) -> None:
+    with source.open("rb") as reader, os.fdopen(
+        os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+    ) as writer:
+        shutil.copyfileobj(reader, writer)
+
+
 def fail(message: str) -> None:
     raise RuntimeError(message)
 
@@ -727,9 +739,9 @@ def smoke_recovery_gate(binary: Path, root: Path) -> None:
     # A restored-looking directory (an existing database and a v2-structured
     # restore.json) without an anchor is quarantined and left untouched.
     restored = root / "restored-shape"
-    restored.mkdir()
-    shutil.copyfile(source, restored / "rsia.sqlite3")
-    (restored / "restore.json").write_text(v2_restore_receipt())
+    restored.mkdir(mode=0o700)
+    fixture_copy_private(source, restored / "rsia.sqlite3")
+    fixture_write_private(restored / "restore.json", v2_restore_receipt().encode())
     before = tree_digest(restored)
     for label, run in (("serve", serve), ("mcp", mcp)):
         quarantined = run(restored / "rsia.sqlite3")
@@ -749,8 +761,8 @@ def smoke_recovery_gate(binary: Path, root: Path) -> None:
 
     # An anchor is only accepted for a restored directory that was not admitted.
     plain = root / "never-restored"
-    plain.mkdir()
-    shutil.copyfile(source, plain / "rsia.sqlite3")
+    plain.mkdir(mode=0o700)
+    fixture_copy_private(source, plain / "rsia.sqlite3")
     before = tree_digest(plain)
     for label, run in (("serve", serve), ("mcp", mcp)):
         rejected = run(plain / "rsia.sqlite3", "--trusted-revocations-db", str(source))
@@ -778,8 +790,9 @@ def restore_inputs(base: Path, source: Path) -> tuple[Path, Path, Path]:
     does not have yet, so one is recorded before the backup is taken.
     """
     live_dir = base / "live"
-    live_dir.mkdir()
+    live_dir.mkdir(mode=0o700)
     live = live_dir / "rsia.sqlite3"
+    fixture_write_private(live, b"")
     # Opening it recovers the WAL the terminated process left behind.
     with sqlite3.connect(source) as connection:
         namespaces = [
@@ -800,8 +813,8 @@ def restore_inputs(base: Path, source: Path) -> tuple[Path, Path, Path]:
         connection.commit()
         connection.execute("VACUUM INTO ?", (str(live),))
     backup = base / "backup"
-    backup.mkdir()
-    shutil.copyfile(live, backup / "rsia.sqlite3")
+    backup.mkdir(mode=0o700)
+    fixture_copy_private(live, backup / "rsia.sqlite3")
     database = (backup / "rsia.sqlite3").read_bytes()
     with sqlite3.connect(live) as connection:
         migrations = [
@@ -833,7 +846,7 @@ def restore_inputs(base: Path, source: Path) -> tuple[Path, Path, Path]:
         },
         indent=2,
     ).encode()
-    (backup / "backup-manifest.json").write_bytes(manifest)
+    fixture_write_private(backup / "backup-manifest.json", manifest)
     delta = base / "delta.json"
     delta.write_text(
         json.dumps(
@@ -898,7 +911,7 @@ def smoke_restore_admission(binary: Path, root: Path) -> None:
     if not source.is_file():
         fail("the MCP smoke database is missing")
     base = root / "restore-e2e"
-    base.mkdir()
+    base.mkdir(mode=0o700)
     base = base.resolve()  # restore_backup.py refuses symlinks in a supplied path
     live, backup, delta = restore_inputs(base, source)
     serve_dir = restore_into(base, "restored-serve", live, backup, delta)
@@ -1026,7 +1039,7 @@ def smoke_bare_data_path(binary: Path, root: Path) -> None:
 
     def start_directory(name: str) -> Path:
         directory = root / name
-        directory.mkdir()
+        directory.mkdir(mode=0o700)
         return directory
 
     def start_serve(directory: Path, bind_port: int, *data: str) -> subprocess.Popen[str]:
@@ -1134,7 +1147,7 @@ def smoke_formal_single_writer(binary: Path, root: Path) -> None:
             fail(f"{label} did not refuse the live writer: {completed!r}")
 
     served = root / "service-versus-formal"
-    served.mkdir()
+    served.mkdir(mode=0o700)
     port = free_port()
     service = start_process([str(binary), "serve", "--bind", f"127.0.0.1:{port}",
         "--data", str(served / "service.sqlite3"), "--namespace", "smoke",],
@@ -1142,8 +1155,9 @@ def smoke_formal_single_writer(binary: Path, root: Path) -> None:
     try:
         wait_http(f"http://127.0.0.1:{port}")
         staging = served / ".blob-staging" / "live-writer"
-        staging.mkdir(parents=True)
-        (staging / "payload.tmp").write_bytes(b"live payload must survive refusal")
+        staging.parent.mkdir(mode=0o700, exist_ok=True)
+        staging.mkdir(mode=0o700)
+        fixture_write_private(staging / "payload.tmp", b"live payload must survive refusal")
         before = tree_digest(served)
         refused = run_process([str(formal)], input=command(served / "other.sqlite3"),
             capture_output=True, text=True, timeout=10)
@@ -1155,8 +1169,9 @@ def smoke_formal_single_writer(binary: Path, root: Path) -> None:
 
     for crash in (False, True):
         directory = root / ("formal-crash-release" if crash else "formal-versus-cli")
-        directory.mkdir()
+        directory.mkdir(mode=0o700)
         data = directory / "formal.sqlite3"
+        fixture_write_private(data, b"")
         blocker = sqlite3.connect(data, timeout=1)
         process = None
         paused = False

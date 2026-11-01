@@ -9819,7 +9819,14 @@ impl PrincipalAuthorityService {
             }
             let (data_lock, gate) = crate::data_directory_lock::mount_gate(&database, None)
                 .await
-                .map_err(|error| Error::Conflict(error.to_string()))?;
+                .map_err(|error| match error {
+                    crate::startup_gate::StartupGateError::Rejected(reason)
+                        if reason == "data_directory_insecure" =>
+                    {
+                        Error::Invalid(reason)
+                    }
+                    other => Error::Conflict(other.to_string()),
+                })?;
             let store = Store::open(&database).await?;
             let owner = OwnedPrincipalAuthority {
                 service,
@@ -9827,8 +9834,14 @@ impl PrincipalAuthorityService {
                 _data_lock: data_lock,
             };
             let result = async {
-                gate.admit()
-                    .map_err(|error| Error::Conflict(error.to_string()))?;
+                gate.admit().map_err(|error| match error {
+                    crate::startup_gate::StartupGateError::Rejected(reason)
+                        if reason == "data_directory_insecure" =>
+                    {
+                        Error::Invalid(reason)
+                    }
+                    other => Error::Conflict(other.to_string()),
+                })?;
                 owner.serve(&socket, connections).await
             }
             .await;
