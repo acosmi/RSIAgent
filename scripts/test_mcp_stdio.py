@@ -78,7 +78,7 @@ def subject_id(tool: str, key: str, namespace: str, actor: str) -> str:
     prefix = {"evo_prepare": "run", "evo_feedback": "feedback", "evo_propose": "candidate"}[tool]
     parts = [namespace, actor]
     if tool == "evo_prepare":
-        parts.append("prepare")
+        parts.append("prepare.v3")
     parts.append(key)
     return f"{prefix}-{hashlib.sha256(chr(0).join(parts).encode()).hexdigest()[:24]}"
 
@@ -370,6 +370,10 @@ class McpStdioTests(unittest.TestCase):
             "tool_only_cannot_claim_attached_or_used",
         ])
         run = prepared["run"]
+        self.assertEqual(
+            run["id"],
+            subject_id("evo_prepare", prepare_args["request_key"], host.namespace, host.actor),
+        )
         self.assertEqual((run["owner"], run["goal"], run["capabilities"]), (host.actor, goal, []))
         self.assertEqual((run["status"], run["source"], run["improver_version"]),
                          ("prepared", "trusted_host_snapshot", "unavailable"))

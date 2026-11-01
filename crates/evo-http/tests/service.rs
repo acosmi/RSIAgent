@@ -4,8 +4,10 @@ use evo_core::evidence::Purpose;
 use evo_core::replay::*;
 use evo_core::strategy::{ActionKindV1, ElasticPolicyV1, ExplorationCapsV1, ObservedStatus};
 use evo_core::{Context, Role, hash};
-use evo_engine::service::{HostPrepareConfig, HostService};
-use evo_http::{AuthIdentity, AuthRegistry, HttpState, router};
+use evo_engine::service::{CompleteHostPrepareConfig, HostPrepareConfig, HostService};
+use evo_http::{
+    AuthIdentity, AuthRegistry, HttpState, TOOL_ROUTE_PATHS, router, typed_route_tool_source,
+};
 use evo_storage::Store;
 use evo_storage::replay::{register_replay_pool, seal_replay_world};
 use reqwest::StatusCode;
@@ -45,13 +47,13 @@ async fn state(auth: AuthRegistry) -> (tempfile::TempDir, HttpState) {
             retired: vec![],
             classifications: vec![evo_core::contract::HostSurfaceClassificationV2 {
                 name: "model".into(),
-                coverage: SurfaceCoverage::Supported,
-                mapped_field: Some("host.model".into()),
-                consumer: Some("runner".into()),
-                reason: "fixed disabled-model software fixture".into(),
+                coverage: SurfaceCoverage::RuntimeOwned,
+                mapped_field: None,
+                consumer: None,
+                reason: "ToolOnly protocol fixture has no native model slot".into(),
                 renamed_from: None,
-                test_ref: Some("existing service integration assertions".into()),
-                capability: Some("fixture-model".into()),
+                test_ref: None,
+                capability: None,
             }],
         },
         None,
@@ -66,7 +68,7 @@ async fn state(auth: AuthRegistry) -> (tempfile::TempDir, HttpState) {
             host_id: "reference-host".into(),
             host_version: "1.0.0".into(),
             model_id: "disabled".into(),
-            tools: vec!["read_config".into()],
+            tools: vec![],
             mandatory_context_digest: d("mandatory"),
         },
         host_surface_id: "reference-surface".into(),
@@ -77,6 +79,11 @@ async fn state(auth: AuthRegistry) -> (tempfile::TempDir, HttpState) {
         evolution_enabled: true,
         capability_level: CapabilityLevel::ToolOnly,
     };
+    let prepare_config = CompleteHostPrepareConfig::from_producer(
+        &prepare_config,
+        typed_route_tool_source().unwrap(),
+    )
+    .unwrap();
     let service = HostService::new(store, host).unwrap();
     let management = evo_engine::dispatch::ManagementDispatcher::new(
         service.store().clone(),
@@ -1625,25 +1632,29 @@ async fn ag147_parent_history_http_state() -> (tempfile::TempDir, Store, Value, 
             Context::new("n", "fixture-host", Role::Host).unwrap(),
         )
         .unwrap(),
-        prepare_config: HostPrepareConfig {
-            profile_id: "unused-read-only-profile".into(),
-            system_snapshot: SystemSnapshot {
-                schema_version: "rsia.system_snapshot.v2".into(),
+        prepare_config: CompleteHostPrepareConfig::from_producer(
+            &HostPrepareConfig {
                 profile_id: "unused-read-only-profile".into(),
-                host_id: "fixture-host".into(),
-                host_version: "1".into(),
-                model_id: "disabled".into(),
-                tools: vec![],
-                mandatory_context_digest: d("unused-read-only-context"),
+                system_snapshot: SystemSnapshot {
+                    schema_version: "rsia.system_snapshot.v2".into(),
+                    profile_id: "unused-read-only-profile".into(),
+                    host_id: "fixture-host".into(),
+                    host_version: "1".into(),
+                    model_id: "disabled".into(),
+                    tools: vec![],
+                    mandatory_context_digest: d("unused-read-only-context"),
+                },
+                host_surface_id: "unused-read-only-surface".into(),
+                host_capabilities: HostCapabilities {
+                    available: BTreeSet::new(),
+                    granted: BTreeSet::new(),
+                },
+                evolution_enabled: false,
+                capability_level: CapabilityLevel::ToolOnly,
             },
-            host_surface_id: "unused-read-only-surface".into(),
-            host_capabilities: HostCapabilities {
-                available: BTreeSet::new(),
-                granted: BTreeSet::new(),
-            },
-            evolution_enabled: false,
-            capability_level: CapabilityLevel::ToolOnly,
-        },
+            typed_route_tool_source().unwrap(),
+        )
+        .unwrap(),
         auth,
         management,
     };
@@ -2322,4 +2333,208 @@ async fn dedicated_job_status_and_cancel_remain_live_without_new_jobs() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(management_sql_snapshot(&path), before);
     server.abort();
+}
+
+#[tokio::test]
+async fn http_typed_route_source_is_server_owned_and_keeps_authentication_order() {
+    let source = typed_route_tool_source().unwrap();
+    assert_eq!(source.domain, "http_protocol");
+    assert_eq!(source.producer_id, "evo-http.typed_routes");
+    assert_eq!(source.producer_version, "rsia.http_typed_routes.v1");
+    let expected_paths = [
+        "/v1/tools/prepare",
+        "/v1/tools/feedback",
+        "/v1/tools/propose",
+        "/v1/tools/inspect",
+    ];
+    assert_eq!(TOOL_ROUTE_PATHS, expected_paths);
+    let schemas = [
+        serde_json::to_value(rmcp::schemars::schema_for!(evo_core::Prepare)).unwrap(),
+        serde_json::to_value(rmcp::schemars::schema_for!(evo_core::Feedback)).unwrap(),
+        serde_json::to_value(rmcp::schemars::schema_for!(evo_core::Proposal)).unwrap(),
+        serde_json::to_value(rmcp::schemars::schema_for!(evo_core::Inspect)).unwrap(),
+    ];
+    for (index, name) in ["evo_prepare", "evo_feedback", "evo_propose", "evo_inspect"]
+        .into_iter()
+        .enumerate()
+    {
+        let definition = &source.definitions[index];
+        assert_eq!(definition["name"], name);
+        assert_eq!(definition["path"], expected_paths[index]);
+        assert_eq!(definition["method"], "POST");
+        assert_eq!(definition["input_schema"], schemas[index]);
+        assert!(
+            serde_json::to_vec(definition).unwrap().len()
+                <= evo_core::contract::V1_TOOL_DESCRIPTOR_MAX
+        );
+    }
+    let (_dir, healthy) = state(registry()).await;
+    let store = healthy.service.store().clone();
+    let (base, server) = spawn(healthy).await;
+    let client = reqwest::Client::new();
+    let response = post(&client, &base, TOOL_ROUTE_PATHS[0], Some(AGENT_A_TOKEN), json!({"request_key":"typed-route-health","goal":"same complete HTTP source","capabilities":[]})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let prepared: Value = response.json().await.unwrap();
+    let run_id = prepared["run"]["id"].as_str().unwrap();
+    let response = post(
+        &client,
+        &base,
+        "/v1/host/snapshot",
+        Some(HOST_TOKEN),
+        json!({"run_id":run_id}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let snapshot: Value = response.json().await.unwrap();
+    assert_eq!(snapshot["schema_version"], "rsia.run_application.v3");
+    assert_eq!(
+        snapshot["system_snapshot"]["tool_source"],
+        serde_json::to_value(&source).unwrap()
+    );
+    let full: evo_core::contract::SystemSnapshotV3 =
+        serde_json::from_value(snapshot["system_snapshot"].clone()).unwrap();
+    let caps: HostCapabilities =
+        serde_json::from_value(snapshot["host_capabilities"].clone()).unwrap();
+    let material: evo_engine::release_store::AppliedRequestMaterial =
+        serde_json::from_value(snapshot["request_material"].clone()).unwrap();
+    let environment = snapshot["environment_digest"].as_str().unwrap();
+    let surface = snapshot["host_surface_digest"].as_str().unwrap();
+    assert_eq!(
+        environment,
+        evo_core::canonical_fingerprint(&("rsia.tool_capability_environment.v3", &full, &caps))
+            .unwrap()
+    );
+    assert_eq!(
+        snapshot["request_digest"],
+        evo_core::canonical_fingerprint(&(
+            "rsia.applied_request.v3",
+            &material,
+            environment,
+            surface,
+            evo_core::fingerprint(&caps).unwrap()
+        ))
+        .unwrap()
+    );
+    let response = post(&client, &base, TOOL_ROUTE_PATHS[1], Some(AGENT_A_TOKEN), json!({"request_key":"typed-route-feedback","run_id":run_id,"outcome":"failure","details":"software HTTP source control","failure_class":"reasoning"})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let feedback: Value = response.json().await.unwrap();
+    let response = post(&client, &base, TOOL_ROUTE_PATHS[2], Some(AGENT_A_TOKEN), json!({"request_key":"typed-route-proposal","run_id":run_id,"kind":"skill","parent_snapshot":prepared["run"]["snapshot_id"],"hypothesis":"software fixture hypothesis","applicability":"software HTTP fixture","counterexample":"different source","content":"offered fixture content","evidence_refs":[feedback["id"]],"required_capabilities":[],"dependencies":[]})).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let proposal: Value = response.json().await.unwrap();
+    let response = post(
+        &client,
+        &base,
+        TOOL_ROUTE_PATHS[3],
+        Some(AGENT_A_TOKEN),
+        json!({"kind":"candidate","id":proposal["id"]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap()["state"], "proposed");
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    store.close().await;
+
+    let (dir, mut mismatched) = state(registry()).await;
+    mismatched
+        .prepare_config
+        .system_snapshot
+        .tool_source
+        .definitions[0]["input_schema"]["description"] =
+        json!("same name, changed typed definition");
+    mismatched.prepare_config.validate().unwrap();
+    let store = mismatched.service.store().clone();
+    let before = management_sql_snapshot(&dir.path().join("http.sqlite3"));
+    let (base, server) = spawn(mismatched).await;
+    let response = client
+        .post(format!("{base}{}", TOOL_ROUTE_PATHS[0]))
+        .header("content-type", "application/json")
+        .body("{")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"bearer_token_required"}})
+    );
+    let response = raw_post(
+        &client,
+        &base,
+        TOOL_ROUTE_PATHS[0],
+        "wrong-token-0123456789",
+        "{",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"invalid_bearer_token"}})
+    );
+    let response = client
+        .post(format!("{base}{}", TOOL_ROUTE_PATHS[0]))
+        .bearer_auth(AGENT_A_TOKEN)
+        .header("x-role", "admin")
+        .body("{")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"identity_headers_forbidden"}})
+    );
+    let response = raw_post(&client, &base, TOOL_ROUTE_PATHS[0], AGENT_A_TOKEN, "{").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"invalid_prepare_payload"}})
+    );
+    let response = post(
+        &client,
+        &base,
+        TOOL_ROUTE_PATHS[0],
+        Some(AGENT_A_TOKEN),
+        json!({"role":"admin"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"body_identity_forbidden"}})
+    );
+    let request = json!({"request_key":"mismatched-source","goal":"refuse before any prepare writes","capabilities":[]});
+    let response = post(
+        &client,
+        &base,
+        TOOL_ROUTE_PATHS[0],
+        Some(ADMIN_TOKEN),
+        request.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"forbidden"}})
+    );
+    let response = post(
+        &client,
+        &base,
+        TOOL_ROUTE_PATHS[0],
+        Some(AGENT_A_TOKEN),
+        request,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"conflict"}})
+    );
+    assert_eq!(
+        management_sql_snapshot(&dir.path().join("http.sqlite3")),
+        before
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+    store.close().await;
 }

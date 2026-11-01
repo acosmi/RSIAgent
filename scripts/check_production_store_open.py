@@ -175,7 +175,7 @@ def check_tree(root: Path) -> list[str]:
     if len(authorities)!=1 or re.sub(r"\s+","",authorities[0]).replace(",)",")")!=expected_authority:
         errors.append("formal host authority must only call the unique owned entry")
     signature=re.search(r"pub\s+async\s+fn\s+serve_owned\s*\(([^{}]*)\)\s*->\s*Result<Value>\s*\{",formal)
-    expected_parameters="database:std::path::PathBuf,host:RegisteredFormalHost,principals:RegisteredPrincipalSet,socket:std::path::PathBuf,connections:u16"
+    expected_parameters="database:std::path::PathBuf,host:LoadedRegisteredFormalHost,principals:RegisteredPrincipalSet,socket:std::path::PathBuf,connections:u16"
     if signature is None or re.sub(r"\s+","",signature[1]).rstrip(",")!=expected_parameters:
         errors.append("owned entry cannot accept an external Store, guard or authority flag")
     if sum(len(re.findall(r"\bserve_owned\s*\(",code)) for code in contents.values())!=2:

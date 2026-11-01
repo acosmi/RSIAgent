@@ -4,14 +4,15 @@ use evo_core::contract::{
     CapabilityLevel, CompileParts, HostCapabilities, HostSurfaceClassificationV2,
     HostSurfaceManifest, HostSurfaceRegistrationV2, ImproverPatch, Profile,
     ReviewedHostSourceEnvelopeV1, SkillPatch, SkillSnapshot, SurfaceCoverage, SurfaceItem,
-    SystemSnapshot,
+    SystemSnapshot, SystemSnapshotV3, ToolSourceV1,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::{Context, Error, Role, Strategy, hash};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::release_store::{
-    AppliedRequestMaterial, CurrentReleaseCandidateRecord as ReleaseCandidateRecord,
+    AppliedRequestMaterial, CompletePrepareRunRequest,
+    CurrentReleaseCandidateRecord as ReleaseCandidateRecord,
     CurrentStageBundleRequest as StageBundleRequest, HostSurfaceRecord, HostSurfaceRecordV2,
     PersistentRelease, PersistentReleaseState, PrepareRunRequest, ReleaseStore,
     RunApplicationSnapshot, TrustedHostExecutionEvidence, TypedSourceRef,
@@ -71,6 +72,30 @@ fn system(profile_id: &str) -> SystemSnapshot {
         model_id: "model-v1".into(),
         tools: vec!["tool-a".into()],
         mandatory_context_digest: d("mandatory"),
+    }
+}
+
+fn complete_system(profile_id: &str) -> SystemSnapshotV3 {
+    let legacy = system(profile_id);
+    let source = ToolSourceV1 {
+        schema_version: evo_core::contract::TOOL_SOURCE_SCHEMA.into(),
+        domain: "mcp_protocol".into(),
+        producer_id: "rmcp.ToolRouter.list_all".into(),
+        producer_version: "rmcp-3.3.0".into(),
+        definitions: serde_json::from_str(include_str!(
+            "fixtures/ag168-actual-mcp-descriptors.json"
+        ))
+        .unwrap(),
+    };
+    SystemSnapshotV3 {
+        schema_version: "rsia.system_snapshot.v3".into(),
+        profile_id: legacy.profile_id,
+        host_id: legacy.host_id,
+        host_version: legacy.host_version,
+        model_id: legacy.model_id,
+        tools: source.names().unwrap(),
+        mandatory_context_digest: legacy.mandatory_context_digest,
+        tool_source: source,
     }
 }
 
@@ -410,13 +435,13 @@ async fn raw_host_claims_cannot_turn_zero_skill_or_tool_only_into_used() {
     let admin = ctx("n", "admin", Role::Admin);
     let host = ctx("n", "host", Role::Host);
     register_surface(&admin, &store, "surface-1").await;
-    let run = ReleaseStore::prepare_run(
+    let run = ReleaseStore::prepare_complete_run(
         &host,
         &store,
-        PrepareRunRequest {
+        CompletePrepareRunRequest {
             run_id: "run-a".into(),
             profile_id: "p1".into(),
-            system_snapshot: system("p1"),
+            system_snapshot: complete_system("p1"),
             host_surface_id: "surface-1".into(),
             host_capabilities: HostCapabilities {
                 available: BTreeSet::new(),
@@ -1210,13 +1235,13 @@ async fn legacy_baseline_reload_and_replay_cannot_authorize_new_applied_request(
     assert_eq!(serde_json::to_vec(&reloaded).unwrap(), wire);
 
     register_surface(&admin, &store, "surface-current").await;
-    let current = ReleaseStore::prepare_run(
+    let current = ReleaseStore::prepare_complete_run(
         &host,
         &store,
-        PrepareRunRequest {
+        CompletePrepareRunRequest {
             run_id: "current-baseline".into(),
             profile_id: "p1".into(),
-            system_snapshot: system,
+            system_snapshot: complete_system("p1"),
             host_surface_id: "surface-current".into(),
             host_capabilities: capabilities,
             task_input_digest: d("current-task"),
@@ -1226,7 +1251,7 @@ async fn legacy_baseline_reload_and_replay_cannot_authorize_new_applied_request(
     )
     .await
     .unwrap();
-    assert!(current.current_v2().is_some());
+    assert!(current.current_v3().is_some());
     let applied = ReleaseStore::record_applied_request(
         &host,
         &store,

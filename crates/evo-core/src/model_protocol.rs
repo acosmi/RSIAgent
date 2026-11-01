@@ -97,6 +97,31 @@ fn message(role: ChatRole, content: &str) -> Result<Value> {
     Ok(json!({"role": role, "content": content}))
 }
 
+/// This compiled adapter builds four text-only request fields below and consumes
+/// text responses. It implements no native tool dispatch. This says nothing
+/// about the native capabilities of an external host using another adapter.
+pub fn registered_chat_wire_v1_tool_source() -> crate::contract::ToolSourceV1 {
+    crate::contract::ToolSourceV1 {
+        schema_version: crate::contract::TOOL_SOURCE_SCHEMA.into(),
+        domain: "registered_chat_wire_v1_adapter".into(),
+        producer_id: "evo-engine.RegisteredExternalTransport".into(),
+        producer_version: "rsia.chat_wire_v1.native_tool_contract.v1".into(),
+        definitions: Vec::new(),
+    }
+}
+
+pub fn verify_registered_chat_wire_v1_snapshot(
+    snapshot: &crate::contract::SystemSnapshotV3,
+) -> Result<()> {
+    snapshot.validate()?;
+    if snapshot.tool_source != registered_chat_wire_v1_tool_source() || !snapshot.tools.is_empty() {
+        return Err(Error::Conflict(
+            "registered adapter native tool source differs".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_chat_payload_v1(
     provider: &ChatProviderProjectionInput,
     messages: Vec<Value>,

@@ -6,10 +6,11 @@
 //! frames to rmcp, so typed tool dispatch never sees a last-wins JSON object.
 
 use evo_core::contract::{
-    MODEL_TOOLS, V1_TOOL_DESCRIPTOR_MAX, model_tool_names, reject_admin_as_model_tool,
+    MODEL_TOOLS, TOOL_SOURCE_SCHEMA, ToolSourceV1, V1_TOOL_DESCRIPTOR_MAX, model_tool_names,
+    reject_admin_as_model_tool,
 };
 use evo_core::{Context, Error, Feedback, Inspect, Prepare, Proposal, Result as CoreResult, Role};
-use evo_engine::service::{HostPrepareConfig, HostService};
+use evo_engine::service::{CompleteHostPrepareConfig, HostPrepareConfig, HostService};
 use rmcp::{
     RoleServer, ServerHandler, ServiceExt,
     handler::server::{
@@ -46,7 +47,7 @@ pub fn reject_if_admin(name: &str) -> CoreResult<()> {
 pub struct McpHost {
     service: HostService,
     caller: Context,
-    prepare_config: HostPrepareConfig,
+    prepare_config: CompleteHostPrepareConfig,
     tool_router: ToolRouter<Self>,
 }
 
@@ -62,12 +63,45 @@ impl McpHost {
             return Err(Error::Forbidden);
         }
         prepare_config.validate()?;
+        let tool_router = Self::tool_router();
+        let prepare_config = CompleteHostPrepareConfig::from_producer(
+            &prepare_config,
+            router_tool_source(&tool_router)?,
+        )?;
         Ok(Self {
             service,
             caller,
             prepare_config,
-            tool_router: Self::tool_router(),
+            tool_router,
         })
+    }
+    /// Production constructor for an already complete startup configuration.
+    /// The actual router, rather than caller-supplied JSON, owns its source.
+    pub fn new_complete(
+        service: HostService,
+        caller: Context,
+        prepare_config: CompleteHostPrepareConfig,
+    ) -> CoreResult<Self> {
+        caller.require(&[Role::Agent])?;
+        if caller.namespace() != service.trusted_namespace() {
+            return Err(Error::Forbidden);
+        }
+        prepare_config.validate()?;
+        let tool_router = Self::tool_router();
+        if prepare_config.system_snapshot.tool_source != router_tool_source(&tool_router)? {
+            return Err(Error::Conflict(
+                "MCP complete source differs from actual router".into(),
+            ));
+        }
+        Ok(Self {
+            service,
+            caller,
+            prepare_config,
+            tool_router,
+        })
+    }
+    pub fn tool_source(&self) -> &ToolSourceV1 {
+        &self.prepare_config.system_snapshot.tool_source
     }
     #[tool(
         name = "evo_prepare",
@@ -76,7 +110,7 @@ impl McpHost {
     async fn evo_prepare(&self, Parameters(request): Parameters<Prepare>) -> CallToolResult {
         match self
             .service
-            .prepare(&self.caller, request, &self.prepare_config)
+            .prepare_complete(&self.caller, request, &self.prepare_config)
             .await
         {
             Ok(value) => structured(value),
@@ -149,8 +183,8 @@ impl ServerHandler for McpHost {
     }
 }
 
-pub fn tool_descriptors() -> CoreResult<Vec<Value>> {
-    let tools = McpHost::tool_router().list_all();
+fn router_tool_source(router: &ToolRouter<McpHost>) -> CoreResult<ToolSourceV1> {
+    let tools = router.list_all();
     if tools.len() != TOOL_COUNT
         || !tools
             .iter()
@@ -158,7 +192,7 @@ pub fn tool_descriptors() -> CoreResult<Vec<Value>> {
     {
         return Err(Error::Internal);
     }
-    tools
+    let definitions = tools
         .into_iter()
         .map(|tool| {
             let value = serde_json::to_value(tool).map_err(|_| Error::Internal)?;
@@ -170,7 +204,20 @@ pub fn tool_descriptors() -> CoreResult<Vec<Value>> {
             }
             Ok(value)
         })
-        .collect()
+        .collect::<CoreResult<Vec<_>>>()?;
+    let source = ToolSourceV1 {
+        schema_version: TOOL_SOURCE_SCHEMA.into(),
+        domain: "mcp_protocol".into(),
+        producer_id: "rmcp.ToolRouter.list_all".into(),
+        producer_version: "rmcp-3.3.0".into(),
+        definitions,
+    };
+    source.validate()?;
+    Ok(source)
+}
+/// Descriptor utility only. Actual advertisement/prepare use the instance router.
+pub fn tool_descriptors() -> CoreResult<Vec<Value>> {
+    Ok(router_tool_source(&McpHost::tool_router())?.definitions)
 }
 
 pub async fn serve_stdio(
