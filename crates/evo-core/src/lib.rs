@@ -8,6 +8,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub mod clock;
 pub mod contract;
 pub mod curriculum;
+pub mod direction_hint;
 pub mod evaluation;
 pub mod evidence;
 pub mod features;
