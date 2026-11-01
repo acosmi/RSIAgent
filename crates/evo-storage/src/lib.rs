@@ -5489,7 +5489,21 @@ mod tests {
                 "run",
                 "run-1",
                 admin.actor(),
-                &json!({"id":"run-1","marker":"source"}),
+                &json!({
+                    "schema_version": "rsia.optimization.source.v1",
+                    "record": {
+                        "id": "run-1", "body": b"source".to_vec(),
+                        "parent_family": "ag157-backup-fixture",
+                        "task_origin": "trusted_run", "execution_attestation": "trusted_host",
+                        "purpose": "development"
+                    },
+                    "trace": {
+                        "run_id": "run-1", "parent_family": "ag157-backup-fixture",
+                        "source_digest": hash(b"source"), "purpose": "development",
+                        "outcome": "success", "diagnosis": null, "excerpt": "source", "seed": 1
+                    },
+                    "excerpt_start": 0, "excerpt_end": 6
+                }),
             )
             .await
             .unwrap();
