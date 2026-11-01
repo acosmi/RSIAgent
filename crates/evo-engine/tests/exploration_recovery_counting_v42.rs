@@ -1946,7 +1946,7 @@ async fn expect_status_conflict(
     assert!(
         matches!(result, Err(Error::Conflict(_))),
         "{what}: expected a Conflict, got {:?}",
-        result.map(|job| job.state)
+        result.map(|job| job.identity().state)
     );
 }
 

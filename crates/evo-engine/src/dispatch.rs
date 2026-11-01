@@ -616,12 +616,10 @@ impl ManagementDispatcher {
                     Err(error) => {
                         tracing::error!(job_id = %job_id, error = %error, "management background supervisor failed");
                         if !matches!(&error, Error::Conflict(reason) if reason == "management job lease fence changed")
-                        {
-                            if let Err(record_error) =
+                            && let Err(record_error) =
                                 dispatcher.record_background_error(&job_id, &error).await
-                            {
-                                tracing::error!(job_id = %job_id, error = %record_error, "management supervisor diagnostic unavailable");
-                            }
+                        {
+                            tracing::error!(job_id = %job_id, error = %record_error, "management supervisor diagnostic unavailable");
                         }
                         break;
                     }
@@ -1932,10 +1930,10 @@ impl WorkerControl {
         self.stop_new_steps.store(true, Ordering::Release);
     }
     fn stop_with_error(&self, error: Error) {
-        if let Ok(mut reason) = self.stop_error.lock() {
-            if reason.is_none() {
-                *reason = Some(error);
-            }
+        if let Ok(mut reason) = self.stop_error.lock()
+            && reason.is_none()
+        {
+            *reason = Some(error);
         }
         self.stop();
     }
@@ -3454,15 +3452,15 @@ async fn optimization_historical_accounting_in_session(
         {
             return Ok(None);
         }
-        if reference.kind == "step_prepared" {
-            if reference.request_id != step_request || step.replace(reference).is_some() {
-                return Ok(None);
-            }
+        if reference.kind == "step_prepared"
+            && (reference.request_id != step_request || step.replace(reference).is_some())
+        {
+            return Ok(None);
         }
-        if reference.kind == "step_completed" {
-            if reference.request_id != step_request || completed.replace(reference).is_some() {
-                return Ok(None);
-            }
+        if reference.kind == "step_completed"
+            && (reference.request_id != step_request || completed.replace(reference).is_some())
+        {
+            return Ok(None);
         }
         if reference.kind == "edit_compiled" {
             compiled_refs.push(reference.clone());
@@ -3632,10 +3630,9 @@ fn optimization_accounting_progress(
     record: &VersionedManagementJob,
 ) -> Result<ConsumerProgress> {
     if let Some(terminal) = &facts.terminal {
-        return Ok(ConsumerProgress::Committed(optimization_terminal_outcome(
-            terminal,
-            &facts.compiled,
-        )?));
+        return Ok(ConsumerProgress::Committed(Box::new(
+            optimization_terminal_outcome(terminal, &facts.compiled)?,
+        )));
     }
     if facts.historical_terminal {
         let VersionedManagementJob::V2(job) = record else {
@@ -3644,15 +3641,17 @@ fn optimization_accounting_progress(
         let Some(target) = job.pending_terminal_state else {
             return Ok(ConsumerProgress::Unknown);
         };
-        return Ok(ConsumerProgress::Committed(JobOutcome {
+        return Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
             state: restored_terminal(target),
             step: job.step.clone(),
             result: job.result.clone(),
             error_code: job.error_code.clone(),
-        }));
+        })));
     }
     if !facts.compiled.is_empty() || !facts.historical_compiled.is_empty() {
-        return Ok(ConsumerProgress::Committed(optimization_partial_outcome()));
+        return Ok(ConsumerProgress::Committed(Box::new(
+            optimization_partial_outcome(),
+        )));
     }
     Ok(ConsumerProgress::NotCommitted)
 }
@@ -3672,7 +3671,7 @@ async fn optimization_accounting_or_unknown(
 #[derive(Debug)]
 enum ConsumerProgress {
     NotCommitted,
-    Committed(JobOutcome),
+    Committed(Box<JobOutcome>),
     Unknown,
 }
 
@@ -3721,12 +3720,12 @@ async fn consumer_progress(
         {
             return Ok(ConsumerProgress::Unknown);
         }
-        return Ok(ConsumerProgress::Committed(JobOutcome {
+        return Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
             state: ManagementJobState::Succeeded,
             step: job.step.clone(),
             result: job.result.clone(),
             error_code: None,
-        }));
+        })));
     }
     if record.identity().operation == "optimization.step" {
         let mut session = store.session().await?;
@@ -3743,9 +3742,11 @@ async fn consumer_progress(
         .await
         .map_err(InputFault::into_error)?;
     validate_request_authority(ctx, &request)?;
-    let mut sources = store.session().await?;
-    ensure_dependencies_live(ctx, &mut sources, &private_dependencies(&request)?).await?;
-    sources.commit().await?;
+    if !matches!(&request, ParsedRequest::ReplayRun(_)) {
+        let mut sources = store.session().await?;
+        ensure_dependencies_live(ctx, &mut sources, &private_dependencies(&request)?).await?;
+        sources.commit().await?;
+    }
     match request {
         ParsedRequest::ExperimentRegister(request) => {
             let mut session = store.session().await?;
@@ -3793,19 +3794,21 @@ async fn consumer_progress(
             }
             match (progress.control_digest, progress.holdout_digest) {
                 (None, None) => Ok(ConsumerProgress::NotCommitted),
-                (Some(control_digest), None) => Ok(ConsumerProgress::Committed(JobOutcome {
-                    state: ManagementJobState::Blocked,
-                    step: "control_registered".into(),
-                    result: Some(ManagementResultV2::Partial(
-                        ManagementPartialResultV2::ControlRegistered {
-                            control_id: request.control.id,
-                            control_digest,
-                        },
-                    )),
-                    error_code: Some("blocked_partial_commit".into()),
-                })),
+                (Some(control_digest), None) => {
+                    Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                        state: ManagementJobState::Blocked,
+                        step: "control_registered".into(),
+                        result: Some(ManagementResultV2::Partial(
+                            ManagementPartialResultV2::ControlRegistered {
+                                control_id: request.control.id,
+                                control_digest,
+                            },
+                        )),
+                        error_code: Some("blocked_partial_commit".into()),
+                    })))
+                }
                 (Some(control_digest), Some(holdout_digest)) => {
-                    Ok(ConsumerProgress::Committed(JobOutcome {
+                    Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
                         state: ManagementJobState::Succeeded,
                         step: "experiment_registered".into(),
                         result: Some(ManagementResultV2::Original(
@@ -3817,7 +3820,7 @@ async fn consumer_progress(
                             },
                         )),
                         error_code: None,
-                    }))
+                    })))
                 }
                 _ => Err(Error::Conflict(
                     "holdout exists without its registered control".into(),
@@ -3867,7 +3870,7 @@ async fn consumer_progress(
                     {
                         return Ok(ConsumerProgress::Unknown);
                     }
-                    Ok(ConsumerProgress::Committed(JobOutcome {
+                    Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
                         state: ManagementJobState::Succeeded,
                         step: if record.identity().schema_version
                             == evo_storage::MANAGEMENT_JOB_V2_SCHEMA
@@ -3887,7 +3890,7 @@ async fn consumer_progress(
                             },
                         )),
                         error_code: None,
-                    }))
+                    })))
                 }
                 _ => Err(Error::Conflict(
                     "holdout exists without its registered control".into(),
@@ -3906,7 +3909,7 @@ async fn consumer_progress(
             else {
                 return Ok(ConsumerProgress::NotCommitted);
             };
-            Ok(ConsumerProgress::Committed(JobOutcome {
+            Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
                 state: ManagementJobState::Blocked,
                 step: "ticket_issued_execution_blocked".into(),
                 result: Some(ManagementResultV2::Original(
@@ -3915,7 +3918,7 @@ async fn consumer_progress(
                     },
                 )),
                 error_code: Some("execution_provider_unconfigured".into()),
-            }))
+            })))
         }
         ParsedRequest::EvaluationStatus(request) => {
             // This is the real full read-only consumer. It does not claim the
@@ -3952,11 +3955,20 @@ async fn consumer_progress(
             };
             for id in ids {
                 let mut session = store.session().await?;
-                let present =
-                    evo_storage::replay::replay_report_version_in_session(&mut session, ctx, &id)
-                        .await
-                        .map_err(crate::replay::replay_read_isolation_for_existing_api)?
-                        .is_some();
+                let present = match evo_storage::replay::replay_report_version_in_session(
+                    &mut session,
+                    ctx,
+                    &id,
+                )
+                .await
+                {
+                    Ok(Some(_)) => true,
+                    Err(evo_core::replay::ReplayReadIsolation::Source(Error::NotFound)) => false,
+                    Ok(None) => return Ok(ConsumerProgress::Unknown),
+                    Err(error) => {
+                        return Err(crate::replay::replay_read_isolation_for_existing_api(error));
+                    }
+                };
                 session.commit().await?;
                 if !present {
                     continue;
@@ -3994,7 +4006,7 @@ async fn consumer_progress(
                 {
                     return Err(Error::Conflict("replay report view digest mismatch".into()));
                 }
-                return Ok(ConsumerProgress::Committed(JobOutcome {
+                return Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
                     state: ManagementJobState::Succeeded,
                     step: "replay_stored".into(),
                     result: Some(ManagementResultV2::Original(
@@ -4005,12 +4017,13 @@ async fn consumer_progress(
                         },
                     )),
                     error_code: None,
-                }));
+                })));
             }
-            // Both exact producer report identities are absent after the real
-            // private request/source gate. This offline adapter has not stored
-            // its business effect; an absent pool is a producer failure, not a
-            // reason to invent an indefinitely in-flight provider execution.
+            // The bound private request and both exact producer report reads
+            // prove no report commit. This adapter only recomputes locally and
+            // writes that report in one final transaction; it has no provider
+            // execution to drain. Its new-use pool/source gates remain in the
+            // producer, not in this historical effect lookup.
             Ok(ConsumerProgress::NotCommitted)
         }
         ParsedRequest::CurriculumStep(request) => {
@@ -4111,7 +4124,7 @@ async fn consumer_progress(
             {
                 return Ok(ConsumerProgress::Unknown);
             }
-            Ok(ConsumerProgress::Committed(JobOutcome {
+            Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
                 state: ManagementJobState::Succeeded,
                 step: "probe_scheduled".into(),
                 result: Some(ManagementResultV2::Original(
@@ -4122,7 +4135,7 @@ async fn consumer_progress(
                     },
                 )),
                 error_code: None,
-            }))
+            })))
         }
         ParsedRequest::ExplorationStart(request) => {
             let physical = crate::exploration::exploration_world_storage_id(&request.world.id)?;
@@ -4148,7 +4161,7 @@ async fn consumer_progress(
                     "exploration decision view differs from the stored result".into(),
                 ));
             }
-            Ok(ConsumerProgress::Committed(JobOutcome {
+            Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
                 state: ManagementJobState::Succeeded,
                 step: "exploration_started".into(),
                 result: Some(ManagementResultV2::Original(
@@ -4163,7 +4176,7 @@ async fn consumer_progress(
                     },
                 )),
                 error_code: None,
-            }))
+            })))
         }
         ParsedRequest::OptimizationStep(_) => Err(Error::Internal),
         ParsedRequest::Blocked(request) => {
@@ -4476,42 +4489,42 @@ impl ManagementDispatcher {
             }
             if let Some(facts) = &accounting {
                 let actual = optimization_accounting_progress(facts, &current_record)?;
-                if let ConsumerProgress::Committed(outcome) = actual {
-                    if progress_preserves_committed_result(
+                if let ConsumerProgress::Committed(outcome) = actual
+                    && progress_preserves_committed_result(
                         current.result.as_ref(),
                         &ConsumerProgress::Committed(outcome.clone()),
-                    )? && (facts.terminal.is_some() || facts.historical_terminal)
-                    {
-                        let original_token = current.lease_token.clone();
-                        let original_until = current.lease_until;
-                        apply_completed_outcome(&mut current, &outcome)?;
-                        if facts.pending() {
-                            current.pending_terminal_state = pending_terminal(current.state);
-                            current.state = ManagementJobState::Draining;
-                            current.lease_token = original_token;
-                            current.lease_until = original_until;
-                        }
-                        if fingerprint(&current)? != before {
-                            now()?;
-                            session
-                                .put(ctx, "job", &current.id, ctx.actor(), &current)
-                                .await?;
-                            session
-                                .audit(
-                                    ctx,
-                                    if current.state == ManagementJobState::Draining {
-                                        "management.job.draining"
-                                    } else {
-                                        "management.job.finish"
-                                    },
-                                    &current.id,
-                                )
-                                .await?;
-                        }
-                        let state = current.state;
-                        session.commit().await?;
-                        return Ok(state);
+                    )?
+                    && (facts.terminal.is_some() || facts.historical_terminal)
+                {
+                    let original_token = current.lease_token.clone();
+                    let original_until = current.lease_until;
+                    apply_completed_outcome(&mut current, &outcome)?;
+                    if facts.pending() {
+                        current.pending_terminal_state = pending_terminal(current.state);
+                        current.state = ManagementJobState::Draining;
+                        current.lease_token = original_token;
+                        current.lease_until = original_until;
                     }
+                    if fingerprint(&current)? != before {
+                        now()?;
+                        session
+                            .put(ctx, "job", &current.id, ctx.actor(), &current)
+                            .await?;
+                        session
+                            .audit(
+                                ctx,
+                                if current.state == ManagementJobState::Draining {
+                                    "management.job.draining"
+                                } else {
+                                    "management.job.finish"
+                                },
+                                &current.id,
+                            )
+                            .await?;
+                    }
+                    let state = current.state;
+                    session.commit().await?;
+                    return Ok(state);
                 }
             }
             let pre_consumer_exit = matches!(
@@ -4540,33 +4553,33 @@ impl ManagementDispatcher {
                     current.lease_token = original_token;
                     current.lease_until = original_until;
                 }
-                if let ObservedWorkerExit::Failed(code) = observed {
-                    if let Some(facts) = &accounting {
-                        if !facts.compiled.is_empty() || !facts.historical_compiled.is_empty() {
-                            current.pending_terminal_state =
-                                Some(ManagementPendingTerminalState::Blocked);
-                            current.step = "optimization_partial_commit".into();
-                            current.error_code = Some("blocked_partial_commit".into());
-                        } else if facts.terminal.is_none()
-                            && !facts.historical_terminal
-                            && !stored_result_has_side_effect(current.result.as_ref())
-                        {
-                            current.pending_terminal_state = Some(if current.cancel_requested {
-                                ManagementPendingTerminalState::Cancelled
-                            } else {
-                                ManagementPendingTerminalState::Failed
-                            });
-                            current.step = if current.cancel_requested {
-                                "cancelled".into()
-                            } else {
-                                "worker_exited_before_commit".into()
-                            };
-                            current.error_code = Some(if current.cancel_requested {
-                                "cancelled".into()
-                            } else {
-                                code.clone()
-                            });
-                        }
+                if let ObservedWorkerExit::Failed(code) = observed
+                    && let Some(facts) = &accounting
+                {
+                    if !facts.compiled.is_empty() || !facts.historical_compiled.is_empty() {
+                        current.pending_terminal_state =
+                            Some(ManagementPendingTerminalState::Blocked);
+                        current.step = "optimization_partial_commit".into();
+                        current.error_code = Some("blocked_partial_commit".into());
+                    } else if facts.terminal.is_none()
+                        && !facts.historical_terminal
+                        && !stored_result_has_side_effect(current.result.as_ref())
+                    {
+                        current.pending_terminal_state = Some(if current.cancel_requested {
+                            ManagementPendingTerminalState::Cancelled
+                        } else {
+                            ManagementPendingTerminalState::Failed
+                        });
+                        current.step = if current.cancel_requested {
+                            "cancelled".into()
+                        } else {
+                            "worker_exited_before_commit".into()
+                        };
+                        current.error_code = Some(if current.cancel_requested {
+                            "cancelled".into()
+                        } else {
+                            code.clone()
+                        });
                     }
                 }
                 current.state = ManagementJobState::Draining;
@@ -4602,19 +4615,19 @@ impl ManagementDispatcher {
                     current.state = ManagementJobState::Draining;
                     // Existing step/result/error/refs stay intact. No guessed
                     // terminal, no new dispatch and no empty-fee completion.
-                    if let ObservedWorkerExit::Failed(code) = observed {
-                        if !current.diagnostics.last().is_some_and(|last| {
+                    if let ObservedWorkerExit::Failed(code) = observed
+                        && !current.diagnostics.last().is_some_and(|last| {
                             last.code == *code && last.observed_generation == current.generation
-                        }) {
-                            if current.diagnostics.len() >= 32 {
-                                current.diagnostics.remove(0);
-                            }
-                            current.diagnostics.push(ManagementDiagnostic {
-                                code: code.clone(),
-                                observed_generation: current.generation,
-                                recorded_at: _at,
-                            });
+                        })
+                    {
+                        if current.diagnostics.len() >= 32 {
+                            current.diagnostics.remove(0);
                         }
+                        current.diagnostics.push(ManagementDiagnostic {
+                            code: code.clone(),
+                            observed_generation: current.generation,
+                            recorded_at: _at,
+                        });
                     }
                 }
                 ConsumerProgress::Committed(mut outcome) => {
@@ -4653,7 +4666,17 @@ impl ManagementDispatcher {
                             ObservedWorkerExit::Failed(code) => code.clone(),
                             _ => "management_worker_exited".into(),
                         };
-                        ("worker_exited_before_commit", code)
+                        let step = if current.operation == "replay.run"
+                            && current.step == "before_replay_run"
+                            && matches!(observed, ObservedWorkerExit::Failed(code) if code == "not_found")
+                        {
+                            // NotCommitted already proved both exact report
+                            // identities absent for this offline producer.
+                            "failed"
+                        } else {
+                            "worker_exited_before_commit"
+                        };
+                        (step, code)
                     };
                     let outcome = JobOutcome {
                         state: if current.cancel_requested {

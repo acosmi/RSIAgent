@@ -1157,13 +1157,13 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
             lease_until,
             now,
         };
-        if let Some(claim) = management {
-            if let Err(error) = claim.admit_new(&mut session).await {
-                if let Some(response) = management_pre_commit_refusal(&request, &error) {
-                    return Ok(response);
-                }
-                return Err(error);
+        if let Some(claim) = management
+            && let Err(error) = claim.admit_new(&mut session).await
+        {
+            if let Some(response) = management_pre_commit_refusal(&request, &error) {
+                return Ok(response);
             }
+            return Err(error);
         }
         let mut call = match session
             .reserve_budget_call_with_sources_typed(&ctx, &reservation, &source_ids)
@@ -1211,8 +1211,8 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                     &format!("{PRE_DISPATCH_REASON_PREFIX}{reason}"),
                 )
                 .await?;
-            if let Some(claim) = management {
-                if let Err(error) = claim
+            if let Some(claim) = management
+                && let Err(error) = claim
                     .record_call(
                         &mut session,
                         ctx.actor(),
@@ -1222,12 +1222,11 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                         &artifact,
                     )
                     .await
-                {
-                    if let Some(response) = management_pre_commit_refusal(&request, &error) {
-                        return Ok(response);
-                    }
-                    return Err(error);
+            {
+                if let Some(response) = management_pre_commit_refusal(&request, &error) {
+                    return Ok(response);
                 }
+                return Err(error);
             }
             session.commit().await?;
             return Ok(undispatched_terminal_response(&request, &released));
@@ -1242,8 +1241,8 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                             &format!("{PRE_DISPATCH_REASON_PREFIX}{}", refusal.code()),
                         )
                         .await?;
-                    if let Some(claim) = management {
-                        if let Err(error) = claim
+                    if let Some(claim) = management
+                        && let Err(error) = claim
                             .record_call(
                                 &mut session,
                                 ctx.actor(),
@@ -1253,21 +1252,19 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                                 &artifact,
                             )
                             .await
-                        {
-                            if let Some(response) = management_pre_commit_refusal(&request, &error)
-                            {
-                                return Ok(response);
-                            }
-                            return Err(error);
+                    {
+                        if let Some(response) = management_pre_commit_refusal(&request, &error) {
+                            return Ok(response);
                         }
+                        return Err(error);
                     }
                     session.commit().await?;
                     return Ok(undispatched_terminal_response(&request, &released));
                 }
             }
         };
-        if let Some(claim) = management {
-            if let Err(error) = claim
+        if let Some(claim) = management
+            && let Err(error) = claim
                 .record_call(
                     &mut session,
                     ctx.actor(),
@@ -1277,12 +1274,11 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                     &artifact,
                 )
                 .await
-            {
-                if let Some(response) = management_pre_commit_refusal(&request, &error) {
-                    return Ok(response);
-                }
-                return Err(error);
+        {
+            if let Some(response) = management_pre_commit_refusal(&request, &error) {
+                return Ok(response);
             }
+            return Err(error);
         }
         // This commit is the single authorization linearization point: profile,
         // P/B, complete request, sources, lease and dispatch fence are one snapshot.
