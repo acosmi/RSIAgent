@@ -956,6 +956,14 @@ async fn provider_meter_and_host_surface_limits_preserve_idempotency() {
         100
     );
     session.commit().await.unwrap();
+    let (mut protocol_source, mut protocol_registration) = host_surface_input();
+    let protocol_name = evo_core::contract::MODEL_TOOLS[0];
+    let mut declarations: Value = serde_json::from_str(&protocol_source.original_utf8).unwrap();
+    declarations["declarations"][0]["name"] = json!(protocol_name);
+    protocol_source.original_utf8 = serde_json::to_string(&declarations).unwrap();
+    protocol_registration.classifications[0].name = protocol_name.into();
+    evo_core::contract::host_surface_v2_from_source(&protocol_source, &protocol_registration)
+        .unwrap();
     let before = image(directory.path());
     assert_eq!(
         ReleaseStore::register_host_surface_from_source(
@@ -971,6 +979,19 @@ async fn provider_meter_and_host_surface_limits_preserve_idempotency() {
         .id,
         original.id
     );
+    assert!(matches!(
+        ReleaseStore::register_host_surface_from_source(
+            &admin,
+            service.store(),
+            "surface-protocol-excess",
+            protocol_source,
+            protocol_registration,
+            None,
+        )
+        .await,
+        Err(Error::Invalid(reason)) if reason == "host_surface_rsia_tool_is_not_configuration"
+    ));
+    assert_eq!(image(directory.path()), before);
     capacity(
         ReleaseStore::register_host_surface_from_source(
             &admin,

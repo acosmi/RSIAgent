@@ -984,11 +984,11 @@ impl ReleaseStore {
             session.commit().await?;
             return Ok(existing);
         }
+        validate_host_surface_v2_new_use(&record.manifest)?;
         session
             .admit_capacity(&[(evo_core::capacity::CapacityItem::HostSurface, 1)])
             .await?;
         // Every new source/typed/upgrade guard above precedes this first DML.
-        validate_host_surface_v2_new_use(&record.manifest)?;
         session
             .put(ctx, "artifact", id, ctx.actor(), &record)
             .await?;
