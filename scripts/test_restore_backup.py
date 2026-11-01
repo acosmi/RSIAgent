@@ -610,6 +610,7 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(schemas[11],"rsia.monitoring.consolidation_proposal.v2")
         self.assertEqual(schemas[12],"rsia.management_job.v2")
         self.assertEqual(schemas[-1],"rsia.practice_attempt_set.v2")
+        self.assertEqual(schemas[-3:],["rsia.monitoring.consolidation_proposal.v2","rsia.management_job.v2","rsia.practice_attempt_set.v2"])
         con=sqlite3.connect(":memory:")
         self.addCleanup(con.close)
         con.execute("CREATE TABLE objects(namespace,kind,id,body)")
