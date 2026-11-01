@@ -1754,9 +1754,9 @@ fn surface() -> HostSurfaceManifest {
         source_digest: d("surface-source"),
         items: vec![SurfaceItem {
             name: "model".into(),
-            coverage: SurfaceCoverage::Supported,
-            mapped_field: Some("host.model".into()),
-            consumer: Some("runner".into()),
+            coverage: SurfaceCoverage::RuntimeOwned,
+            mapped_field: None,
+            consumer: None,
             reason: "reference fixture mapping".into(),
         }],
     }
@@ -1815,7 +1815,7 @@ async fn an_unapproved_candidate_or_a_missing_trusted_receipt_has_no_influence()
             },
             task_input_digest: d("task-input"),
             evolution_enabled: true,
-            capability_level: CapabilityLevel::Attached,
+            capability_level: CapabilityLevel::ToolOnly,
         },
     )
     .await

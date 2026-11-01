@@ -66,9 +66,9 @@ fn surface() -> HostSurfaceManifest {
         source_digest: d("surface-source"),
         items: vec![SurfaceItem {
             name: "model".into(),
-            coverage: SurfaceCoverage::Supported,
-            mapped_field: Some("host.model".into()),
-            consumer: Some("runner".into()),
+            coverage: SurfaceCoverage::RuntimeOwned,
+            mapped_field: None,
+            consumer: None,
             reason: "fixture projection".into(),
         }],
     }
@@ -173,7 +173,7 @@ impl Fixture {
                 },
                 task_input_digest: d("task-input"),
                 evolution_enabled: true,
-                capability_level: CapabilityLevel::Attached,
+                capability_level: CapabilityLevel::ToolOnly,
             },
         )
         .await
@@ -947,7 +947,7 @@ async fn environment_drift_invalidates_old_scope_and_unknown_is_not_harmful() {
             },
             task_input_digest: d("task-input-2"),
             evolution_enabled: true,
-            capability_level: CapabilityLevel::Attached,
+            capability_level: CapabilityLevel::ToolOnly,
         },
     )
     .await

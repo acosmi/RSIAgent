@@ -191,13 +191,9 @@ async fn baseline_store() -> (tempfile::TempDir, Store, Context, String) {
     let store = Store::open(&dir.path().join("host.sqlite3")).await.unwrap();
     let admin = context("admin", Role::Admin);
     let host = context("gateway", Role::Host);
-    // These software declarations preserve the seven structural names without
-    // promoting the unverified Claude candidate or granting native/tool use.
+    // These new software declarations describe only host configuration names;
+    // the historical seven-name Claude fixture above remains unchanged.
     let fields = [
-        ("evo_prepare", SurfaceCoverage::RuntimeOwned),
-        ("evo_feedback", SurfaceCoverage::RuntimeOwned),
-        ("evo_propose", SurfaceCoverage::RuntimeOwned),
-        ("evo_inspect", SurfaceCoverage::RuntimeOwned),
         ("shell_tool", SurfaceCoverage::Unsupported),
         ("web_search", SurfaceCoverage::Unsupported),
         ("model_selection", SurfaceCoverage::RuntimeOwned),

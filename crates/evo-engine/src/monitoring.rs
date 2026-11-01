@@ -49,6 +49,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub const ENVIRONMENT_IDENTITY_SCHEMA: &str = "rsia.monitoring.environment.v1";
 pub const ENVIRONMENT_IDENTITY_SCHEMA_V3: &str = "rsia.monitoring.environment.v3";
+const TOOL_ONLY_DIAGNOSTIC_SCHEMA: &str = "rsia.monitoring.environment.v2";
 pub const DEPLOYMENT_OBSERVATION_SCHEMA: &str = "rsia.monitoring.observation.v1";
 /// Current cycle schema. `v1` kept a score-biased `pair_classes` list without task
 /// ids; it is refused when read (there is no production writer to migrate).
@@ -71,6 +72,249 @@ const RECEIPT_KIND: &str = "receipt";
 /// it). The self-trigger guard reads it off a redacted claim, whose body no longer
 /// says what it was.
 const CLAIM_ID_PREFIX: &str = "consolidation-claim-";
+
+/// A retained routing fact, deliberately separate from complete environment identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolOnlyDiagnostic {
+    pub id: String,
+    pub schema_version: String,
+    pub record_kind: String,
+    pub namespace: String,
+    pub host_actor: String,
+    pub run_id: String,
+    pub snapshot_id: String,
+    pub snapshot_digest: String,
+    pub application_id: String,
+    pub application_digest: String,
+    pub route: String,
+    pub consumer: String,
+    pub state: String,
+    pub failure_kind: String,
+}
+
+pub(crate) fn tool_only_diagnostic_id(namespace: &str, run_id: &str) -> Result<String> {
+    Ok(format!(
+        "monitor-env-diag-{}",
+        &fingerprint(&(TOOL_ONLY_DIAGNOSTIC_SCHEMA, namespace, run_id))?[..32]
+    ))
+}
+
+fn is_tool_only_not_attached(
+    snapshot: &RunApplicationSnapshot,
+    application: &HostApplicationRecord,
+) -> bool {
+    snapshot.capability_level == evo_core::contract::CapabilityLevel::ToolOnly
+        && !snapshot.projection.instructions.is_empty()
+        && application.receipt.as_ref().is_some_and(|receipt| {
+            receipt.capability_level == evo_core::contract::CapabilityLevel::ToolOnly
+        })
+        && application_status(snapshot, application) == ApplicationStatus::OfferedNotAttached
+}
+
+// The application writer has already passed its actual Current/material gates.
+// Its new-write and replay commits call this same Session function; no service
+// run or second transaction is needed to retain the routing fact.
+pub(crate) async fn record_tool_only_diagnostic_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    snapshot: &RunApplicationSnapshot,
+    application: &HostApplicationRecord,
+) -> Result<()> {
+    if !is_tool_only_not_attached(snapshot, application) {
+        return Ok(());
+    }
+    let snapshot_body = session
+        .need::<evo_core::contract::StrictJsonValue>(ctx, ARTIFACT_KIND, &snapshot.id)
+        .await?
+        .0;
+    let application_body = session
+        .need::<evo_core::contract::StrictJsonValue>(ctx, RECEIPT_KIND, &application.id)
+        .await?
+        .0;
+    let diagnostic = ToolOnlyDiagnostic {
+        id: tool_only_diagnostic_id(ctx.namespace(), &snapshot.run_id)?,
+        schema_version: TOOL_ONLY_DIAGNOSTIC_SCHEMA.into(),
+        record_kind: "tool_only_diagnostic".into(),
+        namespace: ctx.namespace().into(),
+        host_actor: ctx.actor().into(),
+        run_id: snapshot.run_id.clone(),
+        snapshot_id: snapshot.id.clone(),
+        snapshot_digest: crate::formal_authority::content_digest(&snapshot_body)?,
+        application_id: application.id.clone(),
+        application_digest: crate::formal_authority::content_digest(&application_body)?,
+        route: "environment".into(),
+        consumer: "inspect".into(),
+        state: "retained".into(),
+        failure_kind: "host_capability_tool_only".into(),
+    };
+    if let Some(existing) = session
+        .get::<ToolOnlyDiagnostic>(ctx, ARTIFACT_KIND, &diagnostic.id)
+        .await?
+    {
+        if existing != diagnostic {
+            return Err(Error::Conflict(
+                "tool-only diagnostic id reused with different facts".into(),
+            ));
+        }
+        // Replays also require the original two edges and authenticated sources.
+        load_tool_only_diagnostic_in_session(session, ctx, &diagnostic.id, &snapshot.run_id)
+            .await?;
+        return Ok(());
+    }
+    crate::revocation_gate::ensure_dependencies_live(
+        ctx,
+        session,
+        &[
+            (ARTIFACT_KIND.into(), snapshot.id.clone()),
+            (RECEIPT_KIND.into(), application.id.clone()),
+        ],
+        "tool-only diagnostic",
+    )
+    .await?;
+    session
+        .put(ctx, ARTIFACT_KIND, &diagnostic.id, ctx.actor(), &diagnostic)
+        .await?;
+    session
+        .put_edge(
+            ctx,
+            ARTIFACT_KIND,
+            &diagnostic.id,
+            ARTIFACT_KIND,
+            &snapshot.id,
+        )
+        .await?;
+    session
+        .put_edge(
+            ctx,
+            ARTIFACT_KIND,
+            &diagnostic.id,
+            RECEIPT_KIND,
+            &application.id,
+        )
+        .await?;
+    crate::formal_authority::attest_content(
+        session,
+        ctx,
+        ARTIFACT_KIND,
+        &diagnostic.id,
+        &diagnostic,
+    )
+    .await
+}
+
+/// Loads this routing version and its complete authenticated source closure.
+pub(crate) async fn load_tool_only_diagnostic_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    id: &str,
+    run_id: &str,
+) -> Result<Option<ToolOnlyDiagnostic>> {
+    let Some(body) = session
+        .get::<evo_core::contract::StrictJsonValue>(ctx, ARTIFACT_KIND, id)
+        .await?
+        .map(|value| value.0)
+    else {
+        return Ok(None);
+    };
+    if body["schema_version"] != TOOL_ONLY_DIAGNOSTIC_SCHEMA {
+        // A retained locator whose body was removed or changed cannot become
+        // usable Skill evidence through the historical/cache return path.
+        if id == tool_only_diagnostic_id(ctx.namespace(), run_id)? {
+            return Err(Error::Conflict(
+                "invalid or redacted tool-only diagnostic schema".into(),
+            ));
+        }
+        return Ok(None);
+    }
+    let diagnostic: ToolOnlyDiagnostic = serde_json::from_value(body.clone())
+        .map_err(|_| Error::Conflict("invalid tool-only diagnostic body".into()))?;
+    if diagnostic.id != id
+        || diagnostic.id != tool_only_diagnostic_id(ctx.namespace(), run_id)?
+        || diagnostic.namespace != ctx.namespace()
+        || diagnostic.host_actor != ctx.actor()
+        || diagnostic.run_id != run_id
+        || diagnostic.record_kind != "tool_only_diagnostic"
+        || diagnostic.route != "environment"
+        || diagnostic.consumer != "inspect"
+        || diagnostic.state != "retained"
+        || diagnostic.failure_kind != "host_capability_tool_only"
+    {
+        return Err(Error::Conflict(
+            "tool-only diagnostic scope or route differs".into(),
+        ));
+    }
+    crate::formal_authority::require_content_witness(
+        session,
+        ctx,
+        ARTIFACT_KIND,
+        id,
+        &body,
+        Role::Host,
+    )
+    .await?;
+    crate::revocation_gate::ensure_dependencies_live(
+        ctx,
+        session,
+        &[(ARTIFACT_KIND.into(), id.into())],
+        "tool-only diagnostic",
+    )
+    .await?;
+    let edges = session.dependency_edges(ctx, ARTIFACT_KIND, id).await?;
+    if edges.len() != 2
+        || !edges.contains(&(ARTIFACT_KIND.into(), diagnostic.snapshot_id.clone()))
+        || !edges.contains(&(RECEIPT_KIND.into(), diagnostic.application_id.clone()))
+    {
+        return Err(Error::Conflict(
+            "tool-only diagnostic lacks its actual source edges".into(),
+        ));
+    }
+    // Read the complete original wire, rather than serializing the shared view.
+    let snapshot_body = session
+        .need::<evo_core::contract::StrictJsonValue>(ctx, ARTIFACT_KIND, &diagnostic.snapshot_id)
+        .await?
+        .0;
+    let application_body = session
+        .need::<evo_core::contract::StrictJsonValue>(ctx, RECEIPT_KIND, &diagnostic.application_id)
+        .await?
+        .0;
+    if crate::formal_authority::content_digest(&snapshot_body)? != diagnostic.snapshot_digest
+        || crate::formal_authority::content_digest(&application_body)?
+            != diagnostic.application_digest
+    {
+        return Err(Error::Conflict(
+            "tool-only diagnostic source content changed".into(),
+        ));
+    }
+    crate::formal_authority::require_content_witness(
+        session,
+        ctx,
+        ARTIFACT_KIND,
+        &diagnostic.snapshot_id,
+        &snapshot_body,
+        Role::Host,
+    )
+    .await?;
+    let snapshot: RunApplicationSnapshot = serde_json::from_value(snapshot_body)
+        .map_err(|_| Error::Conflict("invalid tool-only diagnostic snapshot".into()))?;
+    let application: HostApplicationRecord = serde_json::from_value(application_body)
+        .map_err(|_| Error::Conflict("invalid tool-only diagnostic application".into()))?;
+    if snapshot.id != diagnostic.snapshot_id
+        || snapshot.run_id != run_id
+        || application.id != diagnostic.application_id
+        || application
+            .receipt
+            .as_ref()
+            .is_none_or(|receipt| receipt.attested_by != diagnostic.host_actor)
+        || !is_tool_only_not_attached(&snapshot, &application)
+    {
+        return Err(Error::Conflict(
+            "tool-only diagnostic differs from frozen offering".into(),
+        ));
+    }
+    validate_host_application(session, ctx, &snapshot, &application).await?;
+    Ok(Some(diagnostic))
+}
 
 fn validate_digest(value: &str, name: &str) -> Result<()> {
     if value.len() != 64
@@ -5155,5 +5399,423 @@ mod proposal_lineage_read_tests {
         session.commit().await.unwrap();
         assert_eq!(store.verify_audit(&admin).await.unwrap(), audit);
         store.close().await;
+    }
+}
+
+#[cfg(test)]
+mod tool_only_diagnostic_controls {
+    use super::*;
+    use crate::release_store::{AppliedRequestMaterial, RunApplicationSnapshotV2};
+    use evo_core::contract::{
+        AppliedReceipt, CapabilityLevel, HostCapabilities, RunProjection, SystemSnapshot,
+    };
+    use serde_json::{Value, json};
+
+    // Given frozen legacy software components only. These tests neither invoke
+    // prepare with an Active release nor authenticate a Current/P combination.
+    fn inputs(run_id: &str, nonempty: bool) -> (RunApplicationSnapshot, HostApplicationRecord) {
+        let system = SystemSnapshot {
+            schema_version: "rsia.system_snapshot.v2".into(),
+            profile_id: "component-profile".into(),
+            host_id: "component-host".into(),
+            host_version: "1".into(),
+            model_id: "disabled".into(),
+            tools: vec!["fs_read".into()],
+            mandatory_context_digest: hash(b"mandatory component data"),
+        };
+        let caps = HostCapabilities {
+            available: Default::default(),
+            granted: Default::default(),
+        };
+        let bundle_digest = nonempty.then(|| hash(b"given legacy component bundle"));
+        let instructions = if nonempty {
+            vec!["given frozen software offering".into()]
+        } else {
+            vec![]
+        };
+        let material = AppliedRequestMaterial {
+            mandatory_context_digest: system.mandatory_context_digest.clone(),
+            task_input_digest: hash(b"component task"),
+            instructions: instructions.clone(),
+            tools: system.tools.clone(),
+        };
+        let request_digest = fingerprint(&material).unwrap();
+        let original = RunApplicationSnapshotV2 {
+            id: format!("run-snapshot-{run_id}"),
+            schema_version: "rsia.run_application.v2".into(),
+            run_id: run_id.into(),
+            profile_id: system.profile_id.clone(),
+            pointer_epoch: 0,
+            release_id: None,
+            bundle_digest: bundle_digest.clone(),
+            environment_digest: system.digest().unwrap(),
+            system_snapshot: system,
+            host_surface_id: "component-surface".into(),
+            host_surface_digest: hash(b"given software surface"),
+            host_capabilities_digest: fingerprint(&caps).unwrap(),
+            host_capabilities: caps,
+            projection: RunProjection {
+                bundle_digest: bundle_digest.clone().unwrap_or_default(),
+                instructions,
+                tools: material.tools.clone(),
+            },
+            request_material: material,
+            request_digest: request_digest.clone(),
+            capability_level: CapabilityLevel::ToolOnly,
+            evolution_enabled: true,
+        };
+        let snapshot: RunApplicationSnapshot =
+            serde_json::from_value(serde_json::to_value(original).unwrap()).unwrap();
+        assert!(snapshot.current_v3().is_none());
+        let application = HostApplicationRecord {
+            id: format!("component-application-{run_id}"),
+            schema_version: "rsia.host_application.v1".into(),
+            run_id: run_id.into(),
+            release_id: None,
+            actual_request_digest: request_digest.clone(),
+            execution_receipt_id: None,
+            receipt: bundle_digest.map(|bundle_digest| AppliedReceipt {
+                offered: vec!["component-skill".into()],
+                attached: vec![],
+                used: vec![],
+                verified_benefit: vec![],
+                bundle_digest,
+                request_digest,
+                capability_level: CapabilityLevel::ToolOnly,
+                truncated: false,
+                attested_by: "host".into(),
+            }),
+        };
+        (snapshot, application)
+    }
+
+    async fn store() -> (tempfile::TempDir, Store, Context) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("component.sqlite3"))
+            .await
+            .unwrap();
+        let host = Context::new("component-ns", "host", Role::Host).unwrap();
+        (dir, store, host)
+    }
+
+    async fn put_inputs(
+        session: &mut Session,
+        host: &Context,
+        snapshot: &RunApplicationSnapshot,
+        application: &HostApplicationRecord,
+    ) {
+        session
+            .put(host, ARTIFACT_KIND, &snapshot.id, host.actor(), snapshot)
+            .await
+            .unwrap();
+        crate::formal_authority::attest_content(
+            session,
+            host,
+            ARTIFACT_KIND,
+            &snapshot.id,
+            snapshot,
+        )
+        .await
+        .unwrap();
+        session
+            .put(
+                host,
+                RECEIPT_KIND,
+                &application.id,
+                host.actor(),
+                application,
+            )
+            .await
+            .unwrap();
+        crate::formal_authority::attest_content(
+            session,
+            host,
+            RECEIPT_KIND,
+            &application.id,
+            application,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_only_diagnostic_requires_nontruncated_offering() {
+        let (_dir, store, host) = store().await;
+        let mut session = store.session().await.unwrap();
+        for (run_id, nonempty, truncated, report_offered) in [
+            ("positive", true, false, true),
+            ("baseline", false, false, false),
+            ("truncated", true, true, true),
+            ("unknown", true, false, false),
+        ] {
+            let (snapshot, mut application) = inputs(run_id, nonempty);
+            if let Some(receipt) = &mut application.receipt {
+                receipt.truncated = truncated;
+                if !report_offered {
+                    receipt.offered.clear();
+                }
+            }
+            put_inputs(&mut session, &host, &snapshot, &application).await;
+            record_tool_only_diagnostic_in_session(&mut session, &host, &snapshot, &application)
+                .await
+                .unwrap();
+            let id = tool_only_diagnostic_id(host.namespace(), run_id).unwrap();
+            assert_eq!(
+                load_tool_only_diagnostic_in_session(&mut session, &host, &id, run_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                run_id == "positive",
+                "{run_id}"
+            );
+        }
+        assert_eq!(
+            session
+                .namespace_object_count(&host, "candidate")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            session
+                .namespace_object_count(&host, "capability_request")
+                .await
+                .unwrap(),
+            0
+        );
+        session.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_only_diagnostic_rolls_back_with_application() {
+        let (_dir, store, host) = store().await;
+        let admin = Context::new(host.namespace(), "admin", Role::Admin).unwrap();
+        let (snapshot, application) = inputs("rollback", true);
+        let id = tool_only_diagnostic_id(host.namespace(), &snapshot.run_id).unwrap();
+        {
+            let mut session = store.session().await.unwrap();
+            put_inputs(&mut session, &host, &snapshot, &application).await;
+            record_tool_only_diagnostic_in_session(&mut session, &host, &snapshot, &application)
+                .await
+                .unwrap();
+            assert!(
+                load_tool_only_diagnostic_in_session(&mut session, &host, &id, &snapshot.run_id)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            // The application's transaction fails before commit.
+        }
+        let mut session = store.session().await.unwrap();
+        for (kind, key) in [
+            (ARTIFACT_KIND, id.as_str()),
+            (ARTIFACT_KIND, snapshot.id.as_str()),
+            (RECEIPT_KIND, application.id.as_str()),
+        ] {
+            assert!(
+                session
+                    .get::<Value>(&host, kind, key)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                session
+                    .dependency_edges(&host, kind, key)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        session.commit().await.unwrap();
+        assert_eq!(store.verify_audit(&admin).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn tool_only_diagnostic_replay_is_single_and_conflict_is_atomic() {
+        let (_dir, store, host) = store().await;
+        let admin = Context::new(host.namespace(), "admin", Role::Admin).unwrap();
+        let (snapshot, application) = inputs("replay", true);
+        let id = tool_only_diagnostic_id(host.namespace(), &snapshot.run_id).unwrap();
+        let mut session = store.session().await.unwrap();
+        put_inputs(&mut session, &host, &snapshot, &application).await;
+        record_tool_only_diagnostic_in_session(&mut session, &host, &snapshot, &application)
+            .await
+            .unwrap();
+        let original: Value = session.need(&host, ARTIFACT_KIND, &id).await.unwrap();
+        session.commit().await.unwrap();
+        let audit_count = store.verify_audit(&admin).await.unwrap();
+        let mut session = store.session().await.unwrap();
+        record_tool_only_diagnostic_in_session(&mut session, &host, &snapshot, &application)
+            .await
+            .unwrap();
+        assert_eq!(
+            session
+                .dependency_edges(&host, ARTIFACT_KIND, &id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        let values: Vec<Value> = session.list(&host, ARTIFACT_KIND).await.unwrap();
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value["schema_version"] == TOOL_ONLY_DIAGNOSTIC_SCHEMA)
+                .count(),
+            1
+        );
+        session.commit().await.unwrap();
+        assert_eq!(store.verify_audit(&admin).await.unwrap(), audit_count);
+        let mut changed = application.clone();
+        changed.id = "different-component-application".into();
+        {
+            let mut session = store.session().await.unwrap();
+            session
+                .put(&host, RECEIPT_KIND, &changed.id, host.actor(), &changed)
+                .await
+                .unwrap();
+            crate::formal_authority::attest_content(
+                &mut session,
+                &host,
+                RECEIPT_KIND,
+                &changed.id,
+                &changed,
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(record_tool_only_diagnostic_in_session(&mut session, &host, &snapshot, &changed).await,
+                Err(Error::Conflict(reason)) if reason == "tool-only diagnostic id reused with different facts")
+            );
+        }
+        let mut session = store.session().await.unwrap();
+        assert!(
+            session
+                .get::<Value>(&host, RECEIPT_KIND, &changed.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            session
+                .need::<Value>(&host, ARTIFACT_KIND, &id)
+                .await
+                .unwrap(),
+            original
+        );
+        session.commit().await.unwrap();
+        assert_eq!(store.verify_audit(&admin).await.unwrap(), audit_count);
+    }
+
+    #[tokio::test]
+    async fn tool_only_diagnostic_is_not_full_environment_identity() {
+        let (_dir, store, host) = store().await;
+        let (snapshot, application) = inputs("identity", true);
+        let mut session = store.session().await.unwrap();
+        put_inputs(&mut session, &host, &snapshot, &application).await;
+        record_tool_only_diagnostic_in_session(&mut session, &host, &snapshot, &application)
+            .await
+            .unwrap();
+        let id = tool_only_diagnostic_id(host.namespace(), &snapshot.run_id).unwrap();
+        let body: Value = session.need(&host, ARTIFACT_KIND, &id).await.unwrap();
+        assert_eq!(body.as_object().unwrap().len(), 14);
+        assert!(serde_json::from_value::<LoadedEnvironment>(body.clone()).is_err());
+        assert!(body.get("identity_digest").is_none());
+        assert!(body.get("instructions").is_none());
+        assert_eq!(
+            body["snapshot_digest"],
+            crate::formal_authority::content_digest(
+                &session
+                    .need::<Value>(&host, ARTIFACT_KIND, &snapshot.id)
+                    .await
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            body["application_digest"],
+            crate::formal_authority::content_digest(&application).unwrap()
+        );
+        session.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_only_diagnostic_rejects_forged_cross_namespace_and_cross_run_refs() {
+        let (_dir, store, host) = store().await;
+        let (snapshot, application) = inputs("scope", true);
+        let id = tool_only_diagnostic_id(host.namespace(), &snapshot.run_id).unwrap();
+        let mut session = store.session().await.unwrap();
+        put_inputs(&mut session, &host, &snapshot, &application).await;
+        record_tool_only_diagnostic_in_session(&mut session, &host, &snapshot, &application)
+            .await
+            .unwrap();
+        let original: Value = session.need(&host, ARTIFACT_KIND, &id).await.unwrap();
+        assert!(
+            load_tool_only_diagnostic_in_session(&mut session, &host, &id, "another-run")
+                .await
+                .is_err()
+        );
+        let other = Context::new("other-ns", "host", Role::Host).unwrap();
+        assert!(
+            load_tool_only_diagnostic_in_session(&mut session, &other, &id, "scope")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        session.commit().await.unwrap();
+        for (key, value) in [
+            ("namespace", json!("other-ns")),
+            ("run_id", json!("another-run")),
+            ("snapshot_digest", json!(hash(b"forged digest"))),
+            ("extra", json!("not allowed")),
+        ] {
+            let mut session = store.session().await.unwrap();
+            let mut forged = original.clone();
+            forged[key] = value;
+            session
+                .put(&host, ARTIFACT_KIND, &id, host.actor(), &forged)
+                .await
+                .unwrap();
+            assert!(
+                load_tool_only_diagnostic_in_session(&mut session, &host, &id, "scope")
+                    .await
+                    .is_err(),
+                "{key}"
+            );
+            // Roll back the mutation instead of rewriting accepted original evidence.
+        }
+        let mut session = store.session().await.unwrap();
+        session
+            .put(
+                &host,
+                ARTIFACT_KIND,
+                "forged-prefix",
+                host.actor(),
+                &json!({"id":"forged-prefix","failure_kind":"host_capability_tool_only"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            load_tool_only_diagnostic_in_session(&mut session, &host, "forged-prefix", "scope")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        session
+            .put(
+                &host,
+                ARTIFACT_KIND,
+                &snapshot.id,
+                host.actor(),
+                &json!({"schema_version":"rsia.redacted.v1"}),
+            )
+            .await
+            .unwrap();
+        assert!(
+            load_tool_only_diagnostic_in_session(&mut session, &host, &id, "scope")
+                .await
+                .is_err()
+        );
     }
 }

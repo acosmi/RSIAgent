@@ -3520,6 +3520,62 @@ pub fn host_surface_v2_allows_field(
     })
 }
 
+/// Applies the configuration-name boundary to a new source-bound use only.
+/// Historical source validation and manifest digests keep their original meaning.
+pub fn validate_host_surface_v2_new_use(manifest: &HostSurfaceManifestV2) -> Result<()> {
+    if manifest
+        .items
+        .iter()
+        .any(|item| MODEL_TOOLS.contains(&item.name.as_str()))
+    {
+        return Err(Error::Invalid(
+            "host_surface_rsia_tool_is_not_configuration".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Checks a trusted capability declaration after the manifest's source is authenticated.
+/// A declaration never grants capabilities beyond `available ∩ granted`.
+pub fn validate_host_capability_level(
+    manifest: &HostSurfaceManifestV2,
+    capabilities: &HostCapabilities,
+    level: CapabilityLevel,
+) -> Result<()> {
+    match level {
+        CapabilityLevel::ToolOnly => {
+            if manifest
+                .items
+                .iter()
+                .any(|item| item.coverage == SurfaceCoverage::Supported)
+            {
+                return Err(Error::Conflict(
+                    "host_capability_tool_only_requires_zero_supported".into(),
+                ));
+            }
+        }
+        CapabilityLevel::Attached => {
+            if manifest.schema_version != SURFACE_SCHEMA_V2
+                || !manifest.items.iter().any(|item| {
+                    item.coverage == SurfaceCoverage::Supported
+                        && item.mapped_field.as_deref() == Some("skill.content")
+                        && item.consumer.as_deref() == Some("compiler")
+                        && item
+                            .test_ref
+                            .as_deref()
+                            .is_some_and(|value| !value.trim().is_empty())
+                })
+                || !host_surface_v2_allows_field(manifest, capabilities, "skill.content")
+            {
+                return Err(Error::Conflict(
+                    "host_capability_attached_requires_skill_content".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod digest_receipt_v3_controls {
     use super::*;

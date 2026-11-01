@@ -213,6 +213,12 @@ impl HostService {
                 if fingerprint(&run)? != fingerprint(&existing.run)? {
                     return Err(Error::Conflict("cached service run changed".into()));
                 }
+                ReleaseStore::validate_run_capability_for_new_use_in_session(
+                    &self.trusted_host,
+                    &mut session,
+                    &live,
+                )
+                .await?;
                 session.commit().await?;
                 return Ok(existing);
             }
@@ -312,6 +318,12 @@ impl HostService {
             if fingerprint(&run)? != fingerprint(&existing.run)? {
                 return Err(Error::Conflict("cached service run changed".into()));
             }
+            ReleaseStore::validate_run_capability_for_new_use_in_session(
+                &self.trusted_host,
+                &mut session,
+                &live,
+            )
+            .await?;
             session.commit().await?;
             return Ok(existing);
         }
@@ -446,6 +458,19 @@ impl HostService {
             if fingerprint(&current)? != fingerprint(&existing)? {
                 return Err(Error::Conflict("cached candidate changed".into()));
             }
+            let run: Run = session
+                .need(caller, SERVICE_RUN_KIND, &request.run_id)
+                .await?;
+            caller.owns(&run.owner)?;
+            if request.kind == evo_core::ArtifactKind::Skill {
+                reject_tool_only_skill_evidence(
+                    &mut session,
+                    &self.trusted_host,
+                    &run.id,
+                    &request.evidence_refs,
+                )
+                .await?;
+            }
             session.commit().await?;
             return Ok(existing);
         }
@@ -476,6 +501,15 @@ impl HostService {
                 .get::<FeedbackRecord>(caller, "feedback", evidence_id)
                 .await?;
             let Some(feedback) = feedback else {
+                if request.kind == evo_core::ArtifactKind::Skill {
+                    reject_tool_only_skill_evidence(
+                        &mut session,
+                        &self.trusted_host,
+                        &run.id,
+                        std::slice::from_ref(evidence_id),
+                    )
+                    .await?;
+                }
                 return Err(Error::NotFound);
             };
             caller.owns(&feedback.owner)?;
@@ -553,7 +587,7 @@ impl HostService {
                 {
                     let run: Run = serde_json::from_value(raw).map_err(|_| Error::NotFound)?;
                     caller.owns(&run.owner)?;
-                    json!({
+                    let mut view = json!({
                         "kind": "run",
                         "id": run.id,
                         "owner": run.owner,
@@ -561,7 +595,27 @@ impl HostService {
                         "status": run.status,
                         "source": run.source,
                         "created_at": run.created_at
-                    })
+                    });
+                    let diagnostic_id =
+                        crate::monitoring::tool_only_diagnostic_id(caller.namespace(), &run.id)?;
+                    if let Some(diagnostic) =
+                        crate::monitoring::load_tool_only_diagnostic_in_session(
+                            &mut session,
+                            &self.trusted_host,
+                            &diagnostic_id,
+                            &run.id,
+                        )
+                        .await?
+                    {
+                        view["diagnostic"] = json!({
+                            "id": diagnostic.id,
+                            "route": diagnostic.route,
+                            "consumer": diagnostic.consumer,
+                            "state": diagnostic.state,
+                            "failure_kind": diagnostic.failure_kind,
+                        });
+                    }
+                    view
                 } else {
                     self.inspect_trace_authority(caller, &mut session, &request.id)
                         .await?
@@ -730,7 +784,13 @@ impl HostService {
                 && fingerprint(&existing.receipt)? == fingerprint(&expected_receipt)?;
             session.commit().await?;
             if same {
-                return Ok(existing);
+                return ReleaseStore::record_applied_request(
+                    &self.trusted_host,
+                    &self.store,
+                    run_id,
+                    evidence,
+                )
+                .await;
             }
             return Err(Error::Conflict(
                 "run application already recorded with different evidence".into(),
@@ -781,6 +841,28 @@ impl HostService {
             &snapshot.projection.instructions,
         )
     }
+}
+
+// References locate stored facts; neither a prefix nor self-reported feedback
+// can establish this cause. Both the initial and cached Skill paths use this gate.
+async fn reject_tool_only_skill_evidence(
+    session: &mut Session,
+    host: &Context,
+    run_id: &str,
+    evidence_refs: &[String],
+) -> Result<()> {
+    for id in evidence_refs {
+        if crate::monitoring::load_tool_only_diagnostic_in_session(session, host, id, run_id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Conflict("host_capability_tool_only".into()));
+        }
+        if *id == crate::monitoring::tool_only_diagnostic_id(host.namespace(), run_id)? {
+            return Err(Error::NotFound);
+        }
+    }
+    Ok(())
 }
 
 // Content projection only. The caller must first reload and validate the real
@@ -1037,5 +1119,436 @@ impl std::ops::Deref for PrepareConfiguration<'_> {
     type Target = PrepareConfigurationView;
     fn deref(&self) -> &Self::Target {
         &self.view
+    }
+}
+
+#[cfg(test)]
+mod tool_only_service_controls {
+    use super::*;
+    use crate::release_store::{AppliedRequestMaterial, RunApplicationSnapshotV2};
+    use evo_core::contract::{HostCapabilities, RunProjection, SystemSnapshot};
+    use evo_core::{ArtifactKind, Outcome};
+
+    struct Component {
+        _dir: tempfile::TempDir,
+        service: HostService,
+        host: Context,
+        agent: Context,
+        run: Run,
+        snapshot: RunApplicationSnapshot,
+        application: HostApplicationRecord,
+    }
+    impl Component {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(&dir.path().join("service-component.sqlite3"))
+                .await
+                .unwrap();
+            let host = Context::new("service-component", "actual-host-writer", Role::Host).unwrap();
+            let agent = Context::new("service-component", "run-owner-agent", Role::Agent).unwrap();
+            let system = SystemSnapshot {
+                schema_version: "rsia.system_snapshot.v2".into(),
+                profile_id: "component-profile".into(),
+                host_id: "software-host".into(),
+                host_version: "1".into(),
+                model_id: "disabled".into(),
+                tools: vec!["fs_read".into()],
+                mandatory_context_digest: hash(b"component mandatory"),
+            };
+            let caps = HostCapabilities {
+                available: Default::default(),
+                granted: Default::default(),
+            };
+            let material = AppliedRequestMaterial {
+                mandatory_context_digest: system.mandatory_context_digest.clone(),
+                task_input_digest: hash(b"component task"),
+                instructions: vec!["given frozen legacy component offering".into()],
+                tools: system.tools.clone(),
+            };
+            let request_digest = fingerprint(&material).unwrap();
+            let bundle_digest = hash(b"given legacy component bundle");
+            let original = RunApplicationSnapshotV2 {
+                id: "run-snapshot-component-run".into(),
+                schema_version: "rsia.run_application.v2".into(),
+                run_id: "component-run".into(),
+                profile_id: system.profile_id.clone(),
+                pointer_epoch: 0,
+                release_id: None,
+                bundle_digest: Some(bundle_digest.clone()),
+                environment_digest: system.digest().unwrap(),
+                system_snapshot: system,
+                host_surface_id: "component-surface".into(),
+                host_surface_digest: hash(b"given component surface"),
+                host_capabilities_digest: fingerprint(&caps).unwrap(),
+                host_capabilities: caps,
+                projection: RunProjection {
+                    bundle_digest: bundle_digest.clone(),
+                    instructions: material.instructions.clone(),
+                    tools: material.tools.clone(),
+                },
+                request_material: material,
+                request_digest: request_digest.clone(),
+                capability_level: CapabilityLevel::ToolOnly,
+                evolution_enabled: true,
+            };
+            let snapshot: RunApplicationSnapshot =
+                serde_json::from_value(serde_json::to_value(original).unwrap()).unwrap();
+            assert!(
+                snapshot.current_v3().is_none(),
+                "component premises must stay legacy; no Active/P authority is seeded"
+            );
+            let application = HostApplicationRecord {
+                id: "given-component-application".into(),
+                schema_version: "rsia.host_application.v1".into(),
+                run_id: snapshot.run_id.clone(),
+                release_id: None,
+                actual_request_digest: request_digest.clone(),
+                execution_receipt_id: None,
+                receipt: Some(AppliedReceipt {
+                    offered: vec!["component-skill".into()],
+                    attached: vec![],
+                    used: vec![],
+                    verified_benefit: vec![],
+                    bundle_digest,
+                    request_digest,
+                    capability_level: CapabilityLevel::ToolOnly,
+                    truncated: false,
+                    attested_by: host.actor().into(),
+                }),
+            };
+            let run = Run {
+                id: snapshot.run_id.clone(),
+                owner: agent.actor().into(),
+                goal: "component given facts".into(),
+                snapshot_id: snapshot.id.clone(),
+                improver_version: "unavailable".into(),
+                capabilities: vec![],
+                status: "prepared".into(),
+                source: "software_component_precondition".into(),
+                created_at: now().unwrap(),
+            };
+            let mut session = store.session().await.unwrap();
+            session
+                .put(&host, "artifact", &snapshot.id, host.actor(), &snapshot)
+                .await
+                .unwrap();
+            crate::formal_authority::attest_content(
+                &mut session,
+                &host,
+                "artifact",
+                &snapshot.id,
+                &snapshot,
+            )
+            .await
+            .unwrap();
+            session
+                .put(
+                    &host,
+                    "receipt",
+                    &application.id,
+                    host.actor(),
+                    &application,
+                )
+                .await
+                .unwrap();
+            crate::formal_authority::attest_content(
+                &mut session,
+                &host,
+                "receipt",
+                &application.id,
+                &application,
+            )
+            .await
+            .unwrap();
+            session
+                .put(&agent, SERVICE_RUN_KIND, &run.id, agent.actor(), &run)
+                .await
+                .unwrap();
+            session
+                .put_edge(&agent, SERVICE_RUN_KIND, &run.id, "artifact", &snapshot.id)
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+            let service = HostService::new(store, host.clone()).unwrap();
+            Self {
+                _dir: dir,
+                service,
+                host,
+                agent,
+                run,
+                snapshot,
+                application,
+            }
+        }
+        async fn record(&self) -> String {
+            let mut session = self.service.store.session().await.unwrap();
+            crate::monitoring::record_tool_only_diagnostic_in_session(
+                &mut session,
+                &self.host,
+                &self.snapshot,
+                &self.application,
+            )
+            .await
+            .unwrap();
+            session.commit().await.unwrap();
+            crate::monitoring::tool_only_diagnostic_id(self.host.namespace(), &self.run.id).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn diagnostic_reference_blocks_new_and_cached_skill_proposals() {
+        let fixture = Component::new().await;
+        let id = fixture.record().await;
+        let request = Proposal {
+            request_key: "component-proposal".into(),
+            run_id: fixture.run.id.clone(),
+            kind: ArtifactKind::Skill,
+            parent_snapshot: fixture.run.snapshot_id.clone(),
+            hypothesis: "component hypothesis".into(),
+            applicability: "component scope".into(),
+            counterexample: "a different environment".into(),
+            content: "component proposed content".into(),
+            evidence_refs: vec![id],
+            required_capabilities: vec![],
+            dependencies: vec![],
+        };
+        let mut session = fixture.service.store.session().await.unwrap();
+        // Exercise the shared production gate at the new-write point, with
+        // source premises stated above rather than a fabricated Current prepare.
+        assert!(
+            matches!(reject_tool_only_skill_evidence(&mut session, &fixture.host, &fixture.run.id, &request.evidence_refs).await,
+            Err(Error::Conflict(reason)) if reason == "host_capability_tool_only")
+        );
+        assert_eq!(
+            session
+                .namespace_object_count(&fixture.agent, "candidate")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            session
+                .namespace_object_count(&fixture.agent, "capability_request")
+                .await
+                .unwrap(),
+            0
+        );
+        // Given an old proposed/cache record, the identical shared gate is also
+        // required before returning it; this is a cache-consumer component test.
+        let cached = Candidate {
+            id: "given-cached-candidate".into(),
+            owner: fixture.agent.actor().into(),
+            digest: fingerprint(&request).unwrap(),
+            proposal: request.clone(),
+            state: CandidateState::Proposed,
+            improver_version: "unavailable".into(),
+            evaluation_id: None,
+            approved_by: None,
+            created_at: now().unwrap(),
+        };
+        session
+            .put(
+                &fixture.agent,
+                "candidate",
+                &cached.id,
+                fixture.agent.actor(),
+                &cached,
+            )
+            .await
+            .unwrap();
+        session
+            .cache(
+                &fixture.agent,
+                "service.propose",
+                &request.request_key,
+                &request,
+                &cached.id,
+                &cached,
+            )
+            .await
+            .unwrap();
+        let replay: Candidate = session
+            .cached(
+                &fixture.agent,
+                "service.propose",
+                &request.request_key,
+                &request,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(reject_tool_only_skill_evidence(&mut session, &fixture.host, &replay.proposal.run_id, &replay.proposal.evidence_refs).await,
+            Err(Error::Conflict(reason)) if reason == "host_capability_tool_only")
+        );
+        let mut changed = request.clone();
+        changed.content.push_str(" changed");
+        assert!(matches!(
+            session
+                .cached::<Candidate, _>(
+                    &fixture.agent,
+                    "service.propose",
+                    &request.request_key,
+                    &changed
+                )
+                .await,
+            Err(Error::Conflict(_))
+        ));
+        assert_eq!(
+            session
+                .namespace_object_count(&fixture.agent, "candidate")
+                .await
+                .unwrap(),
+            1
+        );
+        session.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspect_tool_only_diagnostic_is_owned_and_retained() {
+        let fixture = Component::new().await;
+        let inspect = Inspect {
+            kind: EntityKind::Run,
+            id: fixture.run.id.clone(),
+        };
+        let original = fixture
+            .service
+            .inspect(&fixture.agent, inspect.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            original,
+            json!({"kind":"run","id":fixture.run.id,"owner":fixture.run.owner,"snapshot_id":fixture.run.snapshot_id,
+            "status":fixture.run.status,"source":fixture.run.source,"created_at":fixture.run.created_at})
+        );
+        let id = fixture.record().await;
+        let mut expected = original;
+        expected["diagnostic"] = json!({"id":id,"route":"environment","consumer":"inspect","state":"retained","failure_kind":"host_capability_tool_only"});
+        assert_eq!(
+            fixture
+                .service
+                .inspect(&fixture.agent, inspect.clone())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            fixture
+                .service
+                .inspect(&fixture.host, inspect.clone())
+                .await
+                .unwrap(),
+            expected
+        );
+        let other = Context::new(fixture.host.namespace(), "another-agent", Role::Agent).unwrap();
+        assert!(matches!(
+            fixture.service.inspect(&other, inspect.clone()).await,
+            Err(Error::NotFound)
+        ));
+        let foreign =
+            Context::new("foreign-namespace", fixture.agent.actor(), Role::Agent).unwrap();
+        assert!(matches!(
+            fixture.service.inspect(&foreign, inspect.clone()).await,
+            Err(Error::Forbidden)
+        ));
+        assert_eq!(expected["diagnostic"].as_object().unwrap().len(), 5);
+        let wire = fixture
+            .service
+            .inspect(&fixture.agent, inspect)
+            .await
+            .unwrap()
+            .to_string();
+        assert!(!wire.contains(fixture.host.actor()));
+        assert!(!wire.contains("snapshot_digest"));
+        assert!(!wire.contains("application_id"));
+        assert!(!wire.contains("given frozen"));
+        let mut session = fixture.service.store.session().await.unwrap();
+        let stored: Value = session.need(&fixture.host, "artifact", &id).await.unwrap();
+        assert_eq!(stored["state"], "retained");
+        session.commit().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_feedback_not_selected_and_unknown_keep_original_proposal_rules() {
+        let fixture = Component::new().await;
+        let mut session = fixture.service.store.session().await.unwrap();
+        for case in ["not_selected", "unknown", "truncated"] {
+            let mut snapshot = serde_json::to_value(&fixture.snapshot).unwrap();
+            let mut application = fixture.application.clone();
+            match case {
+                "not_selected" => {
+                    snapshot["bundle_digest"] = Value::Null;
+                    application.receipt = None;
+                }
+                "unknown" => application.receipt.as_mut().unwrap().offered.clear(),
+                "truncated" => application.receipt.as_mut().unwrap().truncated = true,
+                _ => unreachable!(),
+            }
+            let snapshot: RunApplicationSnapshot = serde_json::from_value(snapshot).unwrap();
+            crate::monitoring::record_tool_only_diagnostic_in_session(
+                &mut session,
+                &fixture.host,
+                &snapshot,
+                &application,
+            )
+            .await
+            .unwrap();
+            let id = crate::monitoring::tool_only_diagnostic_id(
+                fixture.host.namespace(),
+                &snapshot.run_id,
+            )
+            .unwrap();
+            reject_tool_only_skill_evidence(&mut session, &fixture.host, &snapshot.run_id, &[id])
+                .await
+                .unwrap();
+        }
+        // Self-reported wording alone cannot mint a fixed diagnostic or block a
+        // normal feedback reference; it retains the original feedback contract.
+        let request = Feedback {
+            request_key: "ordinary-feedback".into(),
+            run_id: fixture.run.id.clone(),
+            outcome: Outcome::Failure,
+            details: "host_capability_tool_only".into(),
+            failure_class: Default::default(),
+        };
+        let feedback = FeedbackRecord {
+            id: "ordinary-feedback".into(),
+            owner: fixture.agent.actor().into(),
+            request,
+            verification: "self_reported_unverified".into(),
+        };
+        session
+            .put(
+                &fixture.agent,
+                "feedback",
+                &feedback.id,
+                fixture.agent.actor(),
+                &feedback,
+            )
+            .await
+            .unwrap();
+        reject_tool_only_skill_evidence(
+            &mut session,
+            &fixture.host,
+            &fixture.run.id,
+            std::slice::from_ref(&feedback.id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            session
+                .namespace_object_count(&fixture.agent, "candidate")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            session
+                .namespace_object_count(&fixture.agent, "capability_request")
+                .await
+                .unwrap(),
+            0
+        );
+        session.commit().await.unwrap();
     }
 }

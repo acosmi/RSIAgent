@@ -2798,3 +2798,80 @@ async fn seed_install_v1_v2_cleanup_redacts_same_registered_content() {
         session.commit().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn cleanup_redacts_tool_only_diagnostic_to_minimal_facts() {
+    let (_dir, store) = database().await;
+    let admin = ctx("admin", Role::Admin);
+    put_source(&store, "diagnostic-source", "REVOKED-SOURCE-CONTENT").await;
+    let id = "monitor-env-diag-cleanup-component";
+    let snapshot_id = "snapshot-PRIVATE-REFERENCE";
+    let application_id = "application-PRIVATE-REFERENCE";
+    let snapshot_digest = hash(b"PRIVATE-SNAPSHOT-CONTENT");
+    let application_digest = hash(b"PRIVATE-APPLICATION-CONTENT");
+    let original = json!({
+        "id":id,"schema_version":"rsia.monitoring.environment.v2","record_kind":"tool_only_diagnostic",
+        "namespace":"n","host_actor":"PRIVATE-HOST-ACTOR","run_id":"diagnostic-run",
+        "snapshot_id":snapshot_id,"snapshot_digest":snapshot_digest,
+        "application_id":application_id,"application_digest":application_digest,
+        "route":"environment","consumer":"inspect","state":"retained","failure_kind":"host_capability_tool_only"
+    });
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "artifact", id, admin.actor(), &original)
+        .await
+        .unwrap();
+    session
+        .put_edge(&admin, "artifact", id, "run", "diagnostic-source")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let mut status = LifecycleStore::begin_revoke(
+        &admin,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "diagnostic-source".into(),
+        },
+        "source revoked",
+        10,
+    )
+    .await
+    .unwrap();
+    for now in 11..100 {
+        if status.state == CleanupState::Complete {
+            break;
+        }
+        status = LifecycleStore::cleanup_step(&admin, &store, &status.job_id, 16, now)
+            .await
+            .unwrap();
+    }
+    assert_eq!(status.state, CleanupState::Complete);
+    let mut session = store.session().await.unwrap();
+    let redacted: serde_json::Value = session.need(&admin, "artifact", id).await.unwrap();
+    assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+    assert_eq!(
+        redacted["original_schema"],
+        "rsia.monitoring.environment.v2"
+    );
+    assert_eq!(
+        redacted["metadata"],
+        json!({"run_id":"diagnostic-run","namespace":"n","record_kind":"tool_only_diagnostic","state":"retained","failure_kind":"host_capability_tool_only"})
+    );
+    let body = redacted.to_string();
+    for removed in [
+        "PRIVATE-HOST-ACTOR",
+        snapshot_id,
+        application_id,
+        &snapshot_digest,
+        &application_digest,
+        "REVOKED-SOURCE-CONTENT",
+    ] {
+        assert!(
+            !body.contains(removed),
+            "redacted diagnostic retained {removed}"
+        );
+    }
+    assert_eq!(session.capacity_usage_v41(0).await.unwrap().events, 0);
+    session.commit().await.unwrap();
+}
