@@ -1205,6 +1205,25 @@ async fn authorized_store() -> (tempfile::TempDir, Store, Context, Context) {
     (dir, store, admin, worker)
 }
 
+// 完整软件来源 fixture；不授予真实 Host、Current 或 P 权限。
+fn budget_run_source(id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "rsia.optimization.source.v1",
+        "record": {
+            "id": id, "body": id.as_bytes().to_vec(),
+            "parent_family": format!("family-{id}"),
+            "task_origin": "trusted_run", "execution_attestation": "trusted_host",
+            "purpose": "development"
+        },
+        "trace": {
+            "run_id": id, "parent_family": format!("family-{id}"),
+            "source_digest": hash(id.as_bytes()), "purpose": "development",
+            "outcome": "success", "diagnosis": null, "excerpt": id, "seed": 1
+        },
+        "excerpt_start": 0, "excerpt_end": id.len()
+    })
+}
+
 async fn put_budget_gate_object(
     store: &Store,
     admin: &Context,
@@ -1518,6 +1537,7 @@ async fn ag054_call_reuse_preserves_reserved_finalized_and_uncertain_facts() {
 #[tokio::test]
 async fn ag054_source_closure_changed_is_typed_but_unreadable_ref_stays_internal() {
     let (_dir, store, admin, worker) = authorized_store().await;
+    put_budget_gate_object(&store, &admin, "run", "source", budget_run_source("source")).await;
     let request = reservation("closure", 10, 2);
     let call = store
         .reserve_budget_call_with_sources(&worker, &request, &["source".into()])
@@ -1604,6 +1624,7 @@ async fn ag054_begin_causes_are_distinct_and_store_session_legacy_errors_are_exa
         "root_concurrency_limit",
     ] {
         let (_dir, store, admin, worker) = authorized_store().await;
+        put_budget_gate_object(&store, &admin, "run", "source", budget_run_source("source")).await;
         let request = reservation("pending", 13, 2);
         let call = store
             .reserve_budget_call_with_sources(&worker, &request, &["source".into()])
@@ -1806,8 +1827,7 @@ async fn ag054_typed_access_refusals_preserve_legacy_scope_errors_without_mutati
 #[tokio::test]
 async fn ag054_r1_empty_source_recovery_preserves_money_refs_edges_and_revocation_gate() {
     let (dir, store, admin, worker) = authorized_store().await;
-    put_budget_gate_object(&store, &admin, "run", "source",
-        serde_json::json!({"id":"source","schema_version":"rsia.optimization.source.v1","body":"trusted source"})).await;
+    put_budget_gate_object(&store, &admin, "run", "source", budget_run_source("source")).await;
     let request = reservation("recovery", 13, 2);
     let call = store
         .reserve_budget_call_with_sources(&worker, &request, &["source".into()])
