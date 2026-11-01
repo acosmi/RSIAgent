@@ -41,6 +41,10 @@ use evo_core::strategy::ConsolidationClass;
 use evo_core::{Context, Error, Role, Strategy, fingerprint, hash};
 use evo_engine::broker::BudgetPortBinding;
 use evo_engine::curriculum_profiles::RegisteredPureFunctionProfileV1;
+use evo_engine::development::projection::{
+    ConfigProjectionControlV1, ConfigProjectionDevelopmentRunner, ConfigProjectionTaskV1,
+    register_config_projection_control,
+};
 use evo_engine::development::{
     CONTROL_KIND, DevelopmentControlV1, DevelopmentEvidenceScope, DevelopmentTaskSpecV1,
     EXECUTION_RECEIPT_KIND, RUN_RECEIPT_KIND, RegisteredDevelopmentRunner, RegisteredTargetInputV1,
@@ -1207,13 +1211,13 @@ impl StepMaterial {
     /// The claim's optimization request. Its development request is the registered
     /// control's manifest, environment, grader, rules and tools, so the registered
     /// runner accepts it.
-    fn request<'a>(
+    fn request_raw<'a>(
         &'a self,
         fixture: &'a Fixture,
         claim_id: &str,
         sequence: u32,
     ) -> OptimizationStepRequest<'a> {
-        trusted_compiler_inputs::request(OptimizationStepRequest {
+        OptimizationStepRequest {
             evidence: &self.evidence,
             source_selection: &self.selection,
             source_bindings: &self.bindings,
@@ -1271,7 +1275,16 @@ impl StepMaterial {
                 idempotency_key: format!("consolidation-idempotency-{sequence}"),
             },
             allow_rank_call: false,
-        })
+        }
+    }
+
+    fn request<'a>(
+        &'a self,
+        fixture: &'a Fixture,
+        claim_id: &str,
+        sequence: u32,
+    ) -> OptimizationStepRequest<'a> {
+        trusted_compiler_inputs::request(self.request_raw(fixture, claim_id, sequence))
     }
 }
 
@@ -1329,6 +1342,486 @@ impl Consolidated {
             fixture,
         }
     }
+}
+
+const CONFIG_LOW: &str = "config_precedence.v1: lowest_layer_first";
+const CONFIG_HIGH: &str = "config_precedence.v1: highest_layer_first";
+
+struct ConfigCycleFixture {
+    fixture: Fixture,
+    control: ConfigProjectionControlV1,
+    parent: evo_core::contract::ResolvedBundleV3,
+    candidate: evo_core::contract::ResolvedBundleV3,
+}
+
+impl ConfigCycleFixture {
+    async fn new() -> Self {
+        let mut fixture = Fixture::new().await;
+        let mut control = ConfigProjectionControlV1::registered(
+            "config-control",
+            TENANT,
+            SCOPE,
+            ROOT,
+            "dev-executor",
+            "dev-grader",
+            "optimizer",
+            "config-monitoring-manifest",
+            vec![
+                ConfigProjectionTaskV1::registered(
+                    "family-config",
+                    json!({"template":"F","layer_count":2,"key_type":"B","placement":"E","seed":1}),
+                )
+                .unwrap(),
+            ],
+            d("placeholder"),
+            d("rules"),
+            d("tools"),
+            vec!["source-1".into(), "source-2".into()],
+            1,
+        )
+        .unwrap();
+        fixture.manifest = control.manifest().unwrap();
+        fixture.manifest_digest = fixture.manifest.digest.clone();
+        fixture.grader_digest = control.grader_digest.clone();
+        fixture.environment = MonitoringCoordinator::record_environment_from_run(
+            &fixture.host,
+            &fixture.store,
+            RecordEnvironmentRequest {
+                run_id: "host-run-1".into(),
+                development_manifest_digest: fixture.manifest_digest.clone(),
+                grader_digest: fixture.grader_digest.clone(),
+                generation_strategy_digest: fixture.strategy_digest.clone(),
+                revoke_watermark: 1,
+            },
+        )
+        .await
+        .unwrap();
+        control.environment_digest = fixture.environment.environment.environment_digest.clone();
+        register_config_projection_control(&fixture.admin, &fixture.store, control.clone())
+            .await
+            .unwrap();
+        fixture.parent_skill.content = CONFIG_LOW.into();
+        fixture.parent_skill_digest = skill_snapshot_digest(&fixture.parent_skill).unwrap();
+        let profile = Profile {
+            id: "profile".into(),
+            evolution_enabled: true,
+            parent_digest: d("old-label"),
+            baseline_digest: d("old-baseline"),
+        };
+        let caps = HostCapabilities {
+            available: Default::default(),
+            granted: Default::default(),
+        };
+        let strategy = Strategy::default();
+        let mut bundles = vec![];
+        for content in [CONFIG_LOW, CONFIG_HIGH] {
+            let mut skill = fixture.parent_skill.clone();
+            skill.content = content.into();
+            let bundle = trusted_compiler_inputs::bundle_current(
+                &fixture.store,
+                &fixture.worker,
+                evo_core::contract::CompileParts {
+                    profile: &profile,
+                    parent: &skill,
+                    baseline: &fixture.parent_skill,
+                    parent_strategy: &strategy,
+                    baseline_strategy: &strategy,
+                    skill_patch: &Default::default(),
+                    improver_patch: &Default::default(),
+                    caps: &caps,
+                    revoked: &Default::default(),
+                },
+                &control.environment_digest,
+                1,
+            )
+            .await
+            .unwrap();
+            trusted_compiler_inputs::persist_bundle_current(
+                &fixture.store,
+                &fixture.worker,
+                &bundle,
+                &control.environment_digest,
+                1,
+            )
+            .await
+            .unwrap();
+            bundles.push(bundle);
+        }
+        let candidate = bundles.pop().unwrap();
+        let parent = bundles.pop().unwrap();
+        fixture.parent_bundle_digest = parent.digest.clone();
+        Self {
+            fixture,
+            control,
+            parent,
+            candidate,
+        }
+    }
+
+    fn runner(&self) -> ConfigProjectionDevelopmentRunner {
+        ConfigProjectionDevelopmentRunner::with_clock(
+            self.fixture.store.clone(),
+            self.fixture.executor.clone(),
+            self.fixture.grader.clone(),
+            self.control.id.clone(),
+            600,
+            Arc::new(|| 100),
+        )
+        .unwrap()
+    }
+
+    async fn stage(&self, n: u32) -> Staged {
+        let request = DevelopmentRunRequest {
+            request_id: format!("config-cycle-{n}"),
+            namespace: TENANT.into(),
+            purpose: Purpose::Development,
+            episode_id: format!("config-cycle-episode-{n}"),
+            step: n,
+            attempt: 1,
+            manifest: self.control.manifest().unwrap(),
+            parent_bundle_digest: self.parent.digest.clone(),
+            candidate_bundle_digest: self.candidate.digest.clone(),
+            environment_digest: self.control.environment_digest.clone(),
+            grader_digest: self.control.grader_digest.clone(),
+            rules_digest: self.control.rules_digest.clone(),
+            tools_digest: self.control.tools_digest.clone(),
+            revoke_watermark: 1,
+            idempotency_key: format!("config-cycle-key-{n}"),
+        };
+        let inputs = trusted_compiler_inputs::bundle_use_current(
+            &self.fixture.store,
+            &self.fixture.worker,
+            &request.candidate_bundle_digest,
+            &request.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
+        let mut prepared = request_fact(&request);
+        for (kind, id) in [
+            ("bundle", &request.parent_bundle_digest),
+            ("bundle", &request.candidate_bundle_digest),
+            ("grader", &request.grader_digest),
+        ] {
+            prepared.dependencies.push(StageDependency {
+                kind: kind.into(),
+                id: id.clone(),
+            });
+        }
+        prepared = prepared.seal().unwrap();
+        self.fixture
+            .journal()
+            .commit_source_bound(prepared.clone(), &inputs)
+            .await
+            .unwrap();
+        let report = self.runner().run(request.clone()).await.unwrap();
+        let observed = observed_fact(&request, &report, true);
+        self.fixture
+            .journal()
+            .commit_source_bound(observed.clone(), &inputs)
+            .await
+            .unwrap();
+        Staged {
+            request,
+            report,
+            request_fact_id: prepared.artifact_id,
+            observed_fact_id: observed.artifact_id,
+        }
+    }
+
+    async fn claim(&self) -> ConsolidationClaim {
+        for n in 1..=2 {
+            let staged = self.stage(n).await;
+            self.fixture.close(&staged.observed_fact_id).await.unwrap();
+        }
+        let outcome = MonitoringCoordinator::claim_consolidation(
+            &self.fixture.worker,
+            &self.fixture.store,
+            &self.fixture.scope_id().await,
+        )
+        .await
+        .unwrap();
+        let ClaimOutcome::Claimed(claim) = outcome else {
+            panic!("actual projection cycles must contain contrast: {outcome:?}");
+        };
+        assert_eq!(claim.state, ConsolidationClaimState::Claimed);
+        claim
+    }
+}
+
+struct ConfigConsolidationModel(EditingModelPort);
+
+#[async_trait]
+impl ModelPort for ConfigConsolidationModel {
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> evo_core::Result<ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request.clone()).await
+    }
+    async fn dispatch(&self, request: ModelRequest) -> evo_core::Result<ModelResponse> {
+        let parent: SkillSnapshot = serde_json::from_str(
+            &request
+                .input
+                .iter()
+                .find(|part| part.label == "parent-skill")
+                .ok_or(Error::NotFound)?
+                .content,
+        )
+        .map_err(|_| Error::Internal)?;
+        let mut response = self.0.dispatch(request).await?;
+        if let ModelResponse::Completed {
+            output,
+            output_digest,
+            ..
+        } = &mut response
+        {
+            let mut edits: Vec<EditSuggestion> =
+                serde_json::from_str(output).map_err(|_| Error::Internal)?;
+            for edit in &mut edits {
+                if edit.edit.field == SkillTextField::Content {
+                    edit.edit.start = 0;
+                    edit.edit.end = parent.content.len();
+                    edit.edit.expected_text_digest = hash(parent.content.as_bytes());
+                    edit.edit.operation = TextEditOperation::Replace {
+                        text: CONFIG_HIGH.into(),
+                    };
+                }
+            }
+            *output = serde_json::to_string(&edits).map_err(|_| Error::Internal)?;
+            *output_digest = hash(output.as_bytes());
+        }
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl ConsolidationModelPort for ConfigConsolidationModel {
+    async fn trusted_budget_binding(&self, namespace: &str) -> evo_core::Result<BudgetPortBinding> {
+        self.0.trusted_budget_binding(namespace).await
+    }
+}
+
+#[tokio::test]
+async fn real_projection_cycles_keep_current_content_proposals_stageable() {
+    let config = ConfigCycleFixture::new().await;
+    let fixture = &config.fixture;
+    let claim = config.claim().await;
+    let material = StepMaterial::new(fixture).await;
+    let mut request = material.request_raw(fixture, &claim.id, 1);
+    request.development_request.manifest = config.control.manifest().unwrap();
+    request.development_request.environment_digest = config.control.environment_digest.clone();
+    request.development_request.grader_digest = config.control.grader_digest.clone();
+    request.development_request.rules_digest = config.control.rules_digest.clone();
+    request.development_request.tools_digest = config.control.tools_digest.clone();
+    let request = trusted_compiler_inputs::request(request);
+    let model = ConfigConsolidationModel(EditingModelPort {
+        calls: AtomicUsize::new(0),
+    });
+    let runner = config.runner();
+    let journal = fixture.journal();
+    let record = MonitoringCoordinator::run_consolidation(
+        &fixture.worker,
+        &fixture.store,
+        &claim.id,
+        Some(&model),
+        Some(&runner),
+        Some(&journal),
+        request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(record.outcome, ConsolidationRunOutcome::Candidate);
+    assert_eq!(model.0.calls.load(Ordering::SeqCst), 2);
+    let proposal_id = record.proposal_id.unwrap();
+    let original = value(&fixture.store, &fixture.worker, "artifact", &proposal_id).await;
+    assert_eq!(original["provenance"], "program_fixture");
+    assert_eq!(
+        fixture.environment.environment.evidence_scope,
+        EnvironmentEvidenceScope::ProgramFixture
+    );
+    let staged = MonitoringCoordinator::stage_current_consolidation_candidate(
+        &fixture.worker,
+        &fixture.store,
+        &proposal_id,
+        "config-software-candidate",
+    )
+    .await
+    .unwrap();
+    assert_eq!(staged.provenance, EnvironmentEvidenceScope::ProgramFixture);
+    assert_eq!(
+        staged.candidate.bundle_digest,
+        original["candidate_bundle_digest"].as_str().unwrap()
+    );
+    assert_eq!(
+        value(&fixture.store, &fixture.worker, "artifact", &proposal_id).await,
+        original
+    );
+    let mut session = fixture.store.session().await.unwrap();
+    assert!(
+        session
+            .list::<Value>(&fixture.worker, "pointer")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    session.commit().await.unwrap();
+    // This is the actual software scope. No Active/Host/Approval input exists,
+    // so this does not cover a TrustedExecution Current proposal in production.
+}
+
+async fn legacy_proposal_fixture(
+    provenance: EnvironmentEvidenceScope,
+) -> (Fixture, evo_engine::monitoring::ConsolidationProposal) {
+    let fixture = Fixture::new().await;
+    let mut claim = fixture.claimed().await;
+    let index = fixture.scope_index().await;
+    let mut cycles = vec![];
+    for id in &claim.cycle_ids {
+        let cycle: DevelopmentCycleRecord =
+            serde_json::from_value(value(&fixture.store, &fixture.worker, "artifact", id).await)
+                .unwrap();
+        cycles.push(cycle);
+    }
+    let bundle = trusted_compiler_inputs::software_candidate(
+        TENANT,
+        &index.scope.environment_digest,
+        "historical proposal content",
+    );
+    let proposal = evo_engine::monitoring::ConsolidationProposal {
+        id: format!("consolidation-proposal-{}", claim.id),
+        schema_version: evo_engine::monitoring::CONSOLIDATION_PROPOSAL_SCHEMA.into(),
+        claim_id: claim.id.clone(),
+        scope_id: claim.scope_id.clone(),
+        cycle_ids: claim.cycle_ids.clone(),
+        pairs_digest: fingerprint(
+            &cycles
+                .iter()
+                .map(|cycle| (&cycle.id, &cycle.pairs))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap(),
+        parent_skill_digest: index.scope.parent_skill_digest.clone(),
+        parent_bundle_digest: index.scope.parent_bundle_digest.clone(),
+        candidate_skill_digest: skill_snapshot_digest(&bundle.skill).unwrap(),
+        candidate_bundle_digest: bundle.digest.clone(),
+        candidate_bundle: bundle,
+        selection_digest: d("historical-selection"),
+        terminal_fact_id: "historical-terminal".into(),
+        sources: claim.sources.clone(),
+        provenance,
+        environment_digest: index.scope.environment_digest.clone(),
+        revoke_watermark: 1,
+    };
+    // Restore only the immutable shape of historical software records. This is
+    // not a current producer, fresh native environment, approval or positive chain.
+    claim.state = ConsolidationClaimState::CompletedCandidate;
+    put_artifact(
+        &fixture.store,
+        &fixture.worker,
+        &claim.id,
+        &serde_json::to_value(&claim).unwrap(),
+    )
+    .await;
+    put_artifact(
+        &fixture.store,
+        &fixture.worker,
+        &proposal.id,
+        &serde_json::to_value(&proposal).unwrap(),
+    )
+    .await;
+    let run = evo_engine::monitoring::ConsolidationRunRecord {
+        id: format!("consolidation-run-{}", claim.id),
+        schema_version: evo_engine::monitoring::CONSOLIDATION_RUN_SCHEMA.into(),
+        claim_id: claim.id,
+        input_digest: Some(d("historical-input")),
+        outcome: ConsolidationRunOutcome::Candidate,
+        reason: "candidate_observed".into(),
+        budget_call_ids: vec![],
+        proposal_id: Some(proposal.id.clone()),
+    };
+    put_artifact(
+        &fixture.store,
+        &fixture.worker,
+        &run.id,
+        &serde_json::to_value(&run).unwrap(),
+    )
+    .await;
+    (fixture, proposal)
+}
+
+#[tokio::test]
+async fn legacy_proposal_labels_stay_non_authoritative_and_fixture_staging_keeps_its_scope() {
+    for provenance in [
+        EnvironmentEvidenceScope::ProgramFixture,
+        EnvironmentEvidenceScope::TrustedExecution,
+    ] {
+        let (fixture, proposal) = legacy_proposal_fixture(provenance).await;
+        let original = value(&fixture.store, &fixture.worker, "artifact", &proposal.id).await;
+        let decoded: evo_engine::monitoring::ConsolidationProposal =
+            serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(decoded.provenance, provenance);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), original);
+        let mut session = fixture.store.session().await.unwrap();
+        let before = session
+            .list::<Value>(&fixture.worker, "artifact")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let audit = fixture.store.verify_audit(&fixture.worker).await.unwrap();
+        let result = MonitoringCoordinator::stage_consolidation_candidate(
+            &fixture.worker,
+            &fixture.store,
+            &proposal.id,
+            "legacy-label-candidate",
+        )
+        .await;
+        if provenance == EnvironmentEvidenceScope::ProgramFixture {
+            assert!(
+                matches!(result,Err(Error::Conflict(ref message)) if message=="source_legacy: consolidation proposal is not Current input")
+            );
+        } else {
+            // The historical label is readable, but the actual fixture environment
+            // does not authenticate it. Identity mismatch is not relabeled Legacy.
+            assert!(
+                matches!(result,Err(Error::Conflict(ref message)) if message=="consolidation proposal provenance differs from its evidence")
+            );
+        }
+        assert!(
+            MonitoringCoordinator::stage_current_consolidation_candidate(
+                &fixture.worker,
+                &fixture.store,
+                &proposal.id,
+                "legacy-current-candidate"
+            )
+            .await
+            .is_err()
+        );
+        let mut session = fixture.store.session().await.unwrap();
+        assert_eq!(
+            session
+                .list::<Value>(&fixture.worker, "artifact")
+                .await
+                .unwrap(),
+            before
+        );
+        session.commit().await.unwrap();
+        assert_eq!(
+            fixture.store.verify_audit(&fixture.worker).await.unwrap(),
+            audit
+        );
+        assert_eq!(
+            value(&fixture.store, &fixture.worker, "artifact", &proposal.id).await,
+            original
+        );
+        assert_eq!(
+            fixture.environment.environment.evidence_scope,
+            EnvironmentEvidenceScope::ProgramFixture
+        );
+    }
+    // The actual ProgramFixture projection stage success is covered separately
+    // above; no complete historical TrustedExecution Current proposal is claimed.
 }
 
 async fn value(store: &Store, ctx: &Context, kind: &str, id: &str) -> Value {

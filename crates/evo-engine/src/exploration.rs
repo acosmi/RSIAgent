@@ -522,6 +522,16 @@ pub struct MechanismUsageRecordV1 {
     dispatch_state: MechanismUsageState,
     node_id: Option<String>,
     evidence: ExplorationEvidenceV1,
+    content_status: ExplorationContentStatus,
+}
+
+/// Current content capability, derived on read without rewriting the historical label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplorationContentStatus {
+    CurrentVerified,
+    SourceLegacy,
+    NotObserved,
 }
 
 impl MechanismUsageRecordV1 {
@@ -575,6 +585,10 @@ impl MechanismUsageRecordV1 {
     /// happened and still cost something; it is not a trusted observation.
     pub fn evidence(&self) -> ExplorationEvidenceV1 {
         self.evidence
+    }
+
+    pub fn content_status(&self) -> ExplorationContentStatus {
+        self.content_status
     }
 }
 
@@ -816,6 +830,7 @@ impl PersistentCoordinator {
                     ));
                 }
             }
+            let mut content_status = ExplorationContentStatus::NotObserved;
             match (&fact.node_id, dispatch_state) {
                 (None, MechanismUsageState::Observed) => {
                     return Err(Error::Conflict(
@@ -835,6 +850,16 @@ impl PersistentCoordinator {
                             "dispatch node belongs to a different exploration world".into(),
                         ));
                     }
+                    if node.evidence == ExplorationEvidenceV1::Trusted {
+                        content_status = node_content_status(
+                            &mut session,
+                            &self.context,
+                            &world,
+                            node_id,
+                            &node,
+                        )
+                        .await?;
+                    }
                 }
                 (None, MechanismUsageState::Uncertain) => {}
             }
@@ -851,6 +876,7 @@ impl PersistentCoordinator {
                 dispatch_state,
                 node_id: fact.node_id.clone(),
                 evidence: fact.evidence,
+                content_status,
             });
         }
         session.commit().await?;
@@ -1341,6 +1367,7 @@ impl PersistentCoordinator {
                 error
             }
         };
+        let current_content = settlement.evidence == ExplorationEvidenceV1::Trusted;
         let result = self
             .settle(
                 &mut session,
@@ -1357,6 +1384,17 @@ impl PersistentCoordinator {
             )
             .await
             .map_err(original_error)?;
+        if current_content
+            && result.outcome == StepTerminalClass::CandidateObserved.code()
+            && let Some(node_id) = &result.node_id
+        {
+            let stored = storage_id(NODE_RECORD_KIND, node_id)?;
+            for fact_id in [&request_fact_id, &observed_fact_id] {
+                session
+                    .put_edge(&self.context, "artifact", &stored, "artifact", fact_id)
+                    .await?;
+            }
+        }
         session.commit().await.map_err(original_error)?;
         Ok(result)
     }
@@ -1616,6 +1654,11 @@ impl PersistentCoordinator {
                 node.evidence.as_str()
             )));
         }
+        if node_content_status(&mut session, &self.context, &world, node_id, &node).await?
+            != ExplorationContentStatus::CurrentVerified
+        {
+            return Err(source_legacy_content());
+        }
         session.commit().await?;
         let bundle = node
             .candidate_bundle_digest
@@ -1651,6 +1694,15 @@ impl PersistentCoordinator {
         let facts = self
             .load_facts_in_session(&mut session, &world, &nodes)
             .await?;
+        for (id, node) in world.node_ids.iter().zip(&nodes) {
+            if node.evidence == ExplorationEvidenceV1::Trusted
+                && matches!(node.node.status, ObservedStatus::Valid { .. })
+                && node_content_status(&mut session, &self.context, &world, id, node).await?
+                    != ExplorationContentStatus::CurrentVerified
+            {
+                return Err(source_legacy_content());
+            }
+        }
         session.commit().await?;
         Ok((world, nodes, facts))
     }
@@ -1698,6 +1750,134 @@ impl PersistentCoordinator {
         }
         Ok(facts)
     }
+}
+
+fn source_legacy_content() -> Error {
+    Error::Conflict("source_legacy: development evidence is not current Skill content".into())
+}
+
+// New nodes link their exact Prepared/Observed facts. Old immutable nodes have
+// no such content edge and remain readable history, with no current capability.
+async fn node_content_status(
+    s: &mut Session,
+    ctx: &Context,
+    world: &ExplorationWorldV1,
+    node_id: &str,
+    node: &PersistentSearchNode,
+) -> Result<ExplorationContentStatus> {
+    let edges = s
+        .outgoing_edges_bounded(ctx, "artifact", &storage_id(NODE_RECORD_KIND, node_id)?, 3)
+        .await?;
+    let mut observed = None;
+    for (kind, id) in edges {
+        if kind != "artifact" {
+            continue;
+        }
+        let value: serde_json::Value = s.need(ctx, "artifact", &id).await?;
+        if value["schema_version"] != crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA
+            || value["kind"] != "development_observed"
+        {
+            continue;
+        }
+        if observed.replace((id, value)).is_some() {
+            return Err(Error::Conflict(
+                "exploration node names multiple development observations".into(),
+            ));
+        }
+    }
+    let Some((observed_id, value)) = observed else {
+        return Ok(ExplorationContentStatus::SourceLegacy);
+    };
+    let observed: StageFact = serde_json::from_value(value).map_err(|_| Error::Forbidden)?;
+    let prepared_id = crate::optimization::development_request_fact_id(&observed)?;
+    let view =
+        verified_development_observation_in_session(ctx, s, &prepared_id, &observed_id).await?;
+    if view.candidate_consumption != Some(CandidateConsumption::ProjectionConsumed) {
+        return Ok(ExplorationContentStatus::SourceLegacy);
+    }
+    let prepared: StageFact = s.need(ctx, "artifact", &prepared_id).await?;
+    let request: crate::optimization::DevelopmentRunRequest =
+        serde_json::from_value(prepared.payload).map_err(|_| Error::Forbidden)?;
+    let report: DevelopmentRunReport =
+        serde_json::from_value(observed.payload).map_err(|_| Error::Forbidden)?;
+    let quality = mean_quality_micros(
+        view.outcomes
+            .iter()
+            .map(|task| u64::from(task.candidate_score_micros))
+            .sum(),
+        view.outcomes.len(),
+    );
+    let expected_parent = if let Some(parent_seq) = node.node.search_parent_seq {
+        let mut parent: PersistentSearchNode = need_record(
+            s,
+            ctx,
+            NODE_RECORD_KIND,
+            &node_id_for(&world.id, parent_seq),
+        )
+        .await?;
+        let recovering = matches!(parent.node.status, ObservedStatus::RepairableFailure { .. });
+        loop {
+            if let (Some(_), Some(bundle)) = (
+                parent.candidate_skill_digest.as_ref(),
+                parent.candidate_bundle_digest.as_ref(),
+            ) {
+                break bundle.clone();
+            }
+            if !recovering {
+                return Err(Error::Conflict(
+                    "development parent has no complete candidate Bundle".into(),
+                ));
+            }
+            // Recover uses the same nearest complete ancestor as
+            // expected_parent_binding; a candidate-less failure is not a Bundle.
+            let Some(parent_seq) = parent.node.search_parent_seq else {
+                break world.parent_bundle_digest.clone();
+            };
+            parent = need_record(
+                s,
+                ctx,
+                NODE_RECORD_KIND,
+                &node_id_for(&world.id, parent_seq),
+            )
+            .await?;
+        }
+    } else {
+        world.parent_bundle_digest.clone()
+    };
+    if view.episode_id != world.id
+        || view.step != node.node.node_seq
+        || node.terminal_class != Some(StepTerminalClass::CandidateObserved)
+        || view.environment_digest != world.environment_digest
+        || request.parent_bundle_digest != expected_parent
+        || node.candidate_bundle_digest.as_deref() != Some(request.candidate_bundle_digest.as_str())
+        || node.development_selection_digest.as_deref()
+            != Some(
+                fingerprint(&crate::optimization::select_development(&request, &report)?)?.as_str(),
+            )
+        || node.node.status
+            != (ObservedStatus::Valid {
+                quality_micros: quality,
+            })
+    {
+        return Err(Error::Conflict(
+            "exploration node differs from its actual development observation".into(),
+        ));
+    }
+    let bundle: crate::compiler::LoadedAuthenticatedBundleRecord = s
+        .need(
+            ctx,
+            "artifact",
+            &format!("formal-bundle-{}", request.candidate_bundle_digest),
+        )
+        .await?;
+    if node.candidate_skill_digest.as_deref()
+        != Some(skill_snapshot_digest(&bundle.bundle.skill)?.as_str())
+    {
+        return Err(Error::Conflict(
+            "exploration node Skill differs from its actual development observation".into(),
+        ));
+    }
+    Ok(ExplorationContentStatus::CurrentVerified)
 }
 
 /// A world as a dispatch finds it: the world, the nodes it lists (in order), the

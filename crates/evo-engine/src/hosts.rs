@@ -298,7 +298,7 @@ pub fn run_owned_config_reference(
     let mut workspace = OwnedConfigWorkspace::create(case)?;
     let execution = workspace
         .read_once()
-        .and_then(|snapshot| resolve_owned_snapshot(&snapshot));
+        .and_then(|snapshot| resolve_owned_snapshot(&snapshot, ConfigLayerOrder::HighestFirst));
     let cleanup = workspace.finish();
     match (execution, cleanup) {
         (Ok(answer), Ok(())) => Ok(answer),
@@ -310,8 +310,95 @@ pub fn run_owned_config_reference(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigLayerOrder {
+    HighestFirst,
+    LowestFirst,
+}
+
+/// Actual local FD input and its six-field answer; this grants no Host authority.
+#[derive(Debug)]
+pub struct ConfigProjectionExecution {
+    pub snapshot_material: serde_json::Value,
+    pub answer: ControlledTaskAnswerV1,
+}
+
+/// Executes the complete run projection's fixed config-precedence instruction.
+///
+/// The v1 grammar is one line `config_precedence.v1: highest_layer_first` or
+/// `config_precedence.v1: lowest_layer_first` in the Skill instruction text.
+/// Other prose is retained as input and does not select a different task.
+pub fn run_owned_config_projection(
+    selector: ClosedCaseSelector,
+    projection: &evo_core::contract::RunProjection,
+) -> std::result::Result<ConfigProjectionExecution, OwnedWorkspaceError> {
+    let mut order = None;
+    for line in projection.instructions.iter().flat_map(|text| text.lines()) {
+        let Some(instruction) = line.trim().strip_prefix("config_precedence.v1: ") else {
+            continue;
+        };
+        let parsed = match instruction {
+            "highest_layer_first" => ConfigLayerOrder::HighestFirst,
+            "lowest_layer_first" => ConfigLayerOrder::LowestFirst,
+            _ => {
+                return Err(OwnedWorkspaceError::Core(Error::Invalid(
+                    "unsupported config projection instruction".into(),
+                )));
+            }
+        };
+        if order.replace(parsed).is_some() {
+            return Err(OwnedWorkspaceError::Core(Error::Invalid(
+                "config projection requires exactly one layer-order instruction".into(),
+            )));
+        }
+    }
+    let order = order.ok_or_else(|| {
+        OwnedWorkspaceError::Core(Error::Invalid(
+            "config projection requires exactly one layer-order instruction".into(),
+        ))
+    })?;
+    let mut workspace = OwnedConfigWorkspace::create(generate_case(selector)?)?;
+    let execution = workspace.read_once().and_then(|snapshot| {
+        let answer = resolve_owned_snapshot(&snapshot, order)?;
+        let files = snapshot
+            .files()
+            .iter()
+            .map(|file| {
+                let utf8 = std::str::from_utf8(file.bytes()).map_err(|_| {
+                    OwnedWorkspaceError::Core(Error::Invalid(
+                        "configuration snapshot is not UTF-8".into(),
+                    ))
+                })?;
+                Ok(serde_json::json!({
+                    "logical_id": file.logical_id(), "source_path": file.source_path(),
+                    "format": file.format(), "utf8": utf8,
+                }))
+            })
+            .collect::<std::result::Result<Vec<_>, OwnedWorkspaceError>>()?;
+        Ok(ConfigProjectionExecution {
+            snapshot_material: serde_json::json!({
+                "template_id": snapshot.template().template_id(),
+                "layers": snapshot.layers().names(),
+                "key_type": snapshot.key_type().registration(),
+                "query_segments": snapshot.query_segments(), "files": files,
+            }),
+            answer,
+        })
+    });
+    let cleanup = workspace.finish();
+    match (execution, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(execution), Err(cleanup)) => Err(OwnedWorkspaceError::ExecutionAndCleanup {
+            execution: Box::new(execution),
+            cleanup: Box::new(cleanup),
+        }),
+    }
+}
+
 fn resolve_owned_snapshot(
     snapshot: &OwnedConfigSnapshot,
+    order: ConfigLayerOrder,
 ) -> std::result::Result<ControlledTaskAnswerV1, OwnedWorkspaceError> {
     match snapshot.intent() {
         ConfigIntent::WriteProbe => return Err(OwnedWorkspaceError::WriteForbidden),
@@ -352,7 +439,7 @@ fn resolve_owned_snapshot(
         let document = decode_config_document(snapshot.template(), file.bytes())?;
         // Independently follow the complete pointer in this actual decoded document.
         if let Some(value) = document.pointer(&pointer)
-            && answer.is_none()
+            && (answer.is_none() || order == ConfigLayerOrder::LowestFirst)
             && !(snapshot.key_type() == KeyType::H && value.is_null())
         {
             answer = Some(ControlledTaskAnswerV1 {

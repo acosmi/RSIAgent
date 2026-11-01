@@ -71,6 +71,10 @@ use evo_core::strategy::{
 };
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
 use evo_engine::curriculum_profiles::RegisteredPureFunctionProfileV1;
+use evo_engine::development::projection::{
+    ConfigProjectionControlV1, ConfigProjectionDevelopmentRunner, ConfigProjectionTaskV1,
+    register_config_projection_control,
+};
 use evo_engine::development::{
     DEVELOPMENT_RUN_RECEIPT_SCHEMA, DevelopmentControlV1, DevelopmentEvidenceScope,
     DevelopmentExecutionReceiptV1, DevelopmentRunReceiptV1, DevelopmentSide, DevelopmentTaskSpecV1,
@@ -409,6 +413,55 @@ async fn seeded_store(with_control: bool) -> (tempfile::TempDir, Store) {
 // ---------------------------------------------------------------------------
 // The model port and the development runners
 // ---------------------------------------------------------------------------
+
+const CONFIG_LOW: &str = "config_precedence.v1: lowest_layer_first";
+const CONFIG_HIGH: &str = "config_precedence.v1: highest_layer_first";
+
+struct ConfigEditingModel;
+#[async_trait]
+impl ModelPort for ConfigEditingModel {
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request.clone()).await
+    }
+    async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let parent: SkillSnapshot = serde_json::from_str(
+            &request
+                .input
+                .iter()
+                .find(|part| part.label == "parent-skill")
+                .ok_or(Error::NotFound)?
+                .content,
+        )
+        .map_err(|_| Error::Internal)?;
+        let mut response = EditingFixtureModel.dispatch(request).await?;
+        if let ModelResponse::Completed {
+            output,
+            output_digest,
+            ..
+        } = &mut response
+        {
+            let mut edits: Vec<EditSuggestion> =
+                serde_json::from_str(output).map_err(|_| Error::Internal)?;
+            for edit in &mut edits {
+                if edit.edit.field == SkillTextField::Content {
+                    edit.edit.start = 0;
+                    edit.edit.end = parent.content.len();
+                    edit.edit.expected_text_digest = hash(parent.content.as_bytes());
+                    edit.edit.operation = TextEditOperation::Replace {
+                        text: CONFIG_HIGH.into(),
+                    };
+                }
+            }
+            *output = serde_json::to_string(&edits).map_err(|_| Error::Internal)?;
+            *output_digest = hash(output.as_bytes());
+        }
+        Ok(response)
+    }
+}
 
 struct EditingFixtureModel;
 
@@ -3200,38 +3253,122 @@ async fn a_world_without_a_repairable_failure_does_not_depend_on_its_dispatch_fa
     let env = Env::new().await;
     for repair in [Repair::HardFailure, Repair::Valid, Repair::Uncertain] {
         let id = format!("world-no-failure-{}", repair.name());
-        let registered = world(&id, &[1], HALF);
-        let job = env.start(&format!("start-{id}"), &registered).await;
-        let step = env
-            .step(&id, repair.model(), &env.runner(answers_all))
+        let mut registered = world(&id, &[1], HALF);
+        // Only this Valid prerequisite needs current content. Freeze the control,
+        // complete LOW parent and grader before the world's first registration.
+        let config = if repair == Repair::Valid {
+            let control = ConfigProjectionControlV1::registered(
+                "config-recovery-control", NAMESPACE, SCOPE, "dev-root",
+                "dev-executor", "dev-grader", "optimizer", "config-recovery-manifest",
+                vec![ConfigProjectionTaskV1::registered("config-family",
+                    json!({"template":"F","layer_count":2,"key_type":"B","placement":"E","seed":1})).unwrap()],
+                d("environment"), d("rules"), d("tools"),
+                RUNS.iter().map(|run| (*run).into()).collect(), 1,
+            ).unwrap();
+            register_config_projection_control(&admin(), &env.store, control.clone())
+                .await
+                .unwrap();
+            Some(control)
+        } else {
+            None
+        };
+        let parent = if let Some(control) = &config {
+            let skill = SkillSnapshot {
+                content: CONFIG_LOW.into(),
+                ..parent_skill()
+            };
+            let bundle = trusted_compiler_inputs::bundle_current(
+                &env.store,
+                &worker(),
+                evo_core::contract::CompileParts {
+                    profile: &env.fixture.profile,
+                    parent: &skill,
+                    baseline: &env.fixture.baseline,
+                    parent_strategy: &env.fixture.parent_strategy,
+                    baseline_strategy: &env.fixture.baseline_strategy,
+                    skill_patch: &Default::default(),
+                    improver_patch: &env.fixture.improver,
+                    caps: &env.fixture.caps,
+                    revoked: &env.fixture.revoked,
+                },
+                &control.environment_digest,
+                1,
+            )
             .await
             .unwrap();
-        if repair == Repair::Valid {
-            // Derived structure template (AG-187): the trusted valid root the build
-            // before AG-187 stored for this candidate (such a record keeps its label),
-            // so the world holds a valid node offered a Deepen.
-            rewrite_node(&env.store, &node_id(&id, 1), |node| {
-                node["node"]["status"] = json!({"status": "valid", "quality_micros": FULL});
-                node["node"]["best_valid_ancestor_micros"] = json!(FULL);
-                node["node"]["recent_valid_gains_micros"] = json!([FULL - HALF]);
-                node["evidence"] = json!("trusted");
-                node["terminal_class"] = json!({"class": "candidate_observed"});
-            })
-            .await;
-        }
+            trusted_compiler_inputs::persist_bundle_current(
+                &env.store,
+                &worker(),
+                &bundle,
+                &control.environment_digest,
+                1,
+            )
+            .await
+            .unwrap();
+            registered.parent_skill_digest = skill_snapshot_digest(&bundle.skill).unwrap();
+            registered.parent_bundle_digest = bundle.digest.clone();
+            registered.grader_digest = control.grader_digest.clone();
+            registered.context_signature = fingerprint(&(
+                &registered.parent_skill_digest,
+                &registered.parent_bundle_digest,
+                &registered.environment_digest,
+                &registered.model_digest,
+                &registered.tools_digest,
+                &registered.grader_digest,
+                &registered.rules_digest,
+                registered.source_watermark,
+            ))
+            .unwrap();
+            env.fixture.parent(bundle.skill, bundle.digest)
+        } else {
+            env.fixture.root_parent()
+        };
+        let job = env.start(&format!("start-{id}"), &registered).await;
+        let step = if let Some(control) = &config {
+            let runner = ConfigProjectionDevelopmentRunner::with_clock(
+                env.store.clone(),
+                Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
+                Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
+                control.id.clone(),
+                600,
+                Arc::new(|| 100),
+            )
+            .unwrap();
+            let mut request = env.fixture.request(&parent, &id, 1, &format!("{id}-1"));
+            request.development_request.manifest = control.manifest().unwrap();
+            request.development_request.grader_digest = control.grader_digest.clone();
+            let result = env
+                .coordinator
+                .run_next(
+                    Some(&ConfigEditingModel),
+                    Some(&runner),
+                    Some(&env.journal),
+                    request,
+                )
+                .await
+                .unwrap();
+            let node = env.node(&id, 1).await;
+            assert_eq!(node["evidence"], "trusted");
+            assert_eq!(
+                node["node"]["status"],
+                json!({"status":"valid", "quality_micros":FULL})
+            );
+            result
+        } else {
+            env.step(&id, repair.model(), &env.runner(answers_all))
+                .await
+                .unwrap()
+        };
         let dispatch_id = step.dispatch_id.clone().unwrap();
         let decision = env.coordinator.decide_next(&id).await.unwrap();
         let original = raw_record(&env.store, DISPATCH, &dispatch_id).await;
         let reconnect = || async {
-            let parent = env.fixture.root_parent();
-            env.coordinator
-                .run_next(
-                    None,
-                    None,
-                    None,
-                    env.fixture.request(&parent, &id, 1, &format!("{id}-1")),
-                )
-                .await
+            let mut request = env.fixture.request(&parent, &id, 1, &format!("{id}-1"));
+            if let Some(control) = &config {
+                request.development_request.manifest = control.manifest().unwrap();
+                request.development_request.grader_digest = control.grader_digest.clone();
+            }
+            env.coordinator.run_next(None, None, None, request).await
         };
 
         for (what, body, expected) in unreadable_facts(&original, &dispatch_id) {

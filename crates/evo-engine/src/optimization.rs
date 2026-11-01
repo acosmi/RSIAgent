@@ -575,7 +575,7 @@ impl StageFact {
     }
 }
 
-fn canonical_stage_artifact_id(fact: &StageFact) -> Result<String> {
+pub(crate) fn canonical_stage_artifact_id(fact: &StageFact) -> Result<String> {
     Ok(format!(
         "optstage-{}",
         fingerprint(&(
@@ -758,6 +758,14 @@ pub struct VerifiedDevelopmentObservationView {
     pub candidate_consumption: Option<crate::development::CandidateConsumption>,
 }
 
+/// Inspect response containing the observation and both actual per-task projections.
+#[derive(Debug, Clone)]
+pub struct VerifiedDevelopmentProjectionView {
+    pub observation: VerifiedDevelopmentObservationView,
+    pub projection_inputs:
+        Vec<crate::development::projection::VerifiedConfigProjectionTaskInputView>,
+}
+
 /// E03 observation gate shared by E12 (`record_cycle`) and other consumers.
 ///
 /// The two stage facts must form one Development stage; the report must pass
@@ -775,6 +783,19 @@ pub(crate) async fn verified_development_observation_in_session(
     request_fact_id: &str,
     observed_fact_id: &str,
 ) -> Result<VerifiedDevelopmentObservationView> {
+    Ok(
+        verified_development_projection_in_session(ctx, session, request_fact_id, observed_fact_id)
+            .await?
+            .observation,
+    )
+}
+
+async fn verified_development_projection_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    request_fact_id: &str,
+    observed_fact_id: &str,
+) -> Result<VerifiedDevelopmentProjectionView> {
     ctx.require(&[Role::Admin, Role::Worker])?;
     for id in [request_fact_id, observed_fact_id] {
         identifier(id)?;
@@ -847,7 +868,7 @@ pub(crate) async fn verified_development_observation_in_session(
     if report.provenance == DevelopmentExecutionProvenance::Fixture {
         return Err(Error::Forbidden);
     }
-    let (outcomes, candidate_consumption) =
+    let (outcomes, candidate_consumption, projection_inputs) =
         crate::development::verify_observed_report_with_consumption_in_session(
             ctx,
             session,
@@ -859,16 +880,19 @@ pub(crate) async fn verified_development_observation_in_session(
     if outcomes.len() != report.results.len() {
         return Err(Error::Internal);
     }
-    Ok(VerifiedDevelopmentObservationView {
-        episode_id: observed_fact.episode_id,
-        step: observed_fact.step,
-        attempt: observed_fact.attempt,
-        request_id: request.request_id,
-        manifest_digest: request.manifest.digest,
-        environment_digest: request.environment_digest,
-        grader_digest: request.grader_digest,
-        outcomes,
-        candidate_consumption,
+    Ok(VerifiedDevelopmentProjectionView {
+        observation: VerifiedDevelopmentObservationView {
+            episode_id: observed_fact.episode_id,
+            step: observed_fact.step,
+            attempt: observed_fact.attempt,
+            request_id: request.request_id,
+            manifest_digest: request.manifest.digest,
+            environment_digest: request.environment_digest,
+            grader_digest: request.grader_digest,
+            outcomes,
+            candidate_consumption,
+        },
+        projection_inputs,
     })
 }
 
@@ -936,6 +960,25 @@ pub async fn verify_development_observation(
 ) -> Result<VerifiedDevelopmentObservationView> {
     let mut session = store.session().await?;
     let view = verified_development_observation_in_session(
+        ctx,
+        &mut session,
+        request_fact_id,
+        observed_fact_id,
+    )
+    .await?;
+    session.commit().await?;
+    Ok(view)
+}
+
+/// Inspects both actual projections using the same single read/verification as E03.
+pub async fn verify_development_projection_observation(
+    store: &Store,
+    ctx: &Context,
+    request_fact_id: &str,
+    observed_fact_id: &str,
+) -> Result<VerifiedDevelopmentProjectionView> {
+    let mut session = store.session().await?;
+    let view = verified_development_projection_in_session(
         ctx,
         &mut session,
         request_fact_id,

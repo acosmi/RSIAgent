@@ -56,6 +56,10 @@ use evo_core::skill_edit::{
 use evo_core::strategy::{BatchActionV1, ElasticPolicyV1, ExplorationCapsV1, SimulationContext};
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
 use evo_engine::curriculum_profiles::RegisteredPureFunctionProfileV1;
+use evo_engine::development::projection::{
+    ConfigProjectionControlV1, ConfigProjectionDevelopmentRunner, ConfigProjectionTaskV1,
+    register_config_projection_control,
+};
 use evo_engine::development::{
     CONTROL_KIND, CandidateConsumption, DEVELOPMENT_RUN_RECEIPT_SCHEMA, DevelopmentControlV1,
     DevelopmentEvidenceScope, DevelopmentExecutionReceiptV1, DevelopmentRunReceiptV1,
@@ -99,6 +103,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
 use trusted_compiler_inputs::StoreOptimizationJournal;
 
+const CONFIG_LOW: &str = "config_precedence.v1: lowest_layer_first";
+const CONFIG_HIGH: &str = "config_precedence.v1: highest_layer_first";
 const NAMESPACE: &str = "n";
 const SCOPE: &str = "dev-scope";
 const CONTROL_ID: &str = "dev-control";
@@ -1420,6 +1426,389 @@ impl Env {
             .await
             .unwrap()
     }
+}
+
+/// Only the model edit is scripted. Config outputs and scores come from actual
+/// frozen Bundle/FD execution through the separate registered runner.
+struct ConfigEditingModel;
+
+#[async_trait]
+impl ModelPort for ConfigEditingModel {
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request.clone()).await
+    }
+
+    async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let parent: SkillSnapshot = serde_json::from_str(
+            &request
+                .input
+                .iter()
+                .find(|part| part.label == "parent-skill")
+                .ok_or(Error::NotFound)?
+                .content,
+        )
+        .map_err(|_| Error::Internal)?;
+        let mut response = EditingFixtureModel.dispatch(request).await?;
+        if let ModelResponse::Completed {
+            output,
+            output_digest,
+            ..
+        } = &mut response
+        {
+            let mut suggestions: Vec<EditSuggestion> =
+                serde_json::from_str(output).map_err(|_| Error::Internal)?;
+            for suggestion in &mut suggestions {
+                if suggestion.edit.field == SkillTextField::Content {
+                    suggestion.edit.start = 0;
+                    suggestion.edit.end = parent.content.len();
+                    suggestion.edit.expected_text_digest = hash(parent.content.as_bytes());
+                    suggestion.edit.operation = TextEditOperation::Replace {
+                        text: CONFIG_HIGH.into(),
+                    };
+                }
+            }
+            *output = serde_json::to_string(&suggestions).map_err(|_| Error::Internal)?;
+            *output_digest = hash(output.as_bytes());
+        }
+        Ok(response)
+    }
+}
+
+async fn config_content_env(id: &str) -> (Env, ConfigProjectionDevelopmentRunner) {
+    let mut env = Env::new(true).await;
+    let control = ConfigProjectionControlV1::registered(
+        "config-projection-control",
+        NAMESPACE,
+        SCOPE,
+        "dev-root",
+        "dev-executor",
+        "dev-grader",
+        "optimizer",
+        "config-projection-manifest",
+        vec![
+            ConfigProjectionTaskV1::registered(
+                "config-family",
+                json!({"template":"F","layer_count":2,"key_type":"B","placement":"E","seed":1}),
+            )
+            .unwrap(),
+        ],
+        d("environment"),
+        d("rules"),
+        d("tools"),
+        RUNS.iter().map(|run| (*run).into()).collect(),
+        1,
+    )
+    .unwrap();
+    register_config_projection_control(&admin(), &env.store, control.clone())
+        .await
+        .unwrap();
+    env.fixture.manifest = control.manifest().unwrap();
+    let skill = SkillSnapshot {
+        content: CONFIG_LOW.into(),
+        ..parent_skill()
+    };
+    let bundle = trusted_compiler_inputs::bundle_current(
+        &env.store,
+        &worker(),
+        evo_core::contract::CompileParts {
+            profile: &env.fixture.profile,
+            parent: &skill,
+            baseline: &env.fixture.baseline,
+            parent_strategy: &env.fixture.parent_strategy,
+            baseline_strategy: &env.fixture.baseline_strategy,
+            skill_patch: &Default::default(),
+            improver_patch: &env.fixture.improver,
+            caps: &env.fixture.caps,
+            revoked: &env.fixture.revoked,
+        },
+        &control.environment_digest,
+        1,
+    )
+    .await
+    .unwrap();
+    trusted_compiler_inputs::persist_bundle_current(
+        &env.store,
+        &worker(),
+        &bundle,
+        &control.environment_digest,
+        1,
+    )
+    .await
+    .unwrap();
+    env.root = env
+        .fixture
+        .parent(bundle.skill.clone(), bundle.digest.clone());
+    let mut world = world_for(id);
+    world.parent_skill_digest = skill_snapshot_digest(&bundle.skill).unwrap();
+    world.parent_bundle_digest = bundle.digest;
+    world.grader_digest = control.grader_digest.clone();
+    world.root_opportunities.truncate(1);
+    world.context_signature = fingerprint(&(
+        &world.parent_skill_digest,
+        &world.parent_bundle_digest,
+        &world.environment_digest,
+        &world.model_digest,
+        &world.tools_digest,
+        &world.grader_digest,
+        &world.rules_digest,
+        world.source_watermark,
+    ))
+    .unwrap();
+    env.coordinator.register_world(world).await.unwrap();
+    let runner = ConfigProjectionDevelopmentRunner::with_clock(
+        env.store.clone(),
+        Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
+        Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
+        control.id,
+        600,
+        Arc::new(|| 100),
+    )
+    .unwrap();
+    (env, runner)
+}
+
+#[tokio::test]
+async fn projection_consumed_node_is_current_content_and_can_deepen_and_finalize() {
+    let (env, runner) = config_content_env("world-current-projection").await;
+    let mut request = env.fixture.request(
+        &env.root,
+        "world-current-projection",
+        1,
+        "current-projection",
+    );
+    request.development_request.grader_digest =
+        evo_engine::development::projection::config_projection_grader_digest().unwrap();
+    let result = env
+        .coordinator
+        .run_next(
+            Some(&ConfigEditingModel),
+            Some(&runner),
+            Some(&env.journal),
+            request,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.outcome, "candidate_observed");
+    let node_id = result.node_id.unwrap();
+    let node = payload(&env.store, NODE, &node_id).await;
+    assert_eq!(node["evidence"], "trusted");
+    assert_eq!(
+        node["node"]["status"],
+        json!({"status":"valid","quality_micros":1_000_000})
+    );
+    assert_eq!(
+        dispatched_seqs(
+            &env.coordinator
+                .decide_next("world-current-projection")
+                .await
+                .unwrap()
+                .action
+        ),
+        vec![1_000_002]
+    );
+    let final_request = env
+        .coordinator
+        .final_candidate_request("world-current-projection", &node_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        Some(final_request.selected_bundle_digest.as_str()),
+        node["candidate_bundle_digest"].as_str()
+    );
+    let usage = env
+        .coordinator
+        .verified_mechanism_usage("world-current-projection")
+        .await
+        .unwrap();
+    assert_eq!(
+        usage[0].content_status(),
+        evo_engine::exploration::ExplorationContentStatus::CurrentVerified
+    );
+
+    // No native optimization step produces RepairableFailure yet. Preserve that
+    // honest historical software premise, then execute and verify the Recover
+    // itself with the current config projection runner (not an identity receipt).
+    let id = "world-current-recover";
+    let (env, runner) = config_content_env(id).await;
+    let mut request = env.fixture.request(&env.root, id, 1, "recover-failure");
+    request.development_request.grader_digest =
+        evo_engine::development::projection::config_projection_grader_digest().unwrap();
+    let failed = env
+        .coordinator
+        .run_next(
+            Some(&NoChangeModel),
+            Some(&runner),
+            Some(&env.journal),
+            request,
+        )
+        .await
+        .unwrap();
+    assert_eq!(failed.outcome, "no_edit_suggestions");
+    let failed_id = failed.node_id.unwrap();
+    let failure = payload(&env.store, NODE, &failed_id).await;
+    assert_eq!(failure["candidate_skill_digest"], Value::Null);
+    assert_eq!(failure["candidate_bundle_digest"], Value::Null);
+    assert_eq!(failure["evidence"], "not_observed");
+    rewrite_node(&env.store, &failed_id, |node| {
+        node["node"]["status"] = json!({
+            "status":"repairable_failure",
+            "episode_id":"historical-config-compile-failure",
+            "failure_kind":"compile",
+            "repair_template_digest":d("repair-template"),
+            "environment_reset":true,
+            "dispatched_repairs":0,
+        });
+    })
+    .await;
+    let frozen_failure = raw_record(&env.store, NODE, &failed_id).await;
+    assert_eq!(
+        dispatched_seqs(&env.coordinator.decide_next(id).await.unwrap().action),
+        vec![1_000_003]
+    );
+    let mut request = env.fixture.request(&env.root, id, 2, "current-recover");
+    request.development_request.grader_digest =
+        evo_engine::development::projection::config_projection_grader_digest().unwrap();
+    let recovered = env
+        .coordinator
+        .run_next(
+            Some(&ConfigEditingModel),
+            Some(&runner),
+            Some(&env.journal),
+            request,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.outcome, "candidate_observed");
+    let recovered_id = recovered.node_id.unwrap();
+    let recovered_node = payload(&env.store, NODE, &recovered_id).await;
+    assert_eq!(recovered_node["node"]["search_parent_seq"], 1);
+    assert_eq!(recovered_node["evidence"], "trusted");
+    assert_eq!(
+        recovered_node["node"]["status"],
+        json!({"status":"valid","quality_micros":1_000_000})
+    );
+    let dispatch = payload(&env.store, DISPATCH, &recovered.dispatch_id.unwrap()).await;
+    assert_eq!(dispatch["selected_action"]["kind"]["action"], "recover");
+    assert_eq!(dispatch["expected_parent_bundle_digest"], env.root.bundle);
+    let decision = env.coordinator.decide_next(id).await.unwrap();
+    assert_eq!(dispatched_seqs(&decision.action), vec![1_000_004]);
+    assert_eq!(
+        env.coordinator
+            .decision_view(id)
+            .await
+            .unwrap()
+            .decision
+            .prefix_digest,
+        decision.prefix_digest
+    );
+    let final_request = env
+        .coordinator
+        .final_candidate_request(id, &recovered_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        Some(final_request.selected_bundle_digest.as_str()),
+        recovered_node["candidate_bundle_digest"].as_str()
+    );
+    let usage = env.coordinator.verified_mechanism_usage(id).await.unwrap();
+    assert_eq!(usage.len(), 2);
+    assert_eq!(
+        usage[0].content_status(),
+        evo_engine::exploration::ExplorationContentStatus::NotObserved
+    );
+    assert_eq!(
+        usage[1].content_status(),
+        evo_engine::exploration::ExplorationContentStatus::CurrentVerified
+    );
+    assert_eq!(
+        raw_record(&env.store, NODE, &failed_id).await,
+        frozen_failure,
+        "current reads and the real Recover must preserve the failed node"
+    );
+}
+
+#[tokio::test]
+async fn legacy_trusted_nodes_stay_readable_but_cannot_drive_current_selection() {
+    let env = Env::new(true).await;
+    let id = "world-historical-trusted";
+    env.register(id).await;
+    let result = env
+        .run(
+            id,
+            1,
+            "historical-trusted",
+            &env.root,
+            &env.contrast_runner(|_| true),
+        )
+        .await;
+    let node_id = result.node_id.as_ref().unwrap();
+    // Exact pre-Q29 software-history shape: retain old identity receipts and
+    // restore the old Trusted label. It has no new content edge or execution.
+    rewrite_node(&env.store, node_id, |node| {
+        node["node"]["status"] = json!({"status":"valid","quality_micros":1_000_000});
+        node["node"]["best_valid_ancestor_micros"] = json!(1_000_000);
+        node["node"]["recent_valid_gains_micros"] = json!([500_000]);
+        node["evidence"] = json!("trusted");
+    })
+    .await;
+    let dispatch_id = result.dispatch_id.unwrap();
+    let mut dispatch = raw_record(&env.store, DISPATCH, &dispatch_id).await;
+    dispatch["payload"]["evidence"] = json!("trusted");
+    put_raw_record(&env.store, DISPATCH, &dispatch_id, &dispatch).await;
+    let before_node = raw_record(&env.store, NODE, node_id).await;
+    let before_dispatch = raw_record(&env.store, DISPATCH, &dispatch_id).await;
+    let usage = env.coordinator.verified_mechanism_usage(id).await.unwrap();
+    assert_eq!(
+        usage[0].evidence(),
+        evo_engine::exploration::ExplorationEvidenceV1::Trusted
+    );
+    assert_eq!(
+        usage[0].content_status(),
+        evo_engine::exploration::ExplorationContentStatus::SourceLegacy
+    );
+    for result in [
+        env.coordinator.decide_next(id).await.map(|_| ()),
+        env.coordinator
+            .final_candidate_request(id, node_id)
+            .await
+            .map(|_| ()),
+    ] {
+        assert!(
+            matches!(result,Err(Error::Conflict(ref message)) if message=="source_legacy: development evidence is not current Skill content")
+        );
+    }
+    assert_eq!(raw_record(&env.store, NODE, node_id).await, before_node);
+    assert_eq!(
+        raw_record(&env.store, DISPATCH, &dispatch_id).await,
+        before_dispatch
+    );
+    // A separate real current-content chain remains healthy in the same scope.
+    let (healthy, runner) = config_content_env("world-current-control").await;
+    let mut request =
+        healthy
+            .fixture
+            .request(&healthy.root, "world-current-control", 1, "current-control");
+    request.development_request.grader_digest =
+        evo_engine::development::projection::config_projection_grader_digest().unwrap();
+    let actual = healthy
+        .coordinator
+        .run_next(
+            Some(&ConfigEditingModel),
+            Some(&runner),
+            Some(&healthy.journal),
+            request,
+        )
+        .await
+        .unwrap();
+    healthy
+        .coordinator
+        .final_candidate_request("world-current-control", actual.node_id.as_deref().unwrap())
+        .await
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------

@@ -21,23 +21,13 @@
 //!   `decide_next` and `status` would fail for good. The gains a node carries stay
 //!   relative to its parent's own quality, as the replay computes them.
 //!
-//! The verified path uses `ContrastRunner`, which writes honest E03 evidence with chosen
-//! outputs (the budget rows, settlements, execution and grader receipts through the
-//! public issuing functions, the run receipt as a typed envelope), as
-//! `exploration_trust_v42` does. A candidate answers either every task (quality
-//! 1000000) or `task-a` only (500000) over the two registered tasks.
-//!
-//! Since AG-187 (§6.7.4 Q-29) the gate's verified comparison of an identity-only runner
-//! supports no Skill content, so no step derives a trusted valid node: a verified
-//! candidate is a terminal `HardFailure` labelled `EvidenceRejected`. The assertions that
-//! rest on a trusted valid node seed one with `seed_trusted_template`, the node the build
-//! before AG-187 stored for the same candidate (a derived structure template; such a
-//! stored record keeps its label, §5.1.1).
-//!
-//! Not covered (and not claimed): the error paths after a paid step (a failure between
-//! the paid step and the node's write leaves the dispatch claimed), the recovery end to
-//! end (the legal-action conditions of `Recover` are only pinned unchanged), and a
-//! trusted node from a runner that really executes the candidate bundle (none exists).
+//! Current content prerequisites use the registered config projection consumer:
+//! a complete LOW parent is frozen before world registration and really edited to
+//! HIGH. Synthetic FULL/HALF histories, depth, fairness and ancestor regressions
+//! stay in a lookup-only Replay domain; production replay derives every prefix,
+//! gain and wait. These histories do not claim current persistent 8/12-node runs.
+//! Real Store paths independently retain unique dispatch, Stop, legal digest,
+//! ancestry, spending, paid failure and claimed-step recovery assertions.
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 use async_trait::async_trait;
@@ -50,16 +40,27 @@ use evo_core::optimization::{
     EditSuggestion, ModelRequest, ModelRequestContext, ModelStage, OptimizationTrace,
     SkillFailureDiagnosis, SkillFailureKind, TraceOutcome, TrustedSourceBinding,
 };
+use evo_core::replay::{
+    HistoricalUsage, PrefixCoverageV1, REPLAY_MANIFEST_SCHEMA, REPLAY_WORLD_SCHEMA,
+    ReplayActionSpecV1, ReplayReportV3, ReplaySimulationProfile, ReplaySourceRef,
+    ReplayTransitionOutcome, ReplayTransitionV2, ReplayWorldManifestV2, ReplayWorldV2,
+    WorldPartition, replay_baseline_observation_digest, replay_observation_digest,
+};
 use evo_core::skill_edit::{
     EvidenceClosure, EvidenceRef, SKILL_EDIT_COMPILER_VERSION, SKILL_EDIT_SCHEMA, SkillEditBatch,
     SkillTextEdit, SkillTextField, TextEditOperation, TrustedEditContext, skill_snapshot_digest,
 };
 use evo_core::strategy::{
-    ActionKindV1, BatchActionV1, ElasticPolicyV1, ExplorationCapsV1, LegalActionV1, LegalActionsV1,
-    PrefixNodeV2, PrefixViewV2, SimulationContext,
+    ActionKindV1, BatchActionV1, BudgetViewV1, ElasticPolicyV1, ExplorationCapsV1, LegalActionV1,
+    LegalActionsV1, ObservedStatus, PrefixNodeV2, PrefixViewV2, SimulationContext, decide_elastic,
+    legal_candidates,
 };
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
 use evo_engine::curriculum_profiles::RegisteredPureFunctionProfileV1;
+use evo_engine::development::projection::{
+    ConfigProjectionControlV1, ConfigProjectionDevelopmentRunner, ConfigProjectionTaskV1,
+    register_config_projection_control,
+};
 use evo_engine::development::{
     DEVELOPMENT_RUN_RECEIPT_SCHEMA, DevelopmentControlV1, DevelopmentEvidenceScope,
     DevelopmentExecutionReceiptV1, DevelopmentRunReceiptV1, DevelopmentSide, DevelopmentTaskSpecV1,
@@ -84,6 +85,7 @@ use evo_engine::optimization::{
     DevelopmentRunReport, DevelopmentRunRequest, OptimizationJournal, OptimizationStepRequest,
     PairedTaskResult, StageFact, StageFactKind,
 };
+use evo_engine::replay::{LiveWorldAuthority, run_replay};
 use evo_engine::streaming_evaluator::{FixedGraderMethod, FixedGraderSpec};
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -1313,72 +1315,6 @@ fn answers_all(_: &str) -> bool {
     true
 }
 
-/// A candidate that answers `task-a` only: quality 500000.
-fn answers_task_a(task: &str) -> bool {
-    task == "task-a"
-}
-
-/// Derived structure template (AG-187): rewrites node `node_seq` of `world`, the content
-/// refusal of a candidate the gate verified, into the trusted valid node the build before
-/// AG-187 stored for the same candidate. Its quality is the mean of the candidate's
-/// scores (1000000 for each task `candidate_correct` answers), and its best valid ancestor
-/// and gains are what that build derived from the stored parent (the baseline for a
-/// root), so every later node and decision is derived from it as before. It is the
-/// structure the legal-action and prefix assertions rest on, not evidence of content.
-async fn seed_trusted_template(
-    env: &Env,
-    world: &str,
-    node_seq: u32,
-    candidate_correct: fn(&str) -> bool,
-) {
-    let node_id = format!("node-{world}-{node_seq}");
-    let stored = payload(&env.store, NODE, &node_id).await;
-    assert_eq!(
-        stored["evidence"], "evidence_rejected",
-        "{node_id}: only a refused candidate is templated"
-    );
-    let tasks = tasks();
-    let correct = tasks
-        .iter()
-        .filter(|task| candidate_correct(&task.task_id))
-        .count();
-    let quality = i64::from(FULL) * correct as i64 / tasks.len() as i64;
-    // What the gain is measured against: the parent's own quality (its best valid
-    // ancestor when it is not valid), the baseline for a root.
-    let previous = match stored["node"]["search_parent_seq"].as_u64() {
-        Some(parent_seq) => {
-            let parent = env.node(world, u32::try_from(parent_seq).unwrap()).await;
-            parent["node"]["status"]["quality_micros"]
-                .as_i64()
-                .or_else(|| parent["node"]["best_valid_ancestor_micros"].as_i64())
-                .unwrap()
-        }
-        None => payload(&env.store, WORLD, world).await["initial_baseline_quality_micros"]
-            .as_i64()
-            .unwrap(),
-    };
-    rewrite_node(&env.store, &node_id, |node| {
-        let mut gains = node["node"]["recent_valid_gains_micros"]
-            .as_array()
-            .unwrap()
-            .clone();
-        gains.push(json!(quality - previous));
-        if gains.len() > 2 {
-            gains.remove(0);
-        }
-        let best = node["node"]["best_valid_ancestor_micros"]
-            .as_i64()
-            .unwrap()
-            .max(quality);
-        node["node"]["status"] = json!({"status": "valid", "quality_micros": quality});
-        node["node"]["best_valid_ancestor_micros"] = json!(best);
-        node["node"]["recent_valid_gains_micros"] = json!(gains);
-        node["evidence"] = json!("trusted");
-        node["terminal_class"] = json!({"class": "candidate_observed"});
-    })
-    .await;
-}
-
 /// Counts the runs of the runner it wraps: a recovered step must not reach it.
 struct CallCounting<R> {
     inner: R,
@@ -1541,6 +1477,310 @@ impl Env {
     }
 }
 
+const CONFIG_LOW: &str = "config_precedence.v1: lowest_layer_first";
+const CONFIG_HIGH: &str = "config_precedence.v1: highest_layer_first";
+
+struct CurrentRuntime {
+    env: Env,
+    control: ConfigProjectionControlV1,
+    root: Parent,
+}
+
+struct ConfigEditingModel;
+#[async_trait]
+impl ModelPort for ConfigEditingModel {
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request.clone()).await
+    }
+    async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let parent: SkillSnapshot = serde_json::from_str(
+            &request
+                .input
+                .iter()
+                .find(|part| part.label == "parent-skill")
+                .ok_or(Error::NotFound)?
+                .content,
+        )
+        .map_err(|_| Error::Internal)?;
+        let mut response = EditingFixtureModel.dispatch(request).await?;
+        if let ModelResponse::Completed {
+            output,
+            output_digest,
+            ..
+        } = &mut response
+        {
+            let mut edits: Vec<EditSuggestion> =
+                serde_json::from_str(output).map_err(|_| Error::Internal)?;
+            for edit in &mut edits {
+                if edit.edit.field == SkillTextField::Content {
+                    edit.edit.start = 0;
+                    edit.edit.end = parent.content.len();
+                    edit.edit.expected_text_digest = hash(parent.content.as_bytes());
+                    edit.edit.operation = TextEditOperation::Replace {
+                        text: CONFIG_HIGH.into(),
+                    };
+                }
+            }
+            *output = serde_json::to_string(&edits).map_err(|_| Error::Internal)?;
+            *output_digest = hash(output.as_bytes());
+        }
+        Ok(response)
+    }
+}
+
+// An intentionally unverified report for the existing EvidenceRejected fault
+// branch. It never supplies the real root's content evidence or a new receipt.
+struct RejectedConfigReport;
+#[async_trait]
+impl DevRunner for RejectedConfigReport {
+    async fn run(&self, request: DevelopmentRunRequest) -> Result<DevelopmentRunReport> {
+        Ok(DevelopmentRunReport {
+            request_id: request.request_id.clone(),
+            manifest_digest: request.manifest.digest,
+            parent_bundle_digest: request.parent_bundle_digest,
+            candidate_bundle_digest: request.candidate_bundle_digest,
+            environment_digest: request.environment_digest,
+            grader_digest: request.grader_digest,
+            results: request
+                .manifest
+                .tasks
+                .iter()
+                .map(|task| PairedTaskResult {
+                    task_id: task.id.clone(),
+                    parent_score_micros: 0,
+                    candidate_score_micros: 1_000_000,
+                    parent_passed: false,
+                    candidate_passed: true,
+                    parent_execution_id: "unverified-parent".into(),
+                    candidate_execution_id: "unverified-candidate".into(),
+                    grader_receipt_digest: d("unverified-grader"),
+                })
+                .collect(),
+            execution_receipt_id: "unverified-run".into(),
+            usage_record_ids: vec!["unverified-usage".into()],
+            provenance: DevelopmentExecutionProvenance::RegisteredPureFunction,
+        })
+    }
+}
+
+impl CurrentRuntime {
+    async fn new() -> Self {
+        let env = Env::new().await;
+        let control = ConfigProjectionControlV1::registered(
+            "config-legal-control",
+            NAMESPACE,
+            SCOPE,
+            "dev-root",
+            "dev-executor",
+            "dev-grader",
+            "optimizer",
+            "config-legal-manifest",
+            vec![
+                ConfigProjectionTaskV1::registered(
+                    "config-family",
+                    json!({"template":"F","layer_count":2,"key_type":"B","placement":"E","seed":1}),
+                )
+                .unwrap(),
+            ],
+            d("environment"),
+            d("rules"),
+            d("tools"),
+            RUNS.iter().map(|run| (*run).into()).collect(),
+            1,
+        )
+        .unwrap();
+        register_config_projection_control(&admin(), &env.store, control.clone())
+            .await
+            .unwrap();
+        let skill = SkillSnapshot {
+            content: CONFIG_LOW.into(),
+            ..parent_skill()
+        };
+        let bundle = trusted_compiler_inputs::bundle_current(
+            &env.store,
+            &worker(),
+            evo_core::contract::CompileParts {
+                profile: &env.fixture.profile,
+                parent: &skill,
+                baseline: &env.fixture.baseline,
+                parent_strategy: &env.fixture.parent_strategy,
+                baseline_strategy: &env.fixture.baseline_strategy,
+                skill_patch: &Default::default(),
+                improver_patch: &env.fixture.improver,
+                caps: &env.fixture.caps,
+                revoked: &env.fixture.revoked,
+            },
+            &control.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
+        trusted_compiler_inputs::persist_bundle_current(
+            &env.store,
+            &worker(),
+            &bundle,
+            &control.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
+        let root = env.fixture.parent(bundle.skill, bundle.digest);
+        Self { env, control, root }
+    }
+    fn runner(&self) -> ConfigProjectionDevelopmentRunner {
+        ConfigProjectionDevelopmentRunner::with_clock(
+            self.env.store.clone(),
+            Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
+            Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
+            self.control.id.clone(),
+            600,
+            Arc::new(|| 100),
+        )
+        .unwrap()
+    }
+    async fn register(&self, mut registered: ExplorationWorldV1) {
+        registered.parent_skill_digest = skill_snapshot_digest(&self.root.skill).unwrap();
+        registered.parent_bundle_digest = self.root.bundle.clone();
+        registered.grader_digest = self.control.grader_digest.clone();
+        registered.context_signature = fingerprint(&(
+            &registered.parent_skill_digest,
+            &registered.parent_bundle_digest,
+            &registered.environment_digest,
+            &registered.model_digest,
+            &registered.tools_digest,
+            &registered.grader_digest,
+            &registered.rules_digest,
+            registered.source_watermark,
+        ))
+        .unwrap();
+        self.env.register(registered).await;
+    }
+    fn request<'a>(
+        &'a self,
+        parent: &'a Parent,
+        world: &str,
+        step: u32,
+        tag: &str,
+    ) -> OptimizationStepRequest<'a> {
+        let mut request = self.env.fixture.request(parent, world, step, tag);
+        request.development_request.manifest = self.control.manifest().unwrap();
+        request.development_request.grader_digest = self.control.grader_digest.clone();
+        request
+    }
+    async fn parent_of(&self, world: &str, action_seq: u32) -> Parent {
+        if action_seq < 1_000_000 {
+            return self
+                .env
+                .fixture
+                .parent(self.root.skill.clone(), self.root.bundle.clone());
+        }
+        let node = self.env.node(world, (action_seq - 1_000_000) / 2).await;
+        let digest = node["candidate_bundle_digest"].as_str().unwrap();
+        let mut session = self.env.store.session().await.unwrap();
+        let record = evo_engine::compiler::verify_current_bundle_in_session(
+            &mut session,
+            &worker(),
+            digest,
+            &self.control.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
+        session.commit().await.unwrap();
+        self.env
+            .fixture
+            .parent(record.bundle.skill.clone(), digest.into())
+    }
+    async fn step(
+        &self,
+        world: &str,
+        model: &dyn ModelPort,
+        runner: &dyn DevRunner,
+    ) -> Result<CoordinatorStepResult> {
+        let decision = self.env.coordinator.decide_next(world).await?;
+        let parent = match decision.action {
+            BatchActionV1::Dispatch {
+                ref action_seqs, ..
+            } => self.parent_of(world, action_seqs[0]).await,
+            BatchActionV1::Stop { .. } => self
+                .env
+                .fixture
+                .parent(self.root.skill.clone(), self.root.bundle.clone()),
+        };
+        let step = self.env.round(world).await + 1;
+        self.env
+            .coordinator
+            .run_next(
+                Some(model),
+                Some(runner),
+                Some(&self.env.journal),
+                self.request(&parent, world, step, &format!("{world}-{step}")),
+            )
+            .await
+    }
+}
+
+async fn assert_current_child_runtime(child: Child) {
+    let current = CurrentRuntime::new().await;
+    let id = format!("current-child-{}", child.name());
+    current.register(world(&id, &[1], HALF)).await;
+    assert_offered(&current.env, &id, &[widen(1)]).await;
+    let root = current
+        .step(&id, &ConfigEditingModel, &current.runner())
+        .await
+        .unwrap();
+    assert_eq!(
+        payload(&current.env.store, NODE, root.node_id.as_deref().unwrap()).await["evidence"],
+        "trusted"
+    );
+    assert_offered(&current.env, &id, &[deepen(1, 1, 1)]).await;
+    let root_node = current.env.node(&id, 1).await;
+    assert_eq!(
+        root_node["node"]["status"],
+        json!({"status":"valid", "quality_micros":FULL})
+    );
+    assert_eq!(root_node["node"]["best_valid_ancestor_micros"], FULL);
+    assert_eq!(
+        root_node["node"]["recent_valid_gains_micros"],
+        json!([500_000])
+    );
+    let result = current
+        .step(&id, child.model(), &RejectedConfigReport)
+        .await
+        .unwrap();
+    let node = payload(&current.env.store, NODE, result.node_id.as_deref().unwrap()).await;
+    assert_eq!(node["node"]["status"], child.status());
+    if matches!(child, Child::Valid) {
+        assert_eq!(node["evidence"], "evidence_rejected");
+    }
+    assert_eq!(dispatched_seqs(&result.decision.action), vec![1_000_002]);
+    assert_eq!(
+        node["node"]["best_valid_ancestor_micros"],
+        root_node["node"]["best_valid_ancestor_micros"]
+    );
+    assert_eq!(
+        node["node"]["recent_valid_gains_micros"],
+        root_node["node"]["recent_valid_gains_micros"]
+    );
+    let stored = payload(&current.env.store, WORLD, &id).await;
+    assert_eq!(stored["dispatch_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(stored["remaining_root_micros"], 980);
+    assert_world_reads(&current.env, &id).await;
+    assert_offered(&current.env, &id, &[]).await;
+    let stopped = current
+        .step(&id, child.model(), &RejectedConfigReport)
+        .await
+        .unwrap();
+    assert_eq!(stopped.dispatch_id, None);
+    assert_eq!(stopped.node_id, None);
+    assert_eq!(stopped.outcome, STOP_REASON);
+    assert_eq!(payload(&current.env.store, WORLD, &id).await, stored);
+}
+
 fn dispatched_seqs(action: &BatchActionV1) -> Vec<u32> {
     match action {
         BatchActionV1::Dispatch { action_seqs, .. } => action_seqs.clone(),
@@ -1548,71 +1788,320 @@ fn dispatched_seqs(action: &BatchActionV1) -> Vec<u32> {
     }
 }
 
-/// What a round dispatched: the action's sequence and the reason of the decision.
-type Round = (u32, String);
-
-/// Runs `world` round by round, the runner of each round chosen by `script`, until
-/// the decision is Stop. Each round's refused candidate is seeded as the trusted valid
-/// node the build before AG-187 stored for it (`seed_trusted_template`). Returns what
-/// each round dispatched and the reason it stopped. A round that cannot dispatch what
-/// was decided is a world that can neither advance nor stop.
-async fn run_to_stop(
-    env: &Env,
-    world: &str,
-    script: fn(u32) -> fn(&str) -> bool,
-) -> (Vec<Round>, String) {
-    let mut rounds: Vec<Round> = Vec::new();
-    for round in 1..=MAX_ROUNDS {
-        let decision = env
-            .coordinator
-            .decide_next(world)
-            .await
-            .unwrap_or_else(|error| {
-                panic!("{world}: round {round}: decide_next failed with {error:?} after {rounds:?}")
-            });
-        let (action_seq, reason) = match &decision.action {
-            BatchActionV1::Dispatch {
-                action_seqs,
-                reason,
-                ..
-            } => (action_seqs[0], reason.clone()),
-            BatchActionV1::Stop { reason } => return (rounds, reason.clone()),
-        };
-        if let Err(error) = env
-            .step(world, &env.model, &env.runner(script(round)))
-            .await
-        {
-            panic!(
-                "{world}: round {round} could not dispatch action {action_seq} chosen for \
-                 {reason:?} ({error:?}); dispatched so far {rounds:?}"
-            );
-        }
-        seed_trusted_template(env, world, round, script(round)).await;
-        rounds.push((action_seq, reason));
-    }
-    panic!("{world} did not stop within {MAX_ROUNDS} rounds: {rounds:?}");
+// These lookup-only histories exercise the pure algorithm. They never grant
+// current content evidence or write exploration nodes. Prefix ancestry, gains,
+// focus and waits are all derived by the production replay consumer.
+struct AlgorithmMatrix {
+    world: ReplayWorldV2,
+    legal: LegalActionsV1,
 }
 
-/// A world that stops after at least five rounds, each of which dispatched a
-/// different opportunity, and that still reads.
-async fn assert_runs_to_stop(env: &Env, world: &str, rounds: &[Round], reason: &str) {
-    assert!(
-        rounds.len() >= 5,
-        "{world}: only {} rounds before the stop: {rounds:?}",
-        rounds.len()
+impl AlgorithmMatrix {
+    fn new(id: &str, slots: &[u32], baseline: u32, observations: &[ObservedStatus]) -> Self {
+        let context = |seq| d(&format!("{id}-context-{seq}"));
+        let mut catalog = Vec::new();
+        let mut transitions = Vec::new();
+        for &slot in slots {
+            for (index, status) in observations.iter().enumerate() {
+                let depth = u8::try_from(index + 1).unwrap();
+                let seq = (slot - 1) * 4 + u32::from(depth);
+                let kind = if depth == 1 {
+                    ActionKindV1::Widen { root_slot: slot }
+                } else {
+                    ActionKindV1::Deepen {
+                        parent_node_seq: seq - 1,
+                    }
+                };
+                let parent_context = if depth == 1 {
+                    d("baseline-context")
+                } else {
+                    context(seq - 1)
+                };
+                catalog.push(ReplayActionSpecV1 {
+                    record_seq: seq,
+                    generation_signature: d("generation"),
+                    parent_context_signature: parent_context.clone(),
+                    branch_seq: slot,
+                    target_depth: depth,
+                    action_kind: kind.clone(),
+                    estimated_cost_upper_micros: Some(10),
+                    writes_shared_workspace: false,
+                });
+                let source = format!("{id}-observation-{seq}");
+                transitions.push(ReplayTransitionV2 {
+                    record_id: format!("{id}-record-{seq}"),
+                    record_seq: seq,
+                    generation_signature: d("generation"),
+                    parent_context_signature: parent_context,
+                    action_kind: kind,
+                    next_context_signature: context(seq),
+                    outcome: ReplayTransitionOutcome::Observed {
+                        status: status.clone(),
+                    },
+                    actual_usage: HistoricalUsage {
+                        cost_micros: Some(0),
+                        latency_millis: Some(1),
+                        ..Default::default()
+                    },
+                    source_ids: vec![source.clone()],
+                    observation_source_id: source,
+                });
+            }
+        }
+        let legal = LegalActionsV1 {
+            schema_version: "rsia.legal_actions.v1".into(),
+            actions: catalog
+                .iter()
+                .map(|action| LegalActionV1 {
+                    action_id: format!("replay-action-{}", action.record_seq),
+                    action_seq: action.record_seq,
+                    branch_seq: action.branch_seq,
+                    target_depth: action.target_depth,
+                    kind: action.action_kind.clone(),
+                    estimated_cost_upper_micros: action.estimated_cost_upper_micros,
+                })
+                .collect(),
+        };
+        let mut world = ReplayWorldV2 {
+            schema_version: REPLAY_WORLD_SCHEMA.into(),
+            manifest: ReplayWorldManifestV2 {
+                schema_version: REPLAY_MANIFEST_SCHEMA.into(),
+                world_id: id.into(),
+                cluster_id: format!("cluster-{id}"),
+                partition: WorldPartition::Select,
+                purpose: Purpose::Development,
+                generation_signature: d("generation"),
+                world_context_signature: d("world-context"),
+                baseline_context_signature: d("baseline-context"),
+                approved_parent_digest: d("approved"),
+                model_digest: d("model"),
+                tools_digest: d("tools"),
+                scorer_digest: d("scorer"),
+                guidance_digest: d("guidance"),
+                repair_template_digest: d("repair"),
+                input_order_digest: d("order"),
+                initial_baseline_quality_micros: baseline,
+                baseline_observation_source_id: format!("{id}-baseline"),
+                source_closure: Vec::new(),
+                revoke_watermark: 1,
+                prefix_coverage: std::iter::once(d("baseline-context"))
+                    .chain(
+                        transitions
+                            .iter()
+                            .map(|transition| transition.next_context_signature.clone()),
+                    )
+                    .map(|context_signature| PrefixCoverageV1 {
+                        context_signature,
+                        exhausted: true,
+                    })
+                    .collect(),
+                action_catalog: catalog,
+            },
+            transitions,
+            sealed_digest: None,
+        };
+        world.manifest.source_closure = std::iter::once(ReplaySourceRef {
+            source_id: world.manifest.baseline_observation_source_id.clone(),
+            content_digest: replay_baseline_observation_digest(&world.manifest).unwrap(),
+        })
+        .chain(world.transitions.iter().map(|transition| ReplaySourceRef {
+            source_id: transition.observation_source_id.clone(),
+            content_digest: replay_observation_digest(&world.manifest, transition).unwrap(),
+        }))
+        .collect();
+        world.seal().unwrap();
+        Self { world, legal }
+    }
+
+    fn run(&self, probes: u8) -> ReplayReportV3 {
+        let mut profile = ReplaySimulationProfile::default_v2(1, d("algorithm-pool"));
+        profile.probe_budget = probes;
+        profile.horizon = probes;
+        profile.fixed_seed = 7;
+        run_replay(
+            &self.world,
+            &ElasticPolicyV1::default(),
+            &profile,
+            &ExplorationCapsV1::online(),
+            &LiveWorldAuthority {
+                revoke_watermark: 1,
+                revoked_source_ids: BTreeSet::new(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn decision(&self, prefix: &PrefixViewV2) -> BatchActionV1 {
+        decide_elastic(
+            &ElasticPolicyV1::default(),
+            prefix,
+            &self.legal,
+            &BudgetViewV1 {
+                remaining_nodes: 12 - prefix.nodes_used,
+                remaining_recovery_dispatches: 2,
+                remaining_root_micros: 1_000 - u64::from(prefix.nodes_used) * 10,
+            },
+            &ExplorationCapsV1::online(),
+            SimulationContext::Online { fixed_seed: 7 },
+        )
+        .unwrap()
+    }
+}
+
+fn assert_algorithm_offered(prefix: &PrefixViewV2, slots: &[u32], expected: &[LegalActionV1]) {
+    prefix.validate().unwrap();
+    let legal = LegalActionsV1 {
+        schema_version: "rsia.legal_actions.v1".into(),
+        actions: slots
+            .iter()
+            .copied()
+            .map(widen)
+            .chain(
+                prefix
+                    .nodes
+                    .iter()
+                    .map(|node| deepen(node.node_seq, node.branch_seq, node.depth)),
+            )
+            .collect(),
+    };
+    let budget = BudgetViewV1 {
+        remaining_nodes: 12 - prefix.nodes_used,
+        remaining_recovery_dispatches: 2,
+        remaining_root_micros: 1_000,
+    };
+    let offered: Vec<_> = legal_candidates(prefix, &legal, &budget, &ExplorationCapsV1::online())
+        .unwrap()
+        .into_iter()
+        .cloned()
+        .collect();
+    assert_eq!(
+        serde_json::to_value(&offered).unwrap(),
+        serde_json::to_value(expected).unwrap()
     );
-    let distinct: BTreeSet<_> = rounds.iter().map(|(action_seq, _)| action_seq).collect();
-    assert_eq!(distinct.len(), rounds.len(), "{world}: {rounds:?}");
-    assert_eq!(reason, STOP_REASON, "{world}");
-    // `run_next` reports the stop and dispatches nothing.
-    let stopped = env
-        .step(world, &env.model, &env.runner(answers_all))
-        .await
-        .unwrap();
-    assert_eq!(stopped.dispatch_id, None, "{world}");
-    assert_eq!(stopped.node_id, None, "{world}");
-    assert_eq!(stopped.outcome, STOP_REASON, "{world}");
-    assert_world_reads(env, world).await;
+    let decision = decide_elastic(
+        &ElasticPolicyV1::default(),
+        prefix,
+        &legal,
+        &budget,
+        &ExplorationCapsV1::online(),
+        SimulationContext::Online { fixed_seed: 7 },
+    )
+    .unwrap();
+    if expected.is_empty() {
+        assert!(matches!(decision, BatchActionV1::Stop { reason } if reason == STOP_REASON));
+    } else {
+        assert_eq!(dispatched_seqs(&decision), vec![expected[0].action_seq]);
+    }
+}
+
+fn assert_algorithm_stops(matrix: &AlgorithmMatrix, report: &ReplayReportV3) {
+    assert!(
+        report.batches.len() >= 5,
+        "only {} rounds",
+        report.batches.len()
+    );
+    let distinct: BTreeSet<_> = report
+        .batches
+        .iter()
+        .flat_map(|batch| &batch.action_seqs)
+        .collect();
+    assert_eq!(distinct.len(), report.batches.len());
+    let prefix = report.revealed_prefix.as_ref().unwrap();
+    prefix.validate().unwrap();
+    assert!(
+        matches!(matrix.decision(prefix), BatchActionV1::Stop { reason } if reason == STOP_REASON)
+    );
+}
+
+async fn assert_current_rounds_to_stop(id: &str, slots: &[u32]) {
+    let current = CurrentRuntime::new().await;
+    let env = &current.env;
+    current.register(world(id, slots, HALF)).await;
+    let runner = current.runner();
+    let mut dispatched = BTreeSet::new();
+    for _ in 0..MAX_ROUNDS {
+        let prefix = stored_prefix(env, id).await;
+        let stored = payload(&env.store, WORLD, id).await;
+        let legal = LegalActionsV1 {
+            schema_version: "rsia.legal_actions.v1".into(),
+            actions: universe(env, id).await,
+        };
+        let budget = BudgetViewV1 {
+            remaining_nodes: 12 - prefix.nodes_used,
+            remaining_recovery_dispatches: 2,
+            remaining_root_micros: stored["remaining_root_micros"].as_u64().unwrap(),
+        };
+        let expected: Vec<_> =
+            legal_candidates(&prefix, &legal, &budget, &ExplorationCapsV1::online())
+                .unwrap()
+                .into_iter()
+                .cloned()
+                .collect();
+        assert_offered(env, id, &expected).await;
+        let decision = env.coordinator.decide_next(id).await.unwrap();
+        let seq = match decision.action {
+            BatchActionV1::Dispatch {
+                ref action_seqs, ..
+            } => action_seqs[0],
+            BatchActionV1::Stop { ref reason } => {
+                assert_eq!(reason, STOP_REASON);
+                assert_offered(env, id, &[]).await;
+                let before = payload(&env.store, WORLD, id).await;
+                let stopped = current.step(id, &NoChangeModel, &runner).await.unwrap();
+                assert_eq!(stopped.dispatch_id, None);
+                assert_eq!(stopped.node_id, None);
+                assert_eq!(stopped.outcome, STOP_REASON);
+                assert_eq!(payload(&env.store, WORLD, id).await, before);
+                assert_eq!(dispatched.len(), slots.len() * 2);
+                assert_world_reads(env, id).await;
+                return;
+            }
+        };
+        assert!(
+            dispatched.insert(seq),
+            "a spent action was offered again: {seq}"
+        );
+        let model: &dyn ModelPort = if seq < 1_000_000 {
+            &ConfigEditingModel
+        } else {
+            &NoChangeModel
+        };
+        let result = current.step(id, model, &runner).await.unwrap();
+        assert_eq!(dispatched_seqs(&result.decision.action), vec![seq]);
+        let fact = payload(&env.store, DISPATCH, result.dispatch_id.as_deref().unwrap()).await;
+        assert_eq!(fact["selected_action"]["estimated_cost_upper_micros"], 10);
+        assert_eq!(fact["node_id"], result.node_id.as_deref().unwrap());
+        let node = payload(&env.store, NODE, result.node_id.as_deref().unwrap()).await;
+        if seq < 1_000_000 {
+            assert_eq!(node["evidence"], "trusted");
+            assert_eq!(
+                node["node"]["status"],
+                json!({"status":"valid", "quality_micros":FULL})
+            );
+            assert_eq!(node["node"]["recent_valid_gains_micros"], json!([500_000]));
+        } else {
+            let parent = env.node(id, (seq - 1_000_000) / 2).await;
+            assert_eq!(
+                node["node"]["best_valid_ancestor_micros"],
+                parent["node"]["best_valid_ancestor_micros"]
+            );
+            assert_eq!(
+                node["node"]["recent_valid_gains_micros"],
+                parent["node"]["recent_valid_gains_micros"]
+            );
+        }
+        let stored = payload(&env.store, WORLD, id).await;
+        assert_eq!(
+            stored["dispatch_ids"].as_array().unwrap().len(),
+            dispatched.len()
+        );
+        assert_eq!(
+            stored["remaining_root_micros"],
+            1_000 - dispatched.len() * 10
+        );
+        assert_world_reads(env, id).await;
+    }
+    panic!("{id} did not stop within {MAX_ROUNDS} real dispatches");
 }
 
 // What the coordinator derives, in the order it derives it (the roots in
@@ -1817,20 +2306,18 @@ async fn relabel(env: &Env, node_id: &str, label: Option<&str>) {
 
 #[tokio::test]
 async fn a_valid_node_is_deepened_only_when_its_evidence_is_trusted() {
-    let env = Env::new().await;
+    let current = CurrentRuntime::new().await;
+    let env = &current.env;
     for (case, label) in LABELS {
         let id = format!("world-gate-{case}");
-        env.register(world(&id, &[1], HALF)).await;
-        // A trusted valid node (1000000 over the 500000 baseline; seeded as the build
-        // before AG-187 stored it) whose label is rewritten to what the row under test
-        // carries: the label is the only difference between the cases.
-        let first = env
-            .step(&id, &env.model, &env.runner(answers_all))
+        current.register(world(&id, &[1], HALF)).await;
+        // A real LOW→HIGH observation; only its stored label differs between cases.
+        let first = current
+            .step(&id, &ConfigEditingModel, &current.runner())
             .await
             .unwrap();
         let node_id = first.node_id.clone().unwrap();
-        seed_trusted_template(&env, &id, 1, answers_all).await;
-        relabel(&env, &node_id, label).await;
+        relabel(env, &node_id, label).await;
         assert_eq!(
             payload(&env.store, NODE, &node_id).await["node"]["status"],
             json!({"status": "valid", "quality_micros": FULL}),
@@ -1841,7 +2328,7 @@ async fn a_valid_node_is_deepened_only_when_its_evidence_is_trusted() {
         let decision = env.coordinator.decide_next(&id).await.unwrap();
         if label == Some("trusted") {
             assert_eq!(dispatched_seqs(&decision.action), vec![1_000_002], "{case}");
-            assert_offered(&env, &id, &[deepen(1, 1, 1)]).await;
+            assert_offered(env, &id, &[deepen(1, 1, 1)]).await;
         } else {
             match &decision.action {
                 BatchActionV1::Stop { reason } => assert_eq!(reason, STOP_REASON, "{case}"),
@@ -1849,7 +2336,7 @@ async fn a_valid_node_is_deepened_only_when_its_evidence_is_trusted() {
                     "{case}: a valid node without trusted evidence was offered a successor: {other:?}"
                 ),
             }
-            assert_offered(&env, &id, &[]).await;
+            assert_offered(env, &id, &[]).await;
         }
 
         // ... and only the trusted one is proposed as a final candidate (unchanged).
@@ -1870,22 +2357,22 @@ async fn a_valid_node_is_deepened_only_when_its_evidence_is_trusted() {
 
 #[tokio::test]
 async fn a_valid_row_without_trusted_evidence_leaves_the_other_root_offered() {
-    let env = Env::new().await;
+    let current = CurrentRuntime::new().await;
+    let env = &current.env;
     for (case, label) in LABELS.iter().filter(|(_, label)| *label != Some("trusted")) {
         let id = format!("world-gate-roots-{case}");
-        env.register(world(&id, &[2, 1], HALF)).await;
+        current.register(world(&id, &[2, 1], HALF)).await;
         // The first root (slot 1, the lowest sequence) is a valid node whose
         // significant gain would focus the world on deepening it, were it trusted.
-        let first = env
-            .step(&id, &env.model, &env.runner(answers_all))
+        let first = current
+            .step(&id, &ConfigEditingModel, &current.runner())
             .await
             .unwrap();
         assert_eq!(dispatched_seqs(&first.decision.action), vec![1], "{case}");
-        seed_trusted_template(&env, &id, 1, answers_all).await;
-        relabel(&env, first.node_id.as_deref().unwrap(), *label).await;
+        relabel(env, first.node_id.as_deref().unwrap(), *label).await;
 
         // The row drives nothing: the world goes on with the other root.
-        assert_offered(&env, &id, &[widen(2)]).await;
+        assert_offered(env, &id, &[widen(2)]).await;
         let decision = env.coordinator.decide_next(&id).await.unwrap();
         assert_eq!(dispatched_seqs(&decision.action), vec![2], "{case}");
     }
@@ -1897,20 +2384,21 @@ async fn a_valid_row_without_trusted_evidence_leaves_the_other_root_offered() {
 
 #[tokio::test]
 async fn a_deepen_that_was_dispatched_is_not_offered_again_so_the_world_stops() {
-    let env = Env::new().await;
+    let current = CurrentRuntime::new().await;
+    let env = &current.env;
     for child in [Child::HardFailure, Child::Uncertain] {
         let id = format!("world-spent-{}", child.name());
-        env.register(world(&id, &[1], HALF)).await;
-        env.step(&id, &env.model, &env.runner(answers_all))
+        current.register(world(&id, &[1], HALF)).await;
+        current
+            .step(&id, &ConfigEditingModel, &current.runner())
             .await
             .unwrap();
-        seed_trusted_template(&env, &id, 1, answers_all).await;
-        assert_offered(&env, &id, &[deepen(1, 1, 1)]).await;
+        assert_offered(env, &id, &[deepen(1, 1, 1)]).await;
 
         // The root's Deepen is the only opportunity left, and its step ends without a
         // valid node: nothing can be deepened below it.
-        let second = env
-            .step(&id, child.model(), &env.runner(answers_all))
+        let second = current
+            .step(&id, child.model(), &current.runner())
             .await
             .unwrap();
         let node = payload(&env.store, NODE, second.node_id.as_deref().unwrap()).await;
@@ -1924,90 +2412,95 @@ async fn a_deepen_that_was_dispatched_is_not_offered_again_so_the_world_stops() 
         match &decision.action {
             BatchActionV1::Stop { reason } => assert_eq!(reason, STOP_REASON, "{id}"),
             other => {
-                let attempt = env.step(&id, child.model(), &env.runner(answers_all)).await;
+                let attempt = current.step(&id, child.model(), &current.runner()).await;
                 panic!(
                     "{id}: the spent Deepen was offered again: {other:?}; dispatching it gives {attempt:?}"
                 );
             }
         }
-        assert_offered(&env, &id, &[]).await;
-        let stopped = env
-            .step(&id, child.model(), &env.runner(answers_all))
+        assert_offered(env, &id, &[]).await;
+        let stopped = current
+            .step(&id, child.model(), &current.runner())
             .await
             .unwrap();
         assert_eq!(stopped.dispatch_id, None, "{id}");
         assert_eq!(stopped.node_id, None, "{id}");
         assert_eq!(stopped.outcome, STOP_REASON, "{id}");
-        assert_world_reads(&env, &id).await;
+        assert_world_reads(env, &id).await;
     }
 }
 
 #[tokio::test]
 async fn each_node_of_a_chain_is_offered_one_successor_up_to_the_depth_cap() {
-    let env = Env::new().await;
-    let id = "world-chain";
-    env.register(world(id, &[1], HALF)).await;
-    assert_offered(&env, id, &[widen(1)]).await;
-    // Every node is trusted and valid (seeded as the build before AG-187 stored it),
-    // so each is offered a Deepen; once that was dispatched only the newest node's is
-    // left, and at the depth cap (4) none.
+    let observations = vec![
+        ObservedStatus::Valid {
+            quality_micros: FULL
+        };
+        4
+    ];
+    let matrix = AlgorithmMatrix::new("world-chain", &[1], HALF, &observations);
     for depth in 1..=4u8 {
-        env.step(id, &env.model, &env.runner(answers_all))
-            .await
-            .unwrap();
-        seed_trusted_template(&env, id, u32::from(depth), answers_all).await;
-        if depth < 4 {
-            assert_offered(&env, id, &[deepen(u32::from(depth), 1, depth)]).await;
+        let report = matrix.run(depth);
+        let prefix = report.revealed_prefix.unwrap();
+        assert_eq!(prefix.nodes.len(), usize::from(depth));
+        assert_eq!(prefix.nodes.last().unwrap().depth, depth);
+        let expected = if depth < 4 {
+            vec![deepen(u32::from(depth), 1, depth)]
         } else {
-            assert_offered(&env, id, &[]).await;
-        }
+            vec![]
+        };
+        assert_algorithm_offered(&prefix, &[1], &expected);
     }
-    let decision = env.coordinator.decide_next(id).await.unwrap();
-    assert!(
-        matches!(&decision.action, BatchActionV1::Stop { reason } if reason == STOP_REASON),
-        "{decision:?}"
-    );
-}
-
-/// Every round improves on the last.
-fn improves_every_round(_: u32) -> fn(&str) -> bool {
-    answers_all
+    assert_current_child_runtime(Child::HardFailure).await;
 }
 
 #[tokio::test]
 async fn a_world_runs_many_rounds_to_stop_without_a_dispatch_conflict() {
-    let env = Env::new().await;
-    let id = "world-rounds";
-    env.register(world(id, &[2, 1], HALF)).await;
-    let (rounds, reason) = run_to_stop(&env, id, improves_every_round).await;
-    // Two branches, four levels each (the depth cap), every node trusted and valid:
-    // each node is deepened once, and then nothing is left to decide.
-    assert_eq!(rounds.len(), 8, "{rounds:?}");
-    assert_runs_to_stop(&env, id, &rounds, &reason).await;
-}
-
-/// Every round stays at the baseline: no gain anywhere, so the roots and the
-/// successors wait for each other until the fairness rule forces them.
-fn stays_at_the_baseline(_: u32) -> fn(&str) -> bool {
-    answers_task_a
+    let observations = vec![
+        ObservedStatus::Valid {
+            quality_micros: FULL
+        };
+        4
+    ];
+    let matrix = AlgorithmMatrix::new("world-rounds", &[2, 1], HALF, &observations);
+    let report = matrix.run(12);
+    assert_eq!(report.batches.len(), 8, "{:?}", report.batches);
+    assert_algorithm_stops(&matrix, &report);
+    // The real fixed consumer can improve each LOW root once. Its successors
+    // finish NoChange, and every real dispatch remains unique and accounted for.
+    assert_current_rounds_to_stop("current-rounds", &[2, 1]).await;
 }
 
 #[tokio::test]
 async fn a_world_whose_rounds_are_forced_by_fairness_runs_to_the_node_cap_and_stops() {
-    let env = Env::new().await;
-    let id = "world-fairness";
-    env.register(world(id, &[5, 4, 3, 2, 1], HALF)).await;
-    let (rounds, reason) = run_to_stop(&env, id, stays_at_the_baseline).await;
-    // The waiting actions are forced after four rounds, as a spent Deepen would be
-    // had it stayed offered; the world runs to the 12 nodes of the caps instead.
+    let observations = vec![
+        ObservedStatus::Valid {
+            quality_micros: HALF
+        };
+        4
+    ];
+    let matrix = AlgorithmMatrix::new("world-fairness", &[5, 4, 3, 2, 1], HALF, &observations);
+    let report = matrix.run(12);
+    assert_eq!(report.batches.len(), 12, "{:?}", report.batches);
+    let mut fairness_forced = false;
+    for probes in 1..12 {
+        let prefix = matrix.run(probes).revealed_prefix.unwrap();
+        let decision = matrix.decision(&prefix);
+        assert_eq!(
+            dispatched_seqs(&decision),
+            report.batches[usize::from(probes)].action_seqs
+        );
+        if let BatchActionV1::Dispatch { reason, .. } = decision {
+            fairness_forced |= reason == "fairness_wait_threshold";
+        }
+    }
     assert!(
-        rounds
-            .iter()
-            .any(|(_, reason)| reason == "fairness_wait_threshold"),
-        "no round was forced by fairness: {rounds:?}"
+        fairness_forced,
+        "no round was forced by fairness: {:?}",
+        report.batches
     );
-    assert_eq!(rounds.len(), 12, "{rounds:?}");
-    assert_runs_to_stop(&env, id, &rounds, &reason).await;
+    assert_algorithm_stops(&matrix, &report);
+    assert_current_rounds_to_stop("current-fairness", &[5, 4, 3, 2, 1]).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2016,116 +2509,89 @@ async fn a_world_whose_rounds_are_forced_by_fairness_runs_to_the_node_cap_and_st
 
 #[tokio::test]
 async fn a_trusted_root_below_the_baseline_can_be_deepened_without_bricking_the_world() {
-    let env = Env::new().await;
     for child in Child::ALL {
-        let id = format!("world-below-{}", child.name());
-        // The baseline is 900000 and the trusted root scores 500000, below it: the
-        // best valid ancestor its successors inherit (900000) is not the root's own
-        // quality.
-        env.register(world(&id, &[1], 900_000)).await;
-        env.step(&id, &env.model, &env.runner(answers_task_a))
-            .await
-            .unwrap();
-        seed_trusted_template(&env, &id, 1, answers_task_a).await;
-        let root = env.node(&id, 1).await;
-        assert_eq!(root["evidence"], "trusted", "{id}");
-        assert_eq!(
-            root["node"]["status"],
-            json!({"status": "valid", "quality_micros": HALF}),
-            "{id}"
+        let status: ObservedStatus = serde_json::from_value(child.status()).unwrap();
+        let matrix = AlgorithmMatrix::new(
+            &format!("world-below-{}", child.name()),
+            &[1],
+            900_000,
+            &[
+                ObservedStatus::Valid {
+                    quality_micros: HALF,
+                },
+                status,
+            ],
         );
-        assert_eq!(root["node"]["best_valid_ancestor_micros"], 900_000, "{id}");
-        assert_eq!(root["node"]["recent_valid_gains_micros"], json!([-400_000]));
-
-        // Deepen it, the one legal action; the step ends as `child` says.
-        let decision = env.coordinator.decide_next(&id).await.unwrap();
-        assert_eq!(dispatched_seqs(&decision.action), vec![1_000_002], "{id}");
-        env.step(&id, child.model(), &env.runner(answers_task_a))
-            .await
-            .unwrap();
-
-        // The world still reads, and the node inherits the root's best valid ancestor.
-        assert_world_reads(&env, &id).await;
-        let node = env.node(&id, 2).await;
-        assert_eq!(node["node"]["status"], child.status(), "{id}");
-        if matches!(child, Child::Valid) {
-            // AG-187: the verified candidate is refused as identity-only Skill content.
-            assert_eq!(node["evidence"], "evidence_rejected", "{id}");
-        }
+        let root_prefix = matrix.run(1).revealed_prefix.unwrap();
+        let root = &root_prefix.nodes[0];
+        assert!(matches!(
+            root.status,
+            ObservedStatus::Valid {
+                quality_micros: HALF
+            }
+        ));
+        assert_eq!(root.best_valid_ancestor_micros, Some(900_000));
+        assert_eq!(root.recent_valid_gains_micros, vec![-400_000]);
+        assert_algorithm_offered(&root_prefix, &[1], &[deepen(1, 1, 1)]);
+        let prefix = matrix.run(2).revealed_prefix.unwrap();
+        prefix.validate().unwrap();
+        let node = &prefix.nodes[1];
+        assert_eq!(serde_json::to_value(&node.status).unwrap(), child.status());
         assert_eq!(
-            node["node"]["best_valid_ancestor_micros"], root["node"]["best_valid_ancestor_micros"],
-            "{id}: the child's best valid ancestor is its parent's"
+            node.best_valid_ancestor_micros,
+            root.best_valid_ancestor_micros
         );
-        // The gains stay relative to the parent's own quality, as the replay computes
-        // them, and only a valid child adds one: none of these is valid.
-        assert_eq!(
-            node["node"]["recent_valid_gains_micros"],
-            json!([-400_000]),
-            "{id}"
-        );
+        assert_eq!(node.recent_valid_gains_micros, vec![-400_000]);
+        assert_current_child_runtime(child).await;
     }
 }
 
 #[tokio::test]
 async fn a_regressing_parent_does_not_brick_its_children() {
-    let env = Env::new().await;
     for child in Child::ALL {
-        let id = format!("world-regress-{}", child.name());
-        // Grandparent: 1000000 over the 500000 baseline (seeded as the build before
-        // AG-187 stored it, as is the parent).
-        env.register(world(&id, &[1], HALF)).await;
-        env.step(&id, &env.model, &env.runner(answers_all))
-            .await
-            .unwrap();
-        seed_trusted_template(&env, &id, 1, answers_all).await;
-        // Parent: deepens the grandparent and regresses to 500000, below the best
-        // valid ancestor it inherits (1000000).
-        env.step(&id, &env.model, &env.runner(answers_task_a))
-            .await
-            .unwrap();
-        seed_trusted_template(&env, &id, 2, answers_task_a).await;
-        let parent = env.node(&id, 2).await;
-        assert_eq!(
-            parent["node"]["status"],
-            json!({"status": "valid", "quality_micros": HALF}),
-            "{id}"
+        let status: ObservedStatus = serde_json::from_value(child.status()).unwrap();
+        let matrix = AlgorithmMatrix::new(
+            &format!("world-regress-{}", child.name()),
+            &[1],
+            HALF,
+            &[
+                ObservedStatus::Valid {
+                    quality_micros: FULL,
+                },
+                ObservedStatus::Valid {
+                    quality_micros: HALF,
+                },
+                status,
+            ],
         );
-        assert_eq!(parent["node"]["best_valid_ancestor_micros"], FULL, "{id}");
+        let parent_prefix = matrix.run(2).revealed_prefix.unwrap();
+        parent_prefix.validate().unwrap();
+        let parent = &parent_prefix.nodes[1];
+        assert!(matches!(
+            parent.status,
+            ObservedStatus::Valid {
+                quality_micros: HALF
+            }
+        ));
+        assert_eq!(parent.best_valid_ancestor_micros, Some(FULL));
+        assert_eq!(parent.recent_valid_gains_micros, vec![500_000, -500_000]);
+        assert_algorithm_offered(&parent_prefix, &[1], &[deepen(2, 1, 2)]);
+        let prefix = matrix.run(3).revealed_prefix.unwrap();
+        prefix.validate().unwrap();
+        let grandchild = &prefix.nodes[2];
         assert_eq!(
-            parent["node"]["recent_valid_gains_micros"],
-            json!([500_000, -500_000]),
-            "{id}"
+            serde_json::to_value(&grandchild.status).unwrap(),
+            child.status()
         );
-        assert_world_reads(&env, &id).await;
-
-        // The grandparent's Deepen is spent, so the regressed parent's is the next
-        // decision; its step ends as `child` says.
-        let decision = env.coordinator.decide_next(&id).await.unwrap();
-        assert_eq!(dispatched_seqs(&decision.action), vec![1_000_004], "{id}");
-        env.step(&id, child.model(), &env.runner(answers_task_a))
-            .await
-            .unwrap();
-
-        // The world still reads, and the grandchild inherits the parent's best valid
-        // ancestor, not the parent's own (lower) quality.
-        assert_world_reads(&env, &id).await;
-        let grandchild = env.node(&id, 3).await;
-        assert_eq!(grandchild["node"]["status"], child.status(), "{id}");
-        if matches!(child, Child::Valid) {
-            // AG-187: the verified candidate is refused as identity-only Skill content.
-            assert_eq!(grandchild["evidence"], "evidence_rejected", "{id}");
-        }
         assert_eq!(
-            grandchild["node"]["best_valid_ancestor_micros"],
-            parent["node"]["best_valid_ancestor_micros"],
-            "{id}: the child's best valid ancestor is its parent's"
+            grandchild.best_valid_ancestor_micros,
+            parent.best_valid_ancestor_micros
         );
-        // Only a valid child adds a gain: none of these is valid.
         assert_eq!(
-            grandchild["node"]["recent_valid_gains_micros"],
-            json!([500_000, -500_000]),
-            "{id}"
+            grandchild.recent_valid_gains_micros,
+            vec![500_000, -500_000]
         );
+        assert_current_child_runtime(child).await;
     }
 }
 
@@ -2135,25 +2601,26 @@ async fn a_regressing_parent_does_not_brick_its_children() {
 
 #[tokio::test]
 async fn the_legal_actions_of_a_world_without_old_nodes_are_what_they_were() {
-    let env = Env::new().await;
+    let current = CurrentRuntime::new().await;
+    let env = &current.env;
     // A fresh world offers its roots in registration order.
-    env.register(world("world-fresh", &[2, 1], HALF)).await;
-    assert_offered(&env, "world-fresh", &[widen(2), widen(1)]).await;
-    // A trusted first root (seeded as the build before AG-187 stored it) offers its
-    // Deepen after the roots still open.
-    env.step("world-fresh", &env.model, &env.runner(answers_all))
+    current.register(world("world-fresh", &[2, 1], HALF)).await;
+    assert_offered(env, "world-fresh", &[widen(2), widen(1)]).await;
+    // A real current first root offers its Deepen after the roots still open.
+    current
+        .step("world-fresh", &ConfigEditingModel, &current.runner())
         .await
         .unwrap();
-    seed_trusted_template(&env, "world-fresh", 1, answers_all).await;
-    assert_offered(&env, "world-fresh", &[widen(2), deepen(1, 1, 1)]).await;
+    assert_offered(env, "world-fresh", &[widen(2), deepen(1, 1, 1)]).await;
     // A root that failed offers no successor.
     for child in [Child::HardFailure, Child::Uncertain] {
         let id = format!("world-fresh-{}", child.name());
-        env.register(world(&id, &[2, 1], HALF)).await;
-        env.step(&id, child.model(), &env.runner(answers_all))
+        current.register(world(&id, &[2, 1], HALF)).await;
+        current
+            .step(&id, child.model(), &current.runner())
             .await
             .unwrap();
-        assert_offered(&env, &id, &[widen(2)]).await;
+        assert_offered(env, &id, &[widen(2)]).await;
     }
 }
 
@@ -2223,29 +2690,30 @@ async fn the_legal_action_conditions_of_recover_are_unchanged() {
 
 #[tokio::test]
 async fn a_claimed_deepen_stays_legal_and_resumes_without_paying_again() {
-    let env = Env::new().await;
+    let current = CurrentRuntime::new().await;
+    let env = &current.env;
     let id = "world-claimed-deepen";
-    env.register(world(id, &[1], HALF)).await;
-    env.step(id, &env.model, &env.runner(answers_all))
+    current.register(world(id, &[1], HALF)).await;
+    current
+        .step(id, &ConfigEditingModel, &current.runner())
         .await
         .unwrap();
-    seed_trusted_template(&env, id, 1, answers_all).await;
     let before = env.coordinator.decide_next(id).await.unwrap();
     assert_eq!(dispatched_seqs(&before.action), vec![1_000_002]);
 
     // The Deepen is dispatched and the process is lost after the runner's report
     // was saved and before the step observed it: the dispatch stays claimed and no
     // node names the parent yet.
-    let parent = env.parent_of(id, 1_000_002).await;
+    let parent = current.parent_of(id, 1_000_002).await;
     let (hanging, entered) = HangingJournal::new(&env.store, StageFactKind::DevelopmentObserved);
-    let runner = CallCounting::new(env.runner(answers_all));
+    let runner = CallCounting::new(RejectedConfigReport);
     tokio::select! {
         biased;
         result = env.coordinator.run_next(
             Some(&env.model),
             Some(&runner),
             Some(&hanging),
-            env.fixture.request(&parent, id, 2, "claimed-deepen-2"),
+            current.request(&parent, id, 2, "claimed-deepen-2"),
         ) => panic!("the hanging journal must not answer: {result:?}"),
         () = entered.notified() => {}
     }
@@ -2264,25 +2732,25 @@ async fn a_claimed_deepen_stays_legal_and_resumes_without_paying_again() {
     assert_eq!(dispatched_seqs(&during.action), vec![1_000_002]);
     assert_eq!(during.legal_actions_digest, before.legal_actions_digest);
     assert_eq!(during.prefix_digest, before.prefix_digest);
-    assert_offered(&env, id, &[deepen(1, 1, 1)]).await;
+    assert_offered(env, id, &[deepen(1, 1, 1)]).await;
 
     // A new `run_next` finishes the claimed dispatch: the saved report and the
     // model answers are replayed, nothing is paid for again.
     let model_calls = env.model.calls();
-    let replay = CallCounting::new(env.runner(answers_all));
+    let replay = CallCounting::new(RejectedConfigReport);
     let finished = env
         .coordinator
         .run_next(
             Some(&env.model),
             Some(&replay),
             Some(&env.journal),
-            env.fixture.request(&parent, id, 2, "claimed-deepen-2"),
+            current.request(&parent, id, 2, "claimed-deepen-2"),
         )
         .await
         .unwrap();
     assert_eq!(replay.calls(), 0, "the recovery journal replays the report");
     assert_eq!(env.model.calls(), model_calls);
-    // Its one terminal state: the content refusal of the identity-only candidate.
+    // Its one terminal state: the content refusal of the unverified report.
     assert_eq!(finished.outcome, REJECTED_REASON);
     assert_eq!(finished.dispatch_id.as_deref(), claimed["id"].as_str());
 
@@ -2296,4 +2764,18 @@ async fn a_claimed_deepen_stays_legal_and_resumes_without_paying_again() {
     let consumed = payload(&env.store, DISPATCH, dispatch_ids[1].as_str().unwrap()).await;
     assert_eq!(consumed["state"], "observed");
     assert_eq!(consumed["node_id"], finished.node_id.clone().unwrap());
+    let root = env.node(id, 1).await;
+    assert_eq!(
+        child["node"]["best_valid_ancestor_micros"],
+        root["node"]["best_valid_ancestor_micros"]
+    );
+    assert_eq!(
+        child["node"]["recent_valid_gains_micros"],
+        root["node"]["recent_valid_gains_micros"]
+    );
+    let settled = payload(&env.store, WORLD, id).await;
+    assert_eq!(settled["remaining_root_micros"], 980);
+    assert_eq!(settled["dispatch_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(settled["node_ids"].as_array().unwrap().len(), 2);
+    assert_world_reads(env, id).await;
 }
