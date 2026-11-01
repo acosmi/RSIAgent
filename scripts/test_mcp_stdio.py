@@ -24,6 +24,7 @@ import json
 import os
 from pathlib import Path
 import selectors
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -458,6 +459,90 @@ class McpStdioTests(unittest.TestCase):
 
     def test_normal_prepare_feedback_propose_inspect(self) -> None:
         self.chain(self.host())
+
+
+    def test_stdio_run_uses_explicit_structural_reference_identity(self) -> None:
+        host = self.host()
+        prepared = self.structured(self.success(host, "evo_prepare", {
+            "request_key": "structural-reference", "goal": "read project settings", "capabilities": [],
+        }))
+        run = prepared["run"]
+        with sqlite3.connect(self.data.as_uri() + "?mode=ro", uri=True) as connection:
+            objects = {
+                (kind, object_id): (owner, json.loads(body))
+                for kind, object_id, owner, body in connection.execute(
+                    "SELECT kind,id,owner,body FROM objects WHERE namespace=?", (NAMESPACE,),
+                )
+            }
+        persisted_run = objects[("artifact", run["id"])][1]
+        self.assertEqual(persisted_run, run)
+        owner, snapshot = objects[("artifact", persisted_run["snapshot_id"])]
+        self.assertEqual(owner, "reference-host-gateway")
+        self.assertEqual(snapshot["schema_version"], "rsia.run_application.v3")
+        system = snapshot["system_snapshot"]
+        self.assertEqual(system["host_id"], "rsia-mcp-structural-gateway")
+        self.assertEqual(snapshot["host_surface_id"], "rsia-mcp-structural-surface-v3")
+        self.assertEqual(snapshot["capability_level"], "tool_only")
+        surface_owner, surface = objects[("artifact", snapshot["host_surface_id"])]
+        self.assertEqual(surface_owner, "service-admin")
+        self.assertEqual(surface["manifest"]["host"], system["host_id"])
+        source = json.loads(surface["source"]["original_utf8"])
+        self.assertEqual((source["host"], source["host_version"]),
+                         (system["host_id"], system["host_version"]))
+        self.assertEqual(surface["manifest"]["source_digest"],
+                         hashlib.sha256(surface["source"]["original_utf8"].encode()).hexdigest())
+        self.assertEqual(set(system["tools"]), set(TOOLS))
+        self.assertEqual([item["name"] for item in system["tool_source"]["definitions"]], system["tools"])
+        self.assertEqual(snapshot["projection"]["instructions"], [])
+        self.assertEqual(self.inspect(host, "run", run["id"]), {
+            "kind": "run", **{field: run[field] for field in (
+                "id", "owner", "snapshot_id", "status", "source", "created_at",
+            )},
+        })
+
+    def test_tool_only_bootstrap_restart_is_idempotent_and_excludes_protocol_surface_items(self) -> None:
+        first = self.host()
+        args = {"request_key": "bootstrap-restart", "goal": "read project settings", "capabilities": []}
+        prepared = self.success(first, "evo_prepare", args)
+        run = self.structured(prepared)["run"]
+        first.close()
+        with sqlite3.connect(self.data.as_uri() + "?mode=ro", uri=True) as connection:
+            originals = connection.execute(
+                "SELECT kind,id,owner,revision,body FROM objects WHERE namespace=? ORDER BY kind,id",
+                (NAMESPACE,),
+            ).fetchall()
+            dependencies = connection.execute(
+                "SELECT src_kind,src_id,dst_kind,dst_id FROM dependencies WHERE namespace=? ORDER BY src_kind,src_id,dst_kind,dst_id",
+                (NAMESPACE,),
+            ).fetchall()
+            audits = connection.execute("SELECT seq,payload,previous_hash,digest FROM audit WHERE namespace=? ORDER BY seq", (NAMESPACE,)).fetchall()
+        objects = {(kind, object_id): json.loads(body) for kind, object_id, _, _, body in originals}
+        snapshot = objects[("artifact", run["snapshot_id"])]
+        surface = objects[("artifact", snapshot["host_surface_id"])]
+        source = json.loads(surface["source"]["original_utf8"])
+        names = [item["name"] for item in surface["manifest"]["items"]]
+        self.assertTrue(names)
+        self.assertEqual(names, surface["extracted"])
+        self.assertEqual(names, [item["name"] for item in source["declarations"]])
+        self.assertTrue(set(TOOLS).isdisjoint(names))
+        self.assertTrue(all(item["coverage"] in ("runtime_owned", "unsupported")
+                            for item in surface["manifest"]["items"]))
+        self.assertEqual(surface["manifest"]["host"], "rsia-mcp-structural-gateway")
+        self.assertEqual(snapshot["capability_level"], "tool_only")
+        self.assertEqual(snapshot["projection"]["instructions"], [])
+        restarted = self.host()
+        self.assertEqual(self.success(restarted, "evo_prepare", args), prepared)
+        restarted.close()
+        with sqlite3.connect(self.data.as_uri() + "?mode=ro", uri=True) as connection:
+            self.assertEqual(connection.execute(
+                "SELECT kind,id,owner,revision,body FROM objects WHERE namespace=? ORDER BY kind,id",
+                (NAMESPACE,),
+            ).fetchall(), originals)
+            self.assertEqual(connection.execute(
+                "SELECT src_kind,src_id,dst_kind,dst_id FROM dependencies WHERE namespace=? ORDER BY src_kind,src_id,dst_kind,dst_id",
+                (NAMESPACE,),
+            ).fetchall(), dependencies)
+            self.assertEqual(connection.execute("SELECT seq,payload,previous_hash,digest FROM audit WHERE namespace=? ORDER BY seq", (NAMESPACE,)).fetchall(), audits)
 
     def reject_field(self, tool: str, field: str) -> None:
         host = self.host()

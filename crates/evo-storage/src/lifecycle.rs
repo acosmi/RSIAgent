@@ -3645,6 +3645,7 @@ async fn cleanup_node_content(
         // closure). It is content derived from sources and is redacted; the
         // preserved job above keeps the id of the redacted input.
         ("artifact", "rsia.management_private_input.v1", _) => true,
+        ("artifact", "rsia.monitoring.environment.v2", "tool_only_diagnostic") => true,
         _ => false,
     };
     if !redact && !preserve {

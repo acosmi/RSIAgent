@@ -3235,9 +3235,9 @@ mod consolidation {
             source_digest: d("surface-source"),
             items: vec![SurfaceItem {
                 name: "model".into(),
-                coverage: SurfaceCoverage::Supported,
-                mapped_field: Some("host.model".into()),
-                consumer: Some("runner".into()),
+                coverage: SurfaceCoverage::RuntimeOwned,
+                mapped_field: None,
+                consumer: None,
                 reason: "fixture projection".into(),
             }],
         }
@@ -3600,7 +3600,7 @@ mod consolidation {
                 },
                 task_input_digest: d(task),
                 evolution_enabled: true,
-                capability_level: CapabilityLevel::Attached,
+                capability_level: CapabilityLevel::ToolOnly,
             },
         )
         .await

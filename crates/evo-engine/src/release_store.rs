@@ -14,6 +14,7 @@ use evo_core::contract::{
     HostSurfaceRegistrationV2, HostSurfaceUpgradeDiffV2, LoadedSystemSnapshot, ResolvedBundle,
     ReviewedHostSourceEnvelopeV1, RunProjection, StrictJsonValue, SystemSnapshot, SystemSnapshotV3,
     host_surface_upgrade_diff_v2, host_surface_v2_allows_field, host_surface_v2_from_source,
+    validate_host_capability_level, validate_host_surface_v2_new_use,
 };
 use evo_core::evaluation::Verdict;
 use evo_core::{Context, Error, Result, Role, Validate, fingerprint, identifier};
@@ -984,6 +985,7 @@ impl ReleaseStore {
             return Ok(existing);
         }
         // Every new source/typed/upgrade guard above precedes this first DML.
+        validate_host_surface_v2_new_use(&record.manifest)?;
         session
             .put(ctx, "artifact", id, ctx.actor(), &record)
             .await?;
@@ -1093,6 +1095,10 @@ impl ReleaseStore {
                 Self::validate_run_snapshot_live_in_session(ctx, &mut session, &request.run_id)
                     .await?;
             require_current_run_source(&mut session, ctx, &existing).await?;
+            if !matches!(&existing.wire, RunApplicationWire::Legacy(_)) {
+                Self::validate_run_capability_for_new_use_in_session(ctx, &mut session, &existing)
+                    .await?;
+            }
             session.commit().await?;
             return Ok(existing);
         }
@@ -1106,6 +1112,12 @@ impl ReleaseStore {
                 "host surface does not match system snapshot".into(),
             ));
         }
+        validate_host_surface_v2_new_use(&surface.manifest)?;
+        validate_host_capability_level(
+            &surface.manifest,
+            &request.host_capabilities,
+            request.capability_level,
+        )?;
         let environment_digest = requested_environment_digest;
         let caps_digest = requested_caps_digest;
         let pointer = load_pointer(&mut session, ctx, &request.profile_id).await?;
@@ -1137,6 +1149,7 @@ impl ReleaseStore {
                     &request.host_capabilities,
                     &candidate.bundle,
                     &request.system_snapshot,
+                    request.capability_level,
                 )?;
                 (Some(release.id), Some(release.bundle_digest), projection)
             } else {
@@ -1276,6 +1289,22 @@ impl ReleaseStore {
         ctx.require(&[Role::Host, Role::Admin])?;
         Self::validate_run_snapshot_source_in_session(ctx, session, run_id).await
     }
+    // Live-source validation has already authenticated this snapshot and surface.
+    // Replays and new applications share only the additional new-use boundary.
+    pub(crate) async fn validate_run_capability_for_new_use_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        snapshot: &LoadedRunApplicationSnapshot,
+    ) -> Result<()> {
+        let surface: HostSurfaceRecordV2 = session
+            .need(ctx, "artifact", &snapshot.host_surface_id)
+            .await?;
+        validate_host_surface_v2_new_use(&surface.manifest)?;
+        let capabilities = snapshot.raw_capabilities().ok_or_else(|| {
+            Error::Conflict("legacy run snapshot cannot authorize a new applied request".into())
+        })?;
+        validate_host_capability_level(&surface.manifest, capabilities, snapshot.capability_level)
+    }
     pub(crate) async fn validate_environment_run_source_in_session(
         ctx: &Context,
         session: &mut Session,
@@ -1404,6 +1433,7 @@ impl ReleaseStore {
                     capabilities,
                     &candidate.bundle,
                     &snapshot.system_snapshot,
+                    snapshot.capability_level,
                 )?;
                 if fingerprint(&projection)? != fingerprint(&snapshot.projection)? {
                     return Err(Error::Conflict(
@@ -1537,14 +1567,31 @@ impl ReleaseStore {
                 ));
             }
             require_body_witness(&mut session, ctx, "receipt", &id, &existing, Role::Host).await?;
+            Self::validate_run_capability_for_new_use_in_session(ctx, &mut session, &snapshot)
+                .await?;
+            crate::monitoring::record_tool_only_diagnostic_in_session(
+                &mut session,
+                ctx,
+                &snapshot,
+                &existing,
+            )
+            .await?;
             session.commit().await?;
             return Ok(existing);
         }
+        Self::validate_run_capability_for_new_use_in_session(ctx, &mut session, &snapshot).await?;
         session
             .put(ctx, "receipt", &id, ctx.actor(), &record)
             .await?;
         crate::formal_authority::attest_content(&mut session, ctx, "receipt", &id, &record).await?;
         session.audit(ctx, "release.applied_request", &id).await?;
+        crate::monitoring::record_tool_only_diagnostic_in_session(
+            &mut session,
+            ctx,
+            &snapshot,
+            &record,
+        )
+        .await?;
         session.commit().await?;
         Ok(record)
     }
@@ -3445,6 +3492,7 @@ fn project_read_run_surface(
     capabilities: &HostCapabilities,
     bundle: &crate::compiler::ReadBundle,
     snapshot: &LoadedSystemSnapshot,
+    capability_level: CapabilityLevel,
 ) -> Result<RunProjection> {
     if !capabilities.allows(&bundle.skill.required_capabilities) {
         return Err(Error::Forbidden);
@@ -3452,7 +3500,8 @@ fn project_read_run_surface(
     let projection = crate::compiler::projection_for_loaded_snapshot(bundle, snapshot, true)?;
     // SystemSnapshot.tools is the unchanged host baseline. The only candidate
     // content emitted by the existing project_run is skill.content.
-    if !projection.instructions.is_empty()
+    if capability_level == CapabilityLevel::Attached
+        && !projection.instructions.is_empty()
         && !host_surface_v2_allows_field(&surface.manifest, capabilities, "skill.content")
     {
         return Err(Error::Forbidden);
@@ -3546,4 +3595,170 @@ async fn validate_versioned_release_snapshot_source(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tool_only_projection_controls {
+    use super::*;
+    use evo_core::contract::{
+        CompileParts, HostSurfaceClassificationV2, ImproverPatch, Profile, SkillPatch,
+        SkillSnapshot, SurfaceCoverage,
+    };
+    use evo_core::{Strategy, hash};
+
+    fn fixture(
+        body: &str,
+        coverage: SurfaceCoverage,
+    ) -> (
+        HostSurfaceRecordV2,
+        HostCapabilities,
+        crate::compiler::ReadBundle,
+        LoadedSystemSnapshot,
+    ) {
+        let caps = HostCapabilities {
+            available: ["fs_read".into()].into(),
+            granted: ["fs_read".into()].into(),
+        };
+        let source = ReviewedHostSourceEnvelopeV1 {
+            schema_version: "rsia.host_source_envelope.v1".into(),
+            source_kind: "reviewed_fixture".into(),
+            source_schema: "rsia.host_reviewed_declarations.v1".into(),
+            extractor_version: "rsia.host_reviewed_declarations.extractor.v1".into(),
+            original_utf8: r#"{"schema_version":"rsia.host_reviewed_declarations.v1","host":"software-host","host_version":"1","declarations":[{"name":"instruction","value_type":"string","enum_values":[],"default":{"kind":"none"}}]}"#.into(),
+        };
+        let supported = coverage == SurfaceCoverage::Supported;
+        let registration = HostSurfaceRegistrationV2 {
+            adapter_version: "1".into(),
+            classifications: vec![HostSurfaceClassificationV2 {
+                name: "instruction".into(),
+                coverage,
+                mapped_field: supported.then(|| "skill.content".into()),
+                consumer: supported.then(|| "compiler".into()),
+                reason: "private legacy projection component".into(),
+                renamed_from: None,
+                test_ref: supported
+                    .then(|| "attached_legacy_projection_requires_skill_content".into()),
+                capability: supported.then(|| "fs_read".into()),
+            }],
+            retired: vec![],
+        };
+        let (manifest, extracted_typed) =
+            host_surface_v2_from_source(&source, &registration).unwrap();
+        let surface = HostSurfaceRecordV2 {
+            id: "software-surface".into(),
+            schema_version: HOST_SURFACE_RECORD_SCHEMA_V2.into(),
+            manifest_digest: fingerprint(&manifest).unwrap(),
+            manifest,
+            source,
+            extracted: vec!["instruction".into()],
+            extracted_typed,
+            predecessor_surface_id: None,
+            upgrade_diff: HostSurfaceUpgradeDiffV2::default(),
+        };
+        let profile = Profile {
+            id: "software-profile".into(),
+            evolution_enabled: true,
+            parent_digest: hash(b"legacy P"),
+            baseline_digest: hash(b"legacy B"),
+        };
+        let mut skill = SkillSnapshot::empty();
+        skill.content = body.into();
+        skill.applicability = "private component".into();
+        skill.required_capabilities = vec!["fs_read".into()];
+        let strategy = Strategy::default();
+        let compiled = crate::compiler::compile(CompileParts {
+            profile: &profile,
+            parent: &skill,
+            baseline: &skill,
+            parent_strategy: &strategy,
+            baseline_strategy: &strategy,
+            skill_patch: &SkillPatch::default(),
+            improver_patch: &ImproverPatch::default(),
+            caps: &caps,
+            revoked: &BTreeSet::new(),
+        })
+        .unwrap();
+        let bundle = crate::compiler::ReadBundle::from_legacy(compiled).unwrap();
+        assert!(
+            !bundle.is_current(),
+            "a component must retain its actual legacy identity"
+        );
+        let system = SystemSnapshot {
+            schema_version: "rsia.system_snapshot.v2".into(),
+            profile_id: profile.id,
+            host_id: "software-host".into(),
+            host_version: "1".into(),
+            model_id: "disabled".into(),
+            tools: vec!["fs_read".into()],
+            mandatory_context_digest: hash(b"mandatory"),
+        }
+        .into();
+        (surface, caps, bundle, system)
+    }
+
+    #[test]
+    fn tool_only_legacy_compilation_projects_nonempty_offering() {
+        let (surface, caps, bundle, system) = fixture(
+            "Read the actual project settings.",
+            SurfaceCoverage::RuntimeOwned,
+        );
+        validate_host_capability_level(&surface.manifest, &caps, CapabilityLevel::ToolOnly)
+            .unwrap();
+        let projection =
+            project_read_run_surface(&surface, &caps, &bundle, &system, CapabilityLevel::ToolOnly)
+                .unwrap();
+        assert_eq!(projection.instructions, vec![bundle.skill.content.clone()]);
+        assert_eq!(projection.tools, system.tools);
+        let (_, _, changed, _) = fixture(
+            "Read the actual changed project settings.",
+            SurfaceCoverage::RuntimeOwned,
+        );
+        let changed_projection = project_read_run_surface(
+            &surface,
+            &caps,
+            &changed,
+            &system,
+            CapabilityLevel::ToolOnly,
+        )
+        .unwrap();
+        assert_ne!(projection.instructions, changed_projection.instructions);
+        assert_ne!(projection.bundle_digest, changed_projection.bundle_digest);
+        let mut unavailable = caps;
+        unavailable.granted.clear();
+        assert!(matches!(
+            project_read_run_surface(
+                &surface,
+                &unavailable,
+                &bundle,
+                &system,
+                CapabilityLevel::ToolOnly
+            ),
+            Err(Error::Forbidden)
+        ));
+    }
+
+    #[test]
+    fn attached_legacy_projection_requires_skill_content() {
+        let (surface, caps, bundle, system) = fixture(
+            "Use the actual instruction slot.",
+            SurfaceCoverage::Supported,
+        );
+        validate_host_capability_level(&surface.manifest, &caps, CapabilityLevel::Attached)
+            .unwrap();
+        let projection =
+            project_read_run_surface(&surface, &caps, &bundle, &system, CapabilityLevel::Attached)
+                .unwrap();
+        assert_eq!(projection.instructions, vec![bundle.skill.content.clone()]);
+        let (missing, _, _, _) = fixture(
+            "Use the actual instruction slot.",
+            SurfaceCoverage::RuntimeOwned,
+        );
+        assert!(matches!(
+            project_read_run_surface(&missing, &caps, &bundle, &system, CapabilityLevel::Attached),
+            Err(Error::Forbidden)
+        ));
+        assert!(
+            matches!(validate_host_capability_level(&missing.manifest, &caps, CapabilityLevel::Attached), Err(Error::Conflict(reason)) if reason == "host_capability_attached_requires_skill_content")
+        );
+    }
 }

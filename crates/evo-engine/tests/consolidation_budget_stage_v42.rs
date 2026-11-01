@@ -449,9 +449,9 @@ fn surface() -> HostSurfaceManifest {
         source_digest: d("surface-source"),
         items: vec![SurfaceItem {
             name: "model".into(),
-            coverage: SurfaceCoverage::Supported,
-            mapped_field: Some("host.model".into()),
-            consumer: Some("runner".into()),
+            coverage: SurfaceCoverage::RuntimeOwned,
+            mapped_field: None,
+            consumer: None,
             reason: "fixture projection".into(),
         }],
     }
@@ -803,7 +803,7 @@ async fn prepare_host_run(host: &Context, store: &Store, run_id: &str, model: &s
             },
             task_input_digest: d(task),
             evolution_enabled: true,
-            capability_level: CapabilityLevel::Attached,
+            capability_level: CapabilityLevel::ToolOnly,
         },
     )
     .await
