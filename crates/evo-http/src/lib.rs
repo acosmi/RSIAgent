@@ -11,11 +11,13 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use evo_core::{Context, Error, Feedback, Inspect, Prepare, Proposal, Role, hash, identifier};
+use evo_core::{
+    Context, Error, Feedback, Inspect, Prepare, Proposal, Role, Validate, hash, identifier,
+};
 use evo_engine::evidence::StoredTraceAuthority;
 use evo_engine::release_store::{AppliedRequestMaterial, TrustedHostExecutionEvidence};
 use evo_engine::review::{ReviewRequest, ReviewResponse};
-use evo_engine::service::{HostPrepareConfig, HostService};
+use evo_engine::service::{CompleteHostPrepareConfig, HostService};
 use serde::{
     Deserialize, Deserializer, Serialize,
     de::{DeserializeOwned, MapAccess, SeqAccess, Visitor},
@@ -30,6 +32,40 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7788";
 pub const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
+/// The routes and their complete source use these same production paths.
+pub const TOOL_ROUTE_PATHS: [&str; 4] = [
+    "/v1/tools/prepare",
+    "/v1/tools/feedback",
+    "/v1/tools/propose",
+    "/v1/tools/inspect",
+];
+
+pub fn typed_route_tool_source() -> evo_core::Result<evo_core::contract::ToolSourceV1> {
+    let schemas = [
+        serde_json::to_value(rmcp::schemars::schema_for!(Prepare)),
+        serde_json::to_value(rmcp::schemars::schema_for!(Feedback)),
+        serde_json::to_value(rmcp::schemars::schema_for!(Proposal)),
+        serde_json::to_value(rmcp::schemars::schema_for!(Inspect)),
+    ];
+    let definitions = evo_core::contract::MODEL_TOOLS
+        .into_iter()
+        .zip(TOOL_ROUTE_PATHS)
+        .zip(schemas)
+        .map(|((name, path), schema)| {
+            let input_schema = schema.map_err(|_| Error::Internal)?;
+            Ok(json!({"name":name,"path":path,"method":"POST","input_schema":input_schema}))
+        })
+        .collect::<evo_core::Result<Vec<_>>>()?;
+    let source = evo_core::contract::ToolSourceV1 {
+        schema_version: evo_core::contract::TOOL_SOURCE_SCHEMA.into(),
+        domain: "http_protocol".into(),
+        producer_id: "evo-http.typed_routes".into(),
+        producer_version: "rsia.http_typed_routes.v1".into(),
+        definitions,
+    };
+    source.validate()?;
+    Ok(source)
+}
 
 #[derive(Debug, Clone)]
 pub struct AuthIdentity {
@@ -123,17 +159,28 @@ impl AuthRegistry {
 #[derive(Clone)]
 pub struct HttpState {
     pub service: HostService,
-    pub prepare_config: HostPrepareConfig,
+    pub prepare_config: CompleteHostPrepareConfig,
     pub auth: AuthRegistry,
     pub management: evo_engine::dispatch::ManagementDispatcher,
 }
 
 pub fn router(state: HttpState) -> Router {
+    // The typed routes and this state's configuration are fixed once the
+    // server is built, so their complete sources are compared once here.
+    let typed_routes_match = typed_route_tool_source()
+        .is_ok_and(|source| source == state.prepare_config.system_snapshot.tool_source);
     Router::new()
-        .route("/v1/tools/prepare", post(prepare))
-        .route("/v1/tools/feedback", post(feedback))
-        .route("/v1/tools/propose", post(propose))
-        .route("/v1/tools/inspect", post(inspect))
+        .route(
+            TOOL_ROUTE_PATHS[0],
+            post(
+                move |state: State<HttpState>, headers: HeaderMap, body: Bytes| {
+                    prepare(state, headers, body, typed_routes_match)
+                },
+            ),
+        )
+        .route(TOOL_ROUTE_PATHS[1], post(feedback))
+        .route(TOOL_ROUTE_PATHS[2], post(propose))
+        .route(TOOL_ROUTE_PATHS[3], post(inspect))
         .route("/v1/host/trace", post(record_trace))
         .route("/v1/host/snapshot", post(read_snapshot))
         .route("/v1/host/application", post(record_application))
@@ -155,12 +202,27 @@ async fn prepare(
     State(state): State<HttpState>,
     headers: HeaderMap,
     body: Bytes,
+    typed_routes_match: bool,
 ) -> std::result::Result<Json<Value>, HttpError> {
     let caller = state.auth.authenticate(&headers)?;
     let request: Prepare = strict_typed(&body, "invalid_prepare_payload")?;
+    if !typed_routes_match {
+        // The service is never reached; refuse with its caller/request/config
+        // priority before reporting the differing actual route source.
+        caller.require(&[Role::Agent])?;
+        if caller.namespace() != state.service.trusted_namespace() {
+            return Err(Error::Forbidden.into());
+        }
+        request.validate()?;
+        state.prepare_config.validate()?;
+        return Err(Error::Conflict(
+            "HTTP complete source differs from actual typed routes".into(),
+        )
+        .into());
+    }
     let result = state
         .service
-        .prepare(&caller, request, &state.prepare_config)
+        .prepare_complete(&caller, request, &state.prepare_config)
         .await?;
     to_json(result)
 }

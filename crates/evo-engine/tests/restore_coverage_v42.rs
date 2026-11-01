@@ -40,7 +40,10 @@
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
-use evo_core::contract::SkillSnapshot;
+use evo_core::contract::{
+    CapabilityLevel, HostCapabilities, HostSurfaceClassificationV2, HostSurfaceRegistrationV2,
+    ReviewedHostSourceEnvelopeV1, SkillSnapshot, SurfaceCoverage, SystemSnapshotV3,
+};
 use evo_core::curriculum::{ProbeJobV1, ProbeTerminal, ProposalAttemptOutcome};
 use evo_core::skill_edit::skill_snapshot_digest;
 use evo_core::strategy::PracticePlan;
@@ -55,14 +58,20 @@ use evo_engine::monitoring::{
     ConsolidationClaim, ConsolidationClaimState, ConsolidationRunOutcome, ConsolidationRunRecord,
     ConsolidationScope, ConsolidationScopeIndex, ConsolidationStagingBinding,
     ENVIRONMENT_DRIFT_SCHEMA, ENVIRONMENT_IDENTITY_SCHEMA, EnvironmentDriftRecord,
-    EnvironmentEvidenceScope, EnvironmentIdentityRecord, MonitoringCoordinator, SourceDependency,
+    EnvironmentEvidenceScope, EnvironmentIdentityRecord, MonitoringCoordinator,
+    RecordEnvironmentRequest, SourceDependency,
 };
-use evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA;
+use evo_engine::optimization::{
+    DevelopmentManifest, DevelopmentTask, OPTIMIZATION_STAGE_FACT_SCHEMA,
+};
 use evo_engine::practice::{
     PRACTICE_ATTEMPT_SET_SCHEMA, PRACTICE_REGISTRATION_BINDING_SCHEMA,
     PRACTICE_REGISTRATION_SCHEMA, PracticeAttemptSetV1, PracticeOutcomeV1,
     PracticeRegistrationBindingV1, PracticeRegistrationV1, practice_attempt_set_storage_id,
     practice_registration_binding_storage_id,
+};
+use evo_engine::release_store::{
+    CompletePrepareRunRequest, ReleaseStore, TrustedHostExecutionEvidence,
 };
 use evo_engine::startup_gate::{
     RESTORE_ADMISSION_FILE, RecoveryPosture, StartupGate, StartupGateError,
@@ -665,24 +674,185 @@ fn scope_index_fact() -> Fact {
     )
 }
 
-/// What `record_environment_drift` reads: the two environment identities and the
-/// scope over the first one. None of them is a protected schema.
-fn drift_prerequisites() -> Vec<Fact> {
-    vec![
-        Fact::new(
-            "previous environment",
-            "artifact",
-            "environment-1".into(),
-            &environment_record("environment-1", "previous"),
-        ),
-        Fact::new(
-            "current environment",
-            "artifact",
-            "environment-2".into(),
-            &environment_record("environment-2", "current"),
-        ),
-        scope_index_fact(),
-    ]
+/// Only the two actual drift cases use these producer-derived identities. The
+/// static/history matrix above keeps its exact original Env1/Scope fixtures.
+struct DriftPrerequisites {
+    previous_id: String,
+    current_id: String,
+    scope: Fact,
+}
+async fn live_drift_prerequisites(database: &Path) -> DriftPrerequisites {
+    let store = Store::open(database).await.unwrap();
+    let host = Context::new(NS, "restore-drift-host", Role::Host).unwrap();
+    let original = json!({"schema_version":"rsia.host_reviewed_declarations.v1","host":"restore-drift-software","host_version":"1.0.0","declarations":[{"name":"model","value_type":"string","enum_values":[],"default":{"kind":"none"}}]});
+    ReleaseStore::register_host_surface_from_source(
+        &admin(),
+        &store,
+        "restore-drift-surface",
+        ReviewedHostSourceEnvelopeV1 {
+            schema_version: "rsia.host_source_envelope.v1".into(),
+            source_kind: "reviewed_fixture".into(),
+            source_schema: "rsia.host_reviewed_declarations.v1".into(),
+            extractor_version: "rsia.host_reviewed_declarations.extractor.v1".into(),
+            original_utf8: serde_json::to_string(&original).unwrap(),
+        },
+        HostSurfaceRegistrationV2 {
+            adapter_version: "1.0.0".into(),
+            retired: vec![],
+            classifications: vec![HostSurfaceClassificationV2 {
+                name: "model".into(),
+                coverage: SurfaceCoverage::RuntimeOwned,
+                mapped_field: None,
+                consumer: None,
+                reason: "ToolOnly restore fixture does not execute a native model".into(),
+                renamed_from: None,
+                test_ref: None,
+                capability: None,
+            }],
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let task_input_utf8 = "Compare the backup and trusted anchor facts for this software fixture.";
+    let manifest = DevelopmentManifest::build(
+        "restore-drift-development-manifest",
+        vec![DevelopmentTask {
+            id: "restore-drift-task".into(),
+            parent_family: "restore-drift-software-family".into(),
+            input_digest: hash(task_input_utf8.as_bytes()),
+        }],
+    )
+    .unwrap();
+    // Commit the actual fixture Rust source as an unexecuted software-grader
+    // declaration. No grader result, OS capability or paid authority is asserted.
+    let grader_declaration_digest = hash(include_bytes!("restore_coverage_v42.rs"));
+    let mut environments = Vec::new();
+    for (run_id, model) in [
+        ("restore-drift-previous-run", "previous-model"),
+        ("restore-drift-current-run", "current-model"),
+    ] {
+        let source = evo_core::model_protocol::registered_chat_wire_v1_tool_source();
+        let snapshot = ReleaseStore::prepare_complete_run(
+            &host,
+            &store,
+            CompletePrepareRunRequest {
+                run_id: run_id.into(),
+                profile_id: "restore-drift-profile".into(),
+                system_snapshot: SystemSnapshotV3 {
+                    schema_version: evo_core::contract::SYSTEM_SNAPSHOT_SCHEMA_V3.into(),
+                    profile_id: "restore-drift-profile".into(),
+                    host_id: "restore-drift-software".into(),
+                    host_version: "1.0.0".into(),
+                    model_id: model.into(),
+                    tools: source.names().unwrap(),
+                    mandatory_context_digest: d("restore-drift-mandatory-context"),
+                    tool_source: source,
+                },
+                host_surface_id: "restore-drift-surface".into(),
+                host_capabilities: HostCapabilities {
+                    available: BTreeSet::new(),
+                    granted: BTreeSet::new(),
+                },
+                task_input_digest: hash(task_input_utf8.as_bytes()),
+                evolution_enabled: false,
+                capability_level: CapabilityLevel::ToolOnly,
+            },
+        )
+        .await
+        .unwrap();
+        ReleaseStore::record_applied_request(
+            &host,
+            &store,
+            run_id,
+            TrustedHostExecutionEvidence {
+                actual_request_material: snapshot.request_material.clone(),
+                environment_digest: snapshot.environment_digest.clone(),
+                host_surface_digest: snapshot.host_surface_digest.clone(),
+                host_capabilities_digest: snapshot.host_capabilities_digest.clone(),
+                offered: vec![],
+                attached: vec![],
+                used: vec![],
+                execution_receipt_id: None,
+                truncated: false,
+            },
+        )
+        .await
+        .unwrap();
+        let environment = MonitoringCoordinator::record_environment_from_run(
+            &host,
+            &store,
+            RecordEnvironmentRequest {
+                run_id: run_id.into(),
+                development_manifest_digest: manifest.digest.clone(),
+                grader_digest: grader_declaration_digest.clone(),
+                generation_strategy_digest: fingerprint(&evo_core::Strategy::default()).unwrap(),
+                revoke_watermark: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            environment.environment.evidence_scope,
+            EnvironmentEvidenceScope::ProgramFixture
+        );
+        assert_eq!(
+            environment
+                .environment
+                .complete()
+                .unwrap()
+                .run_scope
+                .as_deref(),
+            Some(run_id)
+        );
+        environments.push(environment.environment);
+    }
+    let previous = &environments[0];
+    let current = &environments[1];
+    assert_ne!(previous.id, current.id);
+    let scope = ConsolidationScope {
+        namespace: NS.into(),
+        skill_id: "skill-1".into(),
+        profile_id: previous.profile_id.clone(),
+        development_manifest_digest: previous.development_manifest_digest.clone(),
+        environment_id: previous.id.clone(),
+        environment_identity_digest: previous.identity_digest.clone(),
+        environment_digest: previous.environment_digest.clone(),
+        grader_digest: previous.grader_digest.clone(),
+        generation_strategy_digest: previous.generation_strategy_digest.clone(),
+        parent_skill_digest: skill_snapshot_digest(&SkillSnapshot::empty()).unwrap(),
+        parent_bundle_digest: d("restore-drift-zero-skill-baseline"),
+        // Unused locators on scope metadata, never budget authorization or spend.
+        billing_scope: "scope-a".into(),
+        root_budget_id: "root-a".into(),
+        revoke_watermark: previous.revoke_watermark,
+    };
+    let id = format!(
+        "consolidation-scope-{}",
+        &fingerprint(&scope).unwrap()[..32]
+    );
+    let scope = Fact::new(
+        "consolidation scope index",
+        "artifact",
+        id.clone(),
+        &ConsolidationScopeIndex {
+            id,
+            schema_version: CONSOLIDATION_SCOPE_SCHEMA.into(),
+            scope,
+            cycle_ids: vec![],
+            report_fact_ids: vec![],
+            claim_ids: BTreeMap::new(),
+            invalidated_by: None,
+        },
+    )
+    .depends_on("artifact", &previous.id);
+    put_facts(&store, std::slice::from_ref(&scope)).await;
+    store.close().await;
+    DriftPrerequisites {
+        previous_id: previous.id.clone(),
+        current_id: current.id.clone(),
+        scope,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,14 +1718,17 @@ async fn a_fact_created_and_redacted_after_the_backup_is_invisible_to_the_compar
 
 /// The anchor records an environment drift: one transaction invalidates the scope
 /// (`invalidated_by` on the scope index) and writes the drift record.
-async fn record_drift_on(database: &Path) -> EnvironmentDriftRecord {
+async fn record_drift_on(
+    database: &Path,
+    prerequisites: &DriftPrerequisites,
+) -> EnvironmentDriftRecord {
     let store = Store::open(database).await.unwrap();
     let drift = MonitoringCoordinator::record_environment_drift(
         &admin(),
         &store,
-        "environment-1",
-        "environment-2",
-        &scope_index_fact().id,
+        &prerequisites.previous_id,
+        &prerequisites.current_id,
+        &prerequisites.scope.id,
         "the model identity changed",
     )
     .await
@@ -1569,13 +1742,15 @@ async fn an_environment_drift_recorded_after_the_backup_isolates_the_restore() {
     // The backup holds a live scope. The anchor then learns that its environment
     // drifted, which invalidates the scope. Restoring the old backup would forget
     // that, and consolidation could go on in an environment known to have changed.
-    let scope = scope_index_fact();
-    let scenario = Scenario::with_backup(&drift_prerequisites()).await;
+    let mut scenario = Scenario::begin(&[]).await;
+    let prerequisites = live_drift_prerequisites(&scenario.live).await;
+    let scope = prerequisites.scope.clone();
+    scenario.take_backup().await;
     scenario
         .restore_without_events("unchanged")
         .assert_restored("before the drift", 0);
 
-    let drift = record_drift_on(&scenario.live).await;
+    let drift = record_drift_on(&scenario.live, &prerequisites).await;
     assert_eq!(drift.schema_version, ENVIRONMENT_DRIFT_SCHEMA);
     assert_eq!(drift.invalidated_scope_id, scope.id);
     let stored = read_object(&scenario.live, "artifact", &drift.id)
@@ -1592,8 +1767,9 @@ async fn an_environment_drift_recorded_after_the_backup_isolates_the_restore() {
         .assert_isolated("environment drift recorded after the backup");
 
     // control: a backup taken after the drift holds it, and restores
-    let mut later = Scenario::begin(&drift_prerequisites()).await;
-    record_drift_on(&later.live).await;
+    let mut later = Scenario::begin(&[]).await;
+    let later_prerequisites = live_drift_prerequisites(&later.live).await;
+    record_drift_on(&later.live, &later_prerequisites).await;
     later.take_backup().await;
     later
         .restore_without_events("restored")
@@ -1602,7 +1778,9 @@ async fn an_environment_drift_recorded_after_the_backup_isolates_the_restore() {
 
 #[tokio::test]
 async fn an_environment_drift_recorded_after_the_restore_quarantines_the_directory() {
-    let scenario = Scenario::with_backup(&drift_prerequisites()).await;
+    let mut scenario = Scenario::begin(&[]).await;
+    let prerequisites = live_drift_prerequisites(&scenario.live).await;
+    scenario.take_backup().await;
     let restored = scenario.restore_without_events("restored");
     restored.assert_restored("before the drift", 0);
     let verified = StartupGate::new(&restored.data(), Some(&scenario.live))
@@ -1611,7 +1789,7 @@ async fn an_environment_drift_recorded_after_the_restore_quarantines_the_directo
         .unwrap();
     assert_eq!(verified.posture(), RecoveryPosture::RestoredVerified);
 
-    let drift = record_drift_on(&scenario.live).await;
+    let drift = record_drift_on(&scenario.live, &prerequisites).await;
     let reason = quarantine_reason(&restored.data(), &scenario.live, &restored.dest).await;
     assert!(
         reason.contains("consumed accounting facts differ"),

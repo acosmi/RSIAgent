@@ -3905,11 +3905,10 @@ pub struct PersistentContractVersion {
     pub current: bool,
 }
 macro_rules! contract_versions {
-    ($(($old:literal, $new:literal, $change:literal $(, extra_legacy: $extra:literal)?)),+ $(,)?) => {
+    ($(($($old:literal)|+, $new:literal, $change:literal)),+ $(,)?) => {
         pub const PERSISTENT_CONTRACT_VERSIONS: &[PersistentContractVersion] = &[
-            $(PersistentContractVersion { schema: $old, introduced_change: "frozen historical wire", verifier_retained: true, current: false },
-              $(PersistentContractVersion { schema: $extra, introduced_change: "frozen historical wire", verifier_retained: true, current: false },)?
-              PersistentContractVersion { schema: $new, introduced_change: $change, verifier_retained: true, current: true }),+
+            $($(PersistentContractVersion { schema: $old, introduced_change: "frozen historical wire", verifier_retained: true, current: false },)+
+              PersistentContractVersion { schema: $new, introduced_change: $change, verifier_retained: true, current: true },)+
         ];
     };
 }
@@ -3920,9 +3919,9 @@ contract_versions!(
         "complete P/B original content"
     ),
     (
-        "rsia.authenticated_bundle.v1",
-        "rsia.authenticated_bundle.v2",
-        "complete Current bundle and originals"
+        "rsia.authenticated_bundle.v1" | "rsia.authenticated_bundle.v2",
+        "rsia.authenticated_bundle.v3",
+        "complete tool-source Current bundle and originals"
     ),
     (
         "rsia.formal_compiler_input_binding.v2",
@@ -3945,9 +3944,24 @@ contract_versions!(
         "typed raw source and defaults"
     ),
     (
-        "rsia.run_application.v1",
-        "rsia.run_application.v2",
-        "frozen typed Host input"
+        "rsia.run_application.v1" | "rsia.run_application.v2",
+        "rsia.run_application.v3",
+        "complete tool source and raw Host capabilities"
+    ),
+    (
+        "rsia.monitoring.environment.v1",
+        "rsia.monitoring.environment.v3",
+        "complete tool-source environment and run scope"
+    ),
+    (
+        "rsia.registered_formal_host.v1",
+        "rsia.registered_formal_host.v2",
+        "complete registered adapter tool source"
+    ),
+    (
+        "rsia.frozen_compiler_profile.v1",
+        "rsia.frozen_compiler_profile.v2",
+        "complete tool-source frozen profile original"
     ),
     (
         "rsia.bound_model_request.v1",
@@ -3975,16 +3989,14 @@ contract_versions!(
         "Current candidate binding"
     ),
     (
-        "rsia.experiment_plan.v1",
+        "rsia.experiment_plan.v1" | "rsia.experiment_plan.v2",
         "rsia.experiment_plan.v3",
-        "complete frozen fixed-sample regression configuration and candidate pin",
-        extra_legacy: "rsia.experiment_plan.v2"
+        "complete frozen fixed-sample regression configuration and candidate pin"
     ),
     (
-        "rsia.evaluation_ticket.v2",
+        "rsia.evaluation_ticket.v2" | "rsia.evaluation_ticket.v3",
         "rsia.evaluation_ticket.v4",
-        "frozen regression configuration, source plan and issuance identity",
-        extra_legacy: "rsia.evaluation_ticket.v3"
+        "frozen regression configuration, source plan and issuance identity"
     ),
 );
 pub fn persistent_contract_state(

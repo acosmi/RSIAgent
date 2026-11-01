@@ -17,7 +17,7 @@ use evo_engine::release_store::{
     CurrentReleaseCandidateRecord as ReleaseCandidateRecord,
     CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
 };
-use evo_engine::service::{HostPrepareConfig, HostService};
+use evo_engine::service::{CompleteHostPrepareConfig, HostPrepareConfig, HostService};
 use evo_http::{AuthIdentity, AuthRegistry, HttpState, router};
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -314,14 +314,18 @@ async fn fixture() -> (tempfile::TempDir, HttpState) {
         guard,
         HttpState {
             service,
-            prepare_config: HostPrepareConfig {
-                profile_id: PROFILE_ID.into(),
-                system_snapshot,
-                host_surface_id: "unused-by-read-only-review".into(),
-                host_capabilities: caps,
-                evolution_enabled: true,
-                capability_level: CapabilityLevel::ToolOnly,
-            },
+            prepare_config: CompleteHostPrepareConfig::from_producer(
+                &HostPrepareConfig {
+                    profile_id: PROFILE_ID.into(),
+                    system_snapshot,
+                    host_surface_id: "unused-by-read-only-review".into(),
+                    host_capabilities: caps,
+                    evolution_enabled: true,
+                    capability_level: CapabilityLevel::ToolOnly,
+                },
+                evo_http::typed_route_tool_source().unwrap(),
+            )
+            .unwrap(),
             auth,
             management,
         },

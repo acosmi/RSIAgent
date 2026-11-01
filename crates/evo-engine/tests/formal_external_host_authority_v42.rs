@@ -2821,7 +2821,7 @@ async fn owned_authority_refused_connection_drains_after_caller_cancellation() {
     // Dropping the calling future cancels its wait, not the owned finite run.
     let mut call = Box::pin(PrincipalAuthorityService::serve_owned(
         database.clone(),
-        host,
+        host.into(),
         set,
         socket.clone(),
         1,
