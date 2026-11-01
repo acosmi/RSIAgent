@@ -1498,9 +1498,31 @@ mod tool_only_service_controls {
                 &snapshot.run_id,
             )
             .unwrap();
-            reject_tool_only_skill_evidence(&mut session, &fixture.host, &snapshot.run_id, &[id])
+            assert!(
+                crate::monitoring::load_tool_only_diagnostic_in_session(
+                    &mut session,
+                    &fixture.host,
+                    &id,
+                    &snapshot.run_id,
+                )
                 .await
-                .unwrap();
+                .unwrap()
+                .is_none(),
+                "{case} must not produce a diagnostic"
+            );
+            assert!(
+                matches!(
+                    reject_tool_only_skill_evidence(
+                        &mut session,
+                        &fixture.host,
+                        &snapshot.run_id,
+                        std::slice::from_ref(&id),
+                    )
+                    .await,
+                    Err(Error::NotFound)
+                ),
+                "{case} keeps the missing diagnostic reference error"
+            );
         }
         // Self-reported wording alone cannot mint a fixed diagnostic or block a
         // normal feedback reference; it retains the original feedback contract.
