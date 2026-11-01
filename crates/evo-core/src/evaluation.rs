@@ -3592,12 +3592,12 @@ impl ControlledTaskProfileV1 {
             .map(|clusters| clusters.len())
     }
 
-    /// Each registered semantic triple once, sorted by id, with its single data use.
+    /// Returns the normalized digest and each semantic triple once, sorted by id.
     pub fn registered_clusters_against(
         &self,
         materials: &ControlledTaskProfileMaterialsV1,
-    ) -> Result<Vec<(String, DataUse)>> {
-        self.validate_against(materials)?;
+    ) -> Result<(String, Vec<(String, DataUse)>)> {
+        let digest = self.digest_against(materials)?;
         self.task_commitments
             .iter()
             .map(|task| {
@@ -3607,7 +3607,7 @@ impl ControlledTaskProfileV1 {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>>>()
-            .map(|clusters| clusters.into_iter().collect())
+            .map(|clusters| (digest, clusters.into_iter().collect()))
     }
 
     /// Reads the validated triple identity; seeds, task ids and payloads do not mint clusters.

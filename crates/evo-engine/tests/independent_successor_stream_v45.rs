@@ -618,7 +618,7 @@ fn preregistration_is_a_pure_recomputable_function_of_registered_clusters_and_se
     // The frozen hash-rank sampler, spelled out apart from the library: each use
     // ranks the clusters not dealt yet by sha256(sampler \n seed \n use \n id)
     // and deals them out stream by stream.
-    let registered = profile.registered_clusters_against(&materials).unwrap();
+    let (_, registered) = profile.registered_clusters_against(&materials).unwrap();
     let mut dealt: BTreeSet<String> = BTreeSet::new();
     let mut expected = Vec::new();
     for (purpose, data_use, count) in [
@@ -736,7 +736,7 @@ fn streams_get_disjoint_slices_and_holdout_comes_only_from_acceptance_clusters()
     let (profile, materials) = complete_fixture(&tasks);
 
     // Registered clusters: each semantic triple once, sorted, with its one use.
-    let registered = profile.registered_clusters_against(&materials).unwrap();
+    let (_, registered) = profile.registered_clusters_against(&materials).unwrap();
     assert_eq!(registered.len(), 31);
     assert_eq!(
         registered.len(),
@@ -834,7 +834,7 @@ async fn a_plan_sharing_holdout_clusters_across_streams_is_rejected() {
     }
 
     // Any other repeated cluster, or one outside its use's partition.
-    let registered = profile.registered_clusters_against(&materials).unwrap();
+    let (_, registered) = profile.registered_clusters_against(&materials).unwrap();
     let dealt: BTreeSet<&str> = healthy
         .streams
         .iter()

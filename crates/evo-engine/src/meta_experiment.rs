@@ -137,6 +137,28 @@ impl MetaStreamPreregistrationV1 {
         endpoint_round: u32,
         seed: &str,
     ) -> Result<Self> {
+        let registered = profile.registered_clusters_against(materials)?;
+        Self::sample(
+            id,
+            research_family_id,
+            registered,
+            per_stream,
+            n_streams,
+            endpoint_round,
+            seed,
+        )
+    }
+
+    // Both entry points reuse the same sampler after validating the materials.
+    fn sample(
+        id: &str,
+        research_family_id: &str,
+        registered: (String, Vec<(String, DataUse)>),
+        per_stream: MetaStreamSliceCountsV1,
+        n_streams: u32,
+        endpoint_round: u32,
+        seed: &str,
+    ) -> Result<Self> {
         identifier(id)?;
         identifier(research_family_id)?;
         if seed.len() != 64
@@ -154,8 +176,7 @@ impl MetaStreamPreregistrationV1 {
         {
             return Err(Error::Invalid("meta_stream_shape_invalid".into()));
         }
-        let profile_digest = profile.digest_against(materials)?;
-        let clusters = profile.registered_clusters_against(materials)?;
+        let (profile_digest, clusters) = registered;
         let mut taken: BTreeSet<String> = BTreeSet::new();
         let mut deal = |purpose: &str, data_use: DataUse, count: u32| -> Result<Vec<Vec<String>>> {
             let mut ranked = clusters
@@ -227,9 +248,11 @@ impl MetaStreamPreregistrationV1 {
             return Err(Error::Invalid("meta_stream_schema_unsupported".into()));
         }
         let mismatch = || Error::Conflict("meta_stream_preregistration_mismatch".into());
-        let uses: BTreeMap<String, DataUse> = profile
-            .registered_clusters_against(materials)?
-            .into_iter()
+        let registered = profile.registered_clusters_against(materials)?;
+        let uses: BTreeMap<&str, DataUse> = registered
+            .1
+            .iter()
+            .map(|(cluster, data_use)| (cluster.as_str(), *data_use))
             .collect();
         let mut owners = BTreeMap::new();
         for (index, slot) in self.streams.iter().enumerate() {
@@ -254,7 +277,7 @@ impl MetaStreamPreregistrationV1 {
                     return Err(mismatch());
                 }
                 for cluster in clusters {
-                    if uses.get(cluster) != Some(&data_use) {
+                    if uses.get(cluster.as_str()) != Some(&data_use) {
                         return Err(Error::Conflict("meta_stream_slices_overlap".into()));
                     }
                     if let Some(owner) = owners.insert(cluster.as_str(), index) {
@@ -269,11 +292,10 @@ impl MetaStreamPreregistrationV1 {
             }
         }
         let n_streams = u32::try_from(self.streams.len()).map_err(|_| mismatch())?;
-        let expected = Self::preregister(
+        let expected = Self::sample(
             &self.id,
             &self.research_family_id,
-            profile,
-            materials,
+            registered,
             self.per_stream,
             n_streams,
             self.endpoint_round,
