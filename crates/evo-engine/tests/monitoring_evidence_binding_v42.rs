@@ -2354,6 +2354,13 @@ struct ProposalBoundaryJournal<'a> {
 
 #[async_trait]
 impl OptimizationJournal for ProposalBoundaryJournal<'_> {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> evo_core::Result<Vec<StageFact>> {
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         r: &evo_engine::formal_authority::CompilerInputRequest,
@@ -2766,6 +2773,16 @@ impl RunningClaimHandoffJournal<'_> {
 }
 #[async_trait]
 impl OptimizationJournal for RunningClaimHandoffJournal<'_> {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> evo_core::Result<Vec<StageFact>> {
+        for (_, inputs) in intent.members() {
+            self.observe_original_current_bound_use(inputs);
+        }
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,
@@ -2792,7 +2809,9 @@ impl OptimizationJournal for RunningClaimHandoffJournal<'_> {
             let all: Vec<Value> = s.list(&self.admin, "artifact").await?;
             assert!(
                 !all.iter()
-                    .any(|v| v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                    .any(|v| (v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                        || v["schema_version"]
+                            == evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
                         && v["episode_id"] == self.claim_id)
             );
             *self.running_claim.lock().unwrap() = Some(claim);
@@ -2887,7 +2906,9 @@ impl OptimizationJournal for RunningClaimHandoffJournal<'_> {
             let all: Vec<Value> = s.list(&self.admin, "artifact").await?;
             assert!(
                 !all.iter()
-                    .any(|v| v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                    .any(|v| (v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                        || v["schema_version"]
+                            == evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
                         && v["episode_id"] == self.claim_id)
             );
             *self.running_claim.lock().unwrap() = Some(claim);
@@ -3059,7 +3080,10 @@ async fn running_claim_keeps_original_compiler_use_across_the_child_handoff() {
         let step_facts = all
             .iter()
             .filter(|v| {
-                v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA && v["episode_id"] == claim.id
+                (v["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA
+                    || v["schema_version"]
+                        == evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
+                    && v["episode_id"] == claim.id
             })
             .collect::<Vec<_>>();
         let stored_run = s

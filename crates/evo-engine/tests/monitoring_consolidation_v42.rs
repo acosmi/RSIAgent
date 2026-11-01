@@ -1293,6 +1293,18 @@ struct FailingJournal {
 
 #[async_trait]
 impl OptimizationJournal for FailingJournal {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> evo_core::Result<Vec<StageFact>> {
+        for _ in intent.members() {
+            if self.commits.fetch_add(1, Ordering::SeqCst) == self.fail_on_commit {
+                return Err(Error::NotFound);
+            }
+        }
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,
@@ -1406,6 +1418,13 @@ struct ForgedTerminalJournal {
 
 #[async_trait]
 impl OptimizationJournal for ForgedTerminalJournal {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> evo_core::Result<Vec<StageFact>> {
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,
