@@ -11,6 +11,10 @@ use std::collections::BTreeSet;
 #[serde(deny_unknown_fields)]
 pub struct ImportedEvidenceSummaryView {
     pub result_id: String,
+    /// The stored result version; a legacy (v1) summary is historical metadata
+    /// only and never a current import.
+    pub result_schema: String,
+    pub legacy: bool,
     pub evidence_set_id: String,
     pub evidence_digest: String,
     pub coverage: SourceCoverage,
@@ -32,25 +36,43 @@ pub async fn read_persisted_imported_evidence(
     result_id: &str,
 ) -> Result<ImportedEvidenceSummaryView> {
     context.require(&[evo_core::Role::Admin, evo_core::Role::Evaluator])?;
-    let result = crate::import::PersistentImportService::new(store.clone())
-        .load_live_result(context, result_id)
+    let stored = crate::import::PersistentImportService::new(store.clone())
+        .load_static_result(context, result_id)
         .await?;
-    let evidence_set = result
-        .payload
-        .evidence_set
-        .as_ref()
-        .ok_or_else(|| Error::Invalid("import produced no usable evidence".into()))?;
+    let (result_id, result_schema, legacy, evidence_set, summary, generation_status) = match stored
+    {
+        crate::import::StoredImportResult::V2(record) => (
+            record.id,
+            record.schema_version,
+            false,
+            record.payload.evidence_set,
+            record.payload.aggregate_summary,
+            record.payload.generation_status,
+        ),
+        crate::import::StoredImportResult::LegacyV1(record) => (
+            record.id,
+            record.schema_version,
+            true,
+            record.payload.evidence_set,
+            record.payload.aggregate_summary,
+            record.payload.generation_status,
+        ),
+    };
+    let evidence_set =
+        evidence_set.ok_or_else(|| Error::Invalid("import produced no usable evidence".into()))?;
     Ok(ImportedEvidenceSummaryView {
-        result_id: result.id,
-        evidence_set_id: evidence_set.id.clone(),
-        evidence_digest: evidence_set.digest.clone(),
-        coverage: result.payload.aggregate_summary.coverage.clone(),
-        total_sources: result.payload.aggregate_summary.total_sources,
-        total_events: result.payload.aggregate_summary.total_events,
-        independent_clusters: result.payload.aggregate_summary.unique_clusters,
+        result_id,
+        result_schema,
+        legacy,
+        evidence_set_id: evidence_set.id,
+        evidence_digest: evidence_set.digest,
+        coverage: summary.coverage,
+        total_sources: summary.total_sources,
+        total_events: summary.total_events,
+        independent_clusters: summary.unique_clusters,
         task_origin: TaskOrigin::ImportedHistory,
         execution_attestation: ExecutionAttestation::UnverifiedImport,
-        generation_status: result.payload.generation_status,
+        generation_status,
         formal_evaluation_eligible: false,
     })
 }

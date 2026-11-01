@@ -7,8 +7,12 @@ use crate::lifecycle::{
     REVOKE_TOMBSTONE_SCHEMA, RevokeTombstone, TypedObjectRef, parse_strict_json,
 };
 use crate::{Session, Store, internal, upstream_rows_in_tx};
+use evo_core::evidence::{
+    IMPORT_NORMALIZATION_V2, IMPORT_READER_SET_V2, IMPORT_RESULT_SCHEMA_V2,
+    LEGACY_IMPORT_RESULT_SCHEMA_V1, import_result_id_v2,
+};
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::{Row, Sqlite, Transaction};
 use std::collections::BTreeSet;
 
@@ -99,7 +103,10 @@ fn valid_digest(value: &str) -> bool {
 fn e16_schema(schema: &str) -> bool {
     matches!(
         schema,
-        "rsia.e16.source_selection.v1" | "rsia.e16.import_source.v1" | "rsia.e16.import_result.v1"
+        "rsia.e16.source_selection.v1"
+            | "rsia.e16.import_source.v1"
+            | "rsia.e16.import_result.v1"
+            | "rsia.e16.import_result.v2"
     )
 }
 
@@ -179,6 +186,73 @@ struct SourceHeader {
     schema_version: String,
 }
 
+#[derive(Deserialize)]
+struct ResultIdentity {
+    id: String,
+    payload: ResultAlgorithm,
+}
+
+#[derive(Deserialize)]
+struct ResultAlgorithm {
+    selection_id: String,
+    reader_version: String,
+    normalization_version: String,
+}
+
+#[derive(Deserialize)]
+struct SelectionInput {
+    input_digest: String,
+}
+
+/// Only the current result version can become a new budget source (§5.1.1): a
+/// v1 result is legacy history, and a v2 result must carry the current
+/// algorithm versions and the id they derive from its selection. Calls already
+/// bound to a source never pass through here, so their history is unchanged.
+async fn new_source_is_current_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    namespace: &str,
+    reference: &E16BudgetSourceRef,
+) -> Result<()> {
+    match reference.schema_version.as_str() {
+        LEGACY_IMPORT_RESULT_SCHEMA_V1 => Err(Error::Conflict("import_result_legacy".into())),
+        IMPORT_RESULT_SCHEMA_V2 => {
+            let result: ResultIdentity = artifact_in_tx(tx, namespace, &reference.id).await?;
+            let selection: SelectionInput =
+                artifact_in_tx(tx, namespace, &result.payload.selection_id).await?;
+            if result.payload.reader_version != IMPORT_READER_SET_V2
+                || result.payload.normalization_version != IMPORT_NORMALIZATION_V2
+                || result.id
+                    != import_result_id_v2(&result.payload.selection_id, &selection.input_digest)?
+            {
+                return Err(Error::Conflict("import_result_invalid".into()));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+async fn artifact_in_tx<T: DeserializeOwned>(
+    tx: &mut Transaction<'_, Sqlite>,
+    namespace: &str,
+    id: &str,
+) -> Result<T> {
+    let body: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT CASE WHEN length(CAST(body AS BLOB))<=? THEN body ELSE NULL END
+         FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+    )
+    .bind(MAX_SOURCE_BYTES)
+    .bind(namespace)
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    body.flatten()
+        .and_then(|body| parse_strict_json(&body).ok())
+        .and_then(|value| serde_json::from_value(value).ok())
+        .ok_or_else(sources_unavailable)
+}
+
 impl Store {
     /// Host/Admin snapshot only. Header identity and raw bytes are checked;
     /// business payload, original import permissions and blobs remain untrusted.
@@ -217,11 +291,11 @@ impl Session {
         }
         let mut references = Vec::with_capacity(sources.len());
         for id in keys {
-            references.push(
-                read_source_in_tx(&mut self.tx, ctx.namespace(), id)
-                    .await?
-                    .ok_or_else(sources_unavailable)?,
-            );
+            let reference = read_source_in_tx(&mut self.tx, ctx.namespace(), id)
+                .await?
+                .ok_or_else(sources_unavailable)?;
+            new_source_is_current_in_tx(&mut self.tx, ctx.namespace(), &reference).await?;
+            references.push(reference);
         }
         references.sort();
         Ok(references)
@@ -517,6 +591,9 @@ pub(crate) async fn create_ref_in_tx(
         .and_then(parse_request)
         .ok_or_else(sources_unavailable)?;
     let reference = ref_from_request(call, &request).ok_or_else(sources_unavailable)?;
+    for source in &reference.object_refs {
+        new_source_is_current_in_tx(tx, &call.namespace, source).await?;
+    }
     insert_ref_in_tx(tx, ctx, &reference).await?;
     repair_edges_in_tx(tx, &reference).await?;
     Ok(())

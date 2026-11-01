@@ -265,7 +265,7 @@ mod e16_mode {
     };
     use evo_storage::typed_budget::{
         E16_BUDGET_REF_SCHEMA, E16_BUDGET_REQUEST_SCHEMA, E16BudgetCallRef, E16BudgetRequest,
-        e16_budget_ref_id,
+        E16BudgetSourceRef, e16_budget_ref_id,
     };
     use serde::Serialize;
     use sqlx::Connection;
@@ -1307,6 +1307,126 @@ mod e16_mode {
             .await
             .unwrap();
         assert_eq!(result.actual_cost_micros, Some(9));
+    }
+
+    /// AG-148 (§5.1.1): a call bound to a v1 import result before AG-148 keeps
+    /// that binding through dispatch, settlement and consumption; only a new
+    /// binding to the legacy result is refused.
+    #[tokio::test]
+    async fn historical_e16_call_settlement_keeps_v1_source_bindings() {
+        let (dir, store) = database().await;
+        put(&store, "artifact", "s", &source("s")).await;
+        let mut legacy = source("legacy-result");
+        legacy["schema_version"] = json!("rsia.e16.import_result.v1");
+        legacy["payload"] = json!({"aggregate_summary": {"total_events": 1}});
+        put(&store, "artifact", "legacy-result", &legacy).await;
+        let legacy_ref = E16BudgetSourceRef {
+            namespace: "n".into(),
+            kind: "artifact".into(),
+            id: "legacy-result".into(),
+            schema_version: "rsia.e16.import_result.v1".into(),
+            owner_actor: admin().actor().into(),
+            storage_body_digest: hash(serde_json::to_string(&legacy).unwrap().as_bytes()),
+        };
+        // The pre-AG-148 binding: a real call whose request and ref also name
+        // the v1 result (written below the API, as that writer no longer exists).
+        let call = new_call(&store, "historical", &["s"]).await;
+        let mut request: E16BudgetRequest =
+            serde_json::from_str(&call.request_artifact.as_ref().unwrap().body).unwrap();
+        request.object_refs.push(legacy_ref.clone());
+        request.object_refs.sort();
+        let artifact = request.artifact().unwrap();
+        let mut db = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new().filename(dir.path().join("rsia.sqlite3")),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE root_budget_calls SET request_artifact_schema=?,request_artifact_digest=?,request_artifact_body=? WHERE billing_scope=? AND call_id=?")
+            .bind(artifact.schema_version.as_str()).bind(artifact.digest.as_str()).bind(artifact.body.as_str()).bind("scope-1").bind("historical").execute(&mut db).await.unwrap();
+        drop(db);
+        let ref_id = e16_budget_ref_id("n", "scope-1", "historical").unwrap();
+        let mut reference: E16BudgetCallRef =
+            serde_json::from_value(ref_value(&store, &call).await).unwrap();
+        reference.request_digest = artifact.digest.clone();
+        reference.object_refs = request.object_refs.clone();
+        let mut session = store.session().await.unwrap();
+        session
+            .put(&admin(), "artifact", &ref_id, host().actor(), &reference)
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin(), "artifact", &ref_id, "artifact", "legacy-result")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+
+        let historical = BudgetCallReservation {
+            actual_input_digest: call.actual_input_digest.clone(),
+            request_artifact: Some(artifact.clone()),
+            ..reservation("historical", "s")
+        };
+        let call = store
+            .reserve_e16_budget_call(&host(), &historical)
+            .await
+            .unwrap();
+        assert_eq!(call.request_artifact.as_ref(), Some(&artifact));
+        let dispatched = dispatch(&store, &call).await;
+        let result = store
+            .settle_model_budget_call(
+                &host(),
+                &fence(&dispatched, 4),
+                &charge("historical", 9),
+                &evidence(),
+            )
+            .await
+            .unwrap();
+        assert!(result.response_usable);
+        assert_eq!(result.call.actual_cost_micros, Some(9));
+        assert_eq!(
+            store
+                .consume_e16_budget_response(&host(), "scope-1", "historical")
+                .await
+                .unwrap(),
+            result.response_artifact
+        );
+        let kept: E16BudgetCallRef =
+            serde_json::from_value(ref_value(&store, &call).await).unwrap();
+        assert!(kept.object_refs.contains(&legacy_ref));
+
+        // A new call can neither snapshot nor bind the legacy result.
+        let before = all_rows(&dir).await;
+        let legacy_error = |outcome: evo_core::Result<()>| {
+            assert!(
+                matches!(&outcome, Err(Error::Conflict(code)) if code == "import_result_legacy"),
+                "{outcome:?}"
+            );
+        };
+        legacy_error(
+            store
+                .snapshot_e16_budget_sources(&host(), &keys(&["legacy-result"]))
+                .await
+                .map(|_| ()),
+        );
+        let fresh = E16BudgetRequest {
+            call_id: "fresh".into(),
+            ..request
+        }
+        .artifact()
+        .unwrap();
+        legacy_error(
+            store
+                .reserve_e16_budget_call(
+                    &host(),
+                    &BudgetCallReservation {
+                        actual_input_digest: call.actual_input_digest.clone(),
+                        request_artifact: Some(fresh),
+                        ..reservation("fresh", "s")
+                    },
+                )
+                .await
+                .map(|_| ()),
+        );
+        assert_eq!(before, all_rows(&dir).await);
     }
 
     #[tokio::test]
