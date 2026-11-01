@@ -504,9 +504,41 @@ async fn another_namespace_tombstone_and_edges_do_not_refuse_live_cache() {
 #[tokio::test]
 async fn same_id_artifact_revocation_does_not_refuse_live_run_cache() {
     let fixture = Fixture::new().await;
-    let request = request("kind-isolation", &[A, B]);
-    let response = fixture.complete(&request).await;
-    // Strict E16 import_source shape accepted by the actual begin_revoke API.
+    let cached_request = request("kind-isolation", &[A, B]);
+    fixture.complete(&cached_request).await;
+    let paid = fixture.call(&cached_request).await;
+    let pending_request = request("kind-isolation-pending", &[A, B]);
+    let pending = fixture
+        .store
+        .reserve_budget_call_with_sources(
+            &context(NS, Role::Host),
+            &BudgetCallReservation {
+                billing_scope: SCOPE.into(),
+                call_id: pending_request.request_id.clone(),
+                dispatch_group_id: pending_request.episode_id.clone(),
+                stage: BudgetStage::Reflection,
+                actual_input_digest: pending_request.cache_key_digest.clone(),
+                request_artifact: Some(
+                    BudgetArtifact::from_serializable(
+                        "rsia.model_request.artifact.v1",
+                        &pending_request,
+                    )
+                    .unwrap(),
+                ),
+                max_cost_micros: 20,
+                lease_token: "kind-isolation-pending-lease".into(),
+                lease_until: 100,
+                now: 20,
+            },
+            &[A.into(), B.into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.state, BudgetCallState::Reserved);
+    fixture.assert_accounting(20, 10).await;
+    // Historical name retained: the second revocation identity is an explicit
+    // synthetic stored conflict, which production creators cannot produce. It
+    // isolates new content before any tombstone; paid facts and holds stay put.
     raw_put(
         &fixture.store,
         NS,
@@ -521,14 +553,44 @@ async fn same_id_artifact_revocation_does_not_refuse_live_run_cache() {
         }),
     )
     .await;
-    begin(&fixture.store, NS, "artifact", B).await;
-    let before = sqlite_snapshot(&fixture.path);
-    assert_same_response(
-        &fixture.broker().dispatch(request).await.unwrap(),
-        &response,
-    );
-    assert_eq!(sqlite_snapshot(&fixture.path), before);
-    fixture.assert_accounting(0, 10).await;
+    let new_request = request("kind-isolation-new", &[A, B]);
+    for with_tombstone in [false, true] {
+        if with_tombstone {
+            begin(&fixture.store, NS, "artifact", B).await;
+        }
+        let before = sqlite_snapshot(&fixture.path);
+        assert_unavailable(fixture.broker().dispatch(cached_request.clone()).await);
+        for refused in [&pending_request, &new_request] {
+            let response = fixture.broker().dispatch(refused.clone()).await.unwrap();
+            match response {
+                ModelResponse::Rejected {
+                    request_id,
+                    kind,
+                    reason,
+                    dispatch,
+                } => {
+                    assert_eq!(request_id, refused.request_id);
+                    assert_eq!(kind, ModelRejectionKind::Unauthorized);
+                    assert_eq!(reason, "broker_pre_dispatch_v1.source_revoked");
+                    assert_eq!(dispatch, RejectedDispatch::NotDispatched);
+                }
+                other => panic!("source identity conflict must refuse before dispatch: {other:?}"),
+            }
+        }
+        assert_eq!(sqlite_snapshot(&fixture.path), before);
+        assert_eq!(fixture.call(&cached_request).await, paid);
+        assert_eq!(fixture.call(&pending_request).await, pending);
+        assert!(
+            fixture
+                .store
+                .budget_call(&context(NS, Role::Host), SCOPE, &new_request.request_id,)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_usable(&fixture.call(&cached_request).await, true);
+        fixture.assert_accounting(20, 10).await;
+    }
 }
 
 #[tokio::test]
