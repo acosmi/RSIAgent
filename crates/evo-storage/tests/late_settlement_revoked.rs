@@ -865,20 +865,21 @@ async fn a_response_over_a_live_source_stays_usable_and_is_stored_unchanged() {
     }
 }
 
-/// A revocation tombstone is keyed by the id of its source alone and records the
-/// kind it was written for. The sources of a budget call are runs, so the tombstone
-/// of an artifact that happens to carry the id of a live run revokes nothing the
-/// call was derived from: the response stays usable (AG-032, AG-036, AG-038).
+/// Historical name retained: a run and a strict E16 import source sharing an id
+/// make the namespace unverifiable, regardless of the artifact tombstone's kind.
+/// Dispatch uses a healthy single run first; the later conflicting row is an
+/// explicit synthetic fault, not a legal producer or claimed historical source.
+/// Its late charge and execution close remain accounting facts.
 #[tokio::test]
 async fn a_tombstone_of_an_artifact_with_the_same_id_does_not_block_the_response() {
     let (_dir, path, store) = database().await;
-    // Both exist only because the test writes them around the production creators,
-    // which refuse the pair (AG-036).
     put_run(&store, "shared-id").await;
-    put_import_source(&store, "shared-id").await;
     authorize(&store).await;
     let call = reserve(&store, "call-1", &["shared-id"]).await;
     let dispatched = dispatch(&store, &call).await;
+    assert_eq!(micros(&store).await, (20, 0));
+    // Fault injection after the real dispatch: creators cannot produce this pair.
+    put_import_source(&store, "shared-id").await;
     revoke(&store, "artifact", "shared-id").await;
     let mut session = store.session().await.unwrap();
     let tombstone: evo_storage::lifecycle::RevokeTombstone = session
@@ -898,20 +899,115 @@ async fn a_tombstone_of_an_artifact_with_the_same_id_does_not_block_the_response
         )
         .await
         .unwrap();
-    assert!(settled.response_usable);
-    assert_eq!(settled.response_block_reason, None);
-    let stored = call_of(&store, "call-1").await;
-    assert_eq!(stored.response_usable, Some(true));
+    assert!(!settled.response_usable);
     assert_eq!(
-        stored.transport_artifact.as_ref(),
-        Some(&evidence.transport_artifact)
+        settled.response_block_reason.as_deref(),
+        Some("budget_sources_unverifiable")
     );
+    assert_eq!(settled.response_artifact, evidence.blocked_response);
+    let stored = call_of(&store, "call-1").await;
+    assert_eq!(settled.call, stored);
+    assert_eq!(stored.state, BudgetCallState::Finalized);
+    assert_eq!(stored.actual_cost_micros, Some(10));
+    assert_eq!(stored.actual_currency.as_deref(), Some("USD"));
+    assert_eq!(stored.actual_pricing_version.as_deref(), Some("price-v1"));
+    assert_eq!(
+        stored.provider_request_id.as_deref(),
+        Some("provider-call-1")
+    );
+    assert_eq!(stored.usage_record_id.as_deref(), Some("usage-call-1"));
+    assert_eq!(stored.output_digest, Some(hash(OUTPUT.as_bytes())));
+    assert_eq!(stored.dispatch_id, dispatched.dispatch_id);
+    assert_eq!(stored.actual_input_digest, dispatched.actual_input_digest);
+    assert_eq!(stored.request_artifact, dispatched.request_artifact);
+    assert_eq!(stored.finalized_at, Some(20));
+    assert_eq!(stored.terminal_reason, None);
+    assert_eq!(
+        stored.execution_provenance,
+        Some(BudgetExecutionProvenance::Fixture)
+    );
+    assert_eq!(stored.actual_model_digest, Some(hash(b"model")));
+    assert_eq!(stored.response_usable, Some(false));
+    assert_eq!(
+        stored.response_block_reason.as_deref(),
+        Some("budget_sources_unverifiable")
+    );
+    let transport = stored.transport_artifact.as_ref().unwrap();
+    assert_eq!(transport.schema_version, REDACTED_SCHEMA);
+    assert_eq!(transport.digest, hash(transport.body.as_bytes()));
+    assert_ne!(transport.digest, evidence.transport_artifact.digest);
+    let body: Value = serde_json::from_str(&transport.body).unwrap();
+    assert_eq!(body.as_object().unwrap().len(), 5);
+    assert_eq!(body["schema_version"], REDACTED_SCHEMA);
+    assert_eq!(body["state"], "source_revoked");
+    assert_eq!(body["reason"], "budget_sources_unverifiable");
+    assert_eq!(body["original_schema"], TRANSPORT_SCHEMA);
+    assert_eq!(body["original_digest"], evidence.transport_artifact.digest);
     assert_eq!(
         stored.response_artifact.as_ref(),
-        evidence.usable_response.as_ref()
+        Some(&evidence.blocked_response)
     );
     assert_eq!(micros(&store).await, (0, 10));
-    assert!(!found_in(&path, OUTPUT).await.is_empty());
+    assert!(found_in(&path, OUTPUT).await.is_empty());
+    let events = events_of(&path, "call-1", "model_response_persisted").await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["budget_sources_unverifiable"], true);
+    assert!(events[0].get("source_revoked").is_none());
+    assert_eq!(events[0]["response_usable"], false);
+    assert_eq!(
+        events[0]["response_block_reason"],
+        "budget_sources_unverifiable"
+    );
+    assert_eq!(events[0]["transport_artifact_digest"], transport.digest);
+    assert_eq!(
+        events[0]["transport_original_digest"],
+        evidence.transport_artifact.digest
+    );
+    assert_eq!(
+        events[0]["response_artifact_digest"],
+        evidence.blocked_response.digest
+    );
+
+    assert!(!stored.execution_closed);
+    let closed = store
+        .close_budget_call_execution(
+            &host(),
+            SCOPE,
+            "call-1",
+            stored.dispatch_id.as_deref().unwrap(),
+            "accounted_late_conflict",
+            21,
+        )
+        .await
+        .unwrap();
+    let mut expected = stored.clone();
+    expected.execution_closed = true;
+    expected.execution_closed_at = Some(21);
+    expected.execution_close_reason = Some("accounted_late_conflict".into());
+    assert_eq!(closed, expected);
+    assert_eq!(
+        events_of(&path, "call-1", "execution_closed").await,
+        [json!({"dispatch_id":stored.dispatch_id,"reason":"accounted_late_conflict"})]
+    );
+    let before = fingerprint(&path).await;
+    let replay = store
+        .settle_model_budget_call(
+            &host(),
+            &fence(&dispatched, 22),
+            &late_charge("call-1", 10),
+            &evidence,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.call, closed);
+    assert!(!replay.response_usable);
+    assert_eq!(replay.response_artifact, evidence.blocked_response);
+    assert_nothing_written(
+        &before,
+        &fingerprint(&path).await,
+        "accounted conflict replay",
+    );
+    assert_eq!(micros(&store).await, (0, 10));
 }
 
 // ---------------------------------------------------------------------------
