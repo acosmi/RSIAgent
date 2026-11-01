@@ -88,8 +88,11 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use trusted_compiler_inputs::StoreOptimizationJournal;
+
+// The real config consumer owns one process-wide physical workspace permit.
+static CONFIG_WORKSPACE_GATE: Mutex<()> = Mutex::const_new(());
 
 /// What the world is registered with. The two root opportunities cost different
 /// amounts on purpose: what a dispatch spent is read from its own fact, never
@@ -1657,6 +1660,7 @@ async fn a_world_rewritten_while_the_step_was_paid_for_ends_in_a_terminal_uncert
 
 #[tokio::test]
 async fn a_deepen_settled_after_the_world_moved_is_spent_like_any_other() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     // The settled node sits where the dispatched action derives it, whatever the
     // kind of the action: a Deepen is spent (its parent has a child) and costs the
     // successor cost, not a root's.
@@ -2470,6 +2474,7 @@ async fn a_root_dispatch_rewritten_into_a_deepen_with_its_counters_is_refused_ev
 
 #[tokio::test]
 async fn a_deepen_fact_is_held_to_the_node_it_produced() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     let mut env = env().await;
     let mut world = world_for("world-1");
     env.prepare_current_world(&mut world).await;

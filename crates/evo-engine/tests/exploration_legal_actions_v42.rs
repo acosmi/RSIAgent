@@ -98,8 +98,11 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use trusted_compiler_inputs::StoreOptimizationJournal;
+
+// The real config consumer owns one process-wide physical workspace permit.
+static CONFIG_WORKSPACE_GATE: Mutex<()> = Mutex::const_new(());
 
 const NAMESPACE: &str = "n";
 const SCOPE: &str = "dev-scope";
@@ -2306,6 +2309,7 @@ async fn relabel(env: &Env, node_id: &str, label: Option<&str>) {
 
 #[tokio::test]
 async fn a_valid_node_is_deepened_only_when_its_evidence_is_trusted() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     let current = CurrentRuntime::new().await;
     let env = &current.env;
     for (case, label) in LABELS {
@@ -2357,6 +2361,7 @@ async fn a_valid_node_is_deepened_only_when_its_evidence_is_trusted() {
 
 #[tokio::test]
 async fn a_valid_row_without_trusted_evidence_leaves_the_other_root_offered() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     let current = CurrentRuntime::new().await;
     let env = &current.env;
     for (case, label) in LABELS.iter().filter(|(_, label)| *label != Some("trusted")) {
@@ -2384,6 +2389,7 @@ async fn a_valid_row_without_trusted_evidence_leaves_the_other_root_offered() {
 
 #[tokio::test]
 async fn a_deepen_that_was_dispatched_is_not_offered_again_so_the_world_stops() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     let current = CurrentRuntime::new().await;
     let env = &current.env;
     for child in [Child::HardFailure, Child::Uncertain] {
@@ -2432,6 +2438,7 @@ async fn a_deepen_that_was_dispatched_is_not_offered_again_so_the_world_stops() 
 
 #[tokio::test]
 async fn each_node_of_a_chain_is_offered_one_successor_up_to_the_depth_cap() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     let observations = vec![
         ObservedStatus::Valid {
             quality_micros: FULL
@@ -2456,6 +2463,7 @@ async fn each_node_of_a_chain_is_offered_one_successor_up_to_the_depth_cap() {
 
 #[tokio::test]
 async fn a_world_runs_many_rounds_to_stop_without_a_dispatch_conflict() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     let observations = vec![
         ObservedStatus::Valid {
             quality_micros: FULL
@@ -2473,6 +2481,7 @@ async fn a_world_runs_many_rounds_to_stop_without_a_dispatch_conflict() {
 
 #[tokio::test]
 async fn a_world_whose_rounds_are_forced_by_fairness_runs_to_the_node_cap_and_stops() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     let observations = vec![
         ObservedStatus::Valid {
             quality_micros: HALF
@@ -2509,6 +2518,7 @@ async fn a_world_whose_rounds_are_forced_by_fairness_runs_to_the_node_cap_and_st
 
 #[tokio::test]
 async fn a_trusted_root_below_the_baseline_can_be_deepened_without_bricking_the_world() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     for child in Child::ALL {
         let status: ObservedStatus = serde_json::from_value(child.status()).unwrap();
         let matrix = AlgorithmMatrix::new(
@@ -2548,6 +2558,7 @@ async fn a_trusted_root_below_the_baseline_can_be_deepened_without_bricking_the_
 
 #[tokio::test]
 async fn a_regressing_parent_does_not_brick_its_children() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     for child in Child::ALL {
         let status: ObservedStatus = serde_json::from_value(child.status()).unwrap();
         let matrix = AlgorithmMatrix::new(
@@ -2601,6 +2612,7 @@ async fn a_regressing_parent_does_not_brick_its_children() {
 
 #[tokio::test]
 async fn the_legal_actions_of_a_world_without_old_nodes_are_what_they_were() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     let current = CurrentRuntime::new().await;
     let env = &current.env;
     // A fresh world offers its roots in registration order.
@@ -2690,6 +2702,7 @@ async fn the_legal_action_conditions_of_recover_are_unchanged() {
 
 #[tokio::test]
 async fn a_claimed_deepen_stays_legal_and_resumes_without_paying_again() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     let current = CurrentRuntime::new().await;
     let env = &current.env;
     let id = "world-claimed-deepen";

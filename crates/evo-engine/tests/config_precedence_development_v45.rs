@@ -37,6 +37,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
+static CONFIG_WORKSPACE_TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const HIGH: &str = "config_precedence.v1: highest_layer_first";
 const LOW: &str = "config_precedence.v1: lowest_layer_first";
 const NS: &str = "config-development";
@@ -450,6 +452,7 @@ fn projection_refusal<T: std::fmt::Debug>(result: Result<T>) {
 #[tokio::test]
 async fn config_projection_control_requires_complete_development_registration_and_separated_roles()
 {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(LOW, HIGH, false).await;
     assert_eq!(
         register_config_projection_control(&f.admin, &f.store, f.control.clone())
@@ -504,6 +507,7 @@ async fn config_projection_control_requires_complete_development_registration_an
 
 #[tokio::test]
 async fn equal_content_reaches_equal_real_projection_inputs_across_execution_identities() {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(HIGH, HIGH, false).await;
     assert_ne!(f.parent.digest, f.candidate.digest);
     let first = f.request("equal-a");
@@ -545,6 +549,7 @@ async fn equal_content_reaches_equal_real_projection_inputs_across_execution_ide
 
 #[tokio::test]
 async fn changed_projection_policy_changes_fd_resolver_behavior() {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(LOW, HIGH, false).await;
     let request = f.request("policy");
     let (report, p, o) = f.execute(&request).await;
@@ -599,6 +604,7 @@ async fn changed_projection_policy_changes_fd_resolver_behavior() {
 
 #[tokio::test]
 async fn different_loaded_content_can_keep_behavior_and_quality_equal() {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(
         HIGH,
         &format!("{HIGH}\nDescriptive prose; MUST is not an execution policy."),
@@ -660,6 +666,7 @@ async fn different_loaded_content_can_keep_behavior_and_quality_equal() {
 
 #[tokio::test]
 async fn both_explicit_full_bundles_are_required_and_loaded_from_frozen_request() {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(LOW, HIGH, false).await;
     let request = f.request("full-bundles");
     let (_, p, o) = f.execute(&request).await;
@@ -693,6 +700,7 @@ async fn both_explicit_full_bundles_are_required_and_loaded_from_frozen_request(
 
 #[tokio::test]
 async fn active_zero_truncated_and_missing_projection_evidence_are_invalid() {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(LOW, HIGH, false).await;
     let request = f.request("bad-projection");
     let (_, p, o) = f.execute(&request).await;
@@ -756,6 +764,7 @@ async fn active_zero_truncated_and_missing_projection_evidence_are_invalid() {
 
 #[tokio::test]
 async fn forged_output_or_projection_does_not_verify_even_with_recomputed_outer_digests() {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(LOW, HIGH, false).await;
     let request = f.request("forged");
     let (_, p, o) = f.execute(&request).await;
@@ -822,6 +831,7 @@ async fn forged_output_or_projection_does_not_verify_even_with_recomputed_outer_
 
 #[tokio::test]
 async fn development_replay_and_recovery_leave_active_and_production_projection_unchanged() {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(LOW, HIGH, false).await;
     // A pre-existing nonempty pointer is software fixture data, never a fresh
     // approval or Host credential. Its associated projection is really executed
@@ -932,6 +942,7 @@ async fn development_replay_and_recovery_leave_active_and_production_projection_
 #[tokio::test]
 async fn source_revocation_redacts_real_projection_execution_and_cannot_upgrade_legacy_on_recovery()
 {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     // Legal empty registered closure is real persisted evidence, not a fallback.
     let empty = Fixture::new(LOW, HIGH, false).await;
     let request = empty.request("empty-sources");

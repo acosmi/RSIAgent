@@ -103,6 +103,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Notify;
 use trusted_compiler_inputs::StoreOptimizationJournal;
 
+static CONFIG_WORKSPACE_TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const CONFIG_LOW: &str = "config_precedence.v1: lowest_layer_first";
 const CONFIG_HIGH: &str = "config_precedence.v1: highest_layer_first";
 const NAMESPACE: &str = "n";
@@ -1573,6 +1575,7 @@ async fn config_content_env(id: &str) -> (Env, ConfigProjectionDevelopmentRunner
 
 #[tokio::test]
 async fn projection_consumed_node_is_current_content_and_can_deepen_and_finalize() {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let (env, runner) = config_content_env("world-current-projection").await;
     let mut request = env.fixture.request(
         &env.root,
@@ -1733,6 +1736,7 @@ async fn projection_consumed_node_is_current_content_and_can_deepen_and_finalize
 
 #[tokio::test]
 async fn legacy_trusted_nodes_stay_readable_but_cannot_drive_current_selection() {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let env = Env::new(true).await;
     let id = "world-historical-trusted";
     env.register(id).await;
