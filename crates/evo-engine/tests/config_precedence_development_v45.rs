@@ -13,13 +13,13 @@ use evo_engine::development::projection::{
     ConfigProjectionExecutionIssueRequest, ConfigProjectionExecutionRequestV1,
     ConfigProjectionTaskV1, config_projection_runner_contract,
     issue_config_projection_execution_receipt, load_config_projection_execution_receipt,
-    register_config_projection_control,
+    read_config_projection_execution_receipt_in_session, register_config_projection_control,
 };
 use evo_engine::development::{
-    CandidateConsumption, DevelopmentSide, EXECUTION_OUTPUT_KIND, EXECUTION_RECEIPT_KIND,
-    ExecutionReceiptIssueRequest, execution_budget_call_id, execution_output_id,
-    execution_receipt_id, issue_execution_receipt, load_execution_output, registered_runner_digest,
-    storage_id, typed_receipt_closure,
+    CandidateConsumption, DevelopmentExecutionReceiptVersion, DevelopmentSide,
+    EXECUTION_OUTPUT_KIND, EXECUTION_RECEIPT_KIND, ExecutionReceiptIssueRequest,
+    execution_budget_call_id, execution_output_id, execution_receipt_id, issue_execution_receipt,
+    load_execution_output, registered_runner_digest, storage_id, typed_receipt_closure,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::lifecycle::LifecycleCoordinator;
@@ -703,7 +703,7 @@ async fn active_zero_truncated_and_missing_projection_evidence_are_invalid() {
     let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(LOW, HIGH, false).await;
     let request = f.request("bad-projection");
-    let (_, p, o) = f.execute(&request).await;
+    let (report, p, o) = f.execute(&request).await;
     f.verify(&p, &o).await.unwrap();
     let task = &f.control.tasks[0].task_id;
     let call_id =
@@ -743,9 +743,8 @@ async fn active_zero_truncated_and_missing_projection_evidence_are_invalid() {
         projection_refusal(verify_development_observation(&f.store, &f.executor, &p, &o).await);
     }
     f.replace_budget_request(&call_id, &original);
-    let receipt_id =
-        execution_receipt_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap();
-    let stored = storage_id(EXECUTION_RECEIPT_KIND, &receipt_id).unwrap();
+    let receipt_id = &report.results[0].candidate_execution_id;
+    let stored = storage_id(EXECUTION_RECEIPT_KIND, receipt_id).unwrap();
     let original = f.raw("artifact", &stored).await;
     let mut missing = original.clone();
     missing["payload"]
@@ -764,18 +763,61 @@ async fn active_zero_truncated_and_missing_projection_evidence_are_invalid() {
 
 #[tokio::test]
 async fn forged_output_or_projection_does_not_verify_even_with_recomputed_outer_digests() {
+    use evo_storage::budget::{
+        BudgetArtifact, BudgetCallFence, BudgetCallReservation, BudgetExecutionProvenance,
+        BudgetStage, ModelCallSettlementEvidence, REGISTERED_EXECUTION_SETTLEMENT_SCHEMA,
+        REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2, ReadRegisteredExecutionSettlement,
+        RegisteredExecutionProvenance, RegisteredExecutionSettlement,
+        RegisteredExecutionSettlementV2, UsageCharge,
+    };
+
     let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(LOW, HIGH, false).await;
     let request = f.request("forged");
-    let (_, p, o) = f.execute(&request).await;
+    let (report, p, o) = f.execute(&request).await;
     f.verify(&p, &o).await.unwrap();
     let task = &f.control.tasks[0].task_id;
-    let rid = execution_receipt_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap();
+    let rid = &report.results[0].candidate_execution_id;
     let oid = execution_output_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap();
-    let rstore = storage_id(EXECUTION_RECEIPT_KIND, &rid).unwrap();
+    let rstore = storage_id(EXECUTION_RECEIPT_KIND, rid).unwrap();
     let ostore = storage_id(EXECUTION_OUTPUT_KIND, &oid).unwrap();
     let original_receipt = f.raw("artifact", &rstore).await;
     let original_output = f.raw("artifact", &ostore).await;
+    let mut wrong_identity = original_receipt.clone();
+    wrong_identity["payload"]["execution"]["receipt_id"] =
+        json!(execution_receipt_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap());
+    f.put("artifact", &rstore, &wrong_identity).await;
+    assert!(matches!(
+        load_config_projection_execution_receipt(&f.store, &f.admin, rid).await,
+        Err(Error::Forbidden)
+    ));
+    let mut s = f.store.session().await.unwrap();
+    assert!(matches!(
+        read_config_projection_execution_receipt_in_session(
+            &mut s,
+            &f.admin,
+            &request,
+            task,
+            DevelopmentSide::Candidate,
+            DevelopmentExecutionReceiptVersion::V2,
+        )
+        .await,
+        Err(Error::Forbidden)
+    ));
+    assert!(matches!(
+        read_config_projection_execution_receipt_in_session(
+            &mut s,
+            &f.admin,
+            &request,
+            task,
+            DevelopmentSide::Candidate,
+            DevelopmentExecutionReceiptVersion::V1,
+        )
+        .await,
+        Err(Error::NotFound)
+    ));
+    s.commit().await.unwrap();
+    f.put("artifact", &rstore, &original_receipt).await;
     let mut output = original_output.clone();
     let mut answer: Value =
         serde_json::from_str(output["payload"]["output_utf8"].as_str().unwrap()).unwrap();
@@ -798,7 +840,8 @@ async fn forged_output_or_projection_does_not_verify_even_with_recomputed_outer_
     f.put("artifact", &rstore, &claimed_projection).await;
     projection_refusal(f.verify(&p, &o).await);
     f.put("artifact", &rstore, &original_receipt).await;
-    let mut forged = f.frozen(&request, DevelopmentSide::Candidate).await;
+    let original_frozen = f.frozen(&request, DevelopmentSide::Candidate).await;
+    let mut forged = original_frozen.clone();
     forged.projection.instructions = vec![LOW.into()];
     f.replace_budget_request(
         &execution_budget_call_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap(),
@@ -827,6 +870,255 @@ async fn forged_output_or_projection_does_not_verify_even_with_recomputed_outer_
         .await,
         Err(Error::Forbidden)
     ));
+    f.replace_budget_request(
+        &execution_budget_call_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap(),
+        &serde_json::to_value(&original_frozen).unwrap(),
+    );
+    f.verify(&p, &o).await.unwrap();
+
+    // Reuse the real frozen projection/output from the healthy public runner.
+    // Only this new request's identity and real financial writer vary.
+    let healthy_output = original_output["payload"]["output_utf8"].as_str().unwrap();
+    for (index, (writer, provenance)) in [
+        (ctx("another-real-worker", Role::Worker), None),
+        (ctx(f.executor.actor(), Role::Host), None),
+        (
+            f.admin.clone(),
+            Some(BudgetExecutionProvenance::ExternalProvider),
+        ),
+        (
+            ctx("model-financial-host", Role::Host),
+            Some(BudgetExecutionProvenance::Fixture),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let next = f.request(&format!("settler-{index}"));
+        let prepared = f.journal(f.facts(&next, None), &next).await;
+        let mut frozen = original_frozen.clone();
+        frozen.request = next.clone();
+        frozen.request_fact_id = prepared;
+        let request_digest = fingerprint(&frozen).unwrap();
+        let call_id =
+            execution_budget_call_id(&next.request_id, task, DevelopmentSide::Candidate).unwrap();
+        let call = f
+            .store
+            .reserve_budget_call_with_sources(
+                &f.executor,
+                &BudgetCallReservation {
+                    billing_scope: SCOPE.into(),
+                    call_id: call_id.clone(),
+                    dispatch_group_id: next.episode_id.clone(),
+                    stage: BudgetStage::DevelopmentExecution,
+                    actual_input_digest: request_digest.clone(),
+                    request_artifact: Some(
+                        BudgetArtifact::from_serializable(
+                            "rsia.development_config_request.v1",
+                            &frozen,
+                        )
+                        .unwrap(),
+                    ),
+                    max_cost_micros: 1,
+                    lease_token: format!(
+                        "lease-{}",
+                        &fingerprint(&(&call_id, "config-projection-execution")).unwrap()[..32]
+                    ),
+                    lease_until: 700,
+                    now: 100,
+                },
+                &f.control.source_ids,
+            )
+            .await
+            .unwrap();
+        let fence = BudgetCallFence {
+            billing_scope: SCOPE.into(),
+            call_id: call_id.clone(),
+            actual_input_digest: request_digest.clone(),
+            lease_token: call.lease_token,
+            lease_epoch: call.lease_epoch,
+            now: 100,
+        };
+        let dispatch = f
+            .store
+            .begin_budget_dispatch(&f.executor, &fence)
+            .await
+            .unwrap();
+        let dispatch_id = dispatch.call.dispatch_id.unwrap();
+        let output_digest = hash(healthy_output.as_bytes());
+        let submission = RegisteredExecutionSettlement {
+            schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA.into(),
+            provenance: RegisteredExecutionProvenance::RegisteredPureFunction,
+            call_id: call_id.clone(),
+            dispatch_id: dispatch_id.clone(),
+            request_digest,
+            output_digest: output_digest.clone(),
+            target_id: "config_precedence.v1".into(),
+            target_digest: f.control.target_digest.clone(),
+            runner_digest: f.control.runner_digest.clone(),
+        };
+        let charge = UsageCharge {
+            amount_micros: 0,
+            currency: "USD".into(),
+            pricing_version: "local-zero-v1".into(),
+            provider_request_id: format!("registered-config-projection:{dispatch_id}"),
+            usage_record_id: format!("config-settler-usage-{index}"),
+            output_digest,
+        };
+        let accounted = if let Some(provenance) = provenance {
+            let forged = BudgetArtifact::from_serializable(
+                REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2,
+                &RegisteredExecutionSettlementV2 {
+                    schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2.into(),
+                    settler_actor: f.executor.actor().into(),
+                    settler_role: Role::Worker,
+                    settlement: submission.clone(),
+                },
+            )
+            .unwrap();
+            let model = f
+                .store
+                .settle_model_budget_call(
+                    writer,
+                    &fence,
+                    &charge,
+                    &ModelCallSettlementEvidence {
+                        provenance: *provenance,
+                        actual_model_digest: Some(d("config-model-financial-fixture")),
+                        transport_artifact: BudgetArtifact::from_serializable(
+                            "test.transport.v1",
+                            &json!({"provider_request_id":charge.provider_request_id}),
+                        )
+                        .unwrap(),
+                        usable_response: Some(forged.clone()),
+                        blocked_response: BudgetArtifact::from_serializable(
+                            "test.response.v1",
+                            &json!({"state":"blocked"}),
+                        )
+                        .unwrap(),
+                        forced_block_reason: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(model.response_usable);
+            assert_eq!(model.call.execution_provenance, Some(*provenance));
+            let closed = f
+                .store
+                .close_budget_call_execution(
+                    writer,
+                    SCOPE,
+                    &call_id,
+                    &dispatch_id,
+                    "config_model_financial_close",
+                    100,
+                )
+                .await
+                .unwrap();
+            assert_eq!(closed.response_artifact.as_ref(), Some(&forged));
+            closed
+        } else {
+            let settled = f
+                .store
+                .settle_registered_execution_call(writer, &fence, &charge, &submission)
+                .await
+                .unwrap();
+            let ReadRegisteredExecutionSettlement::Current(fact) =
+                ReadRegisteredExecutionSettlement::from_call(&settled).unwrap()
+            else {
+                panic!("registered writer must persist its actual settler");
+            };
+            assert_eq!(fact.settler_actor, writer.actor());
+            assert_eq!(fact.settler_role, writer.role());
+            settled
+        };
+        assert_eq!(accounted.state, BudgetCallState::Finalized);
+        assert_eq!(accounted.actual_cost_micros, Some(0));
+        assert!(accounted.execution_closed);
+        let issued = issue_config_projection_execution_receipt(
+            &f.executor,
+            &f.store,
+            ConfigProjectionExecutionIssueRequest {
+                control_id: f.control.id.clone(),
+                request: next.clone(),
+                task_id: task.clone(),
+                side: DevelopmentSide::Candidate,
+                lease_seconds: 600,
+                issued_at_unix_seconds: 100,
+            },
+        )
+        .await;
+        if provenance.is_none() && writer.actor() == f.executor.actor() {
+            let receipt = issued.unwrap();
+            assert_eq!(receipt.execution.executor_actor, writer.actor());
+            assert_eq!(receipt.execution.executor_role, Role::Host);
+            let mut s = f.store.session().await.unwrap();
+            let read = read_config_projection_execution_receipt_in_session(
+                &mut s,
+                &f.grader,
+                &next,
+                task,
+                DevelopmentSide::Candidate,
+                DevelopmentExecutionReceiptVersion::V2,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                read.state,
+                evo_storage::PersistentContractState::CurrentVerified
+            );
+            assert_eq!(read.receipt.execution.executor_role, Role::Host);
+            s.commit().await.unwrap();
+        } else {
+            let expected = match provenance {
+                None => "registered execution settler differs from registered executor",
+                Some(BudgetExecutionProvenance::Fixture) => {
+                    "execution receipt lacks a matching closed development budget call"
+                }
+                Some(_) => "registered execution settlement is invalid",
+            };
+            assert!(matches!(issued, Err(Error::Conflict(ref message)) if message == expected));
+            let mut s = f.store.session().await.unwrap();
+            assert!(matches!(
+                read_config_projection_execution_receipt_in_session(
+                    &mut s,
+                    &f.admin,
+                    &next,
+                    task,
+                    DevelopmentSide::Candidate,
+                    DevelopmentExecutionReceiptVersion::V2,
+                )
+                .await,
+                Err(Error::NotFound)
+            ));
+            assert!(
+                s.get::<Value>(
+                    &f.admin,
+                    "artifact",
+                    &storage_id(
+                        EXECUTION_OUTPUT_KIND,
+                        &execution_output_id(&next.request_id, task, DevelopmentSide::Candidate)
+                            .unwrap(),
+                    )
+                    .unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            s.commit().await.unwrap();
+        }
+        assert_eq!(
+            f.store
+                .budget_call(&f.admin, SCOPE, &call_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            accounted
+        );
+        let root = f.store.root_budget(&f.admin, SCOPE).await.unwrap().unwrap();
+        assert_eq!((root.spent_micros, root.reserved_micros), (0, 0));
+    }
 }
 
 #[tokio::test]
@@ -868,9 +1160,13 @@ async fn development_replay_and_recovery_leave_active_and_production_projection_
     let request = f.request("isolation");
     let prepared = f.journal(f.facts(&request, None), &request).await;
     let task = &f.control.tasks[0].task_id;
-    for side in [DevelopmentSide::Parent, DevelopmentSide::Candidate] {
+    for (side, role) in [
+        (DevelopmentSide::Parent, Role::Host),
+        (DevelopmentSide::Candidate, Role::Worker),
+    ] {
+        let issuer = ctx(f.executor.actor(), role);
         let receipt = issue_config_projection_execution_receipt(
-            &f.executor,
+            &issuer,
             &f.store,
             ConfigProjectionExecutionIssueRequest {
                 control_id: f.control.id.clone(),
@@ -883,6 +1179,76 @@ async fn development_replay_and_recovery_leave_active_and_production_projection_
         )
         .await
         .unwrap();
+        assert_eq!(
+            receipt.schema_version,
+            "rsia.development_config_execution.v2"
+        );
+        assert_eq!(
+            receipt.execution.schema_version,
+            "rsia.development_execution_receipt.v2"
+        );
+        assert_eq!(receipt.execution.executor_role, role);
+        let loaded = load_config_projection_execution_receipt(
+            &f.store,
+            &f.admin,
+            &receipt.execution.receipt_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&receipt).unwrap()
+        );
+        let mut s = f.store.session().await.unwrap();
+        let read = read_config_projection_execution_receipt_in_session(
+            &mut s,
+            &f.grader,
+            &request,
+            task,
+            side,
+            DevelopmentExecutionReceiptVersion::V2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read.state,
+            evo_storage::PersistentContractState::CurrentVerified
+        );
+        assert_eq!(read.current_receipt_id, receipt.execution.receipt_id);
+        assert_ne!(read.legacy_receipt_id, read.current_receipt_id);
+        assert_ne!(
+            read.current_receipt_id,
+            execution_receipt_id(&request.request_id, task, side).unwrap()
+        );
+        assert_eq!(
+            read.receipt.request_projection_digest,
+            receipt.request_projection_digest
+        );
+        assert!(matches!(
+            read_config_projection_execution_receipt_in_session(
+                &mut s,
+                &f.grader,
+                &request,
+                task,
+                side,
+                DevelopmentExecutionReceiptVersion::V1,
+            )
+            .await,
+            Err(Error::NotFound)
+        ));
+        let call = s
+            .budget_call(&f.admin, SCOPE, &receipt.execution.budget_call_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let evo_storage::budget::ReadRegisteredExecutionSettlement::Current(fact) =
+            evo_storage::budget::ReadRegisteredExecutionSettlement::from_call(&call).unwrap()
+        else {
+            panic!("config current receipt requires its actual settler");
+        };
+        assert_eq!(fact.settler_actor, f.executor.actor());
+        assert_eq!(fact.settler_role, role);
+        s.commit().await.unwrap();
         assert_eq!(
             receipt.execution.cost_state,
             evo_engine::development::DevelopmentCostState::Known {
@@ -975,8 +1341,28 @@ async fn source_revocation_redacts_real_projection_execution_and_cannot_upgrade_
 
     let f = Fixture::new(LOW, HIGH, true).await;
     let request = f.request("revoked");
-    let (_, p, o) = f.execute(&request).await;
+    let (report, p, o) = f.execute(&request).await;
     f.verify(&p, &o).await.unwrap();
+    let mut s = f.store.session().await.unwrap();
+    let read = read_config_projection_execution_receipt_in_session(
+        &mut s,
+        &f.grader,
+        &request,
+        &f.control.tasks[0].task_id,
+        DevelopmentSide::Candidate,
+        DevelopmentExecutionReceiptVersion::V2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read.state,
+        evo_storage::PersistentContractState::CurrentVerified
+    );
+    assert_eq!(
+        read.current_receipt_id,
+        report.results[0].candidate_execution_id
+    );
+    s.commit().await.unwrap();
     let before = f.calls(&request).await;
     let mut cleanup = LifecycleCoordinator::revoke_source(
         &f.admin,
@@ -1002,6 +1388,19 @@ async fn source_revocation_redacts_real_projection_execution_and_cannot_upgrade_
         Err(Error::Forbidden)
     ));
     assert!(f.verify(&p, &o).await.is_err());
+    assert!(matches!(load_config_projection_execution_receipt(
+        &f.store, &f.admin, &report.results[0].candidate_execution_id,
+    ).await, Err(Error::Conflict(ref message))
+        if message == "development artifact envelope mismatch or redacted"));
+    let mut s = f.store.session().await.unwrap();
+    assert!(
+        matches!(read_config_projection_execution_receipt_in_session(
+        &mut s, &f.grader, &request, &f.control.tasks[0].task_id,
+        DevelopmentSide::Candidate, DevelopmentExecutionReceiptVersion::V2,
+    ).await, Err(Error::Conflict(ref message))
+        if message == "development artifact envelope mismatch or redacted")
+    );
+    s.commit().await.unwrap();
     let output = storage_id(
         EXECUTION_OUTPUT_KIND,
         &execution_output_id(
