@@ -1396,53 +1396,58 @@ async fn redacted_open_execution_without_provenance_closes_and_keeps_uncertain_f
 #[tokio::test]
 async fn q03_upstream_legacy_replay_changes_only_d4_close_set() {
     let fixture = Fixture::new().await;
+    let healthy_refence = Fixture::new().await;
+    let revoked_refence = Fixture::new().await;
     let ctx = context(NS, Role::Host);
-    let mut session = fixture.store.session().await.unwrap();
-    for id in [A, B, U] {
-        session.delete(&ctx, "run", id).await.unwrap();
-    }
-    session.commit().await.unwrap();
-    for id in [A, B, U] {
-        let family = format!("family-{id}");
-        evo_engine::evidence::store_trace_authority(
+    for fixture in [&fixture, &healthy_refence, &revoked_refence] {
+        let mut session = fixture.store.session().await.unwrap();
+        for id in [A, B, U] {
+            session.delete(&ctx, "run", id).await.unwrap();
+        }
+        session.commit().await.unwrap();
+        for id in [A, B, U] {
+            let family = format!("family-{id}");
+            evo_engine::evidence::store_trace_authority(
+                &fixture.store,
+                &ctx,
+                &evo_engine::evidence::StoredTraceAuthority {
+                    schema_version: "rsia.optimization.source.v1".into(),
+                    record: evo_engine::evidence::StoredRunRecord {
+                        id: id.into(),
+                        body: id.as_bytes().to_vec(),
+                        parent_family: family.clone(),
+                        task_origin: evo_core::evidence::TaskOrigin::TrustedRun,
+                        execution_attestation:
+                            evo_core::evidence::ExecutionAttestation::TrustedHost,
+                        purpose: Purpose::Development,
+                    },
+                    trace: evo_core::optimization::OptimizationTrace {
+                        run_id: id.into(),
+                        parent_family: family,
+                        source_digest: hash(id.as_bytes()),
+                        purpose: Purpose::Development,
+                        outcome: evo_core::optimization::TraceOutcome::Success,
+                        diagnosis: None,
+                        excerpt: id.into(),
+                        seed: 1,
+                    },
+                    excerpt_start: 0,
+                    excerpt_end: id.len(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        gate_edges(
             &fixture.store,
-            &ctx,
-            &evo_engine::evidence::StoredTraceAuthority {
-                schema_version: "rsia.optimization.source.v1".into(),
-                record: evo_engine::evidence::StoredRunRecord {
-                    id: id.into(),
-                    body: id.as_bytes().to_vec(),
-                    parent_family: family.clone(),
-                    task_origin: evo_core::evidence::TaskOrigin::TrustedRun,
-                    execution_attestation: evo_core::evidence::ExecutionAttestation::TrustedHost,
-                    purpose: Purpose::Development,
-                },
-                trace: evo_core::optimization::OptimizationTrace {
-                    run_id: id.into(),
-                    parent_family: family,
-                    source_digest: hash(id.as_bytes()),
-                    purpose: Purpose::Development,
-                    outcome: evo_core::optimization::TraceOutcome::Success,
-                    diagnosis: None,
-                    excerpt: id.into(),
-                    seed: 1,
-                },
-                excerpt_start: 0,
-                excerpt_end: id.len(),
-            },
+            NS,
+            &[
+                ("run", B, "candidate", "q03-middle"),
+                ("candidate", "q03-middle", "run", U),
+            ],
         )
-        .await
-        .unwrap();
+        .await;
     }
-    gate_edges(
-        &fixture.store,
-        NS,
-        &[
-            ("run", B, "candidate", "q03-middle"),
-            ("candidate", "q03-middle", "run", U),
-        ],
-    )
-    .await;
     let refused = request("q03-upstream-open-root", &[A, B]);
     let completed = settle_open(&fixture, &refused, true, false).await;
     begin(&fixture.store, NS, "run", U).await;
@@ -1462,4 +1467,116 @@ async fn q03_upstream_legacy_replay_changes_only_d4_close_set() {
         .verify_receipt(&refused, receipt(&completed))
         .await
         .unwrap();
+
+    for (fixture, revoked) in [(&healthy_refence, false), (&revoked_refence, true)] {
+        let request = request("q03-expired-reserved", &[A, B]);
+        let reserved = fixture
+            .store
+            .reserve_budget_call_with_sources(
+                &ctx,
+                &BudgetCallReservation {
+                    billing_scope: SCOPE.into(),
+                    call_id: request.request_id.clone(),
+                    dispatch_group_id: request.episode_id.clone(),
+                    stage: BudgetStage::Reflection,
+                    actual_input_digest: request.cache_key_digest.clone(),
+                    request_artifact: Some(
+                        BudgetArtifact::from_serializable(
+                            "rsia.model_request.artifact.v1",
+                            &request,
+                        )
+                        .unwrap(),
+                    ),
+                    max_cost_micros: 20,
+                    lease_token: "expired-owned-lease".into(),
+                    lease_until: 31,
+                    now: 10,
+                },
+                &[A.into(), B.into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(reserved.state, BudgetCallState::Reserved);
+        assert_eq!(reserved.lease_epoch, 1);
+        assert_eq!(reserved.actual_cost_micros, None);
+        assert_eq!(fixture.transport.calls.load(Ordering::SeqCst), 0);
+        if revoked {
+            // The real revocation at 30 wins before the lease expires at 31.
+            begin(&fixture.store, NS, "run", U).await;
+        }
+        let before = sqlite_snapshot(&fixture.path);
+        let broker = PersistentModelBroker::with_clock(
+            fixture.store.clone(),
+            fixture.transport.clone(),
+            config(),
+            Arc::new(|| 40),
+        )
+        .unwrap();
+        if revoked {
+            let invalid_clock = PersistentModelBroker::with_clock(
+                fixture.store.clone(),
+                fixture.transport.clone(),
+                config(),
+                Arc::new(|| -1),
+            )
+            .unwrap();
+            assert!(matches!(
+                invalid_clock.dispatch(request.clone()).await,
+                Err(Error::ClockRegressed)
+            ));
+            assert_eq!(sqlite_snapshot(&fixture.path), before);
+            for _ in 0..2 {
+                assert_same_response(
+                    &broker.dispatch(request.clone()).await.unwrap(),
+                    &ModelResponse::Rejected {
+                        request_id: request.request_id.clone(),
+                        kind: ModelRejectionKind::Unauthorized,
+                        reason: "broker_pre_dispatch_v1.source_revoked".into(),
+                        dispatch: RejectedDispatch::NotDispatched,
+                    },
+                );
+                assert_eq!(fixture.call(&request).await, reserved);
+                assert_eq!(sqlite_snapshot(&fixture.path), before);
+            }
+            assert_eq!(fixture.transport.calls.load(Ordering::SeqCst), 0);
+        } else {
+            let response = broker.dispatch(request.clone()).await.unwrap();
+            assert!(matches!(response, ModelResponse::Completed { .. }));
+            response.validate_against(&request).unwrap();
+            broker
+                .verify_receipt(&request, receipt(&response))
+                .await
+                .unwrap();
+            let call = fixture.call(&request).await;
+            assert_usable(&call, true);
+            assert_eq!(call.lease_epoch, reserved.lease_epoch + 1);
+            assert_ne!(call.lease_token, reserved.lease_token);
+            assert_eq!(call.lease_until, 100);
+            let after = sqlite_snapshot(&fixture.path);
+            let events = &after["root_budget_events"];
+            assert_eq!(
+                events["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| {
+                        row[column(events, "call_id")] == json!(format!("'{}'", request.request_id))
+                            && row[column(events, "event_kind")] == json!("'refenced'")
+                    })
+                    .count(),
+                1,
+            );
+            assert_eq!(fixture.transport.calls.load(Ordering::SeqCst), 1);
+        }
+        let root = fixture
+            .store
+            .root_budget(&ctx, SCOPE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (root.reserved_micros, root.spent_micros),
+            if revoked { (20, 0) } else { (0, 10) },
+        );
+    }
 }

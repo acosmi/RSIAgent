@@ -12,12 +12,12 @@ use evo_core::optimization::{ModelRequest, ModelStage};
 use evo_core::{
     Context, Error, Result, Role, canonical_fingerprint, fingerprint, hash, identifier, text,
 };
-use evo_storage::Store;
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallRefence, BudgetCallReservation,
     BudgetCallState, BudgetDispatchDecision, BudgetExecutionProvenance, BudgetPreDispatchRefusal,
     BudgetStage, ModelCallSettlementEvidence, RootBudgetRecord, UsageCharge,
 };
+use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -823,20 +823,21 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
 
     async fn release_pre_dispatch(
         &self,
+        mut session: Session,
         ctx: &Context,
         request: &ModelRequest,
         root: &RootBudgetRecord,
         fence: &BudgetCallFence,
         code: &str,
     ) -> Result<ModelResponse> {
-        let released = self
-            .store
+        let released = session
             .release_undispatched_budget_call(
                 ctx,
                 fence,
                 &format!("{PRE_DISPATCH_REASON_PREFIX}{code}"),
             )
             .await?;
+        session.commit().await?;
         // Another valid release may already have won. Replay exactly its stored
         // reason instead of replacing it with this attempted release's diagnosis.
         self.existing_response(request, root, released).await
@@ -844,19 +845,23 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
 
     async fn begin_pre_dispatch(
         &self,
+        mut session: Session,
         ctx: &Context,
         request: &ModelRequest,
         root: &RootBudgetRecord,
         fence: &BudgetCallFence,
     ) -> Result<std::result::Result<BudgetDispatchDecision, ModelResponse>> {
-        match self.store.begin_budget_dispatch_typed(ctx, fence).await? {
-            Ok(decision) => Ok(Ok(decision)),
+        match session.begin_budget_dispatch_typed(ctx, fence).await? {
+            Ok(decision) => {
+                session.commit().await?;
+                Ok(Ok(decision))
+            }
             Err(BudgetPreDispatchRefusal::SourceRevoked) => Ok(Err(pre_dispatch_refusal(
                 request,
                 &BudgetPreDispatchRefusal::SourceRevoked,
             ))),
             Err(refusal) => Ok(Err(self
-                .release_pre_dispatch(ctx, request, root, fence, refusal.code())
+                .release_pre_dispatch(session, ctx, request, root, fence, refusal.code())
                 .await?)),
         }
     }
@@ -960,17 +965,30 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
             .iter()
             .map(|source| source.id.clone())
             .collect::<Vec<_>>();
-        let mut call = match self
-            .store
+        let mut session = self.store.session().await?;
+        let mut call = match session
             .reserve_budget_call_with_sources_typed(&ctx, &reservation, &source_ids)
             .await?
         {
             Ok(call) => call,
             Err(refusal) => return Ok(pre_dispatch_refusal(&request, &refusal)),
         };
+        if call.state == BudgetCallState::Reserved {
+            let roots = source_ids
+                .iter()
+                .map(|id| ("run".to_string(), id.clone()))
+                .collect::<Vec<_>>();
+            // Refencing is a write too. Judge the full closure before it, on
+            // the same connection that reserves, refences and begins dispatch.
+            if !session.revocation_sources_live(&ctx, &roots).await? {
+                return Ok(pre_dispatch_refusal(
+                    &request,
+                    &BudgetPreDispatchRefusal::SourceRevoked,
+                ));
+            }
+        }
         if call.state == BudgetCallState::Reserved && now > call.lease_until {
-            call = self
-                .store
+            call = session
                 .refence_reserved_budget_call(
                     &ctx,
                     &BudgetCallRefence {
@@ -992,8 +1010,7 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
             lease_epoch: call.lease_epoch,
             now,
         };
-        let root = self
-            .store
+        let root = session
             .root_budget(&ctx, &self.config.billing_scope)
             .await?
             .ok_or(Error::Budget)?;
@@ -1002,11 +1019,18 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
             || self.config.max_cost_micros > root.per_call_cap_micros
         {
             return self
-                .release_pre_dispatch(&ctx, &request, &root, &fence, "configuration_mismatch")
+                .release_pre_dispatch(
+                    session,
+                    &ctx,
+                    &request,
+                    &root,
+                    &fence,
+                    "configuration_mismatch",
+                )
                 .await;
         }
         let decision = match self
-            .begin_pre_dispatch(&ctx, &request, &root, &fence)
+            .begin_pre_dispatch(session, &ctx, &request, &root, &fence)
             .await?
         {
             Ok(decision) => decision,
@@ -2145,6 +2169,7 @@ mod pre_dispatch_tests {
         let response = fixture
             .broker
             .begin_pre_dispatch(
+                fixture.broker.store.session().await.unwrap(),
                 &fixture.ctx,
                 &fixture.request,
                 &fixture.root,
@@ -2203,6 +2228,7 @@ mod pre_dispatch_tests {
             fixture
                 .broker
                 .release_pre_dispatch(
+                    fixture.broker.store.session().await.unwrap(),
                     &fixture.ctx,
                     &fixture.request,
                     &fixture.root,
@@ -2252,6 +2278,7 @@ mod pre_dispatch_tests {
         let response = fixture
             .broker
             .release_pre_dispatch(
+                fixture.broker.store.session().await.unwrap(),
                 &fixture.ctx,
                 &fixture.request,
                 &fixture.root,
@@ -2288,7 +2315,7 @@ mod pre_dispatch_tests {
             .unwrap()
             .call;
         assert!(
-            matches!(fixture.broker.release_pre_dispatch(&fixture.ctx, &fixture.request, &fixture.root, &fence,
+            matches!(fixture.broker.release_pre_dispatch(fixture.broker.store.session().await.unwrap(), &fixture.ctx, &fixture.request, &fixture.root, &fence,
             "root_concurrency_limit").await, Err(Error::Conflict(message)) if message == "only_undispatched_reservation_can_be_released")
         );
         assert_eq!(
@@ -2336,6 +2363,7 @@ mod pre_dispatch_tests {
             fixture
                 .broker
                 .begin_pre_dispatch(
+                    fixture.broker.store.session().await.unwrap(),
                     &fixture.ctx,
                     &fixture.request,
                     &fixture.root,
