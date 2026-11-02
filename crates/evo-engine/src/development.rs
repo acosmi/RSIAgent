@@ -38,6 +38,9 @@ use std::sync::Arc;
 #[path = "../../../examples/reference-host/src/curriculum_target.rs"]
 mod curriculum_target;
 
+#[path = "development_projection.rs"]
+pub mod projection;
+
 pub const DEVELOPMENT_CONTROL_SCHEMA: &str = "rsia.development_control.v1";
 pub const DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA: &str = "rsia.development_execution_receipt.v1";
 pub const DEVELOPMENT_GRADER_RECEIPT_SCHEMA: &str = "rsia.development_grader_receipt.v1";
@@ -98,12 +101,18 @@ pub(crate) fn validate_content_envelope(id: &str, body: &serde_json::Value) -> R
     }
     let (payload_id, schema) = match e.record_kind.as_str() {
         CONTROL_KIND => {
+            if e.payload["schema_version"] == projection::CONFIG_PROJECTION_CONTROL_SCHEMA {
+                return projection::validate_control_envelope(id, &e.record_kind, e.payload);
+            }
             let v: DevelopmentControlV1 =
                 serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
             v.validate()?;
             (v.id, v.schema_version)
         }
         EXECUTION_RECEIPT_KIND => {
+            if e.payload["schema_version"] == projection::CONFIG_PROJECTION_EXECUTION_SCHEMA {
+                return projection::validate_execution_envelope(id, &e.record_kind, e.payload);
+            }
             let v: DevelopmentExecutionReceiptV1 =
                 serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
             (v.receipt_id, v.schema_version)
@@ -426,6 +435,10 @@ pub(crate) async fn rebuild_bound_development_pair_in_session(
     task_id: &str,
 ) -> Result<evo_core::BoundPairV2> {
     validate_development_request(request)?;
+    if projection::is_config_control(s, ctx, control_id).await? {
+        return projection::rebuild_bound_pair_in_session(ctx, s, control_id, request, task_id)
+            .await;
+    }
     let c = need_control(s, ctx, control_id).await?;
     if c.evidence_scope != DevelopmentEvidenceScope::RegisteredPureFunctionExecution {
         return Err(Error::Forbidden);
@@ -1467,6 +1480,9 @@ pub async fn issue_execution_receipt(
     }
     let request = &issue.request;
     let mut session = store.session().await?;
+    if projection::is_config_control(&mut session, ctx, &issue.control_id).await? {
+        return Err(Error::Forbidden);
+    }
     let control = need_control(&mut session, ctx, &issue.control_id).await?;
     if control.executor_actor != ctx.actor() {
         return Err(Error::Forbidden);
@@ -1917,7 +1933,7 @@ pub(crate) async fn verify_observed_report_in_session(
     request: &DevelopmentRunRequest,
     report: &DevelopmentRunReport,
 ) -> Result<Vec<VerifiedDevelopmentTaskOutcome>> {
-    let (outcomes, _) = verify_observed_report_with_consumption_in_session(
+    let (outcomes, _, _) = verify_observed_report_with_consumption_in_session(
         ctx,
         session,
         observed_fact,
@@ -1943,9 +1959,28 @@ pub(crate) async fn verify_observed_report_with_consumption_in_session(
 ) -> Result<(
     Vec<VerifiedDevelopmentTaskOutcome>,
     Option<CandidateConsumption>,
+    Vec<projection::VerifiedConfigProjectionTaskInputView>,
 )> {
     if report.provenance == DevelopmentExecutionProvenance::Fixture || report.results.is_empty() {
         return Err(Error::Forbidden);
+    }
+    let run: DevelopmentRunReceiptV1 =
+        need_record(session, ctx, RUN_RECEIPT_KIND, &report.execution_receipt_id).await?;
+    if projection::is_config_control(session, ctx, &run.control_id).await? {
+        let (outcomes, inputs) = projection::verify_observed_report_in_session(
+            ctx,
+            session,
+            observed_fact,
+            request,
+            report,
+            &run,
+        )
+        .await?;
+        return Ok((
+            outcomes,
+            Some(CandidateConsumption::ProjectionConsumed),
+            inputs,
+        ));
     }
     let mut control_ids = BTreeSet::new();
     for result in &report.results {
@@ -2172,6 +2207,7 @@ pub(crate) async fn verify_observed_report_with_consumption_in_session(
     Ok((
         outcomes,
         runner_candidate_consumption(&control.runner_digest)?,
+        Vec::new(),
     ))
 }
 
@@ -2185,6 +2221,10 @@ pub(crate) async fn run_receipt_candidate_consumption(
 ) -> Result<Option<CandidateConsumption>> {
     let run: DevelopmentRunReceiptV1 =
         need_record(session, ctx, RUN_RECEIPT_KIND, run_receipt_id).await?;
+    if projection::is_config_control(session, ctx, &run.control_id).await? {
+        projection::verify_current_run_in_session(session, ctx, &run).await?;
+        return Ok(Some(CandidateConsumption::ProjectionConsumed));
+    }
     let control = need_control(session, ctx, &run.control_id).await?;
     runner_candidate_consumption(&control.runner_digest)
 }

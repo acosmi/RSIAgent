@@ -4102,6 +4102,18 @@ async fn load_stageable_current_proposal(
             "proposal is not the recorded candidate outcome of its claim".into(),
         ));
     }
+    // Fixture cycles retain software staging, without Skill content credit.
+    // A non-fixture label needs the actual frozen execution/score closure.
+    for cycle in &evidence.cycles {
+        if cycle.provenance != DevelopmentExecutionProvenance::Fixture
+            && run_receipt_candidate_consumption(session, ctx, &cycle.execution_receipt_id).await?
+                != Some(CandidateConsumption::ProjectionConsumed)
+        {
+            return Err(Error::Conflict(
+                "source_legacy: consolidation proposal is not Current input".into(),
+            ));
+        }
+    }
     Ok((proposal, derived.provenance))
 }
 

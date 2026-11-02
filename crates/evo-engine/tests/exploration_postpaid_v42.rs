@@ -59,6 +59,10 @@ use evo_core::strategy::{
     BatchActionV1, ElasticPolicyV1, ExplorationCapsV1, OpportunityWait, SimulationContext,
 };
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
+use evo_engine::development::projection::{
+    ConfigProjectionControlV1, ConfigProjectionDevelopmentRunner, ConfigProjectionTaskV1,
+    register_config_projection_control,
+};
 use evo_engine::dispatch::{
     ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
 };
@@ -79,12 +83,16 @@ use evo_engine::optimization::{
     PairedTaskResult,
 };
 use evo_storage::Store;
+use evo_storage::budget::RootBudgetAuthorization;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use trusted_compiler_inputs::StoreOptimizationJournal;
+
+// The real config consumer owns one process-wide physical workspace permit.
+static CONFIG_WORKSPACE_GATE: Mutex<()> = Mutex::const_new(());
 
 /// What the world is registered with. The two root opportunities cost different
 /// amounts on purpose: what a dispatch spent is read from its own fact, never
@@ -208,6 +216,55 @@ async fn seeded_store() -> (tempfile::TempDir, Store) {
     session.bump_watermark(&host, "e09-initial").await.unwrap();
     session.commit().await.unwrap();
     (dir, store)
+}
+
+const CONFIG_LOW: &str = "config_precedence.v1: lowest_layer_first";
+const CONFIG_HIGH: &str = "config_precedence.v1: highest_layer_first";
+
+struct ConfigEditingModel;
+#[async_trait]
+impl ModelPort for ConfigEditingModel {
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request.clone()).await
+    }
+    async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let parent: SkillSnapshot = serde_json::from_str(
+            &request
+                .input
+                .iter()
+                .find(|part| part.label == "parent-skill")
+                .ok_or(Error::NotFound)?
+                .content,
+        )
+        .map_err(|_| Error::Internal)?;
+        let mut response = EditingFixtureModel.dispatch(request).await?;
+        if let ModelResponse::Completed {
+            output,
+            output_digest,
+            ..
+        } = &mut response
+        {
+            let mut edits: Vec<EditSuggestion> =
+                serde_json::from_str(output).map_err(|_| Error::Internal)?;
+            for edit in &mut edits {
+                if edit.edit.field == SkillTextField::Content {
+                    edit.edit.start = 0;
+                    edit.edit.end = parent.content.len();
+                    edit.edit.expected_text_digest = hash(parent.content.as_bytes());
+                    edit.edit.operation = TextEditOperation::Replace {
+                        text: CONFIG_HIGH.into(),
+                    };
+                }
+            }
+            *output = serde_json::to_string(&edits).map_err(|_| Error::Internal)?;
+            *output_digest = hash(output.as_bytes());
+        }
+        Ok(response)
+    }
 }
 
 struct EditingFixtureModel;
@@ -389,6 +446,7 @@ struct Fixture {
     revoked: BTreeSet<String>,
     allowed: Vec<EvidenceRef>,
     parent_bundle: String,
+    current_control: Option<ConfigProjectionControlV1>,
 }
 
 impl Fixture {
@@ -482,6 +540,7 @@ impl Fixture {
             revoked: BTreeSet::new(),
             allowed,
             parent_bundle: hash(b"parent-bundle"),
+            current_control: None,
         }
     }
 
@@ -587,19 +646,29 @@ impl Fixture {
                 episode_id: world_id.into(),
                 step,
                 attempt: 1,
-                manifest: DevelopmentManifest::build(
-                    format!("manifest-{step}"),
-                    vec![DevelopmentTask {
-                        id: "task".into(),
-                        parent_family: "family-a".into(),
-                        input_digest: hash(b"task"),
-                    }],
-                )
-                .unwrap(),
+                manifest: self
+                    .current_control
+                    .as_ref()
+                    .map(|control| control.manifest().unwrap())
+                    .unwrap_or_else(|| {
+                        DevelopmentManifest::build(
+                            format!("manifest-{step}"),
+                            vec![DevelopmentTask {
+                                id: "task".into(),
+                                parent_family: "family-a".into(),
+                                input_digest: hash(b"task"),
+                            }],
+                        )
+                        .unwrap()
+                    }),
                 parent_bundle_digest: bundle.to_string(),
                 candidate_bundle_digest: hash(format!("candidate-{tag}").as_bytes()),
                 environment_digest: hash(b"environment"),
-                grader_digest: hash(b"grader"),
+                grader_digest: self
+                    .current_control
+                    .as_ref()
+                    .map(|control| control.grader_digest.clone())
+                    .unwrap_or_else(|| hash(b"grader")),
                 rules_digest: hash(b"rules"),
                 tools_digest: hash(b"tools"),
                 revoke_watermark: 1,
@@ -793,18 +862,134 @@ impl Env {
         steps
     }
 
-    /// Rewrites a stored node as the observation of a trusted development report:
-    /// valid at `quality_micros`, with that gain over the baseline of the world. A
-    /// `Deepen` is only offered over such a node, and the fixture runner's report is
-    /// not one (it is a fixture); the node is the only thing rewritten.
-    async fn promote_to_trusted_valid(&self, node_id: &str, quality_micros: u32, gain_micros: i32) {
-        let mut node = raw_record(&self.store, NODE_KIND, node_id).await;
-        let payload = &mut node["payload"];
-        payload["evidence"] = json!("trusted");
-        payload["node"]["status"] = json!({"status": "valid", "quality_micros": quality_micros});
-        payload["node"]["best_valid_ancestor_micros"] = json!(quality_micros);
-        payload["node"]["recent_valid_gains_micros"] = json!([gain_micros]);
-        put_raw_record(&self.store, NODE_KIND, node_id, &node).await;
+    // This setup is used only by the two existing Deepen prerequisites. All
+    // material is frozen before exploration.start, including the complete LOW
+    // parent and config grader; the remaining postpaid fixtures keep their inputs.
+    async fn prepare_current_world(&mut self, world: &mut ExplorationWorldV1) {
+        self.store
+            .authorize_root_budget(
+                &admin(),
+                &RootBudgetAuthorization {
+                    root_budget_id: "config-postpaid-root".into(),
+                    billing_scope: "config-postpaid".into(),
+                    allowed_namespaces: vec!["n".into()],
+                    currency: "USD".into(),
+                    pricing_version: "pricing-v1".into(),
+                    payment_subject: "fixture-only".into(),
+                    authorization_receipt_digest: hash(b"admin-budget-receipt"),
+                    per_call_cap_micros: 10,
+                    total_limit_micros: 1_000,
+                    created_at: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let control = ConfigProjectionControlV1::registered(
+            "config-postpaid-control",
+            "n",
+            "config-postpaid",
+            "config-postpaid-root",
+            "dev-executor",
+            "dev-grader",
+            "optimizer",
+            "config-postpaid-manifest",
+            vec![
+                ConfigProjectionTaskV1::registered(
+                    "config-family",
+                    json!({"template":"F","layer_count":2,"key_type":"B","placement":"E","seed":1}),
+                )
+                .unwrap(),
+            ],
+            hash(b"environment"),
+            hash(b"rules"),
+            hash(b"tools"),
+            RUNS.iter().map(|run| (*run).into()).collect(),
+            1,
+        )
+        .unwrap();
+        register_config_projection_control(&admin(), &self.store, control.clone())
+            .await
+            .unwrap();
+        let skill = SkillSnapshot {
+            content: CONFIG_LOW.into(),
+            ..parent_skill()
+        };
+        let bundle = trusted_compiler_inputs::bundle_current(
+            &self.store,
+            &worker(),
+            evo_core::contract::CompileParts {
+                profile: &self.fixture.profile,
+                parent: &skill,
+                baseline: &self.fixture.baseline,
+                parent_strategy: &self.fixture.parent_strategy,
+                baseline_strategy: &self.fixture.baseline_strategy,
+                skill_patch: &Default::default(),
+                improver_patch: &self.fixture.improver,
+                caps: &self.fixture.caps,
+                revoked: &self.fixture.revoked,
+            },
+            &control.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
+        trusted_compiler_inputs::persist_bundle_current(
+            &self.store,
+            &worker(),
+            &bundle,
+            &control.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
+        self.fixture.parent = bundle.skill;
+        self.fixture.parent_bundle = bundle.digest;
+        self.fixture.edit_context = self.fixture.edit_context_for(&self.fixture.parent);
+        world.parent_skill_digest = skill_snapshot_digest(&self.fixture.parent).unwrap();
+        world.parent_bundle_digest = self.fixture.parent_bundle.clone();
+        world.grader_digest = control.grader_digest.clone();
+        world.context_signature = fingerprint(&(
+            &world.parent_skill_digest,
+            &world.parent_bundle_digest,
+            &world.environment_digest,
+            &world.model_digest,
+            &world.tools_digest,
+            &world.grader_digest,
+            &world.rules_digest,
+            world.source_watermark,
+        ))
+        .unwrap();
+        self.fixture.current_control = Some(control);
+    }
+
+    /// A real LOW→HIGH root observation, with quality and gain derived by the
+    /// registered runner and coordinator rather than supplied by this helper.
+    async fn promote_to_trusted_valid(&self, world_id: &str, tag: &str) -> CoordinatorStepResult {
+        let control = self.fixture.current_control.as_ref().unwrap();
+        let runner = ConfigProjectionDevelopmentRunner::with_clock(
+            self.store.clone(),
+            Context::new("n", "dev-executor", Role::Worker).unwrap(),
+            Context::new("n", "dev-grader", Role::Evaluator).unwrap(),
+            control.id.clone(),
+            600,
+            Arc::new(|| 100),
+        )
+        .unwrap();
+        let result = self
+            .run(&ConfigEditingModel, &runner, world_id, 1, tag)
+            .await
+            .unwrap();
+        let node = raw_record(&self.store, NODE_KIND, result.node_id.as_deref().unwrap()).await;
+        assert_eq!(node["payload"]["evidence"], "trusted");
+        assert_eq!(
+            node["payload"]["node"]["status"],
+            json!({"status":"valid", "quality_micros":1_000_000})
+        );
+        assert_eq!(
+            node["payload"]["node"]["recent_valid_gains_micros"],
+            json!([500_000])
+        );
+        result
     }
 
     /// One real `Deepen` of the node `parent_node_id` through `run_next`. Its parent is
@@ -846,9 +1031,25 @@ impl Env {
             .as_str()
             .unwrap()
             .to_string();
-        let mut skill = parent_skill();
-        skill.content.push_str(" [repair]");
-        skill.applicability.push_str(" [repair]");
+        let skill = if let Some(control) = &self.fixture.current_control {
+            let mut session = self.store.session().await.unwrap();
+            let record = evo_engine::compiler::verify_current_bundle_in_session(
+                &mut session,
+                &worker(),
+                &bundle,
+                &control.environment_digest,
+                1,
+            )
+            .await
+            .unwrap();
+            session.commit().await.unwrap();
+            record.bundle.skill.clone()
+        } else {
+            let mut skill = parent_skill();
+            skill.content.push_str(" [repair]");
+            skill.applicability.push_str(" [repair]");
+            skill
+        };
         let edit_context = self.fixture.edit_context_for(&skill);
         self.coordinator
             .run_next(
@@ -861,13 +1062,12 @@ impl Env {
             .await
     }
 
-    /// The two dispatches of a world that deepened: a `Widen` of the first root, whose
-    /// node is then taken for a trusted valid observation, and the `Deepen` of it.
+    /// A real current `Widen` observation followed by its paid `Deepen`.
     async fn widen_then_deepen(&self, world_id: &str) -> Vec<CoordinatorStepResult> {
-        let widen = self.step(world_id, 1, &format!("{world_id}-1")).await;
-        let node_id = widen.node_id.clone().unwrap();
-        self.promote_to_trusted_valid(&node_id, 900_000, 400_000)
+        let widen = self
+            .promote_to_trusted_valid(world_id, &format!("{world_id}-1"))
             .await;
+        let node_id = widen.node_id.clone().unwrap();
         let deepen = self
             .deepen(world_id, &node_id, 2, &format!("{world_id}-2"))
             .await;
@@ -1460,17 +1660,19 @@ async fn a_world_rewritten_while_the_step_was_paid_for_ends_in_a_terminal_uncert
 
 #[tokio::test]
 async fn a_deepen_settled_after_the_world_moved_is_spent_like_any_other() {
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
     // The settled node sits where the dispatched action derives it, whatever the
     // kind of the action: a Deepen is spent (its parent has a child) and costs the
     // successor cost, not a root's.
-    let env = env().await;
-    let world = world_for("world-1");
+    let mut env = env().await;
+    let mut world = world_for("world-1");
+    env.prepare_current_world(&mut world).await;
     let done = env.start_job("deepen-drift-start", &world).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
-    let widen = env.step("world-1", 1, "deepen-drift-1").await;
-    let parent = widen.node_id.clone().unwrap();
-    env.promote_to_trusted_valid(&parent, 900_000, 400_000)
+    let widen = env
+        .promote_to_trusted_valid("world-1", "deepen-drift-1")
         .await;
+    let parent = widen.node_id.clone().unwrap();
 
     let model = CountingModel::default();
     let runner = RewritingRunner::new(&env.store, "world-1", |world| {
@@ -2272,8 +2474,10 @@ async fn a_root_dispatch_rewritten_into_a_deepen_with_its_counters_is_refused_ev
 
 #[tokio::test]
 async fn a_deepen_fact_is_held_to_the_node_it_produced() {
-    let env = env().await;
-    let world = world_for("world-1");
+    let _workspace_guard = CONFIG_WORKSPACE_GATE.lock().await;
+    let mut env = env().await;
+    let mut world = world_for("world-1");
+    env.prepare_current_world(&mut world).await;
     let done = env.start_job("deepen-bind-start", &world).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
     let steps = env.widen_then_deepen("world-1").await;
