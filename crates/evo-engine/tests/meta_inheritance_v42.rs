@@ -10,7 +10,7 @@
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 use async_trait::async_trait;
-use evo_core::contract::{HostCapabilities, ImproverPatch, Profile, SkillSnapshot};
+use evo_core::contract::{CompileParts, HostCapabilities, ImproverPatch, Profile, SkillSnapshot};
 use evo_core::evidence::{
     EvidenceMember, EvidenceSet, ExecutionAttestation, Purpose, SourceCoverage, SourceSelection,
     TaskOrigin,
@@ -30,6 +30,10 @@ use evo_core::strategy::{
     SimulationContext,
 };
 use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
+use evo_engine::development::projection::{
+    ConfigProjectionControlV1, ConfigProjectionDevelopmentRunner, ConfigProjectionTaskV1,
+    register_config_projection_control,
+};
 use evo_engine::dispatch::{
     ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
 };
@@ -53,6 +57,7 @@ use evo_engine::optimization::{
 };
 use evo_engine::replay::{LiveWorldAuthority, run_replay};
 use evo_storage::Store;
+use evo_storage::budget::RootBudgetAuthorization;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -339,6 +344,55 @@ impl ModelPort for EditingFixtureModel {
                 provenance: ModelExecutionProvenance::Fixture,
             },
         })
+    }
+}
+
+/// Scripts only the edit; config outputs and grades come from the registered runner.
+struct ConfigEditingModel;
+
+#[async_trait]
+impl ModelPort for ConfigEditingModel {
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        request.validate()?;
+        self.dispatch(request.request.clone()).await
+    }
+
+    async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
+        let parent: SkillSnapshot = serde_json::from_str(
+            &request
+                .input
+                .iter()
+                .find(|part| part.label == "parent-skill")
+                .ok_or(Error::NotFound)?
+                .content,
+        )
+        .map_err(|_| Error::Internal)?;
+        let mut response = EditingFixtureModel.dispatch(request).await?;
+        if let ModelResponse::Completed {
+            output,
+            output_digest,
+            ..
+        } = &mut response
+        {
+            let mut suggestions: Vec<EditSuggestion> =
+                serde_json::from_str(output).map_err(|_| Error::Internal)?;
+            for suggestion in &mut suggestions {
+                if suggestion.edit.field == SkillTextField::Content {
+                    suggestion.edit.start = 0;
+                    suggestion.edit.end = parent.content.len();
+                    suggestion.edit.expected_text_digest = hash(parent.content.as_bytes());
+                    suggestion.edit.operation = TextEditOperation::Replace {
+                        text: "config_precedence.v1: highest_layer_first".into(),
+                    };
+                }
+            }
+            *output = serde_json::to_string(&suggestions).map_err(|_| Error::Internal)?;
+            *output_digest = hash(output.as_bytes());
+        }
+        Ok(response)
     }
 }
 
@@ -732,23 +786,6 @@ async fn put_raw_record(store: &Store, record_kind: &str, id: &str, value: &Valu
         .await
         .unwrap();
     session.commit().await.unwrap();
-}
-
-/// Rewrites a stored node as the observation of a trusted development report:
-/// valid at `quality_micros`, with that gain over the baseline of the world.
-async fn promote_to_trusted_valid(
-    store: &Store,
-    node_id: &str,
-    quality_micros: u32,
-    gain_micros: i32,
-) {
-    let mut node = raw_record(store, "exploration_node_v1", node_id).await;
-    let payload = &mut node["payload"];
-    payload["evidence"] = json!("trusted");
-    payload["node"]["status"] = json!({"status": "valid", "quality_micros": quality_micros});
-    payload["node"]["best_valid_ancestor_micros"] = json!(quality_micros);
-    payload["node"]["recent_valid_gains_micros"] = json!([gain_micros]);
-    put_raw_record(store, "exploration_node_v1", node_id, &node).await;
 }
 
 async fn raw_fact(store: &Store, dispatch_id: &str) -> Value {
@@ -1294,27 +1331,150 @@ async fn the_policy_really_changes_the_dispatched_action() {
     // two worlds that differ only in `max_focus_actions` get different next
     // actions from the one shared `decide_elastic`, and the record names the
     // policy that was used.
-    let env = env().await;
-    env.register("world-default", ElasticPolicyV1::default())
-        .await;
-    env.register("world-focus", policy_focus_one()).await;
-    let default_first = env.dispatch("world-default", 1, "default-1").await;
-    let focus_first = env.dispatch("world-focus", 1, "focus-1").await;
+    let mut env = env().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    env.store
+        .authorize_root_budget(
+            &admin,
+            &RootBudgetAuthorization {
+                root_budget_id: "config-policy-root".into(),
+                billing_scope: "config-policy".into(),
+                allowed_namespaces: vec!["n".into()],
+                currency: "USD".into(),
+                pricing_version: "pricing-v1".into(),
+                payment_subject: "fixture-only".into(),
+                authorization_receipt_digest: hash(b"admin-budget-receipt"),
+                per_call_cap_micros: 10,
+                total_limit_micros: 1_000,
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let control = ConfigProjectionControlV1::registered(
+        "config-policy-control",
+        "n",
+        "config-policy",
+        "config-policy-root",
+        "dev-executor",
+        "dev-grader",
+        "worker",
+        "config-policy-manifest",
+        vec![
+            ConfigProjectionTaskV1::registered(
+                "config-family",
+                json!({"template":"F","layer_count":2,"key_type":"B","placement":"E","seed":1}),
+            )
+            .unwrap(),
+        ],
+        hash(b"environment"),
+        hash(b"rules"),
+        hash(b"tools"),
+        vec!["run-failure".into(), "run-success".into()],
+        1,
+    )
+    .unwrap();
+    register_config_projection_control(&admin, &env.store, control.clone())
+        .await
+        .unwrap();
+    let manifest = control.manifest().unwrap();
+    let skill = SkillSnapshot {
+        content: "config_precedence.v1: lowest_layer_first".into(),
+        ..parent_skill()
+    };
+    let bundle = trusted_compiler_inputs::bundle_current(
+        &env.store,
+        &worker(),
+        CompileParts {
+            profile: &env.fixture.profile,
+            parent: &skill,
+            baseline: &env.fixture.baseline,
+            parent_strategy: &env.fixture.parent_strategy,
+            baseline_strategy: &env.fixture.baseline_strategy,
+            skill_patch: &Default::default(),
+            improver_patch: &env.fixture.improver,
+            caps: &env.fixture.caps,
+            revoked: &env.fixture.revoked,
+        },
+        &control.environment_digest,
+        1,
+    )
+    .await
+    .unwrap();
+    trusted_compiler_inputs::persist_bundle_current(
+        &env.store,
+        &worker(),
+        &bundle,
+        &control.environment_digest,
+        1,
+    )
+    .await
+    .unwrap();
+    env.fixture.parent = bundle.skill;
+    env.fixture.parent_bundle = bundle.digest;
+
+    let mut default_world = world_for("world-default", ElasticPolicyV1::default());
+    default_world.parent_skill_digest = skill_snapshot_digest(&env.fixture.parent).unwrap();
+    default_world.parent_bundle_digest = env.fixture.parent_bundle.clone();
+    default_world.grader_digest = control.grader_digest.clone();
+    default_world.context_signature = fingerprint(&(
+        &default_world.parent_skill_digest,
+        &default_world.parent_bundle_digest,
+        &default_world.environment_digest,
+        &default_world.model_digest,
+        &default_world.tools_digest,
+        &default_world.grader_digest,
+        &default_world.rules_digest,
+        default_world.source_watermark,
+    ))
+    .unwrap();
+    let mut focus_world = default_world.clone();
+    focus_world.id = "world-focus".into();
+    focus_world.policy = policy_focus_one();
+    env.coordinator.register_world(default_world).await.unwrap();
+    env.coordinator.register_world(focus_world).await.unwrap();
+
+    let runner = ConfigProjectionDevelopmentRunner::with_clock(
+        env.store.clone(),
+        Context::new("n", "dev-executor", Role::Worker).unwrap(),
+        Context::new("n", "dev-grader", Role::Evaluator).unwrap(),
+        control.id.clone(),
+        600,
+        Arc::new(|| 100),
+    )
+    .unwrap();
+    let [mut default_request, mut focus_request] = [
+        env.fixture.request("world-default", 1, "default-1"),
+        env.fixture.request("world-focus", 1, "focus-1"),
+    ];
+    for request in [&mut default_request, &mut focus_request] {
+        request.development_request.manifest = manifest.clone();
+        request.development_request.grader_digest = control.grader_digest.clone();
+    }
+    let default_first = env
+        .coordinator
+        .run_next(
+            Some(&ConfigEditingModel),
+            Some(&runner),
+            Some(&env.journal),
+            default_request,
+        )
+        .await
+        .unwrap();
+    let focus_first = env
+        .coordinator
+        .run_next(
+            Some(&ConfigEditingModel),
+            Some(&runner),
+            Some(&env.journal),
+            focus_request,
+        )
+        .await
+        .unwrap();
     assert_eq!(dispatched_seq(&default_first.decision.action), 1);
     assert_eq!(dispatched_seq(&focus_first.decision.action), 1);
-    // The fixture runner's report is no longer a valid observation (AG-033: the E03
-    // gate is not asked for a Fixture report), so each first node is stored as a
-    // trusted observation would have been: valid, 900000 against the 500000
-    // baseline. The comparison below is about the policy, which needs a valid node
-    // to deepen.
     for step in [&default_first, &focus_first] {
-        promote_to_trusted_valid(
-            &env.store,
-            step.node_id.as_deref().unwrap(),
-            900_000,
-            400_000,
-        )
-        .await;
+        assert_eq!(step.outcome, "candidate_observed");
     }
     let default_next = env.coordinator.decide_next("world-default").await.unwrap();
     let focus_next = env.coordinator.decide_next("world-focus").await.unwrap();
