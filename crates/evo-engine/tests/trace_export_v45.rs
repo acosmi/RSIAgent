@@ -1177,3 +1177,125 @@ fn trace_export_scans_manifest_paths_and_redaction_report_without_raw_snippets()
         matches!(scan_native_candidate_members(&[file("too-large.json", &oversized)]), Err(Error::Invalid(message)) if message == "native candidate member validation failed")
     );
 }
+
+#[tokio::test]
+async fn trace_export_unknown_license_or_source_grant_is_refused() {
+    let (_dir, service, admin, source) = captured_source().await;
+    let host = context("gateway-host", Role::Host);
+    let captured: Value = serde_json::from_slice(&source.record.body).unwrap();
+    let run_id = captured["service_run_id"].as_str().unwrap();
+    let audit_before = service.store().verify_audit(&admin).await.unwrap();
+    let mut session = service.store().session().await.unwrap();
+    let healthy = prepare_native_candidate(&admin, &mut session, &source.record.id)
+        .await
+        .unwrap();
+    let facts_before =
+        serde_json::to_value(session.service_success_facts(&admin, run_id).await.unwrap()).unwrap();
+    let watermark_before = session.watermark(&admin).await.unwrap();
+    let mut rows_before = Vec::new();
+    for kind in ["run", "artifact"] {
+        let mut after = None;
+        let mut image = Vec::new();
+        loop {
+            let rows = session.object_rows_page(&admin, kind, after).await.unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            after = rows.last().map(|row| row.rowid);
+            image.extend(
+                rows.into_iter()
+                    .map(|row| (row.rowid, row.id, row.owner, row.body)),
+            );
+        }
+        rows_before.push(image);
+    }
+    session.commit().await.unwrap();
+
+    for field in ["license", "recipient_scope"] {
+        let mut changed = source.clone();
+        let mut body = captured.clone();
+        body[field] = json!("unknown");
+        changed.record.body = serde_json::to_vec(&body).unwrap();
+        changed.trace.source_digest = hash(&changed.record.body);
+        changed.trace.excerpt = String::from_utf8(changed.record.body.clone()).unwrap();
+        changed.excerpt_end = changed.record.body.len();
+        let mut session = service.store().session().await.unwrap();
+        assert_eq!(
+            prepare_native_candidate(&admin, &mut session, &source.record.id)
+                .await
+                .unwrap(),
+            healthy,
+            "healthy source before changing {field}"
+        );
+        session
+            .put(&host, "run", &source.record.id, host.actor(), &changed)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                load_stored_source(&mut session, &admin, &source.record.id)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&changed).unwrap(),
+            "outer authority remains valid for unknown {field}"
+        );
+        assert!(
+            matches!(
+                prepare_native_candidate(&admin, &mut session, &source.record.id).await,
+                Err(Error::Forbidden)
+            ),
+            "unknown {field} must be refused"
+        );
+        drop(session); // Negative source changes are never committed.
+    }
+
+    let other_admin = Context::new("tenant-b", admin.actor(), Role::Admin).unwrap();
+    let mut session = service.store().session().await.unwrap();
+    assert!(matches!(
+        prepare_native_candidate(&other_admin, &mut session, &source.record.id).await,
+        Err(Error::NotFound)
+    ));
+    assert_eq!(
+        serde_json::to_value(
+            load_stored_source(&mut session, &admin, &source.record.id)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&source).unwrap()
+    );
+    assert_eq!(
+        prepare_native_candidate(&admin, &mut session, &source.record.id)
+            .await
+            .unwrap(),
+        healthy
+    );
+    assert_eq!(
+        serde_json::to_value(session.service_success_facts(&admin, run_id).await.unwrap()).unwrap(),
+        facts_before
+    );
+    assert_eq!(session.watermark(&admin).await.unwrap(), watermark_before);
+    for (kind, before) in ["run", "artifact"].into_iter().zip(rows_before) {
+        let mut after = None;
+        let mut image = Vec::new();
+        loop {
+            let rows = session.object_rows_page(&admin, kind, after).await.unwrap();
+            if rows.is_empty() {
+                break;
+            }
+            after = rows.last().map(|row| row.rowid);
+            image.extend(
+                rows.into_iter()
+                    .map(|row| (row.rowid, row.id, row.owner, row.body)),
+            );
+        }
+        assert_eq!(image, before, "persisted {kind} rows are unchanged");
+    }
+    session.commit().await.unwrap();
+    assert_eq!(
+        service.store().verify_audit(&admin).await.unwrap(),
+        audit_before
+    );
+}
