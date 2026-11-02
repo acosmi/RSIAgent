@@ -377,11 +377,18 @@ async fn nonterminal_v1_resumes_as_v2_with_same_id_input_and_progress() {
     let input = fx.sample["input_id"].as_str().unwrap();
     let old = decode_management_job(&body(&fx, "job", id).await).unwrap();
     let input_before = body(&fx, "artifact", input).await;
+    assert_eq!(old.identity().operation, "meta.start");
+    assert_eq!(
+        fx.sample["request"]["schema_version"],
+        "rsia.management.meta_start.v1"
+    );
+    assert!(old.result().is_none());
     let d = ManagementDispatcher::new(fx.store.clone(), vec![fx.ctx.clone()]).unwrap();
     assert_eq!(d.recover_pending().await.unwrap(), 1);
     let closed = terminal(&d, &fx, id).await;
     assert!(matches!(closed, VersionedManagementJob::V2(_)));
     assert_eq!(closed.identity().id, id);
+    assert_eq!(closed.identity().operation, old.identity().operation);
     assert_eq!(closed.identity().request_key, old.identity().request_key);
     assert_eq!(
         closed.identity().payload_digest,
@@ -389,8 +396,10 @@ async fn nonterminal_v1_resumes_as_v2_with_same_id_input_and_progress() {
     );
     assert_eq!(closed.generation(), old.generation());
     assert_eq!(closed.identity().private_input_ref, input);
-    assert_eq!(closed.identity().state, ManagementJobState::Failed);
-    assert_eq!(closed.error_code(), Some("management_worker_exited"));
+    assert_eq!(closed.identity().state, ManagementJobState::Blocked);
+    assert_eq!(closed.step(), "blocked_feature");
+    assert_eq!(closed.error_code(), Some("meta.start_consumer_unavailable"));
+    assert!(closed.result().is_none());
     assert_eq!(body(&fx, "artifact", input).await, input_before);
     assert_eq!(d.recover_pending().await.unwrap(), 0);
 }

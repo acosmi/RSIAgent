@@ -462,9 +462,55 @@ async fn cancel_before_first_commit_has_no_business_side_effect() {
     .execute(&pool)
     .await
     .unwrap();
+    // The source selection is the holdout input, as in the real cleanup
+    // consumer; its producer writes the run dependency before job submission.
+    let source_id = "current-h-cleanup-source";
+    let host = Context::new("n", "host", Role::Host).unwrap();
+    store_trace_authority(
+        &fx.store,
+        &host,
+        &StoredTraceAuthority {
+            schema_version: "rsia.optimization.source.v1".into(),
+            record: StoredRunRecord {
+                id: source_id.into(),
+                body: source_id.as_bytes().to_vec(),
+                parent_family: "current-h-cleanup-family".into(),
+                task_origin: TaskOrigin::TrustedRun,
+                execution_attestation: ExecutionAttestation::TrustedHost,
+                purpose: Purpose::Development,
+            },
+            trace: OptimizationTrace {
+                run_id: source_id.into(),
+                parent_family: "current-h-cleanup-family".into(),
+                source_digest: hash(source_id.as_bytes()),
+                purpose: Purpose::Development,
+                outcome: TraceOutcome::Success,
+                diagnosis: None,
+                excerpt: source_id.into(),
+                seed: 1,
+            },
+            excerpt_start: 0,
+            excerpt_end: source_id.len(),
+        },
+    )
+    .await
+    .unwrap();
+    let selection = SourceSelection {
+        roots: vec![],
+        run_ids: vec![source_id.into()],
+        purpose: Purpose::Development,
+        allow_model_excerpts: false,
+    };
+    store_source_selection(&fx.store, &host, &selection)
+        .await
+        .unwrap();
     for cancel_after in [false, true] {
         let mut produced = holdout.clone();
         produced.id = format!("current-owned-holdout-{cancel_after}");
+        if cancel_after {
+            produced.rotating_inputs[0].input_artifact_id =
+                format!("optgrant-{}", fingerprint(&selection).unwrap());
+        }
         let payload = serde_json::to_value(ExperimentRegisterRequestV2 {
             schema_version: "rsia.management.experiment_register.v2".into(),
             request_key: produced.id.clone(),
@@ -538,8 +584,8 @@ async fn cancel_before_first_commit_has_no_business_side_effect() {
                 &admin,
                 &fx.store,
                 TypedObjectRef {
-                    kind: "artifact".into(),
-                    id: accepted.identity().private_input_ref.into(),
+                    kind: "run".into(),
+                    id: source_id.into(),
                 },
                 "after actual Current H commit",
                 now().unwrap(),
@@ -561,6 +607,12 @@ async fn cancel_before_first_commit_has_no_business_side_effect() {
                 }
             }
             assert_eq!(cleanup.state, CleanupState::Complete);
+            let input: Value = serde_json::from_str(
+                &legacy_body(&fx, "artifact", accepted.identity().private_input_ref).await,
+            )
+            .unwrap();
+            assert_eq!(input["schema_version"], "rsia.redacted.v1");
+            assert_eq!(input["original_schema"], "rsia.management_private_input.v1");
             let view = d.status_view(&fx.ctx, id).await.unwrap();
             assert_eq!(
                 serde_json::to_value(view.committed_side_effects).unwrap(),
@@ -1374,7 +1426,13 @@ async fn draining_recovery_never_claims_or_reexecutes_request() {
                             })
                             .to_string()
                         } else {
-                            "{".into()
+                            // One duplicate key reaches the strict reader while
+                            // remaining valid JSON for SQLite object storage.
+                            legacy_body(&fx, "artifact", input).await.replacen(
+                                '{',
+                                "{\"schema_version\":\"rsia.management_private_input.v1\",",
+                                1,
+                            )
                         };
                         sqlx::query(
                             "UPDATE objects SET body=? WHERE namespace='n' AND kind='artifact' AND id=?",
