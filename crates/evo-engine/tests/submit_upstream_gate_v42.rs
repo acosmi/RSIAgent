@@ -1912,7 +1912,7 @@ async fn an_experiment_register_over_an_input_derived_from_a_revoked_run_is_refu
             .submit(evaluator, operation, request)
             .await
             .unwrap_or_else(|error| panic!("{operation} was refused: {error:?}"));
-        let done = wait_job(store, evaluator, &queued.id).await;
+        let done = wait_job(store, evaluator, queued.identity().id).await;
         assert_eq!(done.state, expected, "{operation}: {done:?}");
         assert_eq!(
             done.error_code.as_deref(),
@@ -2020,7 +2020,7 @@ async fn judge(
             // The synthetic state is no real learner state: the job fails inside,
             // which is not what is under test, but it has to finish before the
             // store goes away.
-            wait_job(store, admin, &job.id).await;
+            wait_job(store, admin, job.identity().id).await;
         }
         (Verdict::Accepted, Err(error)) => {
             problems.push(format!("{name}: refused, expected accepted: {error:?}"));
@@ -2045,10 +2045,11 @@ async fn judge(
             }
         }
         (Verdict::Refused(_), Ok(job)) => {
-            wait_job(store, admin, &job.id).await;
+            wait_job(store, admin, job.identity().id).await;
             problems.push(format!(
                 "{name}: accepted as {} (step {}), expected a Conflict",
-                job.id, job.step
+                job.identity().id,
+                job.step()
             ));
         }
         (Verdict::Refused(_), Err(other)) => {
@@ -2284,7 +2285,7 @@ async fn a_revoked_source_of_another_namespace_does_not_refuse() {
         .submit(&admin, "curriculum.step", synthetic::request("ns-edges"))
         .await
         .unwrap_or_else(|error| panic!("edges of another namespace were followed: {error:?}"));
-    wait_job(&store, &admin, &accepted.id).await;
+    wait_job(&store, &admin, accepted.identity().id).await;
 
     // The edge exists in `n` too, but the tombstone is only in `other`.
     put_raw(&store, &admin, "run", "run-o", &synthetic::live("run-o")).await;
@@ -2297,7 +2298,7 @@ async fn a_revoked_source_of_another_namespace_does_not_refuse() {
         )
         .await
         .unwrap_or_else(|error| panic!("a tombstone of another namespace was read: {error:?}"));
-    wait_job(&store, &admin, &accepted.id).await;
+    wait_job(&store, &admin, accepted.identity().id).await;
 
     // With the tombstone in `n` as well, the request is refused.
     put_raw(
@@ -2430,8 +2431,8 @@ async fn overlapping_cleanups(name: &str, late: bool) -> Overlap {
             let request = replay_fx::run_request(&format!("ctrl-q2-{round}"), &pool);
             match dispatcher.submit(&admin, "replay.run", request).await {
                 Ok(job) => {
-                    wait_job(&store, &admin, &job.id).await;
-                    accepted.push(job.id);
+                    wait_job(&store, &admin, job.identity().id).await;
+                    accepted.push(job.identity().id.to_owned());
                 }
                 Err(Error::Conflict(message)) => refused.push(message),
                 Err(other) => panic!("round {round}: {other:?}"),

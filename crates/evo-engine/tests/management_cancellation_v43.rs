@@ -1084,7 +1084,7 @@ async fn paid_start(fx: &PaidFixture) -> ManagementJobV2 {
         VersionedManagementJob::V2(v) => v,
         _ => panic!("expected v2 claim"),
     };
-    assert!(job.optimization.as_ref().unwrap().calls.len() > 0);
+    assert!(!job.optimization.as_ref().unwrap().calls.is_empty());
     job
 }
 async fn paid_state(fx: &PaidFixture, id: &str, state: ManagementJobState) -> ManagementJobV2 {

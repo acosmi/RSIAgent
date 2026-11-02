@@ -2780,7 +2780,6 @@ async fn a_recovered_curriculum_step_fails_closed_once_its_source_is_revoked() {
         step_request("curriculum-recover-pending"),
     )
     .await;
-    let crashed = done.clone();
     // The revocation is logically committed; its cleanup has not run yet.
     let cleanup = begin(store, admin, "run-a").await;
     assert_eq!(cleanup.state, CleanupState::Pending);

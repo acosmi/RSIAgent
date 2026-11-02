@@ -1097,7 +1097,7 @@ async fn expect_status_conflict(
     assert!(
         matches!(result, Err(Error::Conflict(_))),
         "{what}: expected a Conflict, got {:?}",
-        result.map(|job| job.state)
+        result.map(|job| job.identity().state)
     );
 }
 
@@ -2036,7 +2036,7 @@ async fn status_of_a_started_world_still_fails_closed_on_a_revoked_source() {
     assert!(
         matches!(result, Err(Error::Forbidden)),
         "a tombstoned source must be Forbidden, got {:?}",
-        result.map(|job| job.state)
+        result.map(|job| job.identity().state)
     );
     // And the persisted terminal is never rewritten.
     let persisted = raw_job(&env.store, &admin(), &done.id).await;
