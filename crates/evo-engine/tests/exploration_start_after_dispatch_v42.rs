@@ -933,7 +933,7 @@ impl Env {
         .await
         .unwrap();
         session.commit().await.unwrap();
-        let skill = record.bundle.skill;
+        let skill = record.bundle.skill.clone();
         let edit_context = self.fixture.edit_context_for(&skill);
         let mut request =
             self.fixture
@@ -2628,7 +2628,7 @@ async fn a_deepen_fact_is_bound_to_the_successor_cost_of_the_world() {
                 payment_subject: "fixture-only".into(),
                 authorization_receipt_digest: hash(b"admin-budget-receipt"),
                 per_call_cap_micros: 10,
-                total_limit_micros: REGISTERED_ROOT_MICROS,
+                total_limit_micros: i64::try_from(REGISTERED_ROOT_MICROS).unwrap(),
                 created_at: 1,
             },
         )
