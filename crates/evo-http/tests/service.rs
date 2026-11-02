@@ -26,7 +26,18 @@ fn d(label: &str) -> String {
 
 async fn state(auth: AuthRegistry) -> (tempfile::TempDir, HttpState) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("http.sqlite3")).await.unwrap();
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.path().join("http.sqlite3"))
+            .unwrap();
+    }
+    let store = Store::open(&dir.path().canonicalize().unwrap().join("http.sqlite3"))
+        .await
+        .unwrap();
     let host = Context::new("tenant-a", "gateway-host", Role::Host).unwrap();
     let admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
     let source = evo_core::contract::ReviewedHostSourceEnvelopeV1 {
@@ -185,6 +196,238 @@ async fn wait_job(client: &reqwest::Client, base: &str, token: &str, job_id: &st
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
     }
     panic!("management job did not finish");
+}
+
+async fn backup_state() -> (tempfile::TempDir, HttpState) {
+    let (directory, state) = state(registry()).await;
+    let admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
+    let mut session = state.service.store().session().await.unwrap();
+    session
+        .bump_watermark(&admin, &d("backup-initial-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    (directory, state)
+}
+
+#[tokio::test]
+async fn backup_create_admin_auth_and_strict_relative_name() {
+    let (directory, state) = backup_state().await;
+    let (base, task) = spawn(state).await;
+    let client = reqwest::Client::new();
+    let valid = json!({"schema_version":"rsia.management.backup_create.v1","request_key":"backup-http","relative_name":"authorized"});
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/backup.create",
+            None,
+            valid.clone()
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for name in ["../escape", "/absolute", "a/b", "a.b", "", "é"] {
+        let mut invalid = valid.clone();
+        invalid["relative_name"] = json!(name);
+        assert_eq!(
+            post(
+                &client,
+                &base,
+                "/v1/manage/backup.create",
+                Some(ADMIN_TOKEN),
+                invalid
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST,
+            "name={name}"
+        );
+    }
+    let mut extra = valid.clone();
+    extra["destination"] = json!("/arbitrary");
+    assert_eq!(
+        post(
+            &client,
+            &base,
+            "/v1/manage/backup.create",
+            Some(ADMIN_TOKEN),
+            extra
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    let duplicate = r#"{"schema_version":"rsia.management.backup_create.v1","request_key":"duplicate","relative_name":"first","relative_name":"last"}"#;
+    assert_eq!(
+        raw_post(
+            &client,
+            &base,
+            "/v1/manage/backup.create",
+            ADMIN_TOKEN,
+            duplicate
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert!(!directory.path().join("backups").exists());
+    let response = post(
+        &client,
+        &base,
+        "/v1/manage/backup.create",
+        Some(ADMIN_TOKEN),
+        valid,
+    )
+    .await;
+    assert!(response.status().is_success());
+    let accepted: Value = response.json().await.unwrap();
+    let completed = wait_job(
+        &client,
+        &base,
+        ADMIN_TOKEN,
+        accepted["id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(completed["state"], "succeeded", "{completed}");
+    assert_eq!(completed["job_schema_version"], "rsia.management_job.v2");
+    assert_eq!(completed["backup"]["phase"], "published");
+    assert!(
+        directory
+            .path()
+            .join("backups/authorized/rsia.sqlite3")
+            .is_file()
+    );
+    task.abort();
+}
+
+#[tokio::test]
+async fn backup_evaluator_is_refused_before_payload_or_path_observation() {
+    let (directory, state) = backup_state().await;
+    let store = state.service.store().clone();
+    let admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
+    let before = store.verify_audit(&admin).await.unwrap();
+    let (base, task) = spawn(state).await;
+    let client = reqwest::Client::new();
+    for body in [
+        "not JSON",
+        r#"{"schema_version":0,"role":"admin","relative_name":"../escape"}"#,
+        r#"{"schema_version":"rsia.management.backup_create.v1","request_key":"refused","relative_name":"exists"}"#,
+        r#"{"relative_name":"first","relative_name":"last"}"#,
+    ] {
+        let response = raw_post(
+            &client,
+            &base,
+            "/v1/manage/backup.create",
+            EVALUATOR_TOKEN,
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "body={body}");
+        let value: Value = response.json().await.unwrap();
+        assert_eq!(value["error"]["code"], "forbidden");
+    }
+    assert!(!directory.path().join("backups").exists());
+    assert_eq!(store.verify_audit(&admin).await.unwrap(), before);
+    let mut session = store.session().await.unwrap();
+    assert!(
+        session
+            .object_rows_page(&admin, "job", None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        session
+            .object_rows_page(&admin, "artifact", None)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| !row.id.starts_with("management-input-"))
+    );
+    session.commit().await.unwrap();
+    task.abort();
+    store.close().await;
+}
+
+#[tokio::test]
+async fn backup_status_cancel_preserve_committed_backup_refs() {
+    let (directory, state) = backup_state().await;
+    let (base, task) = spawn(state).await;
+    let client = reqwest::Client::new();
+    let request = json!({"schema_version":"rsia.management.backup_create.v1","request_key":"cancel-backup","relative_name":"committed"});
+    let accepted: Value = post(
+        &client,
+        &base,
+        "/v1/manage/backup.create",
+        Some(ADMIN_TOKEN),
+        request.clone(),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let id = accepted["id"].as_str().unwrap();
+    let completed = wait_job(&client, &base, ADMIN_TOKEN, id).await;
+    assert_eq!(completed["state"], "succeeded", "{completed}");
+    let manifest = std::fs::read(
+        directory
+            .path()
+            .join("backups/committed/backup-manifest.json"),
+    )
+    .unwrap();
+    let cancelled: Value = post(
+        &client,
+        &base,
+        &format!("/v1/manage/jobs/{id}/cancel"),
+        Some(ADMIN_TOKEN),
+        json!({}),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(cancelled["state"], "succeeded");
+    assert_eq!(cancelled["result"], completed["result"]);
+    assert_eq!(cancelled["cancel_arrival"], "after_side_effect");
+    assert_eq!(cancelled["fee_knowledge"]["state"], "known_none");
+    assert_eq!(cancelled["pending_fees"], json!([]));
+    let repeated: Value = post(
+        &client,
+        &base,
+        "/v1/manage/backup.create",
+        Some(ADMIN_TOKEN),
+        request,
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(repeated["id"], completed["id"]);
+    assert_eq!(repeated["result"], completed["result"]);
+    assert_eq!(
+        std::fs::read_dir(directory.path().join("backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read(
+            directory
+                .path()
+                .join("backups/committed/backup-manifest.json")
+        )
+        .unwrap(),
+        manifest
+    );
+    let public = serde_json::to_string(&cancelled).unwrap();
+    assert!(
+        !public.contains("snapshot_lease_token")
+            && !public.contains("temporary_name")
+            && !public.contains(directory.path().to_str().unwrap())
+    );
+    task.abort();
 }
 
 #[tokio::test]

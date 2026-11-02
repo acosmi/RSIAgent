@@ -640,6 +640,7 @@ fn every_class() -> Vec<Fact> {
                 cancel_arrival: None,
                 pending_terminal_state: None,
                 optimization: None,
+                backup: None,
             },
         ),
     ]
@@ -1062,6 +1063,15 @@ impl Scenario {
         // the script refuses symlinks in any supplied path (`/var` on macOS)
         let root = guard.path().canonicalize().unwrap();
         let live = root.join("rsia.sqlite3");
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(live.clone())
+                .unwrap();
+        }
         let store = Store::open(&live).await.unwrap();
         let admin = admin();
         let host = Context::new(NS, "host", Role::Host).unwrap();
@@ -1085,7 +1095,7 @@ impl Scenario {
         store.close().await;
         Self {
             _guard: guard,
-            backup: root.join("backup"),
+            backup: root.join("backups/backup"),
             root,
             live,
             base: None,
@@ -1096,7 +1106,15 @@ impl Scenario {
     /// Take the real backup of the live database as it is now.
     async fn take_backup(&mut self) {
         let store = Store::open(&self.live).await.unwrap();
-        store.backup(&self.backup).await.unwrap();
+        store
+            .backup(
+                &admin(),
+                evo_storage::lifecycle::BackupName::parse("backup").unwrap(),
+            )
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
         store.close().await;
         self.manifest_bytes = std::fs::read(self.backup.join("backup-manifest.json")).unwrap();
         let manifest: BackupManifest = serde_json::from_slice(&self.manifest_bytes).unwrap();

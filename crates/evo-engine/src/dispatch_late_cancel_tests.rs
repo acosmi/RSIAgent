@@ -1433,6 +1433,7 @@ fn running_job(id: &str) -> ManagementJobV2 {
         cancel_arrival: None,
         pending_terminal_state: None,
         optimization: None,
+        backup: None,
     }
 }
 
