@@ -599,7 +599,9 @@ impl StageFact {
 }
 
 pub(crate) fn canonical_stage_artifact_id(fact: &StageFact) -> Result<String> {
-    if fact.schema_version == OPTIMIZATION_STAGE_FACT_SCHEMA_V2 {
+    if fact.schema_version == OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+        && fact.kind == StageFactKind::StepPrepared
+    {
         return Ok(format!(
             "optstage-{}",
             fingerprint(&(
@@ -1962,6 +1964,10 @@ impl OptimizationJournal for StoreOptimizationJournal {
                 {
                     return Err(Error::Conflict("optimization job scope changed".into()));
                 }
+                if let Some(claim) = &self.management {
+                    claim.require_stage(&mut session, &existing).await?;
+                    claim.admit_new(&mut session).await?;
+                }
                 known_job |= existing.payload["job_scope"]["job_id"] == intent.scope.job_id;
                 facts.push(existing);
             } else {
@@ -2016,6 +2022,11 @@ impl OptimizationJournal for StoreOptimizationJournal {
         }
         for index in missing {
             let member = &intent.members[index];
+            if let Some(claim) = &self.management {
+                claim
+                    .record_prepared_stage(&mut session, &member.fact, &self.owner)
+                    .await?;
+            }
             persist_fact_current_material(
                 &mut session,
                 &self.context,

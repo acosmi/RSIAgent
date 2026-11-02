@@ -3325,6 +3325,9 @@ async fn optimization_live_accounting_in_session(
             let object = input.as_object_mut().ok_or(Error::NotFound)?;
             object.remove("compiler_request");
             object.remove("compiler_binding");
+            if fact.schema_version == crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2 {
+                object.remove("job_scope");
+            }
             if fact.input_digest != fingerprint(&(fingerprint(&input)?, &binding))? {
                 return Ok(None);
             }
@@ -3680,10 +3683,21 @@ fn optimization_stage_reference_matches(
 ) -> Result<bool> {
     let value = evo_storage::lifecycle::parse_strict_json(body)?;
     if is_redacted(&value) {
+        let schema = match value["original_schema"].as_str() {
+            Some(crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA) => {
+                crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA
+            }
+            Some(crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
+                if reference.kind == "step_prepared" =>
+            {
+                crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+            }
+            _ => return Ok(false),
+        };
         return Ok(optimization_object_redaction_matches(
             &value,
             &reference.artifact_id,
-            crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA,
+            schema,
             &reference.record_digest,
         ) && value["metadata"]["artifact_id"].as_str()
             == Some(reference.artifact_id.as_str())
