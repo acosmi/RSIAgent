@@ -1284,6 +1284,39 @@ async fn paid_start(fx: &PaidFixture) -> ManagementJobV2 {
         _ => panic!("expected v2 claim"),
     };
     assert!(!job.optimization.as_ref().unwrap().calls.is_empty());
+    let progress = job.optimization.as_ref().unwrap();
+    assert_eq!(
+        progress
+            .stages
+            .iter()
+            .filter(|s| s.kind == "step_prepared")
+            .count(),
+        1
+    );
+    let prepared = progress
+        .stages
+        .iter()
+        .find(|s| s.kind == "step_prepared")
+        .unwrap();
+    assert_eq!(prepared.generation, job.generation);
+    let mut session = fx.store.session().await.unwrap();
+    let row = session
+        .object_row(&fx.admin, "artifact", &prepared.artifact_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.owner, progress.journal_actor);
+    assert_eq!(prepared.record_digest, hash(row.body.as_bytes()));
+    let fact: evo_engine::optimization::StageFact = serde_json::from_str(&row.body).unwrap();
+    fact.validate().unwrap();
+    assert_eq!(fact.schema_version, "rsia.optimization.stage_fact.v2");
+    assert_eq!(
+        fact.kind,
+        evo_engine::optimization::StageFactKind::StepPrepared
+    );
+    assert_eq!(fact.artifact_id, prepared.artifact_id);
+    assert_eq!(fact.input_digest, prepared.input_digest);
+    session.commit().await.unwrap();
     job
 }
 async fn paid_state(fx: &PaidFixture, id: &str, state: ManagementJobState) -> ManagementJobV2 {
@@ -1553,6 +1586,30 @@ async fn draining_recovery_never_claims_or_reexecutes_request() {
             assert_eq!(draining.step, "optimization_completed");
             assert_eq!(draining.error_code.as_deref(), Some("model_usage_unknown"));
             assert!(draining.result.is_some());
+            let result = serde_json::to_value(draining.result.as_ref().unwrap()).unwrap();
+            let mut session = fx.store.session().await.unwrap();
+            let terminal: evo_engine::optimization::StageFact = session
+                .need(
+                    &fx.admin,
+                    "artifact",
+                    result["stage_fact_id"].as_str().unwrap(),
+                )
+                .await
+                .unwrap();
+            terminal.validate().unwrap();
+            assert_eq!(terminal.schema_version, "rsia.optimization.stage_fact.v1");
+            assert_eq!(
+                terminal.kind,
+                evo_engine::optimization::StageFactKind::StepCompleted
+            );
+            assert_eq!(
+                terminal.input_digest,
+                result["input_digest"].as_str().unwrap()
+            );
+            assert_eq!(terminal.artifact_id, result["stage_fact_id"]);
+            assert_eq!(terminal.payload["status"], "uncertain");
+            assert_eq!(terminal.payload["reason"], "model_usage_unknown");
+            session.commit().await.unwrap();
             (fx, claimed, draining)
         });
         // Actual model I/O already returned; ending its dedicated runtime now
@@ -1566,7 +1623,9 @@ async fn draining_recovery_never_claims_or_reexecutes_request() {
     let before = fx.gate.calls.load(Ordering::SeqCst);
     let stored = raw_record(&fx.store, &fx.admin, &claimed.id).await;
     // Recovery must not call execute_request for an already draining record.
-    let restart = ManagementDispatcher::new(fx.store.clone(), vec![fx.admin.clone()]).unwrap();
+    let pending_image = full_image(&fx.path);
+    let reopened = Store::open(&fx.path).await.unwrap();
+    let restart = ManagementDispatcher::new(reopened, vec![fx.admin.clone()]).unwrap();
     restart.recover_pending().await.unwrap();
     tokio::time::sleep(Duration::from_millis(40)).await;
     assert_eq!(fx.gate.calls.load(Ordering::SeqCst), before);
@@ -1575,6 +1634,7 @@ async fn draining_recovery_never_claims_or_reexecutes_request() {
         draining.generation
     );
     assert_eq!(raw_record(&fx.store, &fx.admin, &claimed.id).await, stored);
+    assert_eq!(full_image(&fx.path), pending_image);
     reconcile(&fx).await;
     let final_job = paid_state(&fx, &claimed.id, ManagementJobState::Blocked).await;
     assert_eq!(final_job.step, draining.step);
@@ -1588,6 +1648,103 @@ async fn draining_recovery_never_claims_or_reexecutes_request() {
 
 #[tokio::test]
 async fn partial_with_unknown_pending_stays_draining_before_blocked() {
+    // Healthy counterpart: the real Clamp pair keeps the incumbent after paid work.
+    {
+        let healthy = paid_fixture(0).await;
+        let accepted = healthy
+            .dispatcher
+            .submit(&healthy.admin, "optimization.step", healthy.request.clone())
+            .await
+            .unwrap();
+        let id = accepted.identity().id.to_owned();
+        let done = paid_state(&healthy, &id, ManagementJobState::Blocked).await;
+        assert_eq!(done.step, "optimization_completed");
+        assert_eq!(
+            done.error_code.as_deref(),
+            Some("keep_incumbent_not_improved")
+        );
+        assert!(!done.cancel_requested);
+        assert!(done.pending_terminal_state.is_none());
+        let result = serde_json::to_value(done.result.as_ref().unwrap()).unwrap();
+        assert_eq!(result["result"], "optimization_step_completed");
+        let progress = done.optimization.as_ref().unwrap();
+        let mut session = healthy.store.session().await.unwrap();
+        for (kind, schema) in [
+            ("step_prepared", "rsia.optimization.stage_fact.v2"),
+            ("step_completed", "rsia.optimization.stage_fact.v1"),
+        ] {
+            assert_eq!(progress.stages.iter().filter(|s| s.kind == kind).count(), 1);
+            let reference = progress.stages.iter().find(|s| s.kind == kind).unwrap();
+            assert_eq!(reference.generation, done.generation);
+            let row = session
+                .object_row(&healthy.admin, "artifact", &reference.artifact_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.owner, progress.journal_actor);
+            assert_eq!(reference.record_digest, hash(row.body.as_bytes()));
+            let fact: evo_engine::optimization::StageFact =
+                serde_json::from_str(&row.body).unwrap();
+            fact.validate().unwrap();
+            assert_eq!(fact.schema_version, schema);
+            assert_eq!(serde_json::to_value(fact.kind).unwrap(), kind);
+            assert_eq!(fact.artifact_id, reference.artifact_id);
+            assert_eq!(fact.input_digest, reference.input_digest);
+            if kind == "step_completed" {
+                assert_eq!(result["stage_fact_id"], fact.artifact_id);
+                assert_eq!(result["input_digest"], fact.input_digest);
+                assert_eq!(fact.payload["status"], "rejected");
+                assert_eq!(fact.payload["reason"], "keep_incumbent_not_improved");
+                assert_eq!(
+                    fact.payload["class"],
+                    json!({"class":"keep_incumbent_not_improved", "parent_total_micros":1_000_000, "candidate_total_micros":1_000_000})
+                );
+            }
+        }
+        session.commit().await.unwrap();
+        let calls = call_rows(&healthy).await;
+        assert!(!calls.is_empty());
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.actual_cost_micros.is_some() && c.execution_closed)
+        );
+        let root = healthy
+            .store
+            .root_budget(&healthy.admin, "management-scope")
+            .await
+            .unwrap()
+            .unwrap();
+        let actual_model_cost: i64 = healthy
+            .gate
+            .witnesses
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|w| w.charge.amount_micros)
+            .sum();
+        assert!(actual_model_cost > 0);
+        assert_eq!(root.spent_micros, actual_model_cost);
+        assert_eq!(root.reserved_micros, 0);
+        let count = healthy.gate.calls.load(Ordering::SeqCst);
+        let original = raw_record(&healthy.store, &healthy.admin, &id).await;
+        let image = full_image(&healthy.path);
+        let reopened = Store::open(&healthy.path).await.unwrap();
+        let restart =
+            ManagementDispatcher::new(reopened.clone(), vec![healthy.admin.clone()]).unwrap();
+        assert_eq!(restart.recover_pending().await.unwrap(), 0);
+        let replay = current(restart.status(&healthy.admin, &id).await.unwrap());
+        assert_eq!(replay.generation, done.generation);
+        let repeated = restart
+            .submit(&healthy.admin, "optimization.step", healthy.request.clone())
+            .await
+            .unwrap();
+        assert_eq!(repeated.identity().id, id);
+        restart.cancel(&healthy.admin, &id).await.unwrap();
+        assert_eq!(raw_record(&reopened, &healthy.admin, &id).await, original);
+        assert_eq!(healthy.gate.calls.load(Ordering::SeqCst), count);
+        assert_eq!(full_image(&healthy.path), image);
+    }
     let fx = paid_fixture(0).await;
     let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.path.display()))
         .await
