@@ -134,6 +134,15 @@ async fn fixture(outcome: TraceOutcome, empty_excerpt: bool) -> Fixture {
     // The real restore script rejects symlinks in its path, including /var on macOS.
     let root = directory.path().canonicalize().unwrap();
     let database = root.join("native-cleanup.sqlite3");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(database.clone())
+            .unwrap();
+    }
     let store = Store::open(&database).await.unwrap();
     let admin = context(NS, Role::Admin);
     let mut session = store.session().await.unwrap();
@@ -805,8 +814,17 @@ async fn complete_backup_with_authority_and_edges_restores_pending_and_continues
         .as_str()
         .unwrap()
         .to_owned();
-    let backup = fixture.root.join("backup");
-    fixture.store.backup(&backup).await.unwrap();
+    let backup = fixture.root.join("backups/backup");
+    fixture
+        .store
+        .backup(
+            &context(NS, Role::Admin),
+            evo_storage::lifecycle::BackupName::parse("backup").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     let backup_snapshot = sqlite_snapshot(&backup.join("rsia.sqlite3"), NS);
     assert_eq!(backup_snapshot["objects"], before["objects"]);
     assert_eq!(backup_snapshot["edges"], before["edges"]);

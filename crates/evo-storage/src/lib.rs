@@ -184,6 +184,17 @@ pub enum ManagementResultV2 {
     Original(ManagementResult),
     Partial(ManagementPartialResultV2),
     Optimization(ManagementOptimizationResultV2),
+    Backup(ManagementBackupResultV2),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementBackupResultV2 {
+    BackupCreated {
+        relative_name: lifecycle::BackupName,
+        manifest_sha256: String,
+        durability: lifecycle::BackupDurability,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,6 +293,18 @@ pub struct ManagementJobV2 {
         deserialize_with = "management_optimization_present"
     )]
     pub optimization: Option<ManagementOptimizationProgressV2>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "management_backup_present"
+    )]
+    pub backup: Option<lifecycle::BackupProgressV2>,
+}
+
+fn management_backup_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<lifecycle::BackupProgressV2>, D::Error> {
+    lifecycle::BackupProgressV2::deserialize(deserializer).map(Some)
 }
 
 fn management_optimization_present<'de, D: serde::Deserializer<'de>>(
@@ -372,6 +395,7 @@ impl VersionedManagementJob {
                     cancel_arrival: after.then_some(ManagementCancelArrival::AfterSideEffect),
                     pending_terminal_state: None,
                     optimization: None,
+                    backup: None,
                 }
             }
         })
@@ -554,6 +578,14 @@ fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
                 || (job.pending_terminal_state.is_some()
                     && job.state != ManagementJobState::Draining)
                 || (job.optimization.is_some() && job.operation != "optimization.step")
+                || (job.backup.is_some() && job.operation != "backup.create")
+                || (job.backup.is_some() && job.optimization.is_some())
+                || job
+                    .backup
+                    .as_ref()
+                    .is_some_and(|progress| !progress.valid_wire())
+                || (matches!(job.result, Some(ManagementResultV2::Backup(_)))
+                    && job.operation != "backup.create")
             {
                 return Err(invalid_shape());
             }
@@ -1917,6 +1949,7 @@ impl Store {
     }
     pub async fn close(&self) {
         self.pool.close().await;
+        let _backup_exit = self.blob_lock.write().await;
     }
     pub async fn integrity(&self) -> Result<String> {
         sqlx::query_scalar("PRAGMA integrity_check")
@@ -1924,8 +1957,15 @@ impl Store {
             .await
             .map_err(internal)
     }
-    pub async fn backup(&self, destination: &Path) -> Result<()> {
-        crate::lifecycle::backup_consistent(self, destination).await
+    /// Authorize one backup under this Store's fixed `backups` directory.
+    /// No filesystem or clock is observed before the Admin gate.
+    pub fn backup(
+        &self,
+        ctx: &Context,
+        name: lifecycle::BackupName,
+    ) -> Result<lifecycle::BackupPreparation> {
+        ctx.require(&[Role::Admin])?;
+        Ok(lifecycle::BackupPreparation::new(self.clone(), name))
     }
     /// Caller must register the returned digest and owner through a trusted host operation.
     pub async fn put_blob(&self, ctx: &Context, bytes: &[u8]) -> Result<String> {
@@ -3826,7 +3866,17 @@ mod tests {
     use evo_core::Role;
     async fn db() -> (tempfile::TempDir, Store) {
         let d = tempfile::tempdir().unwrap();
-        let s = Store::open(&d.path().join("db.sqlite3")).await.unwrap();
+        let root = d.path().canonicalize().unwrap();
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(root.join("db.sqlite3"))
+                .unwrap();
+        }
+        let s = Store::open(&root.join("db.sqlite3")).await.unwrap();
         (d, s)
     }
 
@@ -4471,8 +4521,12 @@ mod tests {
             .unwrap();
         t.commit().await.unwrap();
         assert_eq!(s.verify_audit(&c).await.unwrap(), 1);
-        let backup = d.path().join("backup");
-        s.backup(&backup).await.unwrap();
+        let backup = d.path().join("backups/backup");
+        s.backup(&c, lifecycle::BackupName::parse("backup").unwrap())
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
         let restored = Store::open(&backup.join("rsia.sqlite3")).await.unwrap();
         assert_eq!(restored.verify_audit(&c).await.unwrap(), 1);
         assert_eq!(restored.integrity().await.unwrap(), "ok");

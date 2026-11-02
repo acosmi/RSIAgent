@@ -82,6 +82,15 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let live = root.join("rsia.sqlite3");
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(live.clone())
+                .unwrap();
+        }
         let store = Store::open(&live).await.unwrap();
         store
             .authorize_root_budget(
@@ -215,8 +224,16 @@ impl Fixture {
         s.commit().await.unwrap();
     }
     async fn backup(&self, name: &str) -> PathBuf {
-        let path = self.root.join(name);
-        self.store.backup(&path).await.unwrap();
+        let path = self.root.join("backups").join(name);
+        self.store
+            .backup(
+                &admin(),
+                evo_storage::lifecycle::BackupName::parse(name).unwrap(),
+            )
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
         path
     }
     fn restore(&self, backup: &Path, name: &str) -> (PathBuf, Output) {
