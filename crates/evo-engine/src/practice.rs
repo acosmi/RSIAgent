@@ -62,15 +62,16 @@
 
 use crate::development::{
     CONTROL_KIND, DevelopmentControlV1, DevelopmentCostState, DevelopmentEvidenceScope,
-    DevelopmentSide, EXECUTION_RECEIPT_KIND, RUN_RECEIPT_KIND, execution_receipt_id,
-    load_development_control, load_execution_receipt, load_run_receipt, run_receipt_id, storage_id,
-    typed_receipt_closure, verify_observed_report_in_session,
+    DevelopmentExecutionReceiptV1, DevelopmentGraderReceiptV1, DevelopmentRunReceiptV1,
+    EXECUTION_RECEIPT_KIND, GRADER_RECEIPT_KIND, RUN_RECEIPT_KIND, grader_receipt_id,
+    load_development_control, run_receipt_id, storage_id, typed_receipt_closure,
+    validate_content_envelope, verify_observed_report_in_session,
 };
 use crate::evidence::validate_stored_sources;
 use crate::optimization::{
     DevRunner, DevelopmentExecutionProvenance, DevelopmentRunReport, DevelopmentRunRequest,
-    OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournalStage, StageFact, StageFactKind,
-    select_development, validate_development_request,
+    OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournalStage, PairedTaskResult, StageFact,
+    StageFactKind, select_development, validate_development_request,
 };
 use evo_core::evidence::Purpose;
 use evo_core::strategy::PracticePlan;
@@ -1152,19 +1153,45 @@ async fn record_attempt(
         ));
     }
     select_development(request, report)?;
+    let mut session = store.session().await?;
+    let (attempt, _) =
+        record_attempt_in_session(ctx, &mut session, control_id, request, report, cache_hit)
+            .await?;
+    session.commit().await?;
+    Ok(attempt)
+}
+
+async fn record_attempt_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    control_id: &str,
+    request: &DevelopmentRunRequest,
+    report: &DevelopmentRunReport,
+    cache_hit: bool,
+) -> Result<(PracticeAttemptV1, Vec<String>)> {
     let carrier = verification_carrier(request, report)?;
-    let outcomes = {
-        let mut session = store.session().await?;
-        let outcomes =
-            verify_observed_report_in_session(ctx, &mut session, &carrier, request, report).await?;
-        session.commit().await?;
-        outcomes
-    };
+    let outcomes =
+        verify_observed_report_in_session(ctx, session, &carrier, request, report).await?;
     let mut tasks = Vec::with_capacity(outcomes.len());
     let mut costs = Vec::with_capacity(outcomes.len() * 2);
+    let mut candidate_ids = Vec::with_capacity(outcomes.len());
     for outcome in &outcomes {
-        let parent = load_execution_receipt(store, ctx, &outcome.parent_execution_id).await?;
-        let candidate = load_execution_receipt(store, ctx, &outcome.candidate_execution_id).await?;
+        // E03 verified these exact records in this Session. Read their data
+        // without opening another snapshot after the Current decision.
+        let mut receipts = Vec::with_capacity(2);
+        for id in [
+            &outcome.parent_execution_id,
+            &outcome.candidate_execution_id,
+        ] {
+            let body: serde_json::Value = session
+                .need(ctx, ARTIFACT_KIND, &storage_id(EXECUTION_RECEIPT_KIND, id)?)
+                .await?;
+            let receipt: DevelopmentExecutionReceiptV1 =
+                serde_json::from_value(body["payload"].clone()).map_err(|_| Error::Internal)?;
+            receipts.push(receipt);
+        }
+        let candidate = receipts.pop().ok_or(Error::Internal)?;
+        let parent = receipts.pop().ok_or(Error::Internal)?;
         // The set names one control and so one root budget: executions that a
         // runner bound to another control paid for are not this set's evidence.
         if parent.control_id != control_id || candidate.control_id != control_id {
@@ -1174,6 +1201,7 @@ async fn record_attempt(
         }
         costs.push(parent.cost_state);
         costs.push(candidate.cost_state);
+        candidate_ids.push(candidate.receipt_id);
         tasks.push(PracticeTaskResultV1 {
             task_id: outcome.task_id.clone(),
             parent_family: outcome.parent_family.clone(),
@@ -1182,24 +1210,123 @@ async fn record_attempt(
             output_digest: candidate.output_digest,
         });
     }
-    Ok(PracticeAttemptV1 {
-        attempt: request.attempt,
-        request_id: request.request_id.clone(),
-        execution_receipt_id: report.execution_receipt_id.clone(),
-        tasks,
-        cost_state: aggregate_cost(&costs),
-        cache_hit,
-    })
+    Ok((
+        PracticeAttemptV1 {
+            attempt: request.attempt,
+            request_id: request.request_id.clone(),
+            execution_receipt_id: report.execution_receipt_id.clone(),
+            tasks,
+            cost_state: aggregate_cost(&costs),
+            cache_hit,
+        },
+        candidate_ids,
+    ))
 }
 
-/// Whether the attempt's run receipt already exists: the runner will only hand
-/// back stored evidence (V094.b, "reconnect retrieves the original result").
-async fn attempt_already_executed(store: &Store, ctx: &Context, request_id: &str) -> Result<bool> {
-    match load_run_receipt(store, ctx, &run_receipt_id(request_id)?).await {
-        Ok(_) => Ok(true),
-        Err(Error::NotFound) => Ok(false),
-        Err(error) => Err(error),
+// The report is only transport into the shared E03 verifier: every field is
+// rebuilt from stored run/grader data, then all executions and fees are reloaded.
+async fn cached_attempt_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    control: &DevelopmentControlV1,
+    request: &DevelopmentRunRequest,
+    cache_hit: bool,
+) -> Result<Option<(PracticeAttemptV1, Vec<String>)>> {
+    let run_storage = storage_id(RUN_RECEIPT_KIND, &run_receipt_id(&request.request_id)?)?;
+    let Some(body) = session
+        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &run_storage)
+        .await?
+    else {
+        return Ok(None);
+    };
+    validate_content_envelope(&run_storage, &body)?;
+    let run: DevelopmentRunReceiptV1 =
+        serde_json::from_value(body["payload"].clone()).map_err(|_| Error::Internal)?;
+    let mut results = Vec::with_capacity(request.manifest.tasks.len());
+    for task in &request.manifest.tasks {
+        let grader_storage = storage_id(
+            GRADER_RECEIPT_KIND,
+            &grader_receipt_id(&request.request_id, &task.id)?,
+        )?;
+        let body: serde_json::Value = session.need(ctx, ARTIFACT_KIND, &grader_storage).await?;
+        validate_content_envelope(&grader_storage, &body)?;
+        let grader: DevelopmentGraderReceiptV1 =
+            serde_json::from_value(body["payload"].clone()).map_err(|_| Error::Internal)?;
+        results.push(PairedTaskResult {
+            task_id: grader.task_id.clone(),
+            parent_score_micros: grader.parent_score_micros,
+            candidate_score_micros: grader.candidate_score_micros,
+            parent_passed: grader.parent_passed,
+            candidate_passed: grader.candidate_passed,
+            parent_execution_id: grader.parent_execution_receipt_id.clone(),
+            candidate_execution_id: grader.candidate_execution_receipt_id.clone(),
+            grader_receipt_digest: fingerprint(&grader)?,
+        });
     }
+    let first = run.execution_receipt_ids.first().ok_or(Error::NotFound)?;
+    let execution_storage = storage_id(EXECUTION_RECEIPT_KIND, first)?;
+    let execution: serde_json::Value = session.need(ctx, ARTIFACT_KIND, &execution_storage).await?;
+    validate_content_envelope(&execution_storage, &execution)?;
+    let provenance = serde_json::from_value(execution["payload"]["execution_provenance"].clone())
+        .map_err(|_| Error::Internal)?;
+    let report = DevelopmentRunReport {
+        request_id: run.request_id,
+        manifest_digest: request.manifest.digest.clone(),
+        parent_bundle_digest: request.parent_bundle_digest.clone(),
+        candidate_bundle_digest: request.candidate_bundle_digest.clone(),
+        environment_digest: request.environment_digest.clone(),
+        grader_digest: request.grader_digest.clone(),
+        results,
+        execution_receipt_id: run.id,
+        usage_record_ids: run.usage_record_ids,
+        provenance,
+    };
+    if report.provenance == DevelopmentExecutionProvenance::Fixture {
+        return Err(Error::Forbidden);
+    }
+    select_development(request, &report)?;
+    record_attempt_in_session(ctx, session, &control.id, request, &report, cache_hit)
+        .await
+        .map(Some)
+}
+
+/// Reconnect may reuse only a Current run, never a legacy run's existence.
+async fn attempt_already_executed(
+    store: &Store,
+    ctx: &Context,
+    control: &DevelopmentControlV1,
+    request: &DevelopmentRunRequest,
+) -> Result<bool> {
+    let mut session = store.session().await?;
+    let exists = cached_attempt_in_session(ctx, &mut session, control, request, true)
+        .await?
+        .is_some();
+    session.commit().await?;
+    Ok(exists)
+}
+
+async fn verify_set_attempts_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    control: &DevelopmentControlV1,
+    request: &PracticeRunRequest,
+    set: &PracticeAttemptSetV1,
+) -> Result<Vec<Vec<String>>> {
+    let mut candidate_ids = Vec::with_capacity(set.attempts.len());
+    for attempt in &set.attempts {
+        let development = practice_attempt_request(control, request, attempt.attempt)?;
+        let (current, receipts) =
+            cached_attempt_in_session(ctx, session, control, &development, attempt.cache_hit)
+                .await?
+                .ok_or(Error::NotFound)?;
+        if current != *attempt {
+            return Err(Error::Conflict(
+                "practice attempt differs from its current execution receipts".into(),
+            ));
+        }
+        candidate_ids.push(receipts);
+    }
+    Ok(candidate_ids)
 }
 
 /// An attempt whose cost is uncertain has an unknown outcome: the set stops
@@ -1224,7 +1351,7 @@ async fn run_attempts(
     let mut attempts = Vec::new();
     for number in 1..=k {
         let development = practice_attempt_request(control, request, number)?;
-        let cache_hit = attempt_already_executed(store, ctx, &development.request_id).await?;
+        let cache_hit = attempt_already_executed(store, ctx, control, &development).await?;
         let report = match runner.run(development.clone()).await {
             Ok(report) => report,
             Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
@@ -1281,6 +1408,7 @@ pub async fn run_practice_set(
         }
         let mut session = store.session().await?;
         require_no_tombstone(&mut session, ctx, &control.source_ids).await?;
+        verify_set_attempts_in_session(ctx, &mut session, &control, &request, &existing).await?;
         session.commit().await?;
         return Ok(existing);
     }
@@ -1345,7 +1473,7 @@ pub async fn run_practice_set(
         created_at: request.created_at,
     };
     set.validate()?;
-    persist_set(ctx, store, &control, set).await
+    persist_set(ctx, store, &control, &request, set).await
 }
 
 /// Writes the set once. The live-source gate is re-checked inside the writing
@@ -1358,6 +1486,7 @@ async fn persist_set(
     ctx: &Context,
     store: &Store,
     control: &DevelopmentControlV1,
+    request: &PracticeRunRequest,
     set: PracticeAttemptSetV1,
 ) -> Result<PracticeAttemptSetV1> {
     let storage = set.id.clone();
@@ -1373,9 +1502,12 @@ async fn persist_set(
                 "practice set id is already recorded for a different request".into(),
             ));
         }
+        verify_set_attempts_in_session(ctx, &mut session, control, request, &existing).await?;
         session.commit().await?;
         return Ok(existing);
     }
+    let candidate_ids =
+        verify_set_attempts_in_session(ctx, &mut session, control, request, &set).await?;
     if let Some(registration) = &set.registration_id {
         bind_registration(&mut session, ctx, registration, &set.set_id).await?;
     }
@@ -1396,7 +1528,7 @@ async fn persist_set(
             &storage_id(CONTROL_KIND, &control.id)?,
         )
         .await?;
-    for attempt in &set.attempts {
+    for (attempt, candidates) in set.attempts.iter().zip(candidate_ids) {
         session
             .put_edge(
                 ctx,
@@ -1406,12 +1538,7 @@ async fn persist_set(
                 &storage_id(RUN_RECEIPT_KIND, &attempt.execution_receipt_id)?,
             )
             .await?;
-        for task in &attempt.tasks {
-            let candidate = execution_receipt_id(
-                &attempt.request_id,
-                &task.task_id,
-                DevelopmentSide::Candidate,
-            )?;
+        for candidate in candidates {
             session
                 .put_edge(
                     ctx,
