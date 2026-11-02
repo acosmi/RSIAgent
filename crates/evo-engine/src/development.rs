@@ -127,7 +127,9 @@ pub(crate) fn validate_content_envelope(id: &str, body: &serde_json::Value) -> R
             (v.id, v.schema_version)
         }
         EXECUTION_RECEIPT_KIND => {
-            if e.payload["schema_version"] == projection::CONFIG_PROJECTION_EXECUTION_SCHEMA {
+            if e.payload["schema_version"] == projection::CONFIG_PROJECTION_EXECUTION_SCHEMA
+                || e.payload["schema_version"] == projection::CONFIG_PROJECTION_EXECUTION_SCHEMA_V2
+            {
                 return projection::validate_execution_envelope(id, &e.record_kind, e.payload);
             }
             let v = parse_execution_receipt(e.payload)?;
