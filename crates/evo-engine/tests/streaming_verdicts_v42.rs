@@ -2425,8 +2425,19 @@ async fn queued_legacy_private_inputs_recover_with_or_without_a_registered_contr
             value
         };
         let queued = seed_legacy_registration_job(&fixture, "legacy-recovery").await;
+        assert_eq!(queued.schema_version, "rsia.management_job.v1");
+        assert_eq!(queued.state, ManagementJobState::Queued);
+        assert_eq!(queued.step, "accepted");
+        assert_eq!(queued.generation, 0);
+        assert!(queued.lease_token.is_none() && queued.result.is_none());
+        assert_eq!(queued.lease_until, 0);
         let private_before = {
             let mut session = fixture.store.session().await.unwrap();
+            let persisted: Value = session
+                .need(&fixture.evaluator, "job", &queued.id)
+                .await
+                .unwrap();
+            assert_eq!(persisted, serde_json::to_value(&queued).unwrap());
             let private: Value = session
                 .need(&fixture.evaluator, "artifact", &queued.private_input_ref)
                 .await

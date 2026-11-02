@@ -789,11 +789,17 @@ impl ManagementDispatcher {
             // Full stable physical/private identity is checked before any
             // capacity-wait, v1 continuation or fresh claim write.
             let record = load_job_record_in_session(trusted, &mut session, job_id).await?;
-            if record.cancel_requested()
-                && record.generation() == 0
-                && record.identity().lease_token.is_none()
+            let identity = record.identity();
+            // Both cancellation and a new consumer need this same untouched
+            // origin, before claim overwrites the original phase and fence.
+            let never_started = record.generation() == 0
+                && identity.lease_token.is_none()
+                && identity.lease_until == 0
                 && record.result().is_none()
-            {
+                && record.pending_terminal_state().is_none()
+                && matches!(record.step(), "accepted" | Self::CAPACITY_WAIT_STEP)
+                && !matches!(&record, VersionedManagementJob::V2(job) if job.optimization.is_some());
+            if record.cancel_requested() && never_started {
                 // Proven never-started cancellation is closure, not new use of
                 // private content; revoked input cannot prevent this close.
                 let job = record.into_unfinished_v2()?;
@@ -802,7 +808,6 @@ impl ManagementDispatcher {
                     .await?;
                 return Ok((trusted.clone(), None));
             }
-            let identity = record.identity();
             // The physical read's Internal/Clock error propagates untouched.
             // Only an actually read missing/redacted/invalid private body is
             // the original private-input fault, not an inferred storage fault.
@@ -827,13 +832,10 @@ impl ManagementDispatcher {
                 )
                 .map_err(InputFault::Other),
             };
-            if record.generation() != 0
-                || identity.lease_token.is_some()
-                || record.result().is_some()
-            {
-                // A Queued label and unusable source cannot establish that an
-                // earlier generation ended. Preserve its fence and references;
-                // only the existing exit/startup reconciliation may close it.
+            if !never_started {
+                // Only an untouched accepted/capacity-wait origin may start a
+                // new consumer. Historical phases, leases and saved work must
+                // retain the existing exit/startup reconciliation path.
                 let mut job = record.into_unfinished_v2()?;
                 now()?;
                 job.state = ManagementJobState::Draining;
@@ -1965,7 +1967,7 @@ async fn execute_request(
     let mut job = claimed.clone();
     let result = match request {
         ParsedRequest::ExperimentRegister(request) => {
-            run_experiment_register(ctx, store, &mut job, *request, control).await
+            return run_experiment_register(ctx, store, job, *request, control).await;
         }
         ParsedRequest::ExperimentRegisterCurrent(request) => {
             run_experiment_register_current(ctx, store, &mut job, *request, control).await
@@ -2063,10 +2065,10 @@ fn execution_outcome(mut job: ManagementJobV2, result: Result<()>) -> Result<Job
 async fn run_experiment_register(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJobV2,
+    mut job: ManagementJobV2,
     request: ExperimentRegisterRequest,
     control: &WorkerControl,
-) -> Result<()> {
+) -> Result<ObservedWorkerExit> {
     if request.control.evaluator_actor != ctx.actor()
         || request.holdout.registration_id != request.control.id
     {
@@ -2095,14 +2097,20 @@ async fn run_experiment_register(
         ));
     }
     if progress.control_digest.is_some() {
-        return Err(Error::Conflict(
-            "legacy registered control is not Current input".into(),
-        ));
+        // This owned worker passed claim's never-started origin gate. The
+        // matching C was only read, before this consumer's first writer.
+        return execution_outcome(
+            job,
+            Err(Error::Conflict(
+                "legacy registered control is not Current input".into(),
+            )),
+        )
+        .map(ObservedWorkerExit::BeforeCommitFailed);
     }
     if progress.control_digest.is_none() {
         IndependentEvaluationControl::register_control(ctx, store, request.control.clone()).await?;
         job.step = "control_registered".into();
-        checkpoint_claim(ctx, store, job, "control_registered", control).await?;
+        checkpoint_claim(ctx, store, &job, "control_registered", control).await?;
         progress = IndependentEvaluationControl::registration_progress(
             ctx,
             store,
@@ -2112,7 +2120,7 @@ async fn run_experiment_register(
         .await?;
     }
     if progress.holdout_digest.is_none() {
-        checkpoint_claim(ctx, store, job, "before_holdout_registration", control).await?;
+        checkpoint_claim(ctx, store, &job, "before_holdout_registration", control).await?;
         IndependentEvaluationControl::register_holdout(ctx, store, request.holdout.clone()).await?;
     }
     let final_progress = IndependentEvaluationControl::registration_progress(
@@ -2139,7 +2147,7 @@ async fn run_experiment_register(
             holdout_digest: expected_holdout,
         },
     ));
-    Ok(())
+    execution_outcome(job, Ok(())).map(ObservedWorkerExit::Completed)
 }
 
 async fn run_experiment_register_current(
