@@ -951,6 +951,15 @@ async fn a_current_backup_applies_nothing_and_writes_no_migration_record() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().canonicalize().unwrap();
     let live = root.join("rsia.sqlite3");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(live.clone())
+            .unwrap();
+    }
     let store = Store::open(&live).await.unwrap();
     let context = admin("n");
     let mut session = store.session().await.unwrap();
@@ -969,8 +978,16 @@ async fn a_current_backup_applies_nothing_and_writes_no_migration_record() {
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let backup = root.join("backup");
-    store.backup(&backup).await.unwrap();
+    let backup = root.join("backups/backup");
+    store
+        .backup(
+            &context,
+            evo_storage::lifecycle::BackupName::parse("backup").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     store.close().await;
     let scenario = Scenario {
         _guard: directory,
