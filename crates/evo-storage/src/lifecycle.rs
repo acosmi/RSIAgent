@@ -3854,8 +3854,6 @@ fn minimal_metadata(value: &serde_json::Value) -> serde_json::Value {
         "run_id",
         "release_id",
         "candidate_id",
-        "claim_id",
-        "proposal_id",
         "profile_id",
         "bundle_digest",
         "parent_digest",
@@ -3905,6 +3903,8 @@ fn minimal_metadata(value: &serde_json::Value) -> serde_json::Value {
         "branch_seq",
         "action_seq",
         "estimated_cost_upper_micros",
+        "claim_id",
+        "proposal_id",
     ] {
         if let Some(item) = object.get(key) {
             output.insert(key.into(), item.clone());
