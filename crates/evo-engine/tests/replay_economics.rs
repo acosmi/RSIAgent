@@ -1150,8 +1150,23 @@ async fn actual_m33_history_copy() -> (
     assert_eq!(metadata["scope"]["real_paid_effect_claimed"], false);
     assert_eq!(metadata["scope"]["current_v3_authority_claimed"], false);
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("history-copy.sqlite3");
-    std::fs::write(&path, M33_HISTORY_DATABASE).unwrap();
+    let path = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("history-copy.sqlite3");
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap()
+            .write_all(M33_HISTORY_DATABASE)
+            .unwrap();
+    }
     let store = Store::open(&path).await.unwrap();
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
@@ -1230,8 +1245,18 @@ async fn actual_parent_selection_is_auditable_but_rejected_at_all_new_e11_write_
         serde_json::to_value(read.record.report().unwrap()).unwrap(),
         metadata["selection"]
     );
-    let complete_before = directory.path().join("before-legacy-new-consumption");
-    store.backup(&complete_before).await.unwrap();
+    let complete_before = directory
+        .path()
+        .join("backups/before-legacy-new-consumption");
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("before-legacy-new-consumption").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     let strong =
         evo_engine::replay::verified_replay_report_view(&evaluator, &store, &old.report_id)
             .await
@@ -1265,8 +1290,18 @@ async fn actual_parent_selection_is_auditable_but_rejected_at_all_new_e11_write_
     assert!(is_legacy_consumption_error(&final_write), "{final_write:?}");
     original_m33_rows_unchanged(&store, &admin, &metadata).await;
 
-    let complete_after = directory.path().join("after-legacy-new-consumption");
-    store.backup(&complete_after).await.unwrap();
+    let complete_after = directory
+        .path()
+        .join("backups/after-legacy-new-consumption");
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("after-legacy-new-consumption").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read(complete_after.join("rsia.sqlite3")).unwrap(),
         std::fs::read(complete_before.join("rsia.sqlite3")).unwrap(),
@@ -1600,8 +1635,16 @@ async fn actual_parent_reader_roles_remain_distinct_and_duplicate_wire_fails_clo
 async fn actual_parent_legacy_writer_retries_existing_only_and_conflicts_without_any_write() {
     let (directory, store, admin, evaluator, metadata) = actual_m33_history_copy().await;
     let old: StoredReplayReportV1 = serde_json::from_value(metadata["selection"].clone()).unwrap();
-    let before = directory.path().join("before-old-writer");
-    store.backup(&before).await.unwrap();
+    let before = directory.path().join("backups/before-old-writer");
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("before-old-writer").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     let before_bytes = std::fs::read(before.join("rsia.sqlite3")).unwrap();
     evo_storage::replay::put_replay_report(&admin, &store, &old)
         .await
@@ -1634,8 +1677,16 @@ async fn actual_parent_legacy_writer_retries_existing_only_and_conflicts_without
         Err(Error::Forbidden)
     ));
     original_m33_rows_unchanged(&store, &admin, &metadata).await;
-    let after = directory.path().join("after-old-writer");
-    store.backup(&after).await.unwrap();
+    let after = directory.path().join("backups/after-old-writer");
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("after-old-writer").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read(after.join("rsia.sqlite3")).unwrap(),
         before_bytes,
@@ -1657,8 +1708,16 @@ async fn actual_parent_outer_row_id_constraint_refuses_damage_before_any_reader(
     let mut damaged: serde_json::Value =
         serde_json::from_str(row["body_utf8"].as_str().unwrap()).unwrap();
     damaged["id"] = serde_json::json!("claimed-other-physical-row");
-    let backup_before = directory.path().join("before-physical-id-refusal");
-    store.backup(&backup_before).await.unwrap();
+    let backup_before = directory.path().join("backups/before-physical-id-refusal");
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("before-physical-id-refusal").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     let mut session = store.session().await.unwrap();
     // Existing SQLite json_extract(body,'$.id') = id is the first guard.
     // Keep its exact mapping; never bypass it to manufacture a reader fixture.
@@ -1676,8 +1735,16 @@ async fn actual_parent_outer_row_id_constraint_refuses_damage_before_any_reader(
     ));
     session.commit().await.unwrap();
     original_m33_rows_unchanged(&store, &admin, &metadata).await;
-    let backup_after = directory.path().join("after-physical-id-refusal");
-    store.backup(&backup_after).await.unwrap();
+    let backup_after = directory.path().join("backups/after-physical-id-refusal");
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("after-physical-id-refusal").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read(backup_after.join("rsia.sqlite3")).unwrap(),
         std::fs::read(backup_before.join("rsia.sqlite3")).unwrap()
@@ -1741,8 +1808,18 @@ async fn invalid_derived_current_edges_preserve_the_real_parent_audit_and_all_re
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let before_reads = directory.path().join("before-invalid-neighbor-reads");
-    store.backup(&before_reads).await.unwrap();
+    let before_reads = directory
+        .path()
+        .join("backups/before-invalid-neighbor-reads");
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("before-invalid-neighbor-reads").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     for caller in [&evaluator, &admin] {
         assert!(matches!(
             evo_storage::replay::load_current_replay_report(caller, &store, &current.report_id).await,
@@ -1818,8 +1895,18 @@ async fn invalid_derived_current_edges_preserve_the_real_parent_audit_and_all_re
         old_row.body
     );
     session.commit().await.unwrap();
-    let after_reads = directory.path().join("after-invalid-neighbor-reads");
-    store.backup(&after_reads).await.unwrap();
+    let after_reads = directory
+        .path()
+        .join("backups/after-invalid-neighbor-reads");
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("after-invalid-neighbor-reads").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     assert_eq!(
         std::fs::read(after_reads.join("rsia.sqlite3")).unwrap(),
         std::fs::read(before_reads.join("rsia.sqlite3")).unwrap(),
