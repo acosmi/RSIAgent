@@ -1278,8 +1278,18 @@ async fn record_attempt_in_session(
             let body: serde_json::Value = session
                 .need(ctx, ARTIFACT_KIND, &storage_id(EXECUTION_RECEIPT_KIND, id)?)
                 .await?;
-            let receipt: DevelopmentExecutionReceiptV1 =
-                serde_json::from_value(body["payload"].clone()).map_err(|_| Error::Internal)?;
+            let payload = body["payload"].clone();
+            let receipt: DevelopmentExecutionReceiptV1 = if payload["schema_version"]
+                == crate::development::projection::CONFIG_PROJECTION_EXECUTION_SCHEMA
+                || payload["schema_version"]
+                    == crate::development::projection::CONFIG_PROJECTION_EXECUTION_SCHEMA_V2
+            {
+                let wrapper: crate::development::projection::ConfigProjectionExecutionReceiptV1 =
+                    serde_json::from_value(payload).map_err(|_| Error::Internal)?;
+                wrapper.execution
+            } else {
+                serde_json::from_value(payload).map_err(|_| Error::Internal)?
+            };
             receipts.push(receipt);
         }
         let candidate = receipts.pop().ok_or(Error::Internal)?;
@@ -1359,8 +1369,19 @@ async fn cached_attempt_in_session(
     let execution_storage = storage_id(EXECUTION_RECEIPT_KIND, first)?;
     let execution: serde_json::Value = session.need(ctx, ARTIFACT_KIND, &execution_storage).await?;
     validate_content_envelope(&execution_storage, &execution)?;
-    let provenance = serde_json::from_value(execution["payload"]["execution_provenance"].clone())
-        .map_err(|_| Error::Internal)?;
+    let payload = execution["payload"].clone();
+    let execution: DevelopmentExecutionReceiptV1 = if payload["schema_version"]
+        == crate::development::projection::CONFIG_PROJECTION_EXECUTION_SCHEMA
+        || payload["schema_version"]
+            == crate::development::projection::CONFIG_PROJECTION_EXECUTION_SCHEMA_V2
+    {
+        let wrapper: crate::development::projection::ConfigProjectionExecutionReceiptV1 =
+            serde_json::from_value(payload).map_err(|_| Error::Internal)?;
+        wrapper.execution
+    } else {
+        serde_json::from_value(payload).map_err(|_| Error::Internal)?
+    };
+    let provenance = execution.execution_provenance;
     let report = DevelopmentRunReport {
         request_id: run.request_id,
         manifest_digest: request.manifest.digest.clone(),
