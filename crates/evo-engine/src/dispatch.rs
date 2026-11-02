@@ -704,18 +704,10 @@ impl ManagementDispatcher {
                 optimization_runtime.as_deref(),
             )
             .await
-            {
-                // A consumer error can follow a committed business transaction.
-                // Re-read its actual progress instead of treating result=None as
-                // proof that no side effect or pending execution exists.
-                Ok(outcome) if outcome.state == ManagementJobState::Failed => {
-                    ObservedWorkerExit::Failed(
-                        outcome
-                            .error_code
-                            .unwrap_or_else(|| "management_worker_failed".into()),
-                    )
-                }
-                Ok(outcome) => ObservedWorkerExit::Completed(outcome),
+            .or_else(|error| {
+                execution_outcome(worker_job, Err(error)).map(ObservedWorkerExit::Completed)
+            }) {
+                Ok(observed) => observed,
                 Err(error) => ObservedWorkerExit::Failed(error_code(&error).into()),
             }
         });
@@ -1954,6 +1946,9 @@ impl WorkerControl {
 enum ObservedWorkerExit {
     Completed(JobOutcome),
     BeforeConsumerFailed(JobOutcome),
+    // An actual read-only refusal or business refusal from an atomic
+    // non-dispatching writer, never an operation-name or empty-call guess.
+    BeforeCommitFailed(JobOutcome),
     NeverStarted,
     Failed(String),
     Restarted,
@@ -1966,7 +1961,7 @@ async fn execute_request(
     request: ParsedRequest,
     control: &WorkerControl,
     optimization_runtime: Option<&crate::optimization::ManagementOptimizationRuntime>,
-) -> Result<JobOutcome> {
+) -> Result<ObservedWorkerExit> {
     let mut job = claimed.clone();
     let result = match request {
         ParsedRequest::ExperimentRegister(request) => {
@@ -1976,10 +1971,10 @@ async fn execute_request(
             run_experiment_register_current(ctx, store, &mut job, *request, control).await
         }
         ParsedRequest::EvaluationStart(request) => {
-            run_evaluation_start(ctx, store, &mut job, request, control).await
+            return run_evaluation_start(ctx, store, job, request, control).await;
         }
         ParsedRequest::EvaluationStatus(request) => {
-            run_evaluation_status(ctx, store, &mut job, request, control).await
+            return run_evaluation_status(ctx, store, job, request, control).await;
         }
         ParsedRequest::ReplayRun(request) => {
             run_replay(ctx, store, &mut job, *request, control).await
@@ -1988,7 +1983,7 @@ async fn execute_request(
             run_curriculum_step(ctx, store, &mut job, request, control).await
         }
         ParsedRequest::ExplorationStart(request) => {
-            run_exploration_start(ctx, store, &mut job, *request, control).await
+            return run_exploration_start(ctx, store, job, *request, control).await;
         }
         ParsedRequest::OptimizationStep(request) => {
             run_optimization_management(
@@ -2009,7 +2004,7 @@ async fn execute_request(
             Ok(())
         }
     };
-    execution_outcome(job, result)
+    execution_outcome(job, result).map(ObservedWorkerExit::Completed)
 }
 
 async fn run_optimization_management(
@@ -2312,26 +2307,32 @@ async fn evaluation_start_existing_status(
 async fn run_evaluation_start(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJobV2,
+    mut job: ManagementJobV2,
     request: EvaluationStartRequest,
     control: &WorkerControl,
-) -> Result<()> {
-    checkpoint_claim(ctx, store, job, "before_ticket_issue", control).await?;
-    let ticket = match IndependentEvaluationControl::issue_ticket(
+) -> Result<ObservedWorkerExit> {
+    checkpoint_claim(ctx, store, &job, "before_ticket_issue", control).await?;
+    let issued = match IndependentEvaluationControl::issue_ticket(
         ctx,
         store,
         request.ticket.engine_request(),
     )
     .await
     {
+        Err(Error::Conflict(_)) => evaluation_start_existing_status(ctx, store, &request, None)
+            .await
+            .and_then(|existing| existing.map(|status| status.ticket).ok_or(Error::NotFound)),
+        result => result,
+    };
+    let ticket = match issued {
         Ok(ticket) => ticket,
-        Err(Error::Conflict(_)) => {
-            evaluation_start_existing_status(ctx, store, &request, None)
-                .await?
-                .ok_or(Error::NotFound)?
-                .ticket
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
+        Err(error) => {
+            // issue_ticket commits its business writes only in its final
+            // transaction; this business refusal rolled them back. The
+            // existing-ticket fallback above only reads, never dispatches.
+            return execution_outcome(job, Err(error)).map(ObservedWorkerExit::BeforeCommitFailed);
         }
-        Err(error) => return Err(error),
     };
     job.state = ManagementJobState::Blocked;
     job.step = "ticket_issued_execution_blocked".into();
@@ -2341,24 +2342,32 @@ async fn run_evaluation_start(
             ticket_id: ticket.id,
         },
     ));
-    Ok(())
+    execution_outcome(job, Ok(())).map(ObservedWorkerExit::Completed)
 }
 
 async fn run_evaluation_status(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJobV2,
+    mut job: ManagementJobV2,
     request: EvaluationStatusRequest,
     control: &WorkerControl,
-) -> Result<()> {
-    checkpoint_claim(ctx, store, job, "before_status_read", control).await?;
-    let status = IndependentEvaluationControl::status(ctx, store, &request.ticket_id).await?;
+) -> Result<ObservedWorkerExit> {
+    checkpoint_claim(ctx, store, &job, "before_status_read", control).await?;
+    let status = match IndependentEvaluationControl::status(ctx, store, &request.ticket_id).await {
+        Ok(status) => status,
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
+        Err(error) => {
+            // The executed strict reader has no business writer or outbound
+            // work and cannot own the historical ticket's provider calls.
+            return execution_outcome(job, Err(error)).map(ObservedWorkerExit::BeforeCommitFailed);
+        }
+    };
     job.state = ManagementJobState::Succeeded;
     job.step = "status_read".into();
     job.result = Some(ManagementResultV2::Original(public_evaluation_status(
         &status,
     )));
-    Ok(())
+    execution_outcome(job, Ok(())).map(ObservedWorkerExit::Completed)
 }
 
 fn public_evaluation_status(status: &StreamingEvaluationStatus) -> ManagementResult {
@@ -2442,11 +2451,11 @@ async fn run_curriculum_step(
 async fn run_exploration_start(
     ctx: &Context,
     store: &Store,
-    job: &mut ManagementJobV2,
+    mut job: ManagementJobV2,
     request: ExplorationStartRequest,
     control: &WorkerControl,
-) -> Result<()> {
-    checkpoint_claim(ctx, store, job, "before_exploration_start", control).await?;
+) -> Result<ObservedWorkerExit> {
+    checkpoint_claim(ctx, store, &job, "before_exploration_start", control).await?;
     let coordinator =
         crate::exploration::PersistentCoordinator::new(store.clone(), ctx.clone(), ctx.actor())?;
     let world_id = request.world.id.clone();
@@ -2456,9 +2465,20 @@ async fn run_exploration_start(
     // same world under another request key, converges on the world it already
     // persisted (plan §6.7.4) instead of failing on its own earlier commit, also
     // after the world dispatched.
-    coordinator
+    match coordinator
         .register_world_idempotent(request.world.clone())
-        .await?;
+        .await
+    {
+        Ok(_) => {}
+        // Storage/clock errors do not establish the transaction's outcome.
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
+        Err(error) => {
+            // Every business write of this non-dispatching producer is in this
+            // transaction. A business refusal rolled it back, even if another
+            // job's stored world cannot pass a later observation read.
+            return execution_outcome(job, Err(error)).map(ObservedWorkerExit::BeforeCommitFailed);
+        }
+    }
     // The first decision is a pure function over the empty prefix of the world as
     // requested (plan §7.1), not the live decision: once a dispatch moved the
     // stored world on, the live decision is another one. No node is dispatched
@@ -2482,7 +2502,7 @@ async fn run_exploration_start(
             action: decision.action,
         },
     ));
-    Ok(())
+    execution_outcome(job, Ok(())).map(ObservedWorkerExit::Completed)
 }
 
 fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<()> {
@@ -3848,9 +3868,22 @@ async fn consumer_progress(
             session.commit().await?;
             match (progress.control_digest, progress.holdout_digest) {
                 (None, None) => Ok(ConsumerProgress::NotCommitted),
-                // A Current registration input was admitted before this job.
-                // Its mere presence is not a side effect owned by this job.
-                (Some(_), None) => Ok(ConsumerProgress::NotCommitted),
+                // C is an input, while H and its checkpoint commit together.
+                // Only the actual never-started or pre-H claimed phases prove
+                // that this job has not committed H.
+                (Some(_), None)
+                    if (record.generation() == 0
+                        && record.identity().lease_token.is_none()
+                        && record.result().is_none())
+                        || (record.step() == "claimed"
+                            && matches!(
+                                record.identity().state,
+                                ManagementJobState::Running | ManagementJobState::Draining
+                            )) =>
+                {
+                    Ok(ConsumerProgress::NotCommitted)
+                }
+                (Some(_), None) => Ok(ConsumerProgress::Unknown),
                 (Some(control_digest), Some(holdout_digest)) => {
                     let owned_result = matches!(record.original_result(),
                         Some(ManagementResult::ExperimentRegistered {control_id,control_digest: saved_c,holdout_id,holdout_digest: saved_h})
@@ -3923,7 +3956,12 @@ async fn consumer_progress(
         ParsedRequest::EvaluationStatus(request) => {
             // This is the real full read-only consumer. It does not claim the
             // historical ticket's own provider calls for this management job.
-            IndependentEvaluationControl::status(ctx, store, &request.ticket_id).await?;
+            match IndependentEvaluationControl::status(ctx, store, &request.ticket_id).await {
+                Ok(_) | Err(Error::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+            // This concrete adapter only reads. A missing ticket cannot start
+            // or own any of the historical ticket's provider calls.
             Ok(ConsumerProgress::NotCommitted)
         }
         ParsedRequest::ReplayRun(request) => {
@@ -4185,7 +4223,18 @@ async fn consumer_progress(
             {
                 return Ok(ConsumerProgress::Unknown);
             }
-            Ok(ConsumerProgress::NotCommitted)
+            // This admitted concrete adapter has no business writer or
+            // outbound work. Restore its exact terminal without executing it
+            // again; result=None does not replace any accounting lookup.
+            Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                state: ManagementJobState::Blocked,
+                step: "blocked_feature".into(),
+                result: None,
+                error_code: Some(format!(
+                    "{}_consumer_unavailable",
+                    record.identity().operation
+                )),
+            })))
         }
     }
 }
@@ -4428,6 +4477,7 @@ impl ManagementDispatcher {
             self.optimization_budget_actions(ctx, &claimed.id).await?;
         }
         if let ObservedWorkerExit::Completed(outcome) = observed
+            && outcome.state != ManagementJobState::Failed
             && claimed.operation != "optimization.step"
         {
             match finish_claim(ctx, &self.store, claimed, outcome.clone()).await {
@@ -4449,13 +4499,21 @@ impl ManagementDispatcher {
             return Ok(record.identity().state);
         }
         let progress = match observed {
-            // The real pre-consumer exit/new unclaimed queue has not entered a
-            // producer. This proof comes from the owned handle/claim path.
-            ObservedWorkerExit::BeforeConsumerFailed(_) | ObservedWorkerExit::NeverStarted => {
+            // An owned pre-consumer/never-started exit or an executed reader/
+            // rolled-back producer proves no new business commit, not an empty query.
+            ObservedWorkerExit::BeforeConsumerFailed(_)
+            | ObservedWorkerExit::BeforeCommitFailed(_)
+            | ObservedWorkerExit::NeverStarted => ConsumerProgress::NotCommitted,
+            ObservedWorkerExit::Completed(outcome)
+                if outcome.state != ManagementJobState::Failed =>
+            {
                 ConsumerProgress::NotCommitted
             }
-            ObservedWorkerExit::Completed(_) => ConsumerProgress::NotCommitted,
-            ObservedWorkerExit::Failed(_) | ObservedWorkerExit::Restarted => {
+            // Normal failures retain their outcome, but may still follow a C/H
+            // commit or unresolved execution. Reload the actual progress.
+            ObservedWorkerExit::Completed(_)
+            | ObservedWorkerExit::Failed(_)
+            | ObservedWorkerExit::Restarted => {
                 consumer_progress_or_unknown(ctx, &self.store, &record).await?
             }
         };
@@ -4553,7 +4611,16 @@ impl ManagementDispatcher {
                     current.lease_token = original_token;
                     current.lease_until = original_until;
                 }
-                if let ObservedWorkerExit::Failed(code) = observed
+                let failure = match observed {
+                    ObservedWorkerExit::Failed(code) => Some(code),
+                    ObservedWorkerExit::Completed(outcome)
+                        if outcome.state == ManagementJobState::Failed =>
+                    {
+                        outcome.error_code.as_ref()
+                    }
+                    _ => None,
+                };
+                if let Some(code) = failure
                     && let Some(facts) = &accounting
                 {
                     if !facts.compiled.is_empty() || !facts.historical_compiled.is_empty() {
@@ -4605,9 +4672,14 @@ impl ManagementDispatcher {
         }
         match observed {
             ObservedWorkerExit::Completed(outcome)
-            | ObservedWorkerExit::BeforeConsumerFailed(outcome) => {
-                // These are the actual original seven no-dispatch adapters,
-                // not a request/body claim or an empty BudgetCall query.
+                if outcome.state != ManagementJobState::Failed =>
+            {
+                apply_completed_outcome(&mut current, outcome)?;
+            }
+            ObservedWorkerExit::BeforeConsumerFailed(outcome)
+            | ObservedWorkerExit::BeforeCommitFailed(outcome) => {
+                // These private outcomes came from an owned pre-consumer exit
+                // or an actual reader/rolled-back producer, not request data.
                 apply_completed_outcome(&mut current, outcome)?;
             }
             _ => match progress {
@@ -4615,7 +4687,12 @@ impl ManagementDispatcher {
                     current.state = ManagementJobState::Draining;
                     // Existing step/result/error/refs stay intact. No guessed
                     // terminal, no new dispatch and no empty-fee completion.
-                    if let ObservedWorkerExit::Failed(code) = observed
+                    let failure = match observed {
+                        ObservedWorkerExit::Completed(outcome) => outcome.error_code.as_ref(),
+                        ObservedWorkerExit::Failed(code) => Some(code),
+                        _ => None,
+                    };
+                    if let Some(code) = failure
                         && !current.diagnostics.last().is_some_and(|last| {
                             last.code == *code && last.observed_generation == current.generation
                         })
@@ -4659,34 +4736,38 @@ impl ManagementDispatcher {
                     apply_completed_outcome(&mut current, &outcome)?;
                 }
                 ConsumerProgress::NotCommitted => {
-                    let (step, code) = if current.cancel_requested {
-                        ("cancelled", "cancelled".to_owned())
+                    let outcome = if let ObservedWorkerExit::Completed(outcome) = observed {
+                        outcome.clone()
                     } else {
-                        let code = match observed {
-                            ObservedWorkerExit::Failed(code) => code.clone(),
-                            _ => "management_worker_exited".into(),
-                        };
-                        let step = if current.operation == "replay.run"
-                            && current.step == "before_replay_run"
-                            && matches!(observed, ObservedWorkerExit::Failed(code) if code == "not_found")
-                        {
-                            // NotCommitted already proved both exact report
-                            // identities absent for this offline producer.
-                            "failed"
+                        let (step, code) = if current.cancel_requested {
+                            ("cancelled", "cancelled".to_owned())
                         } else {
-                            "worker_exited_before_commit"
+                            let code = match observed {
+                                ObservedWorkerExit::Failed(code) => code.clone(),
+                                _ => "management_worker_exited".into(),
+                            };
+                            let step = if current.operation == "replay.run"
+                                && current.step == "before_replay_run"
+                                && matches!(observed, ObservedWorkerExit::Failed(code) if code == "not_found")
+                            {
+                                // NotCommitted already proved both exact report
+                                // identities absent for this offline producer.
+                                "failed"
+                            } else {
+                                "worker_exited_before_commit"
+                            };
+                            (step, code)
                         };
-                        (step, code)
-                    };
-                    let outcome = JobOutcome {
-                        state: if current.cancel_requested {
-                            ManagementJobState::Cancelled
-                        } else {
-                            ManagementJobState::Failed
-                        },
-                        step: step.into(),
-                        result: None,
-                        error_code: Some(code),
+                        JobOutcome {
+                            state: if current.cancel_requested {
+                                ManagementJobState::Cancelled
+                            } else {
+                                ManagementJobState::Failed
+                            },
+                            step: step.into(),
+                            result: None,
+                            error_code: Some(code),
+                        }
                     };
                     apply_completed_outcome(&mut current, &outcome)?;
                 }

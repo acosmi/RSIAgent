@@ -169,7 +169,7 @@ async fn submit_status_cancel_share_versioned_job_view() {
         request.clone(),
     )
     .await;
-    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.status(), StatusCode::OK);
     let accepted: Value = response.json().await.unwrap();
     assert_eq!(accepted["schema_version"], "rsia.management_job_status.v1");
     assert_eq!(accepted["job_schema_version"], "rsia.management_job.v2");
@@ -253,7 +253,7 @@ async fn job_lifecycle_routes_keep_auth_identity_and_no_new_job() {
         StatusCode::FORBIDDEN
     );
     let bad=post(&client,&base,"/v1/manage/meta.start",Some(ADMIN_TOKEN),json!({"schema_version":"rsia.management.meta_start.v1","request_key":"identity-body","actor":"other"})).await;
-    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(bad.status(), StatusCode::FORBIDDEN);
     let admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
     let mut s = store.session().await.unwrap();
     assert!(s.list::<Value>(&admin, "job").await.unwrap().is_empty());

@@ -51,7 +51,7 @@ use evo_core::{Context, Job, JobState, Role, fingerprint, hash};
 use evo_engine::curriculum::{
     ProbeScheduleReceiptV1, curriculum_probe_job_storage_id, probe_schedule_receipt_id,
 };
-use evo_engine::dispatch::{ManagementJob, ManagementJobState};
+use evo_engine::dispatch::{ManagementJob, ManagementJobState, ManagementJobV2};
 use evo_engine::monitoring::{
     CONSOLIDATION_CLAIM_SCHEMA, CONSOLIDATION_PROPOSAL_SCHEMA, CONSOLIDATION_PROPOSAL_SCHEMA_V2,
     CONSOLIDATION_RUN_SCHEMA, CONSOLIDATION_SCOPE_SCHEMA, CONSOLIDATION_STAGING_SCHEMA,
@@ -81,7 +81,7 @@ use evo_storage::lifecycle::{
     PROTECTED_ACTION_SCHEMA_VERSIONS, PROTECTED_OBJECT_KINDS, PROTECTED_SCHEMA_VERSIONS,
     RevokeTombstone, TypedObjectRef, read_control_plane_facts,
 };
-use evo_storage::{CAPACITY_MANAGEMENT_JOB_SCHEMA, Store};
+use evo_storage::{CAPACITY_MANAGEMENT_JOB_SCHEMA, MANAGEMENT_JOB_V2_SCHEMA, Store};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,7 +104,7 @@ const REDACTED: &str = "rsia.redacted.v1";
 const CURRICULUM_ENVELOPE_SCHEMA: &str = "rsia.curriculum_artifact_envelope.v1";
 const PRIVATE_INPUT_SCHEMA: &str = "rsia.management_private_input.v1";
 /// AG-051 added the replay-economic envelope to the same list; its own cases are in
-/// `restore_economic_v42.rs`. This file covers eleven action schemas.
+/// `restore_economic_v42.rs`. This file covers twelve action schemas.
 const ECONOMIC_ENVELOPE_SCHEMA: &str = "rsia.replay_economic_artifact_envelope.v1";
 
 fn d(label: &str) -> String {
@@ -571,7 +571,7 @@ fn stage_fact() -> Fact {
     )
 }
 
-/// One fact of every class this change protects (eleven schemas, twelve facts: the
+/// One fact of every class this change protects (twelve schemas, thirteen facts: the
 /// curriculum envelope twice, for its two record kinds that carry scheduling
 /// idempotency and quota facts).
 fn every_class() -> Vec<Fact> {
@@ -588,6 +588,35 @@ fn every_class() -> Vec<Fact> {
         schedule_receipt_fact(),
         job_fact(ManagementJobState::Queued),
         current_proposal_fact(),
+        // Complete typed snapshot for restore selection, not execution authority.
+        Fact::new(
+            "management job v2",
+            "job",
+            "management-job-v2-1".into(),
+            &ManagementJobV2 {
+                id: "management-job-v2-1".into(),
+                schema_version: MANAGEMENT_JOB_V2_SCHEMA.into(),
+                operation: "curriculum.step".into(),
+                request_key: "request-key-v2-1".into(),
+                payload_digest: d("payload-v2"),
+                owner_actor: "admin".into(),
+                owner_role: Role::Admin,
+                state: ManagementJobState::Queued,
+                step: "queued".into(),
+                private_input_ref: "management-input-v2-1".into(),
+                result: None,
+                error_code: None,
+                cancel_requested: false,
+                lease_token: None,
+                lease_until: 0,
+                generation: 0,
+                diagnostics: vec![],
+                created_at: 1,
+                cancel_arrival: None,
+                pending_terminal_state: None,
+                optimization: None,
+            },
+        ),
     ]
 }
 
@@ -1242,6 +1271,7 @@ fn engine_action_schemas() -> BTreeSet<String> {
         PRACTICE_ATTEMPT_SET_SCHEMA,
         CURRICULUM_ENVELOPE_SCHEMA,
         CAPACITY_MANAGEMENT_JOB_SCHEMA,
+        MANAGEMENT_JOB_V2_SCHEMA,
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1251,7 +1281,7 @@ fn engine_action_schemas() -> BTreeSet<String> {
 #[test]
 fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
     let expected = engine_action_schemas();
-    assert_eq!(expected.len(), 11, "eleven distinct schemas");
+    assert_eq!(expected.len(), 12, "twelve distinct schemas");
     let listed: BTreeSet<String> = PROTECTED_ACTION_SCHEMA_VERSIONS
         .iter()
         .map(|schema| (*schema).to_owned())
@@ -1261,7 +1291,7 @@ fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
         listed.len(),
         "a schema is listed twice"
     );
-    // the list is the eleven schemas of this round plus the economic envelope (AG-051)
+    // the list is the twelve schemas of this round plus the economic envelope (AG-051)
     let without_economic: BTreeSet<String> = listed
         .iter()
         .filter(|schema| schema.as_str() != ECONOMIC_ENVELOPE_SCHEMA)
@@ -1319,7 +1349,9 @@ fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
         assert_eq!(fact.body["schema_version"], json!(fact.schema));
         assert_eq!(
             fact.kind,
-            if fact.schema == CAPACITY_MANAGEMENT_JOB_SCHEMA {
+            if fact.schema == CAPACITY_MANAGEMENT_JOB_SCHEMA
+                || fact.schema == MANAGEMENT_JOB_V2_SCHEMA
+            {
                 "job"
             } else {
                 "artifact"
@@ -1424,7 +1456,7 @@ async fn the_script_and_the_reader_select_the_same_objects_in_a_database_holding
     let from_script: BTreeSet<String> = script_selection(&scenario.live).into_iter().collect();
     assert_eq!(from_rust, all_keys, "the Rust reader's selection");
     assert_eq!(from_script, all_keys, "the script's selection");
-    // the twelve fixtures are all in it, under both kinds
+    // the thirteen fixtures are all in it, under both kinds
     assert!(protected_keys.iter().all(|key| from_rust.contains(key)));
     assert!(from_rust.iter().any(|key| key.starts_with("n/job/")));
     assert!(!from_rust.iter().any(|key| key.contains("legacy-job")));

@@ -14,6 +14,131 @@ struct Fixture {
     ctx: Context,
     sample: Value,
 }
+// Complete original audit chain from the closed qualified v1 C1 producer.
+// Snapshot SHA256: d5fbb94dde78c4695acefe84075ccd3b9b1b7bc4a939098ec9ef67ffde4515b1.
+// Restore existing evidence only; payload/hash bytes and the LEGACY wire stay unchanged.
+const LEGACY_CONTROL_AUDIT: &[(i64, &str, &str, &str, &str)] = &[
+    (
+        1,
+        "n",
+        r#"{"actor":"host","entity":"streaming-fixture-source","operation":"optimization.source.host","role":"host","timestamp":1793306575}"#,
+        "",
+        "12424699ff7fd4abd7d5f5b24587f8773dea86eb74f7ec70ab80c7f1bfcef924",
+    ),
+    (
+        2,
+        "n",
+        r#"{"actor":"fixture-admin","entity":"02673692096668edb0a49c5c3fb7ca66d76e4b7a33faf78448df42a6949c810a","operation":"formal.admin.content.v1.a07cf950b1bc482bd819c893a47b66e13af4ab92bc1ff814d49bba2c6da599ff","role":"admin","timestamp":1793306575}"#,
+        "12424699ff7fd4abd7d5f5b24587f8773dea86eb74f7ec70ab80c7f1bfcef924",
+        "d54b49601fae5cfa4a441bf50e1ea2403da0415fa03e323082464b21ad6c81f8",
+    ),
+    (
+        3,
+        "n",
+        r#"{"actor":"fixture-admin","entity":"fixture-host-registration-e51c153243366bdf581641d00ff68a1f7c7326ae88697b0641647ab92da49579","operation":"formal.host.register","role":"admin","timestamp":1793306575}"#,
+        "d54b49601fae5cfa4a441bf50e1ea2403da0415fa03e323082464b21ad6c81f8",
+        "2a3c3200620ce04e459c215d0dfd07c98bd0f476cfd0bb4ba39b51e1220156bd",
+    ),
+    (
+        4,
+        "n",
+        r#"{"actor":"fixture-admin","entity":"4b1e132402e18448f83772911dd3ee476ee8f958ba94e4246fc2ecbf84153453","operation":"formal.admin.content.v1.ba9ebd1eee0f5e2c614e9cc39225eb69225e55be2dfdd97ce96671abb20e46f0","role":"admin","timestamp":1793306575}"#,
+        "2a3c3200620ce04e459c215d0dfd07c98bd0f476cfd0bb4ba39b51e1220156bd",
+        "c601d8ba2ab891a9e778d8b8393612a1cc563d8a080cb63330e9831904a2e624",
+    ),
+    (
+        5,
+        "n",
+        r#"{"actor":"fixture-admin","entity":"fixture-provider-e51c153243366bdf581641d00ff68a1f7c7326ae88697b0641647ab92da49579","operation":"formal.provider.register","role":"admin","timestamp":1793306575}"#,
+        "c601d8ba2ab891a9e778d8b8393612a1cc563d8a080cb63330e9831904a2e624",
+        "6e9da84daed1ac3e2386553eddc246ca96c477a63a89a067c73399b262d47db4",
+    ),
+    (
+        6,
+        "n",
+        r#"{"actor":"fixture-admin","entity":"950bab00d73380d900f2826737fd409edda6745c213cf1cd343a9e2a43509a8d","operation":"formal.admin.content.v1.762edd98bd0eef4a18691965ab3274e157c17aeb56e04fba7b420ceb9c223590","role":"admin","timestamp":1793306575}"#,
+        "6e9da84daed1ac3e2386553eddc246ca96c477a63a89a067c73399b262d47db4",
+        "689f33f96a29b987e44619617ba41b2bfc74e8aa2a6c94ec3424e16048b64df8",
+    ),
+    (
+        7,
+        "n",
+        r#"{"actor":"fixture-admin","entity":"5cc16aaf80a00de5ecdee53f0532ff902aeff44d94f2972742621b1b08331e89","operation":"formal.admin.content.v1.1e239501233ff7b05454086406895cf732a81b422ec436f9b87d412601fc0e6e","role":"admin","timestamp":1793306575}"#,
+        "689f33f96a29b987e44619617ba41b2bfc74e8aa2a6c94ec3424e16048b64df8",
+        "d82aac520466eec9c486089b1b7cace06d43fc43854a2d290427333b5f18632a",
+    ),
+    (
+        8,
+        "n",
+        r#"{"actor":"fixture-admin","entity":"fixture-profile-e51c153243366bdf581641d00ff68a1f7c7326ae88697b0641647ab92da49579","operation":"formal.profile.freeze","role":"admin","timestamp":1793306575}"#,
+        "d82aac520466eec9c486089b1b7cace06d43fc43854a2d290427333b5f18632a",
+        "b72e681eb6b922cbe51da1381de3d8087877fc9518189a5c73b2c0cf787c4a25",
+    ),
+    (
+        9,
+        "n",
+        r#"{"actor":"fixture-admin","entity":"93ad45cc85a3341974036b6d632dbc636873fd34067bc40e28dc3877a2491592","operation":"formal.admin.content.v1.34646c1739e937332dd9ca2601dfb2280a5758e4b3af7eec44fea3b635219f59","role":"admin","timestamp":1793306575}"#,
+        "b72e681eb6b922cbe51da1381de3d8087877fc9518189a5c73b2c0cf787c4a25",
+        "85d8e52f44975041b098f88d785b3f9a76c438c4c09ee1d4cb02f44b25b338c0",
+    ),
+    (
+        10,
+        "n",
+        r#"{"actor":"fixture-admin","entity":"ae93c7d1c9c5f935c6b67ab985d84f7b2ee9275a3c4341191ca812b775ef541d","operation":"formal.admin.content.v1.f5d82295b6249c66c37dc821dd0066eb3e0402723ffa9a2d8115b313bdcf3871","role":"admin","timestamp":1793306575}"#,
+        "85d8e52f44975041b098f88d785b3f9a76c438c4c09ee1d4cb02f44b25b338c0",
+        "c6137788bc49a62b34a058762c778b9876256305bd2076ee359f7e3a5da60c20",
+    ),
+    (
+        11,
+        "n",
+        r#"{"actor":"fixture-admin","entity":"fixture-root-e51c153243366bdf581641d00ff68a1f7c7326ae88697b0641647ab92da49579","operation":"formal.empty_root.authorize","role":"admin","timestamp":1793306575}"#,
+        "c6137788bc49a62b34a058762c778b9876256305bd2076ee359f7e3a5da60c20",
+        "726b142aa686c979a3aeb40b30adce466280bd57b23c149d7c89aeb475bd6f73",
+    ),
+    (
+        12,
+        "n",
+        r#"{"actor":"proposer","entity":"formal-bundle-f0f5e9a60c5fbf07649b2e866d97133a74f613e613759fdcaf645cabd0a8d3e1","operation":"compiler.bundle.persist","role":"worker","timestamp":1793306575}"#,
+        "726b142aa686c979a3aeb40b30adce466280bd57b23c149d7c89aeb475bd6f73",
+        "85562d6b97a9d8eca8765352cc0f3cba6f7de0b7a2315d93fd3d7376f5886a9c",
+    ),
+    (
+        13,
+        "n",
+        r#"{"actor":"proposer","entity":"dda18a0e21ae47c53b4309434cbc02ae8bf764fa83a6defbb719431242722aa7","operation":"release.candidate.stage","role":"worker","timestamp":1793306575}"#,
+        "85562d6b97a9d8eca8765352cc0f3cba6f7de0b7a2315d93fd3d7376f5886a9c",
+        "be247c9e54e88ad386857f85a7865b6177c32547c01dcc83fa9bb8db91b7324d",
+    ),
+    (
+        14,
+        "n",
+        r#"{"actor":"evaluator","entity":"management-job-ae10c9ec67325b06cea1ff97","operation":"management.accept","role":"evaluator","timestamp":1793306575}"#,
+        "be247c9e54e88ad386857f85a7865b6177c32547c01dcc83fa9bb8db91b7324d",
+        "c8627d91ac38fb7e95e6e7676f6e7e394c7fda1dfc5ddade0f61949ebdb59733",
+    ),
+    (
+        15,
+        "n",
+        r#"{"actor":"evaluator","entity":"management-job-ae10c9ec67325b06cea1ff97","operation":"management.job.claim","role":"evaluator","timestamp":1793306575}"#,
+        "c8627d91ac38fb7e95e6e7676f6e7e394c7fda1dfc5ddade0f61949ebdb59733",
+        "4244144d4ae71d38e3432bc28bde6280850b633ad36b0dc612fb8736d214c56f",
+    ),
+    (
+        16,
+        "n",
+        r#"{"actor":"evaluator","entity":"ff9216822ca9449bc278327e7e3ebfd2cb7f0aea6c547ea196589feea218e6bc","operation":"formal.evaluator.content.v1.7e52aea275b6a4ac8ca719a537b55c0363920f6d71e472f1847e156ed07aac72","role":"evaluator","timestamp":1793306575}"#,
+        "4244144d4ae71d38e3432bc28bde6280850b633ad36b0dc612fb8736d214c56f",
+        "5b2c9847326785dd302c46d04527176936325a68ba97a0f142dd7996f0c23f46",
+    ),
+    (
+        17,
+        "n",
+        r#"{"actor":"evaluator","entity":"control-1","operation":"register_evaluation_control","role":"evaluator","timestamp":1793306575}"#,
+        "5b2c9847326785dd302c46d04527176936325a68ba97a0f142dd7996f0c23f46",
+        "0ef25602a3fc12ddbe3a684c49d3bed3752fa6e32bd8f353e8a4618fdf3771e3",
+    ),
+];
+
 async fn legacy(case: &str) -> Fixture {
     let all: Value = serde_json::from_str(LEGACY).unwrap();
     let sample = all[case].clone();
@@ -55,6 +180,25 @@ async fn legacy(case: &str) -> Fixture {
             .bind(row["payload_hash"].as_str().unwrap()).bind(row["subject_id"].as_str().unwrap())
             .bind(row["response"].as_str().unwrap()).bind(row["redacted"].as_i64().unwrap())
             .execute(&pool).await.unwrap();
+    }
+    if case == "control_committed_holdout_not_committed" {
+        for &(seq, namespace, payload, previous_hash, digest) in LEGACY_CONTROL_AUDIT {
+            sqlx::query(
+                "INSERT INTO audit(seq,namespace,payload,previous_hash,digest) VALUES(?,?,?,?,?)",
+            )
+            .bind(seq)
+            .bind(namespace)
+            .bind(payload)
+            .bind(previous_hash)
+            .bind(digest)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            store.verify_audit(&ctx).await.unwrap(),
+            LEGACY_CONTROL_AUDIT.len()
+        );
     }
     pool.close().await;
     Fixture {

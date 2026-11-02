@@ -1015,7 +1015,10 @@ async fn execute_claimed(
         )
         .await
     });
-    let outcome = handle.await.expect("actual producer task exited").unwrap();
+    let outcome = match handle.await.expect("actual producer task exited").unwrap() {
+        ObservedWorkerExit::Completed(outcome) => outcome,
+        other => panic!("expected actual completed management producer, got {other:?}"),
+    };
     (ctx, claimed, outcome)
 }
 

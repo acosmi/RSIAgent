@@ -68,19 +68,17 @@ async fn wait_terminal(
     job_id: &str,
 ) -> ManagementJobV2 {
     for _ in 0..100 {
-        let job = dispatcher
-            .status(context, job_id)
-            .await
-            .map(current_management_job)
-            .unwrap();
+        let job = dispatcher.status(context, job_id).await.unwrap();
         if matches!(
-            job.state,
+            job.identity().state,
             ManagementJobState::Succeeded
                 | ManagementJobState::Failed
                 | ManagementJobState::Cancelled
                 | ManagementJobState::Blocked
         ) {
-            return job;
+            // An unfinished v1 may still await its actual v2 continuation.
+            // Poll its versioned identity instead of fabricating Current.
+            return current_management_job(job);
         }
         tokio::task::yield_now().await;
     }

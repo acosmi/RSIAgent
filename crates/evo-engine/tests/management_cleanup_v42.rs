@@ -368,15 +368,23 @@ mod common {
     /// until it is terminal.
     pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJobV2 {
         for _ in 0..2_000 {
-            let job = job_record(store, ctx, job_id).await;
+            let mut session = store.session().await.unwrap();
+            let row = session
+                .object_row(ctx, "job", job_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let job = evo_storage::decode_management_job(&row.body).unwrap();
+            session.commit().await.unwrap();
             if matches!(
-                job.state,
+                job.identity().state,
                 ManagementJobState::Succeeded
                     | ManagementJobState::Failed
                     | ManagementJobState::Cancelled
                     | ManagementJobState::Blocked
             ) {
-                return job;
+                // Wait for the actual continuation before requiring Current.
+                return current_management_job(job);
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

@@ -123,10 +123,9 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
     let before_admin = rows(&store, &admin).await;
     let before_evaluator = rows(&store, &evaluator).await;
 
-    // Every registered dispatch name without one of the seven old handlers,
-    // submitted by a trusted Admin with a schema-correct-looking payload:
-    // the static operation gate refuses it before the
-    // first session, and control.review must never create a job this way.
+    // Unwired names fail at the static operation gate; optimization.step now
+    // has a real consumer and refuses this incomplete payload at its boundary.
+    // Every refusal precedes the first session, including control.review.
     for entry in MANAGEMENT_CATALOG.iter().filter(|entry| {
         entry.plane == Plane::Dispatch
             && !matches!(
@@ -149,8 +148,9 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, Error::Invalid(message) if message == match entry.execution {
-                ExecutionKind::AsyncJob => "management_operation_not_wired",
+            matches!(&error, Error::Invalid(message) if message == match (entry.name, entry.execution) {
+                ("optimization.step", _) => "invalid management payload",
+                (_, ExecutionKind::AsyncJob) => "management_operation_not_wired",
                 _ => "management operation requires dedicated route",
             }),
             "{}: {error:?}",

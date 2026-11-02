@@ -1568,7 +1568,8 @@ async fn a_crash_re_run_after_a_dispatch_reports_the_first_decision() {
         "the re-run converges on the registered world: {recovered:?}"
     );
     assert_eq!(recovered.step, "exploration_started");
-    assert_eq!(recovered.generation, done.generation + 1);
+    // Recovery reconciles the original generation without a new claim or dispatch.
+    assert_eq!(recovered.generation, done.generation);
     // The result is the first decision, not the live one (the live prefix has two
     // nodes now, and the live decision is a stop).
     assert_eq!(started_result(&recovered), first_decision);
