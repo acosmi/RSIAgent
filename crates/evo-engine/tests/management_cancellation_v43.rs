@@ -1531,7 +1531,28 @@ async fn draining_recovery_never_claims_or_reexecutes_request() {
             let claimed = paid_start(&fx).await;
             fx.dispatcher.cancel(&fx.admin, &claimed.id).await.unwrap();
             fx.gate.release.add_permits(1);
-            let draining = paid_state(&fx, &claimed.id, ManagementJobState::Draining).await;
+            // Cancel can mark Draining before the broker and worker return.
+            // Stop this runtime only after their real terminal checkpoint.
+            let pending_started = Instant::now();
+            let draining = loop {
+                let job = current(fx.dispatcher.status(&fx.admin, &claimed.id).await.unwrap());
+                if job.state == ManagementJobState::Draining && job.pending_terminal_state.is_some()
+                {
+                    break job;
+                }
+                assert!(
+                    pending_started.elapsed() < Duration::from_secs(60),
+                    "actual worker did not record its draining terminal outcome: {job:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(
+                draining.pending_terminal_state,
+                Some(evo_storage::ManagementPendingTerminalState::Blocked)
+            );
+            assert_eq!(draining.step, "optimization_completed");
+            assert_eq!(draining.error_code.as_deref(), Some("model_usage_unknown"));
+            assert!(draining.result.is_some());
             (fx, claimed, draining)
         });
         // Actual model I/O already returned; ending its dedicated runtime now
@@ -1556,6 +1577,8 @@ async fn draining_recovery_never_claims_or_reexecutes_request() {
     assert_eq!(raw_record(&fx.store, &fx.admin, &claimed.id).await, stored);
     reconcile(&fx).await;
     let final_job = paid_state(&fx, &claimed.id, ManagementJobState::Blocked).await;
+    assert_eq!(final_job.step, draining.step);
+    assert_eq!(final_job.error_code, draining.error_code);
     assert_eq!(
         final_job.result.map(|x| serde_json::to_value(x).unwrap()),
         draining.result.map(|x| serde_json::to_value(x).unwrap())
