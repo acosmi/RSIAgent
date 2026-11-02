@@ -123,10 +123,9 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
     let before_admin = rows(&store, &admin).await;
     let before_evaluator = rows(&store, &evaluator).await;
 
-    // Every registered dispatch name without one of the seven old handlers,
-    // submitted by a trusted Admin with a schema-correct-looking payload:
-    // the static operation gate refuses it before the
-    // first session, and control.review must never create a job this way.
+    // Unwired names fail at the static operation gate; optimization.step now
+    // has a real consumer and refuses this incomplete payload at its boundary.
+    // Every refusal precedes the first session, including control.review.
     for entry in MANAGEMENT_CATALOG.iter().filter(|entry| {
         entry.plane == Plane::Dispatch
             && !matches!(
@@ -149,8 +148,9 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, Error::Invalid(message) if message == match entry.execution {
-                ExecutionKind::AsyncJob => "management_operation_not_wired",
+            matches!(&error, Error::Invalid(message) if message == match (entry.name, entry.execution) {
+                ("optimization.step", _) => "invalid management payload",
+                (_, ExecutionKind::AsyncJob) => "management_operation_not_wired",
                 _ => "management operation requires dedicated route",
             }),
             "{}: {error:?}",
@@ -216,7 +216,7 @@ async fn the_old_seven_handlers_keep_their_real_role_guards() {
         )
         .await
         .unwrap();
-    assert_eq!(queued.operation, "meta.start");
+    assert_eq!(queued.identity().operation, "meta.start");
 
     // evaluation.status is Evaluator-gated: an Admin submit is Forbidden,
     // the Evaluator submit passes the role gate (and then fails closed on its
@@ -401,8 +401,11 @@ async fn generic_submit_rejects_dedicated_routes_without_closing_their_consumers
         .unwrap();
     let done = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let job = dispatcher.status(&admin, &queued.id).await.unwrap();
-            if job.state == evo_engine::dispatch::ManagementJobState::Blocked {
+            let job = dispatcher
+                .status(&admin, queued.identity().id)
+                .await
+                .unwrap();
+            if job.identity().state == evo_engine::dispatch::ManagementJobState::Blocked {
                 break job;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -410,11 +413,8 @@ async fn generic_submit_rejects_dedicated_routes_without_closing_their_consumers
     })
     .await
     .unwrap();
-    assert_eq!(done.step, "blocked_feature");
-    assert_eq!(
-        done.error_code.as_deref(),
-        Some("meta.start_consumer_unavailable")
-    );
+    assert_eq!(done.step(), "blocked_feature");
+    assert_eq!(done.error_code(), Some("meta.start_consumer_unavailable"));
     let path = dir.path().join("boundary.sqlite3");
     let before = management_sql_snapshot(&path);
     for name in ["job.status", "job.cancel", "control.review"] {
@@ -432,15 +432,16 @@ async fn generic_submit_rejects_dedicated_routes_without_closing_their_consumers
             .submit(&admin, "meta.start", payload)
             .await
             .unwrap()
+            .identity()
             .id,
-        done.id
+        done.identity().id
     );
     assert_eq!(
-        serde_json::to_value(dispatcher.status(&admin, &done.id).await.unwrap()).unwrap(),
+        serde_json::to_value(dispatcher.status(&admin, done.identity().id).await.unwrap()).unwrap(),
         serde_json::to_value(&done).unwrap()
     );
     assert_eq!(
-        serde_json::to_value(dispatcher.cancel(&admin, &done.id).await.unwrap()).unwrap(),
+        serde_json::to_value(dispatcher.cancel(&admin, done.identity().id).await.unwrap()).unwrap(),
         serde_json::to_value(&done).unwrap()
     );
     assert_eq!(management_sql_snapshot(&path), before);

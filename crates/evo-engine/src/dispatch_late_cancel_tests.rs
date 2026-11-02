@@ -944,9 +944,32 @@ async fn store() -> (tempfile::TempDir, Store) {
     (dir, store)
 }
 
-async fn raw_job(ctx: &Context, store: &Store, id: &str) -> ManagementJob {
+fn current_job(record: VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        VersionedManagementJob::V2(job) => job,
+        VersionedManagementJob::V1(_) => panic!("expected the actual current job wire"),
+    }
+}
+
+async fn persist_current_management(
+    ctx: &Context,
+    store: &Store,
+    operation: &str,
+    payload: Value,
+) -> Result<ManagementJobV2> {
+    Ok(current_job(
+        persist_management(ctx, store, operation, payload).await?,
+    ))
+}
+
+async fn raw_job(ctx: &Context, store: &Store, id: &str) -> ManagementJobV2 {
     let mut session = store.session().await.unwrap();
-    let job = session.need(ctx, "job", id).await.unwrap();
+    let row = session
+        .object_row(ctx, "job", id)
+        .await
+        .unwrap()
+        .expect("actual management row");
+    let job = current_job(evo_storage::decode_management_job(&row.body).unwrap());
     session.commit().await.unwrap();
     job
 }
@@ -959,7 +982,7 @@ async fn artifacts(ctx: &Context, store: &Store) -> Vec<Value> {
     values
 }
 
-fn assert_job_eq(actual: &ManagementJob, expected: &ManagementJob) {
+fn assert_job_eq<A: Serialize, B: Serialize>(actual: &A, expected: &B) {
     assert_eq!(
         serde_json::to_value(actual).unwrap(),
         serde_json::to_value(expected).unwrap()
@@ -970,26 +993,41 @@ async fn execute_claimed(
     dispatcher: &ManagementDispatcher,
     store: &Store,
     id: &str,
-) -> (Context, ManagementJob, JobOutcome) {
+) -> (Context, ManagementJobV2, JobOutcome) {
     let (ctx, claimed) = dispatcher.claim(id).await.unwrap();
     let claimed = claimed.expect("real management claim");
     let request = load_private_request(&ctx, store, &claimed)
         .await
         .map_err(InputFault::into_error)
         .unwrap();
-    let outcome = execute_request(&ctx, store, &claimed, request)
+    let worker_ctx = ctx.clone();
+    let worker_store = store.clone();
+    let worker_claim = claimed.clone();
+    let runtime = dispatcher.optimization_runtime.clone();
+    let handle = tokio::spawn(async move {
+        execute_request(
+            &worker_ctx,
+            &worker_store,
+            &worker_claim,
+            request,
+            &WorkerControl::new(),
+            runtime.as_deref(),
+        )
         .await
-        .unwrap();
+    });
+    let outcome = match handle.await.expect("actual producer task exited").unwrap() {
+        ObservedWorkerExit::Completed(outcome) => outcome,
+        other => panic!("expected actual completed management producer, got {other:?}"),
+    };
     (ctx, claimed, outcome)
 }
 
 // Compare every job field, allowing only the documented finish transition.
-fn preserved_job(mut before: ManagementJob, outcome: &JobOutcome, late: bool) -> ManagementJob {
+fn preserved_job(mut before: ManagementJobV2, outcome: &JobOutcome, late: bool) -> ManagementJobV2 {
     before.state = outcome.state;
     before.step = outcome.step.clone();
-    if late {
-        before.step.push_str(":cancel_after_side_effect");
-    }
+    before.cancel_arrival = late.then_some(ManagementCancelArrival::AfterSideEffect);
+    before.pending_terminal_state = None;
     before.result = outcome.result.clone();
     before.error_code = outcome.error_code.clone();
     before.lease_token = None;
@@ -1003,7 +1041,7 @@ async fn assert_replay_and_cancel(
     store: &Store,
     operation: &str,
     request: Value,
-    expected: &ManagementJob,
+    expected: &ManagementJobV2,
 ) {
     let before = artifacts(ctx, store).await;
     assert_job_eq(
@@ -1017,7 +1055,7 @@ async fn assert_replay_and_cancel(
     let mut session = store.session().await.unwrap();
     assert_eq!(
         session
-            .list::<ManagementJob>(ctx, "job")
+            .list::<ManagementJobV2>(ctx, "job")
             .await
             .unwrap()
             .len(),
@@ -1034,29 +1072,39 @@ async fn real_world_completion(late: bool) {
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
     let world = exploration_world("late-cancel-world", 1);
     let request = exploration_start_request("late-cancel-world-key", &world);
-    let queued = persist_management(&admin, &store, "exploration.start", request.clone())
+    let queued = persist_current_management(&admin, &store, "exploration.start", request.clone())
         .await
         .unwrap();
     let (ctx, claimed, outcome) = execute_claimed(&dispatcher, &store, &queued.id).await;
     assert_eq!(outcome.state, ManagementJobState::Succeeded);
     assert!(outcome.error_code.is_none());
     assert!(
-        matches!(&outcome.result, Some(ManagementResult::ExplorationStarted { world_id, .. }) if world_id == &world.id)
+        matches!(&outcome.result, Some(ManagementResultV2::Original(ManagementResult::ExplorationStarted { world_id, .. })) if world_id == &world.id)
     );
     let worlds = exploration_worlds(&admin, &store).await;
     assert_eq!(worlds.len(), 1);
     assert_eq!(worlds[0]["dispatch_ids"], json!([]));
     let before = if late {
-        dispatcher.cancel(&admin, &queued.id).await.unwrap()
+        current_job(dispatcher.cancel(&admin, &queued.id).await.unwrap())
     } else {
         raw_job(&admin, &store, &queued.id).await
     };
-    assert_eq!(before.state, ManagementJobState::Running);
+    assert_eq!(
+        before.state,
+        if late {
+            ManagementJobState::Draining
+        } else {
+            ManagementJobState::Running
+        }
+    );
     assert_eq!(before.cancel_requested, late);
     let expected = preserved_job(before, &outcome, late);
     let committed = artifacts(&admin, &store).await;
-    finish_claim(&ctx, &store, &claimed, outcome).await.unwrap();
-    let done = dispatcher.status(&admin, &queued.id).await.unwrap();
+    dispatcher
+        .finish_observed_worker(&ctx, &claimed, &ObservedWorkerExit::Completed(outcome))
+        .await
+        .unwrap();
+    let done = current_job(dispatcher.status(&admin, &queued.id).await.unwrap());
     assert_eq!(done.state, ManagementJobState::Succeeded);
     assert_job_eq(&done, &expected);
     assert_eq!(exploration_worlds(&admin, &store).await, worlds);
@@ -1094,29 +1142,34 @@ async fn zero_budget_probe_commit_survives_late_cancel_without_new_probe_or_rece
             .await
             .is_empty()
     );
-    let queued = persist_management(&admin, &store, "curriculum.step", request.clone())
+    let queued = persist_current_management(&admin, &store, "curriculum.step", request.clone())
         .await
         .unwrap();
     let (ctx, claimed, outcome) = execute_claimed(&dispatcher, &store, &queued.id).await;
     assert_eq!(outcome.state, ManagementJobState::Succeeded);
     assert!(matches!(
         &outcome.result,
-        Some(ManagementResult::ProbeScheduled {
-            terminal: Some(ProbeTerminal::BudgetExhausted),
-            ..
-        })
+        Some(ManagementResultV2::Original(
+            ManagementResult::ProbeScheduled {
+                terminal: Some(ProbeTerminal::BudgetExhausted),
+                ..
+            }
+        ))
     ));
     let probes = curriculum_records(&admin, &store, PROBE_JOB_KIND).await;
     let receipts = curriculum_records(&admin, &store, PROBE_RECEIPT_KIND).await;
     assert_eq!(probes.len(), 1);
     assert_eq!(receipts.len(), 1);
-    let before = dispatcher.cancel(&admin, &queued.id).await.unwrap();
-    assert_eq!(before.state, ManagementJobState::Running);
+    let before = current_job(dispatcher.cancel(&admin, &queued.id).await.unwrap());
+    assert_eq!(before.state, ManagementJobState::Draining);
     assert!(before.cancel_requested);
     let expected = preserved_job(before, &outcome, true);
     let committed = artifacts(&admin, &store).await;
-    finish_claim(&ctx, &store, &claimed, outcome).await.unwrap();
-    let done = dispatcher.status(&admin, &queued.id).await.unwrap();
+    dispatcher
+        .finish_observed_worker(&ctx, &claimed, &ObservedWorkerExit::Completed(outcome))
+        .await
+        .unwrap();
+    let done = current_job(dispatcher.status(&admin, &queued.id).await.unwrap());
     assert_eq!(done.state, ManagementJobState::Succeeded);
     assert_job_eq(&done, &expected);
     assert_eq!(artifacts(&admin, &store).await, committed);
@@ -1157,9 +1210,10 @@ async fn committed_blocked_ticket_keeps_result_error_and_exposure_after_late_can
     let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![evaluator.clone()]).unwrap();
     let request = evaluation_start_request();
-    let queued = persist_management(&evaluator, &store, "evaluation.start", request.clone())
-        .await
-        .unwrap();
+    let queued =
+        persist_current_management(&evaluator, &store, "evaluation.start", request.clone())
+            .await
+            .unwrap();
     let (ctx, claimed, outcome) = execute_claimed(&dispatcher, &store, &queued.id).await;
     assert_eq!(outcome.state, ManagementJobState::Blocked);
     assert_eq!(
@@ -1167,14 +1221,16 @@ async fn committed_blocked_ticket_keeps_result_error_and_exposure_after_late_can
         Some("execution_provider_unconfigured")
     );
     let ticket_id = match &outcome.result {
-        Some(ManagementResult::EvaluationTicketBlocked { ticket_id }) => ticket_id.clone(),
+        Some(ManagementResultV2::Original(ManagementResult::EvaluationTicketBlocked {
+            ticket_id,
+        })) => ticket_id.clone(),
         result => panic!("expected the committed blocked ticket, got {result:?}"),
     };
     let status = IndependentEvaluationControl::status(&evaluator, &store, &ticket_id)
         .await
         .unwrap();
     assert!(
-        matches!(&outcome.result, Some(ManagementResult::EvaluationTicketBlocked { ticket_id })
+        matches!(&outcome.result, Some(ManagementResultV2::Original(ManagementResult::EvaluationTicketBlocked { ticket_id }))
             if ticket_id == &status.ticket.id)
     );
     assert_eq!(
@@ -1192,12 +1248,15 @@ async fn committed_blocked_ticket_keeps_result_error_and_exposure_after_late_can
         Err(Error::NotFound)
     ));
     let ticket = serde_json::to_value(status).unwrap();
-    let before = dispatcher.cancel(&evaluator, &queued.id).await.unwrap();
-    assert_eq!(before.state, ManagementJobState::Running);
+    let before = current_job(dispatcher.cancel(&evaluator, &queued.id).await.unwrap());
+    assert_eq!(before.state, ManagementJobState::Draining);
     let expected = preserved_job(before, &outcome, true);
     let committed = artifacts(&evaluator, &store).await;
-    finish_claim(&ctx, &store, &claimed, outcome).await.unwrap();
-    let done = dispatcher.status(&evaluator, &queued.id).await.unwrap();
+    dispatcher
+        .finish_observed_worker(&ctx, &claimed, &ObservedWorkerExit::Completed(outcome))
+        .await
+        .unwrap();
+    let done = current_job(dispatcher.status(&evaluator, &queued.id).await.unwrap());
     assert_eq!(done.state, ManagementJobState::Blocked);
     assert_job_eq(&done, &expected);
     assert_replay_and_cancel(
@@ -1243,16 +1302,17 @@ async fn readonly_status_some_is_not_a_committed_write() {
         "schema_version": "rsia.management.evaluation_status.v1",
         "request_key": "late-cancel-status", "ticket_id": ticket.id
     });
-    let queued = persist_management(&evaluator, &store, "evaluation.status", request.clone())
-        .await
-        .unwrap();
+    let queued =
+        persist_current_management(&evaluator, &store, "evaluation.status", request.clone())
+            .await
+            .unwrap();
     let (ctx, claimed, outcome) = execute_claimed(&dispatcher, &store, &queued.id).await;
     assert_eq!(outcome.state, ManagementJobState::Succeeded);
     assert!(matches!(
         &outcome.result,
-        Some(ManagementResult::EvaluationStatus { ticket_id, .. }) if ticket_id == &ticket.id
+        Some(ManagementResultV2::Original(ManagementResult::EvaluationStatus { ticket_id, .. })) if ticket_id == &ticket.id
     ));
-    let mut expected = dispatcher.cancel(&evaluator, &queued.id).await.unwrap();
+    let mut expected = current_job(dispatcher.cancel(&evaluator, &queued.id).await.unwrap());
     let committed = artifacts(&evaluator, &store).await;
     expected.state = ManagementJobState::Cancelled;
     expected.step = "cancelled".into();
@@ -1260,8 +1320,13 @@ async fn readonly_status_some_is_not_a_committed_write() {
     expected.error_code = Some("cancelled".into());
     expected.lease_token = None;
     expected.lease_until = 0;
-    finish_claim(&ctx, &store, &claimed, outcome).await.unwrap();
-    let done = dispatcher.status(&evaluator, &queued.id).await.unwrap();
+    expected.cancel_arrival = Some(ManagementCancelArrival::BeforeSideEffect);
+    expected.pending_terminal_state = None;
+    dispatcher
+        .finish_observed_worker(&ctx, &claimed, &ObservedWorkerExit::Completed(outcome))
+        .await
+        .unwrap();
+    let done = current_job(dispatcher.status(&evaluator, &queued.id).await.unwrap());
     assert_job_eq(&done, &expected);
     assert_replay_and_cancel(
         &dispatcher,
@@ -1285,21 +1350,26 @@ async fn blocked_without_committed_result_keeps_original_cancellation() {
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
     let request = meta_request("late-cancel-blocked");
-    let queued = persist_management(&admin, &store, "meta.start", request.clone())
+    let queued = persist_current_management(&admin, &store, "meta.start", request.clone())
         .await
         .unwrap();
     let (ctx, claimed, outcome) = execute_claimed(&dispatcher, &store, &queued.id).await;
     assert_eq!(outcome.state, ManagementJobState::Blocked);
     assert!(outcome.result.is_none());
-    let mut expected = dispatcher.cancel(&admin, &queued.id).await.unwrap();
+    let mut expected = current_job(dispatcher.cancel(&admin, &queued.id).await.unwrap());
     expected.state = ManagementJobState::Cancelled;
     expected.step = "cancelled".into();
     expected.result = None;
     expected.error_code = Some("cancelled".into());
     expected.lease_token = None;
     expected.lease_until = 0;
-    finish_claim(&ctx, &store, &claimed, outcome).await.unwrap();
-    let done = dispatcher.status(&admin, &queued.id).await.unwrap();
+    expected.cancel_arrival = Some(ManagementCancelArrival::BeforeSideEffect);
+    expected.pending_terminal_state = None;
+    dispatcher
+        .finish_observed_worker(&ctx, &claimed, &ObservedWorkerExit::Completed(outcome))
+        .await
+        .unwrap();
+    let done = current_job(dispatcher.status(&admin, &queued.id).await.unwrap());
     assert_job_eq(&done, &expected);
     assert_replay_and_cancel(&dispatcher, &admin, &store, "meta.start", request, &done).await;
 }
@@ -1310,11 +1380,11 @@ async fn queued_cancel_still_prevents_consumers_and_replays_one_job() {
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
     let request = meta_request("late-cancel-queued");
-    let queued = persist_management(&admin, &store, "meta.start", request.clone())
+    let queued = persist_current_management(&admin, &store, "meta.start", request.clone())
         .await
         .unwrap();
     let before = artifacts(&admin, &store).await;
-    let cancelled = dispatcher.cancel(&admin, &queued.id).await.unwrap();
+    let cancelled = current_job(dispatcher.cancel(&admin, &queued.id).await.unwrap());
     assert_eq!(cancelled.state, ManagementJobState::Cancelled);
     assert!(cancelled.cancel_requested);
     assert!(cancelled.result.is_none());
@@ -1335,9 +1405,10 @@ async fn queued_cancel_still_prevents_consumers_and_replays_one_job() {
 
 // These synthetic returned values isolate the finisher's persistence/fence
 // contract. They do not replace the real-commit producer tests above.
-fn running_job(id: &str) -> ManagementJob {
-    ManagementJob {
-        id: id.into(),
+fn running_job(id: &str) -> ManagementJobV2 {
+    let ctx = Context::new("n", "admin", Role::Admin).unwrap();
+    ManagementJobV2 {
+        id: stable_id("management-job", &ctx, "meta.start", id),
         schema_version: JOB_SCHEMA.into(),
         operation: "meta.start".into(),
         request_key: id.into(),
@@ -1346,7 +1417,7 @@ fn running_job(id: &str) -> ManagementJob {
         owner_role: Role::Admin,
         state: ManagementJobState::Running,
         step: "claimed".into(),
-        private_input_ref: format!("private-{id}"),
+        private_input_ref: stable_id("management-input", &ctx, "meta.start", id),
         result: None,
         error_code: Some("prior-diagnostic".into()),
         cancel_requested: true,
@@ -1359,6 +1430,9 @@ fn running_job(id: &str) -> ManagementJob {
             recorded_at: 2,
         }],
         created_at: 1,
+        cancel_arrival: None,
+        pending_terminal_state: None,
+        optimization: None,
     }
 }
 
@@ -1397,7 +1471,7 @@ fn returned_write_results() -> Vec<ManagementResult> {
     ]
 }
 
-async fn put_job(ctx: &Context, store: &Store, job: &ManagementJob) {
+async fn put_job(ctx: &Context, store: &Store, job: &ManagementJobV2) {
     let mut session = store.session().await.unwrap();
     session
         .put(ctx, "job", &job.id, ctx.actor(), job)
@@ -1421,7 +1495,7 @@ async fn all_five_returned_write_results_preserve_every_other_job_field() {
                 ManagementJobState::Succeeded
             },
             step: format!("returned-step-{index}"),
-            result: Some(result),
+            result: Some(ManagementResultV2::Original(result)),
             error_code: blocked.then(|| "execution_provider_unconfigured".into()),
         };
         let expected = preserved_job(current.clone(), &outcome, true);
@@ -1454,11 +1528,13 @@ async fn owner_token_generation_and_expired_fences_refuse_without_any_job_change
         let outcome = JobOutcome {
             state: ManagementJobState::Succeeded,
             step: "replay_stored".into(),
-            result: Some(ManagementResult::ReplayStored {
-                report_id: "returned-report".into(),
-                pool_digest: hash(b"pool"),
-                semantic_reports_digest: hash(b"semantic"),
-            }),
+            result: Some(ManagementResultV2::Original(
+                ManagementResult::ReplayStored {
+                    report_id: "returned-report".into(),
+                    pool_digest: hash(b"pool"),
+                    semantic_reports_digest: hash(b"semantic"),
+                },
+            )),
             error_code: None,
         };
         let error = finish_claim(ctx, &store, &claimed, outcome)
@@ -1498,9 +1574,11 @@ async fn terminal_jobs_keep_complete_original_objects_even_with_stale_finish_and
         let outcome = JobOutcome {
             state: ManagementJobState::Succeeded,
             step: "replacement".into(),
-            result: Some(ManagementResult::EvaluationTicketBlocked {
-                ticket_id: "other-ticket".into(),
-            }),
+            result: Some(ManagementResultV2::Original(
+                ManagementResult::EvaluationTicketBlocked {
+                    ticket_id: "other-ticket".into(),
+                },
+            )),
             error_code: None,
         };
         finish_claim(&admin, &store, &stale, outcome).await.unwrap();
@@ -1517,9 +1595,11 @@ async fn clock_error_with_a_returned_result_never_rewrites_the_job() {
     let (_dir, store) = store().await;
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let mut current = running_job("clock-returned-result");
-    current.result = Some(ManagementResult::EvaluationTicketBlocked {
-        ticket_id: "ticket".into(),
-    });
+    current.result = Some(ManagementResultV2::Original(
+        ManagementResult::EvaluationTicketBlocked {
+            ticket_id: "ticket".into(),
+        },
+    ));
     put_job(&admin, &store, &current).await;
     let clock =
         evo_core::clock::unix_seconds_at(std::time::UNIX_EPOCH - std::time::Duration::from_secs(1))
@@ -1534,4 +1614,140 @@ async fn clock_error_with_a_returned_result_never_rewrites_the_job() {
         Err(Error::ClockRegressed)
     ));
     assert_job_eq(&raw_job(&admin, &store, &current.id).await, &current);
+}
+
+fn ag155_job_image(path: &std::path::Path) -> serde_json::Value {
+    let program = r#"
+import json,sqlite3,struct,sys,urllib.parse
+def qi(s):return '"'+s.replace('"','""')+'"'
+def cell(k,v):
+ if k==b'null':return ['null']
+ if k==b'integer':return ['integer',str(v)]
+ if k==b'real':return ['real',struct.pack('>d',v).hex()]
+ if k in (b'text',b'blob'):return [k.decode(),v.hex()]
+ raise AssertionError(k)
+c=sqlite3.connect('file:'+urllib.parse.quote(sys.argv[1],safe='/')+'?mode=ro',uri=True,isolation_level=None);c.text_factory=bytes
+c.execute('PRAGMA query_only=ON');c.execute('BEGIN');assert c.execute('PRAGMA integrity_check').fetchall()==[(b'ok',)]
+schema=c.execute('SELECT type,name,tbl_name,rootpage,sql FROM sqlite_schema ORDER BY type COLLATE BINARY,name COLLATE BINARY').fetchall();tables=[]
+for typ,n,_,_,ddl in schema:
+ if typ!=b'table':continue
+ name=n.decode();info=c.execute('PRAGMA table_xinfo('+qi(name)+')').fetchall();cols=[x[1].decode() for x in info if x[6]!=1]
+ rowid=b'WITHOUT ROWID' not in (ddl or b'').upper();fields=['_rowid_'] if rowid else []
+ for col in cols:fields.extend(['typeof('+qi(col)+')',qi(col)])
+ rows=[]
+ for v in c.execute('SELECT '+','.join(fields)+' FROM '+qi(name)):
+  off=1 if rowid else 0;rows.append([str(v[0]) if rowid else None,[cell(v[off+2*i],v[off+2*i+1]) for i in range(len(cols))]])
+ rows.sort(key=lambda v:json.dumps(v,separators=(',',':')));tables.append({'name':name,'columns':cols,'rowid':rowid,'rows':rows})
+calls=c.execute('SELECT state,actual_cost_micros,execution_closed FROM root_budget_calls ORDER BY billing_scope,call_id').fetchall()
+c.execute('ROLLBACK');c.close();print(json.dumps({'schema':[[a.hex(),b.hex(),d.hex(),p,None if sql is None else sql.hex()] for a,b,d,p,sql in schema],'tables':tables,'calls':[[s.decode(),a,x] for s,a,x in calls]},sort_keys=True,separators=(',',':')))
+"#;
+    let output = std::process::Command::new("python3")
+        .args(["-I", "-B", "-c", program])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "owned readonly full database image failed"
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn valid_lease_renews_same_generation_and_token() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let mut claimed = running_job("renew-same-claim");
+    claimed.cancel_requested = false;
+    claimed.lease_until = now().unwrap() + 10;
+    put_job(&admin, &store, &claimed).await;
+    let before_time = now().unwrap();
+    renew_claim(&admin, &store, &claimed).await.unwrap();
+    let actual = raw_job(&admin, &store, &claimed.id).await;
+    assert!(actual.lease_until >= before_time + 60 && actual.lease_until <= now().unwrap() + 60);
+    let mut expected = claimed.clone();
+    expected.lease_until = actual.lease_until;
+    assert_job_eq(&actual, &expected);
+    assert_eq!(actual.generation, claimed.generation);
+    assert_eq!(actual.lease_token, claimed.lease_token);
+    assert!(actual.lease_until > claimed.lease_until);
+}
+
+#[tokio::test]
+async fn stale_or_expired_worker_cannot_renew_or_finish() {
+    let (dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let mut current = running_job("renew-fence");
+    current.cancel_requested = false;
+    for case in 0..3 {
+        current.lease_until = if case == 2 {
+            now().unwrap() - 1
+        } else {
+            now().unwrap() + 60
+        };
+        put_job(&admin, &store, &current).await;
+        let mut stale = current.clone();
+        if case == 0 {
+            stale.generation -= 1;
+        }
+        if case == 1 {
+            stale.lease_token = Some("different-owner-token".into());
+        }
+        let before = ag155_job_image(&dir.path().join("late-cancel.sqlite3"));
+        let err = renew_claim(&admin, &store, &stale).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Conflict(ref reason) if reason == "management job lease fence changed")
+        );
+        let err = finish_claim(
+            &admin,
+            &store,
+            &stale,
+            JobOutcome {
+                state: ManagementJobState::Failed,
+                step: "failed".into(),
+                result: None,
+                error_code: Some("worker_failed".into()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::Conflict(ref reason) if reason == "management job lease fence changed")
+        );
+        assert_eq!(
+            ag155_job_image(&dir.path().join("late-cancel.sqlite3")),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn current_clock_refusal_does_not_write_renewal_or_completion() {
+    let (dir, store) = store().await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let mut claimed = running_job("current-clock-stop");
+    claimed.cancel_requested = false;
+    put_job(&admin, &store, &claimed).await;
+    let before = ag155_job_image(&dir.path().join("late-cancel.sqlite3"));
+    let control = WorkerControl::new();
+    control.stop_with_error(Error::ClockRegressed);
+    let mut session = store.session().await.unwrap();
+    assert!(matches!(
+        begin_management_step(&admin, &mut session, &claimed, &control).await,
+        Err(Error::ClockRegressed)
+    ));
+    drop(session);
+    let outcome = execution_outcome(claimed.clone(), Err(Error::ClockRegressed));
+    assert!(matches!(outcome, Err(Error::ClockRegressed)));
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    assert!(matches!(
+        dispatcher
+            .record_background_error(&claimed.id, &Error::ClockRegressed)
+            .await,
+        Err(Error::ClockRegressed)
+    ));
+    assert_eq!(
+        ag155_job_image(&dir.path().join("late-cancel.sqlite3")),
+        before
+    );
 }

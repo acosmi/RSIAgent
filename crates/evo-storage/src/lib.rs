@@ -5,9 +5,12 @@ pub mod dependency_read;
 pub mod lifecycle;
 pub mod replay;
 pub mod typed_budget;
+pub use sqlx;
 
-use evo_core::{Context, Error, Result, fingerprint, hash, identifier, now, search_tokens};
-use serde::{Serialize, de::DeserializeOwned};
+use evo_core::curriculum::ProbeTerminal;
+use evo_core::strategy::BatchActionV1;
+use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, now, search_tokens};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sqlx::{
     ConnectOptions, Row, Sqlite, SqlitePool, Transaction,
@@ -39,6 +42,527 @@ const IMPORTED_EVENTS_PATH: &str = "$.payload.aggregate_summary.total_events";
 pub const CAPACITY_EXPLORATION_ENVELOPE_SCHEMA: &str = "rsia.exploration_artifact_envelope.v1";
 pub const CAPACITY_EXPLORATION_NODE_RECORD_KIND: &str = "exploration_node_v1";
 pub const CAPACITY_STAGED_ASSET_SCHEMA: &str = "rsia.e16.staged_asset.v1";
+
+/// Mutable management-job wires have their own explicit versions (§6.1.1).
+/// These original v1 DTOs preserve their field order, defaults and result tags.
+pub const MANAGEMENT_JOB_V1_SCHEMA: &str = "rsia.management_job.v1";
+pub const MANAGEMENT_JOB_V2_SCHEMA: &str = "rsia.management_job.v2";
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementJobState {
+    Queued,
+    Running,
+    Draining,
+    Succeeded,
+    Failed,
+    Cancelled,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementResult {
+    ExperimentRegistered {
+        control_id: String,
+        control_digest: String,
+        holdout_id: String,
+        holdout_digest: String,
+    },
+    EvaluationTicketBlocked {
+        ticket_id: String,
+    },
+    EvaluationStatus {
+        ticket_id: String,
+        lifecycle: String,
+        planned_targets: usize,
+        has_formal_terminal: bool,
+    },
+    // Output-only; the engine serializes its authenticated metadata here once.
+    #[serde(skip_deserializing)]
+    EvaluationStatusReadV2 {
+        ticket_id: String,
+        lifecycle: String,
+        planned_targets: usize,
+        has_formal_terminal: bool,
+        report_read: serde_json::Value,
+    },
+    ReplayStored {
+        report_id: String,
+        pool_digest: String,
+        semantic_reports_digest: String,
+    },
+    ProbeScheduled {
+        probe_job_id: String,
+        trigger_digest: String,
+        terminal: Option<ProbeTerminal>,
+    },
+    ExplorationStarted {
+        world_id: String,
+        context_signature: String,
+        prefix_digest: String,
+        legal_actions_digest: String,
+        /// Digest of the policy the first decision was taken with (E14). A
+        /// result stored before E14 has none and reads as an empty string:
+        /// the job still loads (startup recovery must not depend on it), and
+        /// `status` then fails that job closed with a `Conflict`, because the
+        /// re-run decision never has an empty digest.
+        #[serde(default)]
+        policy_digest: String,
+        /// Digest of the caps the first decision was taken with (E14); empty
+        /// for a pre-E14 result, like `policy_digest`.
+        #[serde(default)]
+        caps_digest: String,
+        action: BatchActionV1,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementDiagnostic {
+    pub code: String,
+    pub observed_generation: u64,
+    pub recorded_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementJob {
+    pub id: String,
+    pub schema_version: String,
+    pub operation: String,
+    pub request_key: String,
+    pub payload_digest: String,
+    pub owner_actor: String,
+    pub owner_role: Role,
+    pub state: ManagementJobState,
+    pub step: String,
+    pub private_input_ref: String,
+    pub result: Option<ManagementResult>,
+    pub error_code: Option<String>,
+    pub cancel_requested: bool,
+    pub lease_token: Option<String>,
+    pub lease_until: i64,
+    pub generation: u64,
+    #[serde(default)]
+    pub diagnostics: Vec<ManagementDiagnostic>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementCancelArrival {
+    BeforeSideEffect,
+    AfterSideEffect,
+}
+
+/// Only a terminal business state is retained while actual costs are draining.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementPendingTerminalState {
+    Succeeded,
+    Failed,
+    Cancelled,
+    Blocked,
+}
+
+/// The only additional partial result is a committed control registration.
+/// Its actual digest/reference must be written with that registration transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementPartialResultV2 {
+    ControlRegistered {
+        control_id: String,
+        control_digest: String,
+    },
+}
+
+/// Explicitly retain every original result wire; the extra tag is v2-only.
+/// The disjoint tags cannot turn a malformed original result into a partial one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ManagementResultV2 {
+    Original(ManagementResult),
+    Partial(ManagementPartialResultV2),
+    Optimization(ManagementOptimizationResultV2),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementOptimizationResultV2 {
+    OptimizationStepCompleted {
+        stage_fact_id: String,
+        input_digest: String,
+    },
+}
+
+/// Only this operation's actual producer references, never amount snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementOptimizationProgressV2 {
+    pub private_input_digest: String,
+    pub journal_actor: String,
+    pub stages: Vec<ManagementOptimizationStageRef>,
+    pub calls: Vec<ManagementOptimizationCallRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementOptimizationStageRef {
+    pub artifact_id: String,
+    pub kind: String,
+    pub request_id: String,
+    pub record_digest: String,
+    pub dispatch_not_performed: bool,
+    pub input_digest: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementOptimizationCallProducer {
+    Model,
+    Development,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementOptimizationCallRef {
+    pub producer_actor: String,
+    pub budget_ref_digest: String,
+    pub producer: ManagementOptimizationCallProducer,
+    pub prepared_stage_id: String,
+    pub generation: u64,
+    pub billing_scope: String,
+    pub root_budget_id: String,
+    pub call_id: String,
+    pub actual_input_digest: String,
+    pub request_schema: String,
+    pub request_digest: String,
+    pub lease_token: String,
+    pub lease_epoch: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementJobV2 {
+    pub id: String,
+    pub schema_version: String,
+    pub operation: String,
+    pub request_key: String,
+    pub payload_digest: String,
+    pub owner_actor: String,
+    pub owner_role: Role,
+    pub state: ManagementJobState,
+    pub step: String,
+    pub private_input_ref: String,
+    pub result: Option<ManagementResultV2>,
+    pub error_code: Option<String>,
+    pub cancel_requested: bool,
+    pub lease_token: Option<String>,
+    pub lease_until: i64,
+    pub generation: u64,
+    #[serde(default)]
+    pub diagnostics: Vec<ManagementDiagnostic>,
+    pub created_at: i64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "management_cancel_arrival_present"
+    )]
+    pub cancel_arrival: Option<ManagementCancelArrival>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "management_pending_terminal_present"
+    )]
+    pub pending_terminal_state: Option<ManagementPendingTerminalState>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "management_optimization_present"
+    )]
+    pub optimization: Option<ManagementOptimizationProgressV2>,
+}
+
+fn management_optimization_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<ManagementOptimizationProgressV2>, D::Error> {
+    ManagementOptimizationProgressV2::deserialize(deserializer).map(Some)
+}
+
+// Missing is different from explicit JSON null. Both fields have finite vocabularies.
+fn management_cancel_arrival_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<ManagementCancelArrival>, D::Error> {
+    ManagementCancelArrival::deserialize(deserializer).map(Some)
+}
+
+fn management_pending_terminal_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<ManagementPendingTerminalState>, D::Error> {
+    ManagementPendingTerminalState::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum VersionedManagementJob {
+    V1(ManagementJob),
+    V2(ManagementJobV2),
+}
+
+/// Borrowed persisted identity only. This projection does not mint Context,
+/// permissions, a claim, a lease or paid authority.
+#[derive(Debug, Clone, Copy)]
+pub struct ManagementJobIdentity<'a> {
+    pub id: &'a str,
+    pub schema_version: &'a str,
+    pub operation: &'a str,
+    pub request_key: &'a str,
+    pub payload_digest: &'a str,
+    pub owner_actor: &'a str,
+    pub owner_role: Role,
+    pub private_input_ref: &'a str,
+    pub state: ManagementJobState,
+    pub lease_token: Option<&'a str>,
+    pub lease_until: i64,
+}
+
+impl VersionedManagementJob {
+    /// Data continuation only. Terminal records never enter a new wire or write.
+    pub fn into_unfinished_v2(self) -> Result<ManagementJobV2> {
+        let state = self.identity().state;
+        if matches!(
+            state,
+            ManagementJobState::Succeeded
+                | ManagementJobState::Failed
+                | ManagementJobState::Cancelled
+                | ManagementJobState::Blocked
+        ) {
+            return Err(Error::Conflict(
+                "terminal management job is read only".into(),
+            ));
+        }
+        Ok(match self {
+            Self::V2(job) => job,
+            Self::V1(job) => {
+                let after = job.step.ends_with(":cancel_after_side_effect");
+                ManagementJobV2 {
+                    id: job.id,
+                    schema_version: MANAGEMENT_JOB_V2_SCHEMA.into(),
+                    operation: job.operation,
+                    request_key: job.request_key,
+                    payload_digest: job.payload_digest,
+                    owner_actor: job.owner_actor,
+                    owner_role: job.owner_role,
+                    state: job.state,
+                    step: job
+                        .step
+                        .strip_suffix(":cancel_after_side_effect")
+                        .unwrap_or(&job.step)
+                        .to_owned(),
+                    private_input_ref: job.private_input_ref,
+                    result: job.result.map(ManagementResultV2::Original),
+                    error_code: job.error_code,
+                    cancel_requested: job.cancel_requested,
+                    lease_token: job.lease_token,
+                    lease_until: job.lease_until,
+                    generation: job.generation,
+                    diagnostics: job.diagnostics,
+                    created_at: job.created_at,
+                    cancel_arrival: after.then_some(ManagementCancelArrival::AfterSideEffect),
+                    pending_terminal_state: None,
+                    optimization: None,
+                }
+            }
+        })
+    }
+
+    pub fn original_result(&self) -> Option<&ManagementResult> {
+        match self {
+            Self::V1(job) => job.result.as_ref(),
+            Self::V2(job) => match job.result.as_ref() {
+                Some(ManagementResultV2::Original(result)) => Some(result),
+                _ => None,
+            },
+        }
+    }
+
+    pub fn result(&self) -> Option<ManagementResultV2> {
+        match self {
+            Self::V1(job) => job.result.clone().map(ManagementResultV2::Original),
+            Self::V2(job) => job.result.clone(),
+        }
+    }
+
+    pub fn cancel_requested(&self) -> bool {
+        match self {
+            Self::V1(job) => job.cancel_requested,
+            Self::V2(job) => job.cancel_requested,
+        }
+    }
+
+    pub fn error_code(&self) -> Option<&str> {
+        match self {
+            Self::V1(job) => job.error_code.as_deref(),
+            Self::V2(job) => job.error_code.as_deref(),
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        match self {
+            Self::V1(job) => job.generation,
+            Self::V2(job) => job.generation,
+        }
+    }
+
+    pub fn pending_terminal_state(&self) -> Option<ManagementPendingTerminalState> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(job) => job.pending_terminal_state,
+        }
+    }
+
+    pub fn identity(&self) -> ManagementJobIdentity<'_> {
+        match self {
+            Self::V1(job) => ManagementJobIdentity {
+                id: &job.id,
+                schema_version: &job.schema_version,
+                operation: &job.operation,
+                request_key: &job.request_key,
+                payload_digest: &job.payload_digest,
+                owner_actor: &job.owner_actor,
+                owner_role: job.owner_role,
+                private_input_ref: &job.private_input_ref,
+                state: job.state,
+                lease_token: job.lease_token.as_deref(),
+                lease_until: job.lease_until,
+            },
+            Self::V2(job) => ManagementJobIdentity {
+                id: &job.id,
+                schema_version: &job.schema_version,
+                operation: &job.operation,
+                request_key: &job.request_key,
+                payload_digest: &job.payload_digest,
+                owner_actor: &job.owner_actor,
+                owner_role: job.owner_role,
+                private_input_ref: &job.private_input_ref,
+                state: job.state,
+                lease_token: job.lease_token.as_deref(),
+                lease_until: job.lease_until,
+            },
+        }
+    }
+
+    pub fn step(&self) -> &str {
+        match self {
+            Self::V1(job) => job
+                .step
+                .strip_suffix(":cancel_after_side_effect")
+                .unwrap_or(&job.step),
+            Self::V2(job) => &job.step,
+        }
+    }
+
+    pub fn cancel_arrival(&self) -> Option<ManagementCancelArrival> {
+        match self {
+            Self::V1(job) => job
+                .step
+                .ends_with(":cancel_after_side_effect")
+                .then_some(ManagementCancelArrival::AfterSideEffect),
+            Self::V2(job) => job.cancel_arrival,
+        }
+    }
+}
+
+/// One physical raw-JSON boundary for capacity, replay provenance and dispatch.
+/// The existing strict parser rejects recursively duplicated keys before Value
+/// or a versioned DTO can erase them. No write or v1 normalization happens here.
+pub fn decode_management_job(raw: &str) -> Result<VersionedManagementJob> {
+    let value = lifecycle::parse_strict_json(raw)
+        .map_err(|_| Error::Invalid("management_job_invalid_json".into()))?;
+    management_job_from_value(value)
+}
+
+/// Recovery uses the existing bounded physical-page API, which also returns
+/// unrelated job kinds. Select their real domain without losing raw duplicate
+/// keys, then enter the same private typed decoder exactly once.
+pub fn decode_management_job_for_recovery(
+    physical_id: &str,
+    raw: &str,
+) -> Result<Option<VersionedManagementJob>> {
+    if physical_id.starts_with("management-job-") {
+        return decode_management_job(raw).map(Some);
+    }
+    // The original generic job scan accepts duplicate keys in unrelated JSON.
+    // This domain-only visitor observes every top-level schema occurrence;
+    // a later unrelated schema cannot hide an earlier management declaration.
+    struct RecoveryDomain;
+    impl<'de> serde::de::Visitor<'de> for RecoveryDomain {
+        type Value = bool;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a job object")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> std::result::Result<bool, A::Error> {
+            let mut candidate = false;
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "schema_version" {
+                    let value = map.next_value::<Value>()?;
+                    candidate |= value
+                        .as_str()
+                        .is_some_and(|schema| schema.starts_with("rsia.management_job."));
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(candidate)
+        }
+    }
+    let original: Value = serde_json::from_str(raw).map_err(internal)?;
+    if !original.is_object() {
+        return Ok(None);
+    }
+    let mut domain = serde_json::Deserializer::from_str(raw);
+    let candidate =
+        serde::de::Deserializer::deserialize_map(&mut domain, RecoveryDomain).map_err(internal)?;
+    if candidate {
+        decode_management_job(raw).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
+    let invalid_shape = || Error::Conflict("management_job_invalid_shape".into());
+    let schema = value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid_shape)?
+        .to_owned();
+    match schema.as_str() {
+        MANAGEMENT_JOB_V1_SCHEMA => {
+            let job: ManagementJob = serde_json::from_value(value).map_err(|_| invalid_shape())?;
+            Ok(VersionedManagementJob::V1(job))
+        }
+        MANAGEMENT_JOB_V2_SCHEMA => {
+            let job: ManagementJobV2 =
+                serde_json::from_value(value).map_err(|_| invalid_shape())?;
+            if job.step.ends_with(":cancel_after_side_effect")
+                || (!job.cancel_requested && job.cancel_arrival.is_some())
+                || (job.pending_terminal_state.is_some()
+                    && job.state != ManagementJobState::Draining)
+                || (job.optimization.is_some() && job.operation != "optimization.step")
+            {
+                return Err(invalid_shape());
+            }
+            Ok(VersionedManagementJob::V2(job))
+        }
+        _ => Err(Error::Conflict("management_job_unknown_schema".into())),
+    }
+}
+
 pub const MAX_LOCAL_EXPORT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_LOCAL_EXPORT_FILES: usize = 101;
 
@@ -181,12 +705,13 @@ pub struct CapacityUsageV41 {
     /// Rows in `replay_worlds` (drafts and sealed worlds alike).
     pub replay_worlds: u64,
     /// Live leases: root budget calls that are reserved, dispatched, uncertain
-    /// or finalized-but-not-closed with `lease_until > now`, plus running
-    /// management jobs whose lease is still live.
+    /// or finalized-but-not-closed with `lease_until > now`, plus unclosed
+    /// management jobs whose real persisted lease is still live.
     pub active_leases: u64,
     /// Staged assets in `prepared`, `staged` or `quarantined` state.
     pub staged_packages: u64,
-    /// Running management jobs whose `lease_until > now`.
+    /// Running/Draining management jobs or jobs retaining an execution lease;
+    /// lease expiry alone does not prove that their execution has ended.
     pub concurrent_dispatches: u64,
 }
 
@@ -203,7 +728,7 @@ fn count_to_u64(count: i64) -> Result<u64> {
 }
 
 /// Live leases across the whole instance at `now`: root budget calls holding a
-/// lease plus running management jobs holding a lease, in every namespace.
+/// lease plus unclosed management jobs holding a live lease, in every namespace.
 /// Shared by the session measurement and the budget reservation gate so both
 /// count the same facts. Counting is instance-wide (F24): the MVP load
 /// contract is per deployment and a shared root cannot be split by claiming
@@ -212,6 +737,15 @@ pub(crate) async fn count_active_leases(
     conn: &mut sqlx::SqliteConnection,
     now: i64,
 ) -> Result<u64> {
+    let budget = count_budget_active_leases(conn, now).await?;
+    let jobs = count_management_job_capacity(conn, now).await?;
+    budget
+        .checked_add(jobs.active_leases)
+        .ok_or(Error::Internal)
+}
+
+// The original budget-call SQL and accounting boundary are unchanged.
+async fn count_budget_active_leases(conn: &mut sqlx::SqliteConnection, now: i64) -> Result<u64> {
     let budget: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM root_budget_calls
          WHERE lease_until>? AND (
@@ -223,26 +757,72 @@ pub(crate) async fn count_active_leases(
     .fetch_one(&mut *conn)
     .await
     .map_err(internal)?;
-    let jobs = count_running_management_jobs(conn, now).await?;
-    count_to_u64(budget)?
-        .checked_add(jobs)
-        .ok_or(Error::Internal)
+    count_to_u64(budget)
 }
 
-async fn count_running_management_jobs(conn: &mut sqlx::SqliteConnection, now: i64) -> Result<u64> {
-    let running: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM objects
-         WHERE kind='job'
-           AND json_extract(body,'$.schema_version')=?
-           AND json_extract(body,'$.state')='running'
-           AND json_extract(body,'$.lease_until')>?",
+struct ManagementJobCapacity {
+    active_leases: u64,
+    concurrent_dispatches: u64,
+}
+
+/// Management jobs consume a dispatch slot until their execution has actually
+/// ended. Lease expiry alone cannot establish that fact; live-lease accounting
+/// still uses the real persisted deadline. Other object kinds/counters stay on
+/// their original paths, including the existing 10000-job insertion bound.
+async fn count_management_job_capacity(
+    conn: &mut sqlx::SqliteConnection,
+    now: i64,
+) -> Result<ManagementJobCapacity> {
+    // Overinclusive discovery only. json_each sees every top-level version,
+    // including duplicate keys; real management IDs also select broken JSON.
+    // The common raw decoder decides the exact wire once after selection.
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id,owner,body FROM objects
+         WHERE kind='job' AND (
+           id LIKE 'management-job-%' OR
+           CASE WHEN json_valid(body) THEN EXISTS (
+             SELECT 1 FROM json_each(objects.body) member
+             WHERE member.key='schema_version' AND member.type='text'
+               AND member.value LIKE 'rsia.management_job.%'
+           ) ELSE 0 END
+         ) ORDER BY rowid LIMIT 10001",
     )
-    .bind(CAPACITY_MANAGEMENT_JOB_SCHEMA)
-    .bind(now)
-    .fetch_one(&mut *conn)
+    .fetch_all(&mut *conn)
     .await
     .map_err(internal)?;
-    count_to_u64(running)
+    if rows.len() > 10000 {
+        return Err(Error::Conflict("scope collection exceeds bounded scan; archive or add paginated query before continuing".into()));
+    }
+    let mut counts = ManagementJobCapacity {
+        active_leases: 0,
+        concurrent_dispatches: 0,
+    };
+    for (physical_id, owner, body) in rows {
+        let record = decode_management_job(&body)?;
+        let job = record.identity();
+        if job.id != physical_id || job.owner_actor != owner {
+            return Err(Error::Conflict(
+                "management_job_physical_identity_mismatch".into(),
+            ));
+        }
+        let unclosed = matches!(
+            job.state,
+            ManagementJobState::Running | ManagementJobState::Draining
+        ) || job.lease_token.is_some()
+            || (job.state == ManagementJobState::Queued
+                && (record.generation() != 0 || record.result().is_some()));
+        if unclosed {
+            counts.concurrent_dispatches = counts
+                .concurrent_dispatches
+                .checked_add(1)
+                .ok_or(Error::Internal)?;
+            if job.lease_until > now {
+                counts.active_leases =
+                    counts.active_leases.checked_add(1).ok_or(Error::Internal)?;
+            }
+        }
+    }
+    Ok(counts)
 }
 
 /// Objects of `kind` across every namespace (a capacity count, never content).
@@ -2152,7 +2732,11 @@ impl Session {
         .await
         .map_err(internal)?;
         let replay_worlds = self.replay_world_count().await?;
-        let active_leases = count_active_leases(&mut self.tx, now).await?;
+        let management_jobs = count_management_job_capacity(&mut self.tx, now).await?;
+        let active_leases = count_budget_active_leases(&mut self.tx, now)
+            .await?
+            .checked_add(management_jobs.active_leases)
+            .ok_or(Error::Internal)?;
         let staged_packages: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM objects WHERE kind='artifact'
                AND json_extract(body,'$.schema_version')=?
@@ -2162,7 +2746,7 @@ impl Session {
         .fetch_one(&mut *self.tx)
         .await
         .map_err(internal)?;
-        let concurrent_dispatches = count_running_management_jobs(&mut self.tx, now).await?;
+        let concurrent_dispatches = management_jobs.concurrent_dispatches;
         Ok(CapacityUsageV41 {
             runs,
             events: imported_events
@@ -2551,6 +3135,46 @@ impl Session {
         let body: String = row.try_get("response").map_err(internal)?;
         Ok(Some(serde_json::from_str(&body).map_err(internal)?))
     }
+    /// Management replay keeps the untouched cached wire until the one strict
+    /// job codec has admitted it. Other idempotency consumers are unchanged.
+    pub async fn cached_management_job<A: Serialize>(
+        &mut self,
+        ctx: &Context,
+        op: &str,
+        key: &str,
+        args: &A,
+    ) -> Result<Option<VersionedManagementJob>> {
+        identifier(key)?;
+        let row = sqlx::query("SELECT payload_hash,subject_id,response,redacted FROM idempotency WHERE namespace=? AND actor=? AND operation=? AND request_key=?")
+            .bind(ctx.namespace()).bind(ctx.actor()).bind(op).bind(key)
+            .fetch_optional(&mut *self.tx).await.map_err(internal)?;
+        let Some(row) = row else { return Ok(None) };
+        let expected: String = row.try_get("payload_hash").map_err(internal)?;
+        if expected != fingerprint(args)? {
+            return Err(Error::Conflict(
+                "idempotency key reused with different content".into(),
+            ));
+        }
+        if row.try_get::<i64, _>("redacted").map_err(internal)? != 0 {
+            return Err(Error::Conflict(
+                "subject was deleted; request cannot be replayed".into(),
+            ));
+        }
+        let body: String = row.try_get("response").map_err(internal)?;
+        let subject: String = row.try_get("subject_id").map_err(internal)?;
+        let record = decode_management_job(&body)?;
+        let job = record.identity();
+        if job.owner_actor != ctx.actor() || job.owner_role != ctx.role() {
+            return Err(Error::NotFound);
+        }
+        if job.id != subject || job.operation != op || job.request_key != key {
+            return Err(Error::Conflict(
+                "cached management job differs from its request".into(),
+            ));
+        }
+        Ok(Some(record))
+    }
+
     pub async fn cache<A: Serialize, T: Serialize>(
         &mut self,
         ctx: &Context,

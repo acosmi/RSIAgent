@@ -1466,6 +1466,18 @@ fn replay_root_strict_json(raw: &str) -> Result<serde_json::Value> {
         .map_err(|_| Error::Invalid("replay_root_source_invalid_json".into()))
 }
 
+// Preserve the replay consumer's existing public error vocabulary. Version and
+// shape remain distinct in the common codec; neither is accepted as provenance.
+fn replay_root_management_job(raw: &str) -> Result<crate::VersionedManagementJob> {
+    crate::decode_management_job(raw).map_err(|error| match error {
+        Error::Invalid(reason) if reason == "management_job_invalid_json" => {
+            Error::Invalid("replay_root_source_invalid_json".into())
+        }
+        Error::Conflict(_) => replay_root_source_unproven(),
+        other => other,
+    })
+}
+
 // Read sealed storage bytes before Value can erase a duplicate. The eventual
 // COMPLETE V3 loader must use this same private gate before minting its guard;
 // this helper alone does not qualify a world or expose a creation capability.
@@ -1595,16 +1607,16 @@ async fn replay_management_originals_in_session(
         }
         let (job_owner, job_body) =
             replay_root_physical_original(session, ctx, "job", &job_id).await?;
-        let job = replay_root_strict_json(&job_body)?;
+        let record = replay_root_management_job(&job_body)?;
+        let job = record.identity();
         if job_owner != owner
-            || job["id"] != job_id
-            || job["schema_version"] != "rsia.management_job.v1"
-            || job["operation"] != "exploration.start"
-            || job["owner_actor"] != owner
-            || job["owner_role"] != "admin"
-            || job["private_input_ref"] != input_id
-            || job["request_key"] != key
-            || job["payload_digest"] != private["payload_digest"]
+            || job.id != job_id
+            || job.operation != "exploration.start"
+            || job.owner_actor != owner
+            || job.owner_role != Role::Admin
+            || job.private_input_ref != input_id
+            || job.request_key != key
+            || Some(job.payload_digest) != private["payload_digest"].as_str()
         {
             return Err(replay_root_source_unproven());
         }
@@ -1617,8 +1629,15 @@ async fn replay_management_originals_in_session(
             }
             let (dependent_owner, dependent_body) =
                 replay_root_physical_original(session, ctx, "job", &dependent_id).await?;
-            let dependent = replay_root_strict_json(&dependent_body)?;
-            if dependent_owner != owner || dependent_id != job_id || dependent != job {
+            let dependent_record = replay_root_management_job(&dependent_body)?;
+            let dependent = dependent_record.identity();
+            // This is the exact same physical job in the same Session. Keep its
+            // complete original bytes, not only the projected identity fields.
+            if dependent_owner != owner
+                || dependent_id != job_id
+                || dependent.id != job.id
+                || dependent_body != job_body
+            {
                 return Err(replay_root_source_unproven());
             }
         }

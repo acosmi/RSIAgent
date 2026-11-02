@@ -593,17 +593,18 @@ class RestoreTests(unittest.TestCase):
     def test_current_proposal_restore_protection_matches_rust(self):
         import re
         rust=(ROOT / "crates/evo-storage/src/lifecycle.rs").read_text()
-        body=re.search(r"PROTECTED_ACTION_SCHEMA_VERSIONS: \[&str; 12\] = \[(.*?)\];",rust,re.S).group(1)
+        body=re.search(r"PROTECTED_ACTION_SCHEMA_VERSIONS: \[&str; 13\] = \[(.*?)\];",rust,re.S).group(1)
         schemas=re.findall(r'"([^"]+)"',body)
-        self.assertEqual(len(schemas),12)
-        self.assertEqual(schemas[-1],"rsia.monitoring.consolidation_proposal.v2")
+        self.assertEqual(len(schemas),13)
+        self.assertEqual(schemas[11],"rsia.monitoring.consolidation_proposal.v2")
+        self.assertEqual(schemas[12],"rsia.management_job.v2")
         con=sqlite3.connect(":memory:")
         self.addCleanup(con.close)
         con.execute("CREATE TABLE objects(namespace,kind,id,body)")
         for index,schema in enumerate(schemas):
             con.execute("INSERT INTO objects VALUES('n','artifact',?,?)",(str(index),json.dumps({"id":str(index),"schema_version":schema,"content":"fixture content"})))
         facts=restore.protected_facts(con,{"n"})
-        self.assertEqual(len(facts),12)
+        self.assertEqual(len(facts),13)
         self.assertEqual({fact[3]["schema_version"] for fact in facts},set(schemas))
 
     def test_current_proposal_tamper_isolates_restore(self):
@@ -1183,6 +1184,53 @@ class RustCurrentHostWireTests(unittest.TestCase):
                         msg=f"CLI rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"):
                         restore.read_current_host_raw(damaged,"name-coverage","artifact",record["id"])
                     checks.assert_isolated(scenario,refused,result,"invalid current host raw JSON")
+
+
+
+
+class ManagementJobVersionProtectionTests(unittest.TestCase):
+    def test_management_job_v1_v2_protection_matches_rust(self):
+        import re
+        rust = (ROOT / "crates/evo-storage/src/lifecycle.rs").read_text()
+        action = re.search(r"PROTECTED_ACTION_SCHEMA_VERSIONS: \[&str; \d+\] = \[(.*?)\];", rust, re.S).group(1)
+        schemas = re.findall(r'"([^"]+)"', action)
+        self.assertEqual(schemas[-1], "rsia.management_job.v2")
+        self.assertIn("rsia.management_job.v1", schemas)
+        con = sqlite3.connect(":memory:")
+        self.addCleanup(con.close)
+        con.execute("CREATE TABLE objects(namespace,kind,id,body)")
+        for index, schema in enumerate(schemas):
+            con.execute("INSERT INTO objects VALUES(?,?,?,?)", ("n", "job", str(index), json.dumps({"id":str(index),"schema_version":schema,"state":"draining"})))
+        facts = restore.protected_facts(con, {"n"})
+        self.assertEqual({fact[3]["schema_version"] for fact in facts}, set(schemas))
+        self.assertEqual(len(facts), len(schemas))
+
+    def test_management_job_v2_tamper_isolates_restore(self):
+        scenario = Scenario(self, CURRENT)
+        con = connect(scenario.history)
+        for version in (1, 2):
+            ident = f"management-job-protected-v{version}"
+            job = {"id":ident,"schema_version":f"rsia.management_job.v{version}","operation":"meta.start","request_key":f"restore-v{version}","payload_digest":hashlib.sha256(b"fixture").hexdigest(),"owner_actor":"admin","owner_role":"admin","state":"draining","step":"claimed","private_input_ref":f"management-input-v{version}","result":None,"error_code":None,"cancel_requested":True,"lease_token":"owned-lease","lease_until":10,"generation":1,"diagnostics":[],"created_at":1}
+            if version == 2:
+                job["cancel_arrival"] = "after_side_effect"
+            con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?)", ("legacy-a","job",ident,"admin",json.dumps(job)))
+        con.commit()
+        con.close()
+        backup = scenario.backup()
+        anchor = scenario.anchor()
+        dest, result = scenario.restore(backup, anchor, "matching-management-facts")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(dest.is_dir())
+        con = connect(anchor)
+        con.execute("UPDATE objects SET body=json_set(body,'$.cancel_arrival','before_side_effect') WHERE id='management-job-protected-v2'")
+        con.commit()
+        con.close()
+        before = database_image(anchor)
+        refused, result = scenario.restore(backup, anchor, "changed-management-facts")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stderr, "ISOLATE consumed query/alpha/dispatch/accounting facts changed; make a fresh backup; not mounting\n")
+        self.assertFalse(refused.exists())
+        self.assertEqual(database_image(anchor), before)
 
 
 if __name__ == "__main__":

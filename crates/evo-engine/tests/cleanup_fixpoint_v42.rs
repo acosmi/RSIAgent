@@ -22,7 +22,7 @@
 //! are untouched.
 
 use evo_core::{Context, Role};
-use evo_engine::dispatch::{ManagementDispatcher, ManagementJob, ManagementJobState};
+use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState, ManagementJobV2};
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, CleanupStatus, LifecycleStore, TypedObjectRef};
 use serde_json::Value;
@@ -106,10 +106,20 @@ mod common {
     }
 
     /// Polls the stored job until it is terminal.
-    pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJob {
+    pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJobV2 {
         for _ in 0..2_000 {
             let mut session = store.session().await.unwrap();
-            let job: ManagementJob = session.need(ctx, "job", job_id).await.unwrap();
+            let row = session
+                .object_row(ctx, "job", job_id)
+                .await
+                .unwrap()
+                .expect("actual current job row");
+            let job = match evo_storage::decode_management_job(&row.body).unwrap() {
+                evo_storage::VersionedManagementJob::V2(job) => job,
+                evo_storage::VersionedManagementJob::V1(_) => {
+                    panic!("expected the actual current producer wire")
+                }
+            };
             session.commit().await.unwrap();
             if matches!(
                 job.state,
@@ -449,7 +459,7 @@ async fn stored_chain(
         )
         .await
         .unwrap();
-    let done = wait_job(store, admin, &queued.id).await;
+    let done = wait_job(store, admin, queued.identity().id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
     (dispatcher, pool)
 }

@@ -2479,15 +2479,40 @@ impl IndependentEvaluationControl {
         identifier(control_id)?;
         identifier(holdout_id)?;
         let mut session = store.session().await?;
-        let control = get_record::<ReadRegisteredEvaluationControl>(
-            &mut session,
+        let progress = Self::registration_progress_validated_in_session(
             ctx,
-            CONTROL_KIND,
+            &mut session,
             control_id,
+            holdout_id,
         )
         .await?;
+        session.commit().await?;
+        Ok(progress)
+    }
+
+    pub(crate) async fn registration_progress_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        control_id: &str,
+        holdout_id: &str,
+    ) -> Result<RegistrationProgress> {
+        ctx.require(&[Role::Evaluator])?;
+        identifier(control_id)?;
+        identifier(holdout_id)?;
+        Self::registration_progress_validated_in_session(ctx, session, control_id, holdout_id).await
+    }
+
+    async fn registration_progress_validated_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        control_id: &str,
+        holdout_id: &str,
+    ) -> Result<RegistrationProgress> {
+        let control =
+            get_record::<ReadRegisteredEvaluationControl>(session, ctx, CONTROL_KIND, control_id)
+                .await?;
         let holdout =
-            get_record::<ReadProtectedHoldoutRecord>(&mut session, ctx, HOLDOUT_KIND, holdout_id)
+            get_record::<ReadProtectedHoldoutRecord>(session, ctx, HOLDOUT_KIND, holdout_id)
                 .await?;
         let progress = match (control, holdout) {
             (None, None) => RegistrationProgress {
@@ -2523,7 +2548,6 @@ impl IndependentEvaluationControl {
                 }
             }
         };
-        session.commit().await?;
         Ok(progress)
     }
 
@@ -2637,8 +2661,28 @@ impl IndependentEvaluationControl {
     ) -> Result<String> {
         ctx.require(&[Role::Evaluator])?;
         let mut session = store.session().await?;
+        let digest =
+            Self::register_current_holdout_validated_in_session(ctx, &mut session, holdout).await?;
+        session.commit().await?;
+        Ok(digest)
+    }
+
+    pub(crate) async fn register_current_holdout_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        holdout: ProtectedHoldoutRecordV2,
+    ) -> Result<String> {
+        ctx.require(&[Role::Evaluator])?;
+        Self::register_current_holdout_validated_in_session(ctx, session, holdout).await
+    }
+
+    async fn register_current_holdout_validated_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        holdout: ProtectedHoldoutRecordV2,
+    ) -> Result<String> {
         let control: ReadRegisteredEvaluationControl =
-            need_record(&mut session, ctx, CONTROL_KIND, &holdout.registration_id).await?;
+            need_record(session, ctx, CONTROL_KIND, &holdout.registration_id).await?;
         control.validate()?;
         if control.evaluator_actor != ctx.actor() {
             return Err(Error::Forbidden);
@@ -2659,7 +2703,7 @@ impl IndependentEvaluationControl {
                 "frozen_configuration_digest",
             )?;
         }
-        if get_record::<ReadProtectedHoldoutRecord>(&mut session, ctx, HOLDOUT_KIND, &holdout.id)
+        if get_record::<ReadProtectedHoldoutRecord>(session, ctx, HOLDOUT_KIND, &holdout.id)
             .await?
             .is_some()
         {
@@ -2668,7 +2712,7 @@ impl IndependentEvaluationControl {
         control.current()?;
         let digest = fingerprint(&holdout)?;
         put_record(
-            &mut session,
+            session,
             ctx,
             HOLDOUT_KIND,
             &holdout.id,
@@ -2688,8 +2732,59 @@ impl IndependentEvaluationControl {
         session
             .audit(ctx, "register_protected_holdout", &holdout.id)
             .await?;
-        session.commit().await?;
         Ok(digest)
+    }
+
+    pub(crate) async fn management_expected_ticket_id_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        request: &IssueTicketRequest,
+    ) -> Result<String> {
+        ctx.require(&[Role::Evaluator])?;
+        identifier(&request.ticket_id)?;
+        identifier(&request.registration_id)?;
+        identifier(&request.holdout_id)?;
+        valid_time(request.issued_at_unix_seconds)?;
+        let control: ReadRegisteredEvaluationControl =
+            need_record(session, ctx, CONTROL_KIND, &request.registration_id).await?;
+        let holdout: ReadProtectedHoldoutRecord =
+            need_record(session, ctx, HOLDOUT_KIND, &request.holdout_id).await?;
+        if control.evaluator_actor != ctx.actor() {
+            return Err(Error::Forbidden);
+        }
+        control.validate()?;
+        holdout.validate_against(&control)?;
+        let issued_at_unix_ms = request
+            .issued_at_unix_seconds
+            .checked_mul(1_000)
+            .ok_or_else(|| Error::Invalid("ticket timestamp conversion overflow".into()))?;
+        if request.issued_at_unix_seconds < control.created_at_unix_seconds
+            || issued_at_unix_ms < holdout.manifest.issued_at_unix_ms
+        {
+            return Err(Error::Invalid(
+                "ticket must be issued after control and manifest registration facts".into(),
+            ));
+        }
+        let Some((candidate, _binding)) =
+            bind_candidate_record_in_session(session, ctx, &control, &holdout).await?
+        else {
+            return Err(Error::Conflict(CANDIDATE_RECORD_MISSING.into()));
+        };
+        control.current()?;
+        holdout.current()?;
+        let source = current_source_plan_binding_from_candidate(
+            ctx.namespace(),
+            &request.ticket_id,
+            &control,
+            &candidate,
+        )?;
+        current_source_bound_ticket_id(
+            ctx.namespace(),
+            &control,
+            &holdout,
+            &source,
+            request.issued_at_unix_seconds,
+        )
     }
 
     pub async fn issue_ticket(

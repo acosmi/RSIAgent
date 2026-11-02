@@ -36,11 +36,20 @@
 //! `tests/dispatch_management.rs` and `tests/streaming_evaluator.rs`); test
 //! crates cannot import each other, and the originals are untouched.
 
+fn current_management_job(record: evo_storage::VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        evo_storage::VersionedManagementJob::V2(job) => job,
+        evo_storage::VersionedManagementJob::V1(_) => {
+            panic!("expected the actual current management producer wire")
+        }
+    }
+}
+
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
 use evo_core::{Context, Error, Role, fingerprint};
-use evo_engine::dispatch::{ManagementDispatcher, ManagementJob, ManagementJobState};
+use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState, ManagementJobV2};
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, CleanupStatus, LifecycleStore, TypedObjectRef};
 use serde_json::{Value, json};
@@ -147,10 +156,16 @@ mod common {
 
     /// Polls the stored job (not `status`, which refuses after a revocation)
     /// until it is terminal.
-    pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJob {
+    pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJobV2 {
         for _ in 0..2_000 {
             let mut session = store.session().await.unwrap();
-            let job: ManagementJob = session.need(ctx, "job", job_id).await.unwrap();
+            let row = session
+                .object_row(ctx, "job", job_id)
+                .await
+                .unwrap()
+                .expect("actual current job row");
+            let job =
+                current_management_job(evo_storage::decode_management_job(&row.body).unwrap());
             session.commit().await.unwrap();
             if matches!(
                 job.state,
@@ -219,10 +234,10 @@ mod common {
         ctx: &Context,
         operation: &str,
         key: &str,
-    ) -> Result<Option<ManagementJob>, Error> {
+    ) -> Result<Option<ManagementJobV2>, Error> {
         let mut session = store.session().await.unwrap();
         let row = session
-            .cached::<ManagementJob, _>(ctx, operation, key, &json!({}))
+            .cached::<ManagementJobV2, _>(ctx, operation, key, &json!({}))
             .await;
         session.commit().await.unwrap();
         row
@@ -1702,6 +1717,7 @@ async fn a_replay_run_over_a_pool_whose_source_run_is_revoked_is_refused_at_subm
             replay_fx::run_request("replay-live", &pool),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(&store, &admin, &live.id).await.state,
@@ -1768,6 +1784,7 @@ async fn a_curriculum_step_over_a_learner_state_derived_from_a_revoked_run_is_re
     let live = dispatcher
         .submit(admin, "curriculum.step", step_request("curriculum-live"))
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(store, admin, &live.id).await.state,
@@ -1832,6 +1849,7 @@ async fn an_experiment_register_over_an_input_derived_from_a_revoked_run_is_refu
             e05.register_request("register-live"),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     let live = wait_job(store, evaluator, &live.id).await;
     assert_eq!(live.state, ManagementJobState::Succeeded, "{live:?}");
@@ -1894,7 +1912,7 @@ async fn an_experiment_register_over_an_input_derived_from_a_revoked_run_is_refu
             .submit(evaluator, operation, request)
             .await
             .unwrap_or_else(|error| panic!("{operation} was refused: {error:?}"));
-        let done = wait_job(store, evaluator, &queued.id).await;
+        let done = wait_job(store, evaluator, queued.identity().id).await;
         assert_eq!(done.state, expected, "{operation}: {done:?}");
         assert_eq!(
             done.error_code.as_deref(),
@@ -1931,6 +1949,7 @@ async fn a_recorded_request_key_returns_its_job_before_the_gate_runs() {
     let accepted = dispatcher
         .submit(&admin, "replay.run", request.clone())
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(&store, &admin, &accepted.id).await.state,
@@ -1947,6 +1966,7 @@ async fn a_recorded_request_key_returns_its_job_before_the_gate_runs() {
     let replayed = dispatcher
         .submit(&admin, "replay.run", request)
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(replayed.id, accepted.id);
     assert_eq!(shape(&store, &admin, &nodes).await, before);
@@ -2000,7 +2020,7 @@ async fn judge(
             // The synthetic state is no real learner state: the job fails inside,
             // which is not what is under test, but it has to finish before the
             // store goes away.
-            wait_job(store, admin, &job.id).await;
+            wait_job(store, admin, job.identity().id).await;
         }
         (Verdict::Accepted, Err(error)) => {
             problems.push(format!("{name}: refused, expected accepted: {error:?}"));
@@ -2025,10 +2045,11 @@ async fn judge(
             }
         }
         (Verdict::Refused(_), Ok(job)) => {
-            wait_job(store, admin, &job.id).await;
+            wait_job(store, admin, job.identity().id).await;
             problems.push(format!(
                 "{name}: accepted as {} (step {}), expected a Conflict",
-                job.id, job.step
+                job.identity().id,
+                job.step()
             ));
         }
         (Verdict::Refused(_), Err(other)) => {
@@ -2264,7 +2285,7 @@ async fn a_revoked_source_of_another_namespace_does_not_refuse() {
         .submit(&admin, "curriculum.step", synthetic::request("ns-edges"))
         .await
         .unwrap_or_else(|error| panic!("edges of another namespace were followed: {error:?}"));
-    wait_job(&store, &admin, &accepted.id).await;
+    wait_job(&store, &admin, accepted.identity().id).await;
 
     // The edge exists in `n` too, but the tombstone is only in `other`.
     put_raw(&store, &admin, "run", "run-o", &synthetic::live("run-o")).await;
@@ -2277,7 +2298,7 @@ async fn a_revoked_source_of_another_namespace_does_not_refuse() {
         )
         .await
         .unwrap_or_else(|error| panic!("a tombstone of another namespace was read: {error:?}"));
-    wait_job(&store, &admin, &accepted.id).await;
+    wait_job(&store, &admin, accepted.identity().id).await;
 
     // With the tombstone in `n` as well, the request is refused.
     put_raw(
@@ -2392,6 +2413,7 @@ async fn overlapping_cleanups(name: &str, late: bool) -> Overlap {
             replay_fx::run_request("ctrl-q2-chain", &pool),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     assert_eq!(
         wait_job(&store, &admin, &queued.id).await.state,
@@ -2409,8 +2431,8 @@ async fn overlapping_cleanups(name: &str, late: bool) -> Overlap {
             let request = replay_fx::run_request(&format!("ctrl-q2-{round}"), &pool);
             match dispatcher.submit(&admin, "replay.run", request).await {
                 Ok(job) => {
-                    wait_job(&store, &admin, &job.id).await;
-                    accepted.push(job.id);
+                    wait_job(&store, &admin, job.identity().id).await;
+                    accepted.push(job.identity().id.to_owned());
                 }
                 Err(Error::Conflict(message)) => refused.push(message),
                 Err(other) => panic!("round {round}: {other:?}"),

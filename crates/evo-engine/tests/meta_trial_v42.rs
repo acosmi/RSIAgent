@@ -49,7 +49,7 @@ use evo_core::{Context, Error, Result, Role, Strategy, fingerprint, hash};
 use evo_engine::broker::{
     BrokerConfig, ModelTransport, PersistentModelBroker, TransportCompletion,
 };
-use evo_engine::dispatch::{ManagementDispatcher, ManagementJob, ManagementJobState};
+use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState, ManagementJobV2};
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
 };
@@ -2921,9 +2921,14 @@ fn exploration_start_payload(request_key: &str, world: &ExplorationWorldV1) -> V
     })
 }
 
-async fn wait_terminal(dispatcher: &ManagementDispatcher, job_id: &str) -> ManagementJob {
+async fn wait_terminal(dispatcher: &ManagementDispatcher, job_id: &str) -> ManagementJobV2 {
     for _ in 0..400 {
-        let job = dispatcher.status(&admin(), job_id).await.unwrap();
+        let job = match dispatcher.status(&admin(), job_id).await.unwrap() {
+            evo_storage::VersionedManagementJob::V2(job) => job,
+            evo_storage::VersionedManagementJob::V1(_) => {
+                panic!("expected the actual current producer wire")
+            }
+        };
         if matches!(
             job.state,
             ManagementJobState::Succeeded
@@ -3002,7 +3007,7 @@ async fn a_fork_enqueues_no_management_job_and_makes_no_paid_call() {
         )
         .await
         .unwrap();
-    wait_terminal(&dispatcher, &queued.id).await;
+    wait_terminal(&dispatcher, queued.identity().id).await;
     assert_eq!(object_count(&env.store, "job").await, 1);
     assert_eq!(
         artifacts_with_schema(&env.store, private_input).await.len(),

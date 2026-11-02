@@ -42,6 +42,15 @@
 //! (the world's own from `exploration_legal_actions_v42.rs` and
 //! `exploration_postpaid_v42.rs`, the replay's from `replay_v41.rs`): this file changes none
 //! of the files it copies from.
+fn current_management_job(record: evo_storage::VersionedManagementJob) -> ManagementJobV2 {
+    match record {
+        evo_storage::VersionedManagementJob::V2(job) => job,
+        evo_storage::VersionedManagementJob::V1(_) => {
+            panic!("expected the actual current management producer wire")
+        }
+    }
+}
+
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 use async_trait::async_trait;
@@ -84,7 +93,7 @@ use evo_engine::development::{
     issue_grader_receipt, load_development_control, register_development_control,
     registered_runner_digest, run_receipt_id, storage_id,
 };
-use evo_engine::dispatch::{ManagementDispatcher, ManagementJob, ManagementJobState};
+use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState, ManagementJobV2};
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
 };
@@ -1520,7 +1529,7 @@ impl Env {
 
     /// Submits `exploration.start` for `world` and waits for the terminal job: it
     /// registers the world, and its `status` re-verifies the registration later.
-    async fn start(&self, request_key: &str, world: &ExplorationWorldV1) -> ManagementJob {
+    async fn start(&self, request_key: &str, world: &ExplorationWorldV1) -> ManagementJobV2 {
         start_job(&self.dispatcher, &admin(), request_key, world).await
     }
 
@@ -1857,7 +1866,7 @@ async fn start_job(
     admin: &Context,
     request_key: &str,
     world: &ExplorationWorldV1,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     let queued = dispatcher
         .submit(
             admin,
@@ -1865,6 +1874,7 @@ async fn start_job(
             exploration_start_payload(request_key, world),
         )
         .await
+        .map(current_management_job)
         .unwrap();
     wait_terminal(dispatcher, admin, &queued.id).await
 }
@@ -1873,9 +1883,13 @@ async fn wait_terminal(
     dispatcher: &ManagementDispatcher,
     context: &Context,
     job_id: &str,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     for _ in 0..400 {
-        let job = dispatcher.status(context, job_id).await.unwrap();
+        let job = dispatcher
+            .status(context, job_id)
+            .await
+            .map(current_management_job)
+            .unwrap();
         if matches!(
             job.state,
             ManagementJobState::Succeeded
@@ -1905,12 +1919,16 @@ fn expect_conflict(result: Result<RegisterWorldOutcome>, what: &str) {
 }
 
 /// `status` on the job holds and serves the stored result unchanged.
-async fn expect_status_ok(dispatcher: &ManagementDispatcher, job: &ManagementJob, when: &str) {
+async fn expect_status_ok(dispatcher: &ManagementDispatcher, job: &ManagementJobV2, when: &str) {
     match dispatcher.status(&admin(), &job.id).await {
         Ok(status) => {
-            assert_eq!(status.state, ManagementJobState::Succeeded, "{when}");
             assert_eq!(
-                serde_json::to_value(&status.result).unwrap(),
+                status.identity().state,
+                ManagementJobState::Succeeded,
+                "{when}"
+            );
+            assert_eq!(
+                serde_json::to_value(status.result()).unwrap(),
                 serde_json::to_value(&job.result).unwrap(),
                 "{when}: the stored result is served unchanged"
             );
@@ -1921,14 +1939,14 @@ async fn expect_status_ok(dispatcher: &ManagementDispatcher, job: &ManagementJob
 
 async fn expect_status_conflict(
     dispatcher: &ManagementDispatcher,
-    job: &ManagementJob,
+    job: &ManagementJobV2,
     what: &str,
 ) {
     let result = dispatcher.status(&admin(), &job.id).await;
     assert!(
         matches!(result, Err(Error::Conflict(_))),
         "{what}: expected a Conflict, got {:?}",
-        result.map(|job| job.state)
+        result.map(|job| job.identity().state)
     );
 }
 
@@ -1936,7 +1954,7 @@ async fn expect_status_conflict(
 async fn assert_still_registered(
     env: &Env,
     world: &ExplorationWorldV1,
-    job: &ManagementJob,
+    job: &ManagementJobV2,
     when: &str,
 ) {
     expect_already_registered(env.register_again(world).await, when);
@@ -1945,7 +1963,7 @@ async fn assert_still_registered(
 
 /// The world still reads: its decision and the `status` read side compute, and the
 /// registration holds.
-async fn assert_decisions_read(env: &Env, world: &str, job: &ManagementJob) {
+async fn assert_decisions_read(env: &Env, world: &str, job: &ManagementJobV2) {
     env.coordinator
         .decide_next(world)
         .await
@@ -1958,7 +1976,7 @@ async fn assert_decisions_read(env: &Env, world: &str, job: &ManagementJob) {
 
 /// The world still reads, and the nodes it stored make a prefix evo-core's own check
 /// accepts.
-async fn assert_world_reads(env: &Env, world: &str, job: &ManagementJob) {
+async fn assert_world_reads(env: &Env, world: &str, job: &ManagementJobV2) {
     assert_decisions_read(env, world, job).await;
     stored_prefix(env, world)
         .await
@@ -1971,7 +1989,7 @@ async fn assert_world_reads(env: &Env, world: &str, job: &ManagementJob) {
 /// Runs `world` round by round (every step ends in a hard failure) until the decision
 /// is Stop, reading the world after each dispatch. Returns the actions it dispatched. A
 /// world that fails to read, or does not stop within `MAX_ROUNDS`, is stuck.
-async fn run_to_stop(env: &Env, world: &str, job: &ManagementJob) -> Vec<u32> {
+async fn run_to_stop(env: &Env, world: &str, job: &ManagementJobV2) -> Vec<u32> {
     let mut dispatched = Vec::new();
     for round in 1..=MAX_ROUNDS {
         let decision = env
@@ -2059,7 +2077,7 @@ type StoredTamper = Box<dyn Fn(&mut Stored)>;
 async fn expect_refused_everywhere(
     env: &Env,
     world: &ExplorationWorldV1,
-    done: &ManagementJob,
+    done: &ManagementJobV2,
     original: &Stored,
     key: &str,
     label: &str,

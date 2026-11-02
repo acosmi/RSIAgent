@@ -625,7 +625,8 @@ def protected_facts(con,namespaces):
             "rsia.practice_registration.v1","rsia.practice_registration_binding.v1",
             "rsia.practice_attempt_set.v1","rsia.curriculum_artifact_envelope.v1",
             "rsia.management_job.v1","rsia.replay_economic_artifact_envelope.v1",
-            "rsia.monitoring.consolidation_proposal.v2"):
+            "rsia.monitoring.consolidation_proposal.v2",
+            "rsia.management_job.v2"):
             facts.append((ns,kind,id,value))
     # Monetary state and irreversible dispatch counters must also agree.
     tables=[r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'root_budget%'")]

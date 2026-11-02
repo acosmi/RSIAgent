@@ -25,6 +25,7 @@ use evo_core::sequential::{
 use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_engine::dispatch::{
     ExperimentRegisterRequest, ManagementDispatcher, ManagementJob, ManagementJobState,
+    ManagementJobV2, VersionedManagementJob,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::release_store::{
@@ -2287,17 +2288,22 @@ async fn wait_management(
     dispatcher: &ManagementDispatcher,
     context: &Context,
     job_id: &str,
-) -> ManagementJob {
+) -> ManagementJobV2 {
     for _ in 0..200 {
         let job = dispatcher.status(context, job_id).await.unwrap();
         if matches!(
-            job.state,
+            job.identity().state,
             ManagementJobState::Succeeded
                 | ManagementJobState::Failed
                 | ManagementJobState::Cancelled
                 | ManagementJobState::Blocked
         ) {
-            return job;
+            return match job {
+                VersionedManagementJob::V2(current) => current,
+                VersionedManagementJob::V1(_) => {
+                    panic!("legacy terminal stays v1; this helper awaits a current continuation")
+                }
+            };
         }
         tokio::task::yield_now().await;
     }
@@ -2419,8 +2425,19 @@ async fn queued_legacy_private_inputs_recover_with_or_without_a_registered_contr
             value
         };
         let queued = seed_legacy_registration_job(&fixture, "legacy-recovery").await;
+        assert_eq!(queued.schema_version, "rsia.management_job.v1");
+        assert_eq!(queued.state, ManagementJobState::Queued);
+        assert_eq!(queued.step, "accepted");
+        assert_eq!(queued.generation, 0);
+        assert!(queued.lease_token.is_none() && queued.result.is_none());
+        assert_eq!(queued.lease_until, 0);
         let private_before = {
             let mut session = fixture.store.session().await.unwrap();
+            let persisted: Value = session
+                .need(&fixture.evaluator, "job", &queued.id)
+                .await
+                .unwrap();
+            assert_eq!(persisted, serde_json::to_value(&queued).unwrap());
             let private: Value = session
                 .need(&fixture.evaluator, "artifact", &queued.private_input_ref)
                 .await
@@ -2481,9 +2498,9 @@ async fn queued_legacy_private_inputs_recover_with_or_without_a_registered_contr
             )
             .await
             .unwrap();
-        assert_eq!(replay.id, queued.id);
-        assert_eq!(replay.generation, done.generation);
-        assert_eq!(replay.payload_digest, queued.payload_digest);
+        assert_eq!(replay.identity().id, queued.id);
+        assert_eq!(replay.generation(), done.generation);
+        assert_eq!(replay.identity().payload_digest, queued.payload_digest);
         let mut changed = request;
         changed.control.schema_version = V2.into();
         assert!(

@@ -32,7 +32,7 @@ use evo_core::replay::{ReplayPoolManifestV1, StoredReplayReportV2, WorldPartitio
 use evo_core::strategy::{ElasticPolicyV1, ExplorationCapsV1};
 use evo_core::{Context, Error, Role};
 use evo_engine::dispatch::{
-    ManagementDispatcher, ManagementJob, ManagementJobState, ManagementResult,
+    ManagementDispatcher, ManagementJobState, ManagementJobV2, ManagementResult,
 };
 use evo_engine::replay::{
     run_and_persist_pool_replay, run_persisted_replay, verified_replay_report_view,
@@ -129,10 +129,20 @@ mod common {
     }
 
     /// Polls the stored job until it is terminal.
-    pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJob {
+    pub async fn wait_job(store: &Store, ctx: &Context, job_id: &str) -> ManagementJobV2 {
         for _ in 0..2_000 {
             let mut session = store.session().await.unwrap();
-            let job: ManagementJob = session.need(ctx, "job", job_id).await.unwrap();
+            let row = session
+                .object_row(ctx, "job", job_id)
+                .await
+                .unwrap()
+                .expect("actual current job row");
+            let job = match evo_storage::decode_management_job(&row.body).unwrap() {
+                evo_storage::VersionedManagementJob::V2(job) => job,
+                evo_storage::VersionedManagementJob::V1(_) => {
+                    panic!("expected the actual current producer wire")
+                }
+            };
             session.commit().await.unwrap();
             if matches!(
                 job.state,
@@ -231,7 +241,7 @@ mod common {
     ) {
         let mut session = store.session().await.unwrap();
         let row = session
-            .cached::<ManagementJob, _>(ctx, operation, key, &json!({}))
+            .cached::<ManagementJobV2, _>(ctx, operation, key, &json!({}))
             .await;
         session.commit().await.unwrap();
         assert!(matches!(row, Ok(None)), "{operation} {key}: {row:?}");
@@ -924,9 +934,13 @@ async fn reads_of_a_cleaned_replay_chain_name_the_redacted_record() {
         )
         .await
         .unwrap();
-    let done = wait_job(&store, &admin, &queued.id).await;
+    let done = wait_job(&store, &admin, queued.identity().id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
-    let Some(ManagementResult::ReplayStored { report_id, .. }) = &done.result else {
+    let Some(evo_engine::dispatch::ManagementResultV2::Original(ManagementResult::ReplayStored {
+        report_id,
+        ..
+    })) = &done.result
+    else {
         panic!("unexpected result: {:?}", done.result);
     };
 
@@ -1357,7 +1371,7 @@ async fn a_revoked_run_does_not_refuse_a_live_artifact_that_shares_its_id() {
         )
         .await
         .expect("a revoked run must not refuse a live artifact of the same id");
-    let done = wait_job(&store, &admin, &queued.id).await;
+    let done = wait_job(&store, &admin, queued.identity().id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
     assert_eq!(done.step, "replay_stored");
     assert!(dispatcher.status(&admin, &done.id).await.is_ok());
@@ -1378,7 +1392,7 @@ async fn a_revoked_run_still_refuses_a_request_that_depends_on_that_run() {
         .await
         .unwrap();
     assert_eq!(
-        wait_job(&store, &admin, &first.id).await.state,
+        wait_job(&store, &admin, first.identity().id).await.state,
         ManagementJobState::Succeeded
     );
 
@@ -1549,7 +1563,7 @@ async fn an_unreadable_tombstone_fails_the_submit_check_closed() {
         )
         .await
         .unwrap();
-    let done = wait_job(&store, &admin, &queued.id).await;
+    let done = wait_job(&store, &admin, queued.identity().id).await;
     assert_eq!(done.state, ManagementJobState::Succeeded, "{done:?}");
 
     // A run dependency: live runs, and the tombstone under one run id.

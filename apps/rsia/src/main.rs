@@ -276,10 +276,15 @@ async fn main() -> Result<()> {
                     ));
                 }
                 let auth = AuthRegistry::from_plaintext(entries)?;
-                let management = evo_engine::dispatch::ManagementDispatcher::new(
-                    service.store().clone(),
-                    auth.management_contexts()?,
-                )?;
+                // This reference Serve has no configured paid backends. The
+                // wired handler returns its fixed blocked state; bootstrap's
+                // model_id=disabled is not runtime authority.
+                let management =
+                    evo_engine::dispatch::ManagementDispatcher::with_optimization_runtime(
+                        service.store().clone(),
+                        auth.management_contexts()?,
+                        None,
+                    )?;
                 management.recover_pending().await?;
                 // Settled model calls whose execution close a crash lost: closed when they
                 // carry their persisted response, counted and left open when they do not.

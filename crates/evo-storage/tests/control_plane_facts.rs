@@ -460,7 +460,15 @@ fn the_exported_selectors_are_the_restore_scripts() {
     // script source itself.
     assert_eq!(PROTECTED_OBJECT_KINDS.len(), 4);
     assert_eq!(PROTECTED_SCHEMA_VERSIONS.len(), 9);
-    assert_eq!(PROTECTED_ACTION_SCHEMA_VERSIONS.len(), 12);
+    assert_eq!(PROTECTED_ACTION_SCHEMA_VERSIONS.len(), 13);
+    assert_eq!(
+        PROTECTED_ACTION_SCHEMA_VERSIONS[11],
+        "rsia.monitoring.consolidation_proposal.v2"
+    );
+    assert_eq!(
+        PROTECTED_ACTION_SCHEMA_VERSIONS[12],
+        "rsia.management_job.v2"
+    );
     // E16 budget refs preserve the original source snapshots through recovery.
     assert!(PROTECTED_SCHEMA_VERSIONS.contains(&"rsia.budget_call_e16_ref.v1"));
     assert!(ROOT_BUDGET_TABLE_QUERY.contains("LIKE 'root_budget%'"));
