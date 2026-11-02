@@ -26,10 +26,11 @@ pub use evo_storage::budget::REGISTERED_EXECUTION_REQUEST_SCHEMA;
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallReservation, BudgetCallState,
     BudgetDispatchDecision, BudgetExecutionProvenance, BudgetStage,
-    REGISTERED_EXECUTION_SETTLEMENT_SCHEMA, RegisteredExecutionProvenance,
-    RegisteredExecutionSettlement, RootBudgetRecord, UsageCharge,
+    REGISTERED_EXECUTION_SETTLEMENT_SCHEMA, ReadRegisteredExecutionSettlement,
+    RegisteredExecutionProvenance, RegisteredExecutionSettlement, RegisteredExecutionSettlementV2,
+    RootBudgetRecord, UsageCharge,
 };
-use evo_storage::{Session, Store};
+use evo_storage::{PersistentContractState, PersistentContractVersion, Session, Store};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -43,6 +44,22 @@ pub mod projection;
 
 pub const DEVELOPMENT_CONTROL_SCHEMA: &str = "rsia.development_control.v1";
 pub const DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA: &str = "rsia.development_execution_receipt.v1";
+pub const DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2: &str = "rsia.development_execution_receipt.v2";
+/// Reviewed execution wires. Version membership alone grants no authority.
+pub const DEVELOPMENT_EXECUTION_RECEIPT_VERSIONS: &[PersistentContractVersion] = &[
+    PersistentContractVersion {
+        schema: DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA,
+        introduced_change: "historical execution without actual settler or independent target proof",
+        verifier_retained: false,
+        current: false,
+    },
+    PersistentContractVersion {
+        schema: DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2,
+        introduced_change: "actual settler and independently recomputed frozen target output",
+        verifier_retained: true,
+        current: true,
+    },
+];
 pub const DEVELOPMENT_GRADER_RECEIPT_SCHEMA: &str = "rsia.development_grader_receipt.v1";
 pub const DEVELOPMENT_EXECUTION_OUTPUT_SCHEMA: &str = "rsia.development_execution_output.v1";
 pub const DEVELOPMENT_RUN_RECEIPT_SCHEMA: &str = "rsia.development_run_receipt.v1";
@@ -113,8 +130,7 @@ pub(crate) fn validate_content_envelope(id: &str, body: &serde_json::Value) -> R
             if e.payload["schema_version"] == projection::CONFIG_PROJECTION_EXECUTION_SCHEMA {
                 return projection::validate_execution_envelope(id, &e.record_kind, e.payload);
             }
-            let v: DevelopmentExecutionReceiptV1 =
-                serde_json::from_value(e.payload).map_err(|_| Error::Forbidden)?;
+            let v = parse_execution_receipt(e.payload)?;
             (v.receipt_id, v.schema_version)
         }
         GRADER_RECEIPT_KIND => {
@@ -139,7 +155,7 @@ pub(crate) fn validate_content_envelope(id: &str, body: &serde_json::Value) -> R
     };
     let expected = match e.record_kind.as_str() {
         CONTROL_KIND => DEVELOPMENT_CONTROL_SCHEMA,
-        EXECUTION_RECEIPT_KIND => DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA,
+        EXECUTION_RECEIPT_KIND => schema.as_str(),
         GRADER_RECEIPT_KIND => DEVELOPMENT_GRADER_RECEIPT_SCHEMA,
         EXECUTION_OUTPUT_KIND => DEVELOPMENT_EXECUTION_OUTPUT_SCHEMA,
         RUN_RECEIPT_KIND => DEVELOPMENT_RUN_RECEIPT_SCHEMA,
@@ -733,6 +749,22 @@ pub struct DevelopmentExecutionReceiptV1 {
     pub issued_at_unix_seconds: i64,
 }
 
+/// The wire requested for an audit or a verified current read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevelopmentExecutionReceiptVersion {
+    V1,
+    V2,
+}
+
+/// A read-time classification and deterministic lineage, never caller authority.
+#[derive(Debug, Clone)]
+pub struct DevelopmentExecutionReceiptRead {
+    pub receipt: DevelopmentExecutionReceiptV1,
+    pub state: PersistentContractState,
+    pub legacy_receipt_id: String,
+    pub current_receipt_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DevelopmentExecutionOutputV1 {
@@ -827,6 +859,23 @@ pub fn storage_id(record_kind: &str, id: &str) -> Result<String> {
 }
 
 pub fn execution_receipt_id(
+    request_id: &str,
+    task_id: &str,
+    side: DevelopmentSide,
+) -> Result<String> {
+    Ok(format!(
+        "devexec-{}",
+        fingerprint(&(
+            DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2,
+            request_id,
+            task_id,
+            side
+        ))?
+    ))
+}
+
+/// Frozen v1 locator for historical data; it does not authorize another run.
+pub fn legacy_execution_receipt_id(
     request_id: &str,
     task_id: &str,
     side: DevelopmentSide,
@@ -1030,7 +1079,7 @@ fn validate_execution_call(
     task: &DevelopmentTaskSpecV1,
     request_digest: &str,
     output_digest: &str,
-) -> Result<RegisteredExecutionSettlement> {
+) -> Result<RegisteredExecutionSettlementV2> {
     if call.namespace != ctx.namespace()
         || call.billing_scope != control.billing_scope
         || call.dispatch_group_id != request.episode_id
@@ -1050,7 +1099,11 @@ fn validate_execution_call(
             "execution receipt lacks a matching closed development budget call".into(),
         ));
     }
-    let settlement = RegisteredExecutionSettlement::from_call(call)?;
+    let fact = match ReadRegisteredExecutionSettlement::from_call(call)? {
+        ReadRegisteredExecutionSettlement::Current(fact) => fact,
+        ReadRegisteredExecutionSettlement::Legacy(_) => return Err(source_legacy()),
+    };
+    let settlement = &fact.settlement;
     if settlement.provenance != RegisteredExecutionProvenance::RegisteredPureFunction
         || settlement.target_id != task.target_id
         || settlement.target_digest != control.target_digest
@@ -1082,7 +1135,13 @@ fn validate_execution_call(
             "execution call request artifact differs from the receipt".into(),
         ));
     }
-    Ok(settlement)
+    // The stored Current reader already checked the registered Worker/Host domain.
+    if fact.settler_actor != control.executor_actor {
+        return Err(Error::Conflict(
+            "registered execution settler differs from registered executor".into(),
+        ));
+    }
+    Ok(fact)
 }
 
 fn validate_execution_receipt_binding(
@@ -1092,12 +1151,19 @@ fn validate_execution_receipt_binding(
     task: &DevelopmentTaskSpecV1,
     side: DevelopmentSide,
 ) -> Result<()> {
-    if receipt.schema_version != DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA {
-        return Err(Error::Invalid(
-            "unsupported development execution receipt schema".into(),
-        ));
-    }
-    let expected_id = execution_receipt_id(&request.request_id, &task.task_id, side)?;
+    let expected_id = match receipt.schema_version.as_str() {
+        DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA => {
+            legacy_execution_receipt_id(&request.request_id, &task.task_id, side)?
+        }
+        DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2 => {
+            execution_receipt_id(&request.request_id, &task.task_id, side)?
+        }
+        _ => {
+            return Err(Error::Invalid(
+                "unsupported development execution receipt schema".into(),
+            ));
+        }
+    };
     if receipt.receipt_id != expected_id
         || receipt.control_id != control.id
         || receipt.namespace != control.namespace
@@ -1379,22 +1445,128 @@ async fn load_typed<T: DeserializeOwned>(
     Ok(value)
 }
 
-pub async fn load_execution_receipt(
-    store: &Store,
-    ctx: &Context,
-    receipt_id: &str,
-) -> Result<DevelopmentExecutionReceiptV1> {
-    let receipt: DevelopmentExecutionReceiptV1 =
-        load_typed(store, ctx, EXECUTION_RECEIPT_KIND, receipt_id).await?;
-    if receipt.schema_version != DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA
-        || receipt.receipt_id != receipt_id
-        || receipt.namespace != ctx.namespace()
-    {
+fn source_legacy() -> Error {
+    Error::Conflict("development execution source_legacy; new request_id required".into())
+}
+
+fn parse_execution_receipt(value: serde_json::Value) -> Result<DevelopmentExecutionReceiptV1> {
+    let version = value
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|schema| {
+            DEVELOPMENT_EXECUTION_RECEIPT_VERSIONS
+                .iter()
+                .find(|version| version.schema == schema)
+        })
+        .ok_or_else(|| Error::Invalid("unsupported development execution receipt schema".into()))?;
+    let receipt: DevelopmentExecutionReceiptV1 = serde_json::from_value(value).map_err(|_| {
+        Error::Conflict(
+            if version.current {
+                "development execution receipt is invalid"
+            } else {
+                "development artifact envelope mismatch or redacted"
+            }
+            .into(),
+        )
+    })?;
+    let expected = if version.current {
+        execution_receipt_id(&receipt.request_id, &receipt.task_id, receipt.side)?
+    } else {
+        legacy_execution_receipt_id(&receipt.request_id, &receipt.task_id, receipt.side)?
+    };
+    if receipt.receipt_id != expected {
         return Err(Error::Conflict(
             "development execution receipt identity mismatch".into(),
         ));
     }
     Ok(receipt)
+}
+
+async fn get_execution_receipt(
+    session: &mut Session,
+    ctx: &Context,
+    receipt_id: &str,
+) -> Result<Option<DevelopmentExecutionReceiptV1>> {
+    let Some(value) = get_record(session, ctx, EXECUTION_RECEIPT_KIND, receipt_id).await? else {
+        return Ok(None);
+    };
+    let receipt = parse_execution_receipt(value)?;
+    if receipt.receipt_id != receipt_id || receipt.namespace != ctx.namespace() {
+        return Err(Error::Conflict(
+            "development execution receipt identity mismatch".into(),
+        ));
+    }
+    Ok(Some(receipt))
+}
+
+/// Reads the unchanged data layout. A getter result grants no Current authority.
+pub async fn load_execution_receipt(
+    store: &Store,
+    ctx: &Context,
+    receipt_id: &str,
+) -> Result<DevelopmentExecutionReceiptV1> {
+    let mut session = store.session().await?;
+    let receipt = get_execution_receipt(&mut session, ctx, receipt_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    session.commit().await?;
+    Ok(receipt)
+}
+
+/// Reads one exact wire and its lineage in the caller's transaction.
+/// CurrentVerified describes this read; later consumers reload their originals.
+pub async fn read_execution_receipt_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    request: &DevelopmentRunRequest,
+    task_id: &str,
+    side: DevelopmentSide,
+    version: DevelopmentExecutionReceiptVersion,
+) -> Result<DevelopmentExecutionReceiptRead> {
+    validate_development_request(request)?;
+    identifier(task_id)?;
+    let legacy_receipt_id = legacy_execution_receipt_id(&request.request_id, task_id, side)?;
+    let current_receipt_id = execution_receipt_id(&request.request_id, task_id, side)?;
+    let (id, schema) = match version {
+        DevelopmentExecutionReceiptVersion::V1 => {
+            (&legacy_receipt_id, DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA)
+        }
+        DevelopmentExecutionReceiptVersion::V2 => {
+            (&current_receipt_id, DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2)
+        }
+    };
+    let receipt = get_execution_receipt(session, ctx, id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if receipt.schema_version != schema {
+        return Err(Error::Conflict(
+            "development execution receipt identity mismatch".into(),
+        ));
+    }
+    let control = need_control(session, ctx, &receipt.control_id).await?;
+    validate_control_request_binding(&control, request)?;
+    let task = registered_task(&control, request, task_id)?;
+    let state = match version {
+        DevelopmentExecutionReceiptVersion::V1 => {
+            validate_execution_receipt_binding(&receipt, &control, request, task, side)?;
+            PersistentContractState::Legacy
+        }
+        DevelopmentExecutionReceiptVersion::V2 => {
+            verify_current_execution_in_session(
+                session, ctx, &control, request, task, side, &receipt,
+            )
+            .await?;
+            require_live_sources(session, ctx, &control.source_ids, request.revoke_watermark)
+                .await?;
+            PersistentContractState::CurrentVerified
+        }
+    };
+    Ok(DevelopmentExecutionReceiptRead {
+        receipt,
+        state,
+        legacy_receipt_id,
+        current_receipt_id,
+    })
 }
 
 pub async fn load_grader_receipt(
@@ -1495,7 +1667,7 @@ pub async fn issue_execution_receipt(
         .budget_call(ctx, &control.billing_scope, &issue.budget_call_id)
         .await?
         .ok_or(Error::NotFound)?;
-    validate_execution_call(
+    let settlement = validate_execution_call(
         ctx,
         &call,
         &control,
@@ -1512,6 +1684,11 @@ pub async fn issue_execution_receipt(
         request.revoke_watermark,
     )
     .await?;
+    if task.input.execute_target()? != issue.output_utf8 {
+        return Err(Error::Conflict(
+            "registered execution output differs from frozen target".into(),
+        ));
+    }
     let output = DevelopmentExecutionOutputV1 {
         schema_version: DEVELOPMENT_EXECUTION_OUTPUT_SCHEMA.into(),
         id: execution_output_id(&request.request_id, &task.task_id, issue.side)?,
@@ -1523,7 +1700,7 @@ pub async fn issue_execution_receipt(
         output_digest: output_digest.clone(),
     };
     let receipt = DevelopmentExecutionReceiptV1 {
-        schema_version: DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA.into(),
+        schema_version: DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2.into(),
         receipt_id: execution_receipt_id(&request.request_id, &task.task_id, issue.side)?,
         control_id: control.id.clone(),
         namespace: control.namespace.clone(),
@@ -1549,8 +1726,8 @@ pub async fn issue_execution_receipt(
         execution_provenance: DevelopmentExecutionProvenance::RegisteredPureFunction,
         revoke_watermark: request.revoke_watermark,
         source_ids: control.source_ids.clone(),
-        executor_actor: ctx.actor().into(),
-        executor_role: ctx.role(),
+        executor_actor: settlement.settler_actor,
+        executor_role: settlement.settler_role,
         issued_at_unix_seconds: issue.issued_at_unix_seconds,
     };
     validate_execution_receipt_binding(&receipt, &control, request, task, issue.side)?;
@@ -1659,6 +1836,64 @@ struct VerifiedPair {
     scored_output_pair_digest: String,
 }
 
+// Callers supply only a receipt freshly loaded from this same Session.
+async fn verify_current_execution_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    control: &DevelopmentControlV1,
+    request: &DevelopmentRunRequest,
+    task: &DevelopmentTaskSpecV1,
+    side: DevelopmentSide,
+    receipt: &DevelopmentExecutionReceiptV1,
+) -> Result<DevelopmentExecutionOutputV1> {
+    if receipt.schema_version == DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA {
+        return Err(source_legacy());
+    }
+    validate_execution_receipt_binding(receipt, control, request, task, side)?;
+    let call = session
+        .budget_call(ctx, &control.billing_scope, &receipt.budget_call_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let settlement = validate_execution_call(
+        ctx,
+        &call,
+        control,
+        request,
+        task,
+        &receipt.request_digest,
+        &receipt.output_digest,
+    )?;
+    if call.dispatch_id.as_deref() != Some(receipt.dispatch_id.as_str())
+        || call.usage_record_id.as_deref() != Some(receipt.usage_record_id.as_str())
+        || cost_state_from_call(&call)? != receipt.cost_state
+    {
+        return Err(Error::Conflict(
+            "execution receipt differs from its persisted budget row".into(),
+        ));
+    }
+    if receipt.executor_actor != settlement.settler_actor
+        || receipt.executor_role != settlement.settler_role
+    {
+        return Err(Error::Conflict(
+            "registered execution settler differs from registered executor".into(),
+        ));
+    }
+    let output: DevelopmentExecutionOutputV1 = need_record(
+        session,
+        ctx,
+        EXECUTION_OUTPUT_KIND,
+        &receipt.output_artifact_id,
+    )
+    .await?;
+    validate_output_artifact(receipt, &output)?;
+    if task.input.execute_target()? != output.output_utf8 {
+        return Err(Error::Conflict(
+            "registered execution output differs from frozen target".into(),
+        ));
+    }
+    Ok(output)
+}
+
 /// Reloads both execution receipts, their budget rows and stored outputs, and
 /// recomputes the scores with the frozen grader against the registered oracle.
 async fn verify_execution_pair(
@@ -1676,43 +1911,18 @@ async fn verify_execution_pair(
         (candidate_receipt_id, DevelopmentSide::Candidate),
     ] {
         identifier(receipt_id)?;
-        let receipt: DevelopmentExecutionReceiptV1 =
-            need_record(session, ctx, EXECUTION_RECEIPT_KIND, receipt_id).await?;
+        let receipt = get_execution_receipt(session, ctx, receipt_id)
+            .await?
+            .ok_or(Error::NotFound)?;
         if receipt.control_id != control.id {
             return Err(Error::Conflict(
                 "execution receipt belongs to a different control".into(),
             ));
         }
-        validate_execution_receipt_binding(&receipt, control, request, task, side)?;
-        let call = session
-            .budget_call(ctx, &control.billing_scope, &receipt.budget_call_id)
-            .await?
-            .ok_or(Error::NotFound)?;
-        validate_execution_call(
-            ctx,
-            &call,
-            control,
-            request,
-            task,
-            &receipt.request_digest,
-            &receipt.output_digest,
-        )?;
-        if call.dispatch_id.as_deref() != Some(receipt.dispatch_id.as_str())
-            || call.usage_record_id.as_deref() != Some(receipt.usage_record_id.as_str())
-            || cost_state_from_call(&call)? != receipt.cost_state
-        {
-            return Err(Error::Conflict(
-                "execution receipt differs from its persisted budget row".into(),
-            ));
-        }
-        let output: DevelopmentExecutionOutputV1 = need_record(
-            session,
-            ctx,
-            EXECUTION_OUTPUT_KIND,
-            &receipt.output_artifact_id,
+        let output = verify_current_execution_in_session(
+            session, ctx, control, request, task, side, &receipt,
         )
         .await?;
-        validate_output_artifact(&receipt, &output)?;
         let score = score_stored_output(
             &control.fixed_grader,
             &output.output_utf8,
@@ -1985,8 +2195,9 @@ pub(crate) async fn verify_observed_report_with_consumption_in_session(
     let mut control_ids = BTreeSet::new();
     for result in &report.results {
         for receipt_id in [&result.parent_execution_id, &result.candidate_execution_id] {
-            let receipt: DevelopmentExecutionReceiptV1 =
-                need_record(session, ctx, EXECUTION_RECEIPT_KIND, receipt_id).await?;
+            let receipt = get_execution_receipt(session, ctx, receipt_id)
+                .await?
+                .ok_or(Error::NotFound)?;
             control_ids.insert(receipt.control_id);
         }
     }
@@ -2415,20 +2626,23 @@ impl RegisteredDevelopmentRunner {
         .await?;
         verify_development_bundle_inputs(&mut session, &self.executor, request).await?;
         let receipt_id = execution_receipt_id(&request.request_id, &task.task_id, side)?;
-        let existing = get_record::<DevelopmentExecutionReceiptV1>(
-            &mut session,
-            &self.executor,
-            EXECUTION_RECEIPT_KIND,
-            &receipt_id,
-        )
-        .await?;
+        let existing = get_execution_receipt(&mut session, &self.executor, &receipt_id).await?;
         if let Some(receipt) = &existing {
             if receipt.control_id != control.id {
                 return Err(Error::Conflict(
                     "development request already executed under a different control".into(),
                 ));
             }
-            validate_execution_receipt_binding(receipt, control, request, task, side)?;
+            verify_current_execution_in_session(
+                &mut session,
+                &self.executor,
+                control,
+                request,
+                task,
+                side,
+                receipt,
+            )
+            .await?;
             if let Some(claim) = &self.management {
                 let call_id = execution_budget_call_id(&request.request_id, &task.task_id, side)?;
                 let call = session
@@ -2965,6 +3179,71 @@ impl DevRunner for RegisteredDevelopmentRunner {
             )
             .await?;
             verify_development_bundle_inputs(&mut session, &self.executor, &request).await?;
+            // Check the whole request before any side can reserve. A new wire
+            // domain does not turn the old request into an unexecuted request.
+            for manifest_task in &request.manifest.tasks {
+                let task = registered_task(&control, &request, &manifest_task.id)?;
+                for side in [DevelopmentSide::Parent, DevelopmentSide::Candidate] {
+                    let legacy_id =
+                        legacy_execution_receipt_id(&request.request_id, &task.task_id, side)?;
+                    if let Some(receipt) =
+                        get_execution_receipt(&mut session, &self.executor, &legacy_id).await?
+                    {
+                        if receipt.control_id != control.id {
+                            return Err(Error::Conflict(
+                                "development request already executed under a different control"
+                                    .into(),
+                            ));
+                        }
+                        validate_execution_receipt_binding(
+                            &receipt, &control, &request, task, side,
+                        )?;
+                        return Err(source_legacy());
+                    }
+                    let call_id =
+                        execution_budget_call_id(&request.request_id, &task.task_id, side)?;
+                    if let Some(call) = session
+                        .budget_call(&self.executor, &control.billing_scope, &call_id)
+                        .await?
+                        && call.response_artifact.as_ref().is_some_and(|artifact| {
+                            artifact.schema_version == REGISTERED_EXECUTION_SETTLEMENT_SCHEMA
+                        })
+                    {
+                        if call.actual_input_digest
+                            != execution_request_digest(&control, &request, task, side)?
+                            || call.dispatch_group_id != request.episode_id
+                            || call.stage != BudgetStage::DevelopmentExecution
+                        {
+                            return Err(Error::Conflict(
+                                "call_id_reused_with_different_content".into(),
+                            ));
+                        }
+                        if matches!(
+                            ReadRegisteredExecutionSettlement::from_call(&call)?,
+                            ReadRegisteredExecutionSettlement::Legacy(_)
+                        ) {
+                            return Err(source_legacy());
+                        }
+                    }
+                }
+            }
+            if let Some(run) = get_record::<DevelopmentRunReceiptV1>(
+                &mut session,
+                &self.executor,
+                RUN_RECEIPT_KIND,
+                &run_receipt_id(&request.request_id)?,
+            )
+            .await?
+            {
+                for id in &run.execution_receipt_ids {
+                    let receipt = get_execution_receipt(&mut session, &self.executor, id)
+                        .await?
+                        .ok_or(Error::NotFound)?;
+                    if receipt.schema_version == DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA {
+                        return Err(source_legacy());
+                    }
+                }
+            }
             session.commit().await?;
         }
         let mut results = Vec::with_capacity(request.manifest.tasks.len());
