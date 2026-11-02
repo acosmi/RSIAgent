@@ -425,7 +425,9 @@ def load_json(path):
     return value, raw
 
 def reject_path_links(path):
-    absolute=Path(os.path.abspath(path))
+    absolute=Path(path)
+    if not absolute.is_absolute(): absolute=Path.cwd()/absolute
+    # Keep .. until its preceding component has been checked for a link.
     current=Path(absolute.anchor)
     for part in absolute.parts[1:]:
         current=current/part
@@ -444,7 +446,7 @@ def private_metadata(info):
 
 def restore_ancestors(path):
     reject_path_links(path)
-    for parent in Path(os.path.abspath(path)).parents:
+    for parent in Path(path).resolve(strict=True).parents:
         info=parent.lstat()
         sticky_root=info.st_uid==0 and info.st_mode & stat.S_ISVTX
         if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0,os.geteuid()) or (info.st_mode & 0o022 and not sticky_root):

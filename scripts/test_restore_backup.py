@@ -1298,18 +1298,42 @@ class LocalPermissionsTests(unittest.TestCase):
         link = scenario.base / "backup-via-link"
         link.symlink_to(scenario.base, target_is_directory=True)
         self._refuse(scenario, link / backup.name, anchor, "symlink in supplied path ancestry")
+        child = backup.parent / "backup-link-child"
+        child.mkdir(mode=0o700)
+        nested_link = backup.parent / "backup-child-link"
+        nested_link.symlink_to(child, target_is_directory=True)
+        supplied = nested_link / ".." / backup.name
+        self.assertEqual(Path(os.path.abspath(supplied)), backup)
+        self.assertEqual(supplied.resolve(strict=True), backup)
+        self._refuse(scenario, supplied, anchor, "symlink in supplied path ancestry")
 
     def test_anchor_ancestor_symlink_refuses_before_temp(self):
         scenario, backup, anchor = self._healthy()
         link = scenario.base / "anchor-via-link"
         link.symlink_to(anchor.parent, target_is_directory=True)
         self._refuse(scenario, backup, link / anchor.name, "symlink in supplied path ancestry")
+        child = anchor.parent / "anchor-link-child"
+        child.mkdir(mode=0o700)
+        nested_link = anchor.parent / "anchor-child-link"
+        nested_link.symlink_to(child, target_is_directory=True)
+        supplied = nested_link / ".." / anchor.name
+        self.assertEqual(Path(os.path.abspath(supplied)), anchor)
+        self.assertEqual(supplied.resolve(strict=True), anchor)
+        self._refuse(scenario, backup, supplied, "symlink in supplied path ancestry")
 
     def test_destination_parent_symlink_refuses_before_temp(self):
         scenario, backup, anchor = self._healthy()
         link = scenario.base / "destination-via-link"
         link.symlink_to(scenario.base, target_is_directory=True)
         self._refuse(scenario, backup, anchor, "symlink in supplied path ancestry", link / "refused")
+        child = scenario.base / "destination-link-child"
+        child.mkdir(mode=0o700)
+        nested_link = scenario.base / "destination-child-link"
+        nested_link.symlink_to(child, target_is_directory=True)
+        supplied = nested_link / ".." / "refused"
+        self.assertEqual(Path(os.path.abspath(supplied)), scenario.base / "refused")
+        self.assertEqual(supplied.parent.resolve(strict=True), scenario.base)
+        self._refuse(scenario, backup, anchor, "symlink in supplied path ancestry", supplied)
 
     def test_writable_destination_parent_has_no_sticky_exception(self):
         scenario, backup, anchor = self._healthy()
