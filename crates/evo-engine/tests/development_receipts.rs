@@ -37,6 +37,7 @@ use evo_storage::Store;
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallReservation, BudgetCallState, BudgetStage,
     REGISTERED_EXECUTION_REQUEST_SCHEMA, REGISTERED_EXECUTION_SETTLEMENT_SCHEMA,
+    REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2, ReadRegisteredExecutionSettlement,
     RegisteredExecutionProvenance, RegisteredExecutionSettlement, RootBudgetAuthorization,
     UsageCharge,
 };
@@ -2075,4 +2076,375 @@ async fn current_bound_pair_reloads_task_control_grader_and_metered_receipts() {
     verify_development_observation(&fixture.store, &fixture.admin, &request_fact, &observation)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn settlement_records_actual_actor_and_role_without_caller_fields() {
+    let fixture = Fixture::new().await;
+    let output_digest = hash(br#"{"answer":{"clamped":-1}}"#);
+    for (index, settler) in [
+        fixture.executor.clone(),
+        Context::new(NAMESPACE, "another-registered-worker", Role::Worker).unwrap(),
+        Context::new(NAMESPACE, "registered-host", Role::Host).unwrap(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let call_id = format!("ag183-writer-{index}");
+        let request_digest = d(&format!("ag183-input-{index}"));
+        let (fence, dispatch_id) = reserve_dispatched(
+            &fixture,
+            &call_id,
+            &format!("ag183-group-{index}"),
+            BudgetStage::DevelopmentExecution,
+            &request_digest,
+        )
+        .await;
+        let submission = RegisteredExecutionSettlement {
+            schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA.into(),
+            provenance: RegisteredExecutionProvenance::RegisteredPureFunction,
+            call_id: call_id.clone(),
+            dispatch_id,
+            request_digest,
+            output_digest: output_digest.clone(),
+            target_id: "reference_host.clamp_i64.v1".into(),
+            target_digest: fixture.control.target_digest.clone(),
+            runner_digest: fixture.control.runner_digest.clone(),
+        };
+        let mut forged = serde_json::to_value(&submission).unwrap();
+        forged["settler_actor"] = serde_json::json!(fixture.control.executor_actor);
+        forged["settler_role"] = serde_json::json!("worker");
+        let error = serde_json::from_value::<RegisteredExecutionSettlement>(forged).unwrap_err();
+        assert!(error.to_string().contains("unknown field `settler_actor`"));
+        let charge = UsageCharge {
+            amount_micros: 0,
+            currency: "USD".into(),
+            pricing_version: "pricing-v1".into(),
+            provider_request_id: "registered-pure-function:ag183".into(),
+            usage_record_id: format!("ag183-writer-usage-{index}"),
+            output_digest: output_digest.clone(),
+        };
+        let before = fixture
+            .store
+            .budget_call(&fixture.admin, SCOPE, &call_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            fixture
+                .store
+                .settle_registered_execution_call(&fixture.admin, &fence, &charge, &submission)
+                .await,
+            Err(Error::Forbidden)
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .budget_call(&fixture.admin, SCOPE, &call_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            before
+        );
+        let settled = fixture
+            .store
+            .settle_registered_execution_call(settler, &fence, &charge, &submission)
+            .await
+            .unwrap();
+        assert_eq!(settled.state, BudgetCallState::Finalized);
+        assert_eq!(settled.actual_cost_micros, Some(0));
+        assert!(settled.execution_closed);
+        assert_eq!(
+            settled.response_artifact.as_ref().unwrap().schema_version,
+            REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2
+        );
+        let ReadRegisteredExecutionSettlement::Current(fact) =
+            ReadRegisteredExecutionSettlement::from_call(&settled).unwrap()
+        else {
+            panic!("new writer must persist its actual caller facts");
+        };
+        assert_eq!(fact.settler_actor, settler.actor());
+        assert_eq!(fact.settler_role, settler.role());
+        assert_eq!(fact.settlement, submission);
+        let mut model_row = settled.clone();
+        model_row.execution_provenance =
+            Some(evo_storage::budget::BudgetExecutionProvenance::ExternalProvider);
+        assert!(matches!(
+            ReadRegisteredExecutionSettlement::from_call(&model_row),
+            Err(Error::Conflict(message)) if message == "registered execution settlement is invalid"
+        ));
+        if index > 0 {
+            assert_ne!(fact.settler_actor, fixture.control.executor_actor);
+        }
+        let root = fixture
+            .store
+            .root_budget(&fixture.admin, SCOPE)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.spent_micros, 0);
+        assert_eq!(root.reserved_micros, 0);
+    }
+    // Financial writer facts are not execution receipts or a control/executor match.
+    fixture.store.close().await;
+}
+
+#[tokio::test]
+async fn settlement_preserves_legacy_bytes_and_current_identity_on_replay() {
+    let fixture = Fixture::new().await;
+    let call_id = "ag183-replay";
+    let request_digest = d("ag183-replay-input");
+    let output_digest = hash(br#"{"answer":{"clamped":-1}}"#);
+    let (fence, dispatch_id) = reserve_dispatched(
+        &fixture,
+        call_id,
+        "ag183-replay-group",
+        BudgetStage::DevelopmentExecution,
+        &request_digest,
+    )
+    .await;
+    let submission = RegisteredExecutionSettlement {
+        schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA.into(),
+        provenance: RegisteredExecutionProvenance::RegisteredPureFunction,
+        call_id: call_id.into(),
+        dispatch_id,
+        request_digest,
+        output_digest: output_digest.clone(),
+        target_id: "reference_host.clamp_i64.v1".into(),
+        target_digest: fixture.control.target_digest.clone(),
+        runner_digest: fixture.control.runner_digest.clone(),
+    };
+    let charge = UsageCharge {
+        amount_micros: 0,
+        currency: "USD".into(),
+        pricing_version: "pricing-v1".into(),
+        provider_request_id: "registered-pure-function:ag183-replay".into(),
+        usage_record_id: "ag183-replay-usage".into(),
+        output_digest,
+    };
+    let first = fixture
+        .store
+        .settle_registered_execution_call(&fixture.executor, &fence, &charge, &submission)
+        .await
+        .unwrap();
+    let path = fixture._dir.path().join("development.sqlite3");
+    let current_before = clock_failure_sqlite_snapshot(&path);
+    for resumer in [
+        Context::new(NAMESPACE, "another-resumer", Role::Worker).unwrap(),
+        Context::new(NAMESPACE, fixture.executor.actor(), Role::Host).unwrap(),
+    ] {
+        let replay = fixture
+            .store
+            .settle_registered_execution_call(&resumer, &fence, &charge, &submission)
+            .await
+            .unwrap();
+        assert_eq!(replay, first);
+        let ReadRegisteredExecutionSettlement::Current(fact) =
+            ReadRegisteredExecutionSettlement::from_call(&replay).unwrap()
+        else {
+            panic!("replay cannot downgrade the current settlement");
+        };
+        assert_eq!(fact.settler_actor, fixture.executor.actor());
+        assert_eq!(fact.settler_role, fixture.executor.role());
+    }
+    assert_eq!(clock_failure_sqlite_snapshot(&path), current_before);
+
+    // Explicitly derived v1 wire fixture, not a claim of a native historical run.
+    // Only its response payload is replaced; no current actor fact is fabricated.
+    let legacy = submission.artifact().unwrap();
+    let legacy_path = fixture._dir.path().join("derived-v1.sqlite3");
+    let copied = std::process::Command::new("python3")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(r#"
+import sqlite3,sys
+source,destination,schema,digest,body,scope,call_id=sys.argv[1:]
+con=sqlite3.connect(source)
+con.execute('VACUUM INTO ?', (destination,))
+con.close()
+con=sqlite3.connect(destination)
+changed=con.execute('UPDATE root_budget_calls SET response_artifact_schema=?,response_artifact_digest=?,response_artifact_body=? WHERE billing_scope=? AND call_id=?',(schema,digest,body,scope,call_id))
+assert changed.rowcount==1
+con.commit()
+con.close()
+"#)
+        .arg(&path).arg(&legacy_path)
+        .arg(&legacy.schema_version).arg(&legacy.digest).arg(&legacy.body)
+        .arg(SCOPE).arg(call_id)
+        .output().unwrap();
+    assert!(copied.status.success(), "{copied:?}");
+    let old_store = Store::open(&legacy_path).await.unwrap();
+    let old = old_store
+        .budget_call(&fixture.admin, SCOPE, call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.response_artifact.as_ref(), Some(&legacy));
+    assert!(
+        matches!(ReadRegisteredExecutionSettlement::from_call(&old).unwrap(), ReadRegisteredExecutionSettlement::Legacy(value) if value == submission)
+    );
+    let mut model_legacy = old.clone();
+    model_legacy.execution_provenance =
+        Some(evo_storage::budget::BudgetExecutionProvenance::ExternalProvider);
+    assert!(
+        matches!(ReadRegisteredExecutionSettlement::from_call(&model_legacy).unwrap(), ReadRegisteredExecutionSettlement::Legacy(value) if value == submission)
+    );
+    let old_before = clock_failure_sqlite_snapshot(&legacy_path);
+    let replay = old_store
+        .settle_registered_execution_call(
+            &Context::new(NAMESPACE, "legacy-resumer", Role::Host).unwrap(),
+            &fence,
+            &charge,
+            &submission,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay, old);
+    assert_eq!(replay.response_artifact.as_ref().unwrap().body, legacy.body);
+    assert!(matches!(
+        ReadRegisteredExecutionSettlement::from_call(&replay).unwrap(),
+        ReadRegisteredExecutionSettlement::Legacy(_)
+    ));
+    assert_eq!(clock_failure_sqlite_snapshot(&legacy_path), old_before);
+    assert_eq!(
+        fixture
+            .store
+            .budget_call(&fixture.admin, SCOPE, call_id)
+            .await
+            .unwrap()
+            .unwrap(),
+        first
+    );
+    old_store.close().await;
+
+    // This is a real generic financial close, not a registered execution witness.
+    // Its self-consistent v1 payload remains Legacy for every legal resumer.
+    for (index, model_settler) in [
+        fixture.admin.clone(),
+        Context::new(NAMESPACE, "generic-financial-host", Role::Host).unwrap(),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let model_call_id = format!("ag183-generic-legacy-{index}");
+        let request_artifact = BudgetArtifact::from_serializable(
+            "rsia.model_request.artifact.v1",
+            &serde_json::json!({"request_id":model_call_id,"source_closure":[],"input":"ag183-financial-replay"}),
+        )
+        .unwrap();
+        let reserved = fixture
+            .store
+            .reserve_budget_call(
+                &fixture.executor,
+                &BudgetCallReservation {
+                    billing_scope: SCOPE.into(),
+                    call_id: model_call_id.clone(),
+                    dispatch_group_id: format!("ag183-generic-group-{index}"),
+                    stage: BudgetStage::DevelopmentExecution,
+                    actual_input_digest: request_artifact.digest.clone(),
+                    request_artifact: Some(request_artifact),
+                    max_cost_micros: 1,
+                    lease_token: format!("ag183-generic-lease-{index}"),
+                    lease_until: 1_000,
+                    now: 100,
+                },
+            )
+            .await
+            .unwrap();
+        let model_fence = BudgetCallFence {
+            billing_scope: SCOPE.into(),
+            call_id: model_call_id.clone(),
+            actual_input_digest: reserved.actual_input_digest.clone(),
+            lease_token: reserved.lease_token,
+            lease_epoch: reserved.lease_epoch,
+            now: 101,
+        };
+        let dispatched = fixture
+            .store
+            .begin_budget_dispatch(&fixture.executor, &model_fence)
+            .await
+            .unwrap()
+            .call;
+        let legacy_submission = RegisteredExecutionSettlement {
+            call_id: model_call_id,
+            dispatch_id: dispatched.dispatch_id.unwrap(),
+            request_digest: model_fence.actual_input_digest.clone(),
+            ..submission.clone()
+        };
+        let legacy_artifact = legacy_submission.artifact().unwrap();
+        let legacy_charge = UsageCharge {
+            provider_request_id: format!("generic-financial:{index}"),
+            usage_record_id: format!("ag183-generic-usage-{index}"),
+            ..charge.clone()
+        };
+        let settled = fixture
+            .store
+            .settle_model_budget_call(
+                model_settler,
+                &model_fence,
+                &legacy_charge,
+                &evo_storage::budget::ModelCallSettlementEvidence {
+                    provenance: evo_storage::budget::BudgetExecutionProvenance::ExternalProvider,
+                    actual_model_digest: Some(d("ag183-generic-model")),
+                    transport_artifact: BudgetArtifact::from_serializable(
+                        "test.transport.v1",
+                        &serde_json::json!({"provider_request_id":legacy_charge.provider_request_id}),
+                    )
+                    .unwrap(),
+                    usable_response: Some(legacy_artifact.clone()),
+                    blocked_response: BudgetArtifact::from_serializable(
+                        "test.response.v1",
+                        &serde_json::json!({"state":"blocked"}),
+                    )
+                    .unwrap(),
+                    forced_block_reason: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(settled.response_usable);
+        assert_eq!(settled.call.actual_cost_micros, Some(0));
+        assert!(!settled.call.execution_closed);
+        assert_eq!(
+            settled.call.execution_provenance,
+            Some(evo_storage::budget::BudgetExecutionProvenance::ExternalProvider)
+        );
+        let closed = fixture
+            .store
+            .close_budget_call_execution(
+                model_settler,
+                SCOPE,
+                &legacy_submission.call_id,
+                &legacy_submission.dispatch_id,
+                "ag183_financial_close",
+                102,
+            )
+            .await
+            .unwrap();
+        assert!(closed.execution_closed);
+        assert_eq!(closed.response_artifact.as_ref(), Some(&legacy_artifact));
+        let financial_before = clock_failure_sqlite_snapshot(&path);
+        for resumer in [
+            fixture.executor.clone(),
+            Context::new(NAMESPACE, "generic-legacy-resumer", Role::Host).unwrap(),
+        ] {
+            let replay = fixture
+                .store
+                .settle_registered_execution_call(
+                    &resumer,
+                    &model_fence,
+                    &legacy_charge,
+                    &legacy_submission,
+                )
+                .await
+                .unwrap();
+            assert_eq!(replay, closed);
+            assert_eq!(replay.response_artifact.as_ref(), Some(&legacy_artifact));
+            assert!(
+                matches!(ReadRegisteredExecutionSettlement::from_call(&replay).unwrap(), ReadRegisteredExecutionSettlement::Legacy(value) if value == legacy_submission)
+            );
+        }
+        assert_eq!(clock_failure_sqlite_snapshot(&path), financial_before);
+    }
+    fixture.store.close().await;
 }
