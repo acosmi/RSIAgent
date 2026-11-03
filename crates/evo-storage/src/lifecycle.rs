@@ -5186,8 +5186,9 @@ impl<'de> serde::de::Visitor<'de> for StrictJsonVisitor {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod backup_lifecycle_tests {
+    #![cfg(unix)]
     use super::*;
     use std::os::unix::fs::OpenOptionsExt;
 
