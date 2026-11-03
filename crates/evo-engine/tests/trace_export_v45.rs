@@ -1299,3 +1299,149 @@ async fn trace_export_unknown_license_or_source_grant_is_refused() {
         audit_before
     );
 }
+
+/// The all-instance trace export record bound and the same-key rule at the
+/// limit, through the real storage `put` gate the prepare job also passes.
+/// Boundary seeds are minimal trace-export identities only: they fabricate no
+/// review, delivery or Current phase, exactly like the replay-world capacity
+/// seeds.
+#[tokio::test]
+async fn trace_export_global_capacity_and_same_key_at_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("trace-capacity.sqlite3"))
+        .await
+        .unwrap();
+    let admin = context("tenant-a", Role::Admin);
+    let other = context("tenant-b", Role::Admin);
+    let seed = |id: &str| json!({"schema_version": evo_storage::TRACE_EXPORT_SCHEMA, "id": id});
+    // One transaction counts and creates together: the count includes every
+    // namespace of the instance, so the last slot is spent by another
+    // namespace's record.
+    let mut session = store.session().await.unwrap();
+    let last = (evo_storage::MVP_MAX_TRACE_EXPORTS - 1) as usize;
+    for index in 0..last {
+        let id = format!("trace-seed-{index:04}");
+        session
+            .put(&admin, "artifact", &id, admin.actor(), &seed(&id))
+            .await
+            .unwrap();
+    }
+    let cross = format!("trace-seed-{last:04}");
+    session
+        .put(&other, "artifact", &cross, other.actor(), &seed(&cross))
+        .await
+        .unwrap();
+    for (ctx, id) in [(&admin, "trace-new-a"), (&other, "trace-new-b")] {
+        match session
+            .put(ctx, "artifact", id, ctx.actor(), &seed(id))
+            .await
+        {
+            Err(Error::Conflict(message)) => assert_eq!(
+                message,
+                "MVP capacity exceeded: trace exports 1000 >= limit 1000"
+            ),
+            other => panic!("{id} must hit the all-instance bound, got {other:?}"),
+        }
+        assert!(
+            session
+                .object_row(ctx, "artifact", id)
+                .await
+                .unwrap()
+                .is_none(),
+            "refused record {id} leaves zero new rows"
+        );
+    }
+    // Same key, same content, full quota: the original object is still the
+    // answer and no capacity refusal happens, because this is not a new slot.
+    let original = session
+        .object_row(&admin, "artifact", "trace-seed-0000")
+        .await
+        .unwrap()
+        .unwrap();
+    session
+        .put(
+            &admin,
+            "artifact",
+            "trace-seed-0000",
+            admin.actor(),
+            &seed("trace-seed-0000"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .object_row(&admin, "artifact", "trace-seed-0000")
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        original.body
+    );
+    // History is never deleted to free a slot.
+    match session.delete(&admin, "artifact", "trace-seed-0001").await {
+        Err(Error::Conflict(message)) => {
+            assert_eq!(message, "trace export history must be retained")
+        }
+        other => panic!("deleting trace history must be retained, got {other:?}"),
+    }
+    // A real revocation redaction of one record keeps occupying the same
+    // all-instance quota and stays read-only: no slot is freed by redacting.
+    let redacted_id = "trace-seed-0002".to_string();
+    let row = session
+        .object_row(&admin, "artifact", &redacted_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let tombstone = evo_storage::lifecycle::redacted_object_body(
+        "artifact",
+        &redacted_id,
+        &serde_json::from_str::<Value>(&row.body).unwrap(),
+        &row.body,
+    );
+    session
+        .put(&admin, "artifact", &redacted_id, admin.actor(), &tombstone)
+        .await
+        .unwrap();
+    match session
+        .put(
+            &admin,
+            "artifact",
+            "trace-late",
+            admin.actor(),
+            &seed("trace-late"),
+        )
+        .await
+    {
+        Err(Error::Conflict(message)) => assert_eq!(
+            message,
+            "MVP capacity exceeded: trace exports 1000 >= limit 1000"
+        ),
+        other => panic!("the redacted placeholder keeps its slot, got {other:?}"),
+    }
+    match session
+        .put(
+            &admin,
+            "artifact",
+            &redacted_id,
+            admin.actor(),
+            &seed(&redacted_id),
+        )
+        .await
+    {
+        Err(Error::Conflict(message)) => {
+            assert_eq!(message, "redacted trace export history is read only")
+        }
+        other => panic!("redacted history is read only, got {other:?}"),
+    }
+    assert_eq!(
+        session
+            .object_row(&admin, "artifact", &redacted_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        serde_json::to_string(&tombstone).unwrap()
+    );
+    session.commit().await.unwrap();
+    store.close().await;
+}

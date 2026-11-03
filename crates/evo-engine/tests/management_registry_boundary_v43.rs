@@ -150,6 +150,10 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
         assert!(
             matches!(&error, Error::Invalid(message) if message == match (entry.name, entry.execution) {
                 ("optimization.step", _) => "invalid management payload",
+                // trace.export migrated from the unwired set to its real
+                // handler: its strict DTO now refuses this incomplete boundary
+                // payload exactly like optimization.step does, with zero writes.
+                ("trace.export", _) => "invalid management payload",
                 (_, ExecutionKind::AsyncJob) => "management_operation_not_wired",
                 _ => "management operation requires dedicated route",
             }),
@@ -181,7 +185,7 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
             .await
             .unwrap_err();
         assert!(
-            matches!(error, Error::Invalid(ref message) if message == "management_operation_plane_mismatch"),
+            matches!(&error, Error::Invalid(ref message) if message == "management_operation_plane_mismatch"),
             "{name}: {error:?}"
         );
         assert_eq!(
@@ -191,6 +195,86 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
         );
     }
     assert_eq!(rows(&store, &admin).await, before_admin, "zero writes");
+
+    // The real trace.export handler behind the migrated boundary: a real
+    // request is accepted for the Admin role only, and the real job then fails
+    // honestly on this source-less boundary store — either at its authenticated
+    // source loader (no captured source exists here) or, on a dirty build, at
+    // the fail-closed exporter identity. Both are real handler refusals.
+    let accepted = dispatcher
+        .submit(
+            &admin,
+            "trace.export",
+            json!({
+                "schema_version": "rsia.management.trace_export.prepare.v1",
+                "request_key": "boundary-trace-real-handler",
+                "export_id": "boundary-export",
+                "source_ids": ["boundary-source"],
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.identity().operation, "trace.export");
+    assert_eq!(
+        accepted.identity().state,
+        evo_engine::dispatch::ManagementJobState::Queued
+    );
+    for caller in [
+        evaluator.clone(),
+        Context::new("boundary", "agent", Role::Agent).unwrap(),
+    ] {
+        assert!(
+            matches!(
+                dispatcher
+                    .submit(
+                        &caller,
+                        "trace.export",
+                        json!({
+                            "schema_version": "rsia.management.trace_export.prepare.v1",
+                            "request_key": "boundary-trace-role",
+                            "export_id": "boundary-export",
+                            "source_ids": ["boundary-source"],
+                        }),
+                    )
+                    .await
+                    .unwrap_err(),
+                Error::Forbidden
+            ),
+            "trace.export keeps the Admin role guard"
+        );
+    }
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let job = dispatcher
+                .status(&admin, accepted.identity().id)
+                .await
+                .unwrap();
+            if matches!(
+                job.identity().state,
+                evo_engine::dispatch::ManagementJobState::Failed
+                    | evo_engine::dispatch::ManagementJobState::Succeeded
+                    | evo_engine::dispatch::ManagementJobState::Cancelled
+                    | evo_engine::dispatch::ManagementJobState::Blocked
+            ) {
+                break job;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the real trace.export job reaches a terminal state");
+    assert_eq!(
+        finished.identity().state,
+        evo_engine::dispatch::ManagementJobState::Failed
+    );
+    assert!(
+        matches!(
+            finished.error_code(),
+            Some("not_found") | Some("invalid_input")
+        ),
+        "the real handler refuses honestly: {:?}",
+        finished.error_code()
+    );
 }
 
 /// The old seven handlers keep their real role guards (healthy positive and

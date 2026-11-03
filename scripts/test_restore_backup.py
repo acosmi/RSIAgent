@@ -681,6 +681,99 @@ class RestoreTests(unittest.TestCase):
                 self.assertEqual(database_image(anchor),before_anchor)
                 self.assertEqual(database_image(changed / "rsia.sqlite3"),before_backup)
 
+    def test_restore_refuses_trace_export_history_rollback(self):
+        # AG-175: rsia.trace_export.v1 records and their rsia.redacted.v1
+        # tombstones are consumed facts. A backup that rolls that history back
+        # (either row missing, or the tombstone reshaped) is isolated exactly
+        # like the other consumed accounting facts.
+        def member(path,digest,size):
+            return {"path":path,"digest_sha256":digest,"size_bytes":size}
+
+        candidate_digest=sha256_text("trace-export-candidate")
+        receipt_digest=sha256_text("trace-export-receipt")
+        record={
+            "schema_version":"rsia.trace_export.v1",
+            "id":"trace-export-6b1f2a9c0d4e5f60718293a4",
+            "export_id":"restore-export",
+            "phase":"delivered",
+            "prepare_job_id":"management-job-prepare",
+            "publish_job_id":"management-job-publish",
+            "candidate_digest":candidate_digest,
+            "members":[
+                member("traces/0000.json",sha256_text("member-0"),32),
+                member("manifest.json",sha256_text("manifest"),32)],
+            "candidate_storage":{"staged":False,"paths":[]},
+            "delivery":{"status":"delivered","receipt_digest":receipt_digest},
+            "durability":{"tree_fsynced":True,"verified_tree_digest":candidate_digest},
+            "local_cost":{"wall_seconds":1,"bytes":64},
+            "source_snapshots":[],
+            "source_watermark_seq":None,
+            "source_watermark_digest":None,
+            "owner_actor":"admin",
+            "created_at":1,
+            "updated_at":2}
+        record_body=json.dumps(record)
+        # The one tombstone shape the Rust lifecycle redaction constructs
+        # (redacted_object_body): identity, the replaced digest and exactly the
+        # retained metadata of a delivered export.
+        tombstone={
+            "id":"trace-export-9c3e5a7b1d2f40618273a4b5",
+            "schema_version":"rsia.redacted.v1",
+            "state":"source_revoked",
+            "original_kind":"artifact",
+            "original_schema":"rsia.trace_export.v1",
+            "original_digest":sha256_text("revoked export record body"),
+            "metadata":{
+                "phase":"delivered",
+                "prepare_job_id":"management-job-prepare",
+                "publish_job_id":"management-job-publish",
+                "candidate_digest":candidate_digest,
+                "delivery":{"status":"delivered","receipt_digest":receipt_digest},
+                "durability":{"tree_fsynced":True,"verified_tree_digest":candidate_digest},
+                "owner_actor":"admin"}}
+        scenario=Scenario(self,CURRENT)
+        con=connect(scenario.history)
+        for body in (record_body,json.dumps(tombstone)):
+            con.execute(
+                "INSERT INTO objects(namespace,kind,id,owner,body) VALUES('legacy-a','artifact',?,'admin',?)",
+                (json.loads(body)["id"],body))
+        con.close()
+        anchor=scenario.anchor()
+        # An intact history restores; both rows survive the copy untouched.
+        healthy=scenario.backup("healthy-trace-history")
+        dest,result=scenario.restore(healthy,anchor,"healthy-trace-restore")
+        self.assert_restored(dest,result,0,"none")
+        restored=sqlite3.connect(dest / "rsia.sqlite3")
+        try:
+            kept=dict(restored.execute(
+                "SELECT id,body FROM objects WHERE id IN (?,?)",
+                (record["id"],tombstone["id"])).fetchall())
+        finally:
+            restored.close()
+        self.assertEqual(kept[record["id"]],record_body)
+        self.assertEqual(kept[tombstone["id"]],json.dumps(tombstone))
+        # Every rollback of that history is refused against the live anchor.
+        rollbacks={
+            "whole-history":"DELETE FROM objects WHERE id IN ('%s','%s')"%(record["id"],tombstone["id"]),
+            "delivered-record-only":"DELETE FROM objects WHERE id='%s'"%record["id"],
+            "redacted-tombstone-only":"DELETE FROM objects WHERE id='%s'"%tombstone["id"]}
+        before_anchor=database_image(anchor)
+        for name,sql in rollbacks.items():
+            with self.subTest(rollback=name):
+                rolled_back=scenario.backup(f"rolled-back-{name}",db_sql=sql)
+                before_backup=database_image(rolled_back / "rsia.sqlite3")
+                dest,result=scenario.restore(rolled_back,anchor,f"refused-{name}")
+                self.assert_isolated(scenario,dest,result,
+                    "consumed query/alpha/dispatch/accounting facts changed; make a fresh backup")
+                self.assertEqual(database_image(anchor),before_anchor)
+                self.assertEqual(database_image(rolled_back / "rsia.sqlite3"),before_backup)
+        # A reshaped tombstone is isolated by the trace_redacted segment itself,
+        # before any comparison can treat it as an unknown schema.
+        reshaped=scenario.backup("reshaped-tombstone",
+            db_sql="UPDATE objects SET body=json_set(body,'$.state','other') WHERE id='%s'"%tombstone["id"])
+        dest,result=scenario.restore(reshaped,anchor,"refused-reshaped")
+        self.assert_isolated(scenario,dest,result,"trace export redaction shape differs")
+
 
 def _host_database_family(path):
     path=Path(path)
