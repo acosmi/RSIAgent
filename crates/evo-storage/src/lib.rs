@@ -32,6 +32,11 @@ pub const MVP_MAX_RUNS: u64 = 1_000;
 pub const MVP_MAX_REPLAY_WORLDS: u64 = 100;
 pub const MVP_MAX_ACTIVE_LEASES: u64 = 10;
 pub const TRACE_EXPORT_SCHEMA: &str = "rsia.trace_export.v1";
+/// The exact `Conflict` reason [`Store::verify_trace_export_tree`] returns for
+/// a published trace export tree that is missing or no longer the frozen
+/// member set. The engine string-matches this one reason so crash recovery can
+/// tell "no proof of publication" apart from a drifted source closure.
+pub const TRACE_EXPORT_TREE_UNAVAILABLE: &str = "published trace export tree is unavailable";
 pub const MVP_MAX_TRACE_EXPORTS: u64 = 1_000;
 /// Schema identifiers the capacity measurement recognises. They mirror the
 /// engine's persisted schema versions; the engine asserts they stay equal.
@@ -215,6 +220,18 @@ pub enum ManagementTraceExportResultV2 {
         record_id: String,
         candidate_digest: String,
         phase: String,
+    },
+    /// The publish job's terminal success: the record reached `delivered`
+    /// after the manifest and every member were really on disk and digest
+    /// verified, and `receipt_digest` is the delivery receipt those bytes
+    /// earned. The candidate artifacts stay in the record, never a second
+    /// copy here.
+    TraceExportDelivered {
+        export_id: String,
+        record_id: String,
+        candidate_digest: String,
+        phase: String,
+        receipt_digest: String,
     },
 }
 
@@ -644,6 +661,19 @@ pub struct LocalExportReceipt {
     pub package_tree_digest: String,
     pub delivered_bytes: u64,
     pub completion_receipt_digest: String,
+}
+
+/// The FS facts of one trace export tree publication: the delivery receipt the
+/// published bytes earn, the tree digest recomputed from the published
+/// directory's real bytes, whether this call fsynced the tree it verified, and
+/// whether this call's rename published it or a prior (crashed) call already
+/// had published the identical tree.
+#[derive(Debug, Clone)]
+pub struct TraceExportTreePublication {
+    pub receipt: LocalExportReceipt,
+    pub verified_tree_digest: String,
+    pub tree_fsynced: bool,
+    pub published_now: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1593,6 +1623,118 @@ async fn ensure_unlinked_directory(path: &Path) -> Result<()> {
         Err(error) => return Err(internal(error)),
     }
     Ok(())
+}
+
+/// Build one member directory chain under the trace export staging root.
+/// Every missing directory is created with an explicit 0700 mode; an ancestor
+/// that already exists as a symlink or a non-directory is refused — a broken
+/// or foreign parent is never chmodded into shape, and an existing real
+/// directory keeps its own observed permissions.
+fn ensure_trace_staging_directory(root: &Path, directory: &Path) -> Result<()> {
+    let relative = directory
+        .strip_prefix(root)
+        .map_err(|_| Error::Invalid("trace export staging path escapes its private root".into()))?;
+    let mut built = root.to_path_buf();
+    for segment in relative.iter() {
+        built = built.join(segment);
+        match std::fs::symlink_metadata(&built) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+                    return Err(Error::Conflict(
+                        "trace export staging ancestor is linked or non-directory".into(),
+                    ));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::DirBuilderExt;
+                    std::fs::DirBuilder::new()
+                        .mode(0o700)
+                        .create(&built)
+                        .map_err(internal)?;
+                }
+                #[cfg(not(unix))]
+                std::fs::create_dir(&built).map_err(internal)?;
+            }
+            Err(error) => return Err(internal(error)),
+        }
+    }
+    Ok(())
+}
+
+fn sync_directory_blocking(path: &Path) -> Result<()> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(internal)
+}
+
+/// The trace export private staging writer. Each member is created with
+/// `create_new` (NOREPLACE: an existing file is never overwritten) and an
+/// explicit 0600 mode, fsynced, then made read-only so the shared published-
+/// tree verifier accepts the staged tree; every parent directory is fsynced
+/// after its members and the staging root is fsynced last. The bytes are the
+/// caller's frozen candidate members; path, size and member limits were
+/// already enforced by [`local_export_tree_digest`].
+async fn write_trace_export_staging(root: &Path, files: &[LocalExportFile]) -> Result<()> {
+    let root = root.to_path_buf();
+    let members: Vec<(String, Vec<u8>)> = files
+        .iter()
+        .map(|file| (file.path.clone(), file.bytes.clone()))
+        .collect();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::io::Write;
+        for (path, bytes) in &members {
+            let target = root.join(path);
+            let parent = target
+                .parent()
+                .ok_or_else(|| Error::Invalid("trace export member lacks a parent".into()))?;
+            ensure_trace_staging_directory(&root, parent)?;
+            #[cfg(unix)]
+            let mut file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(&target)
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::AlreadyExists {
+                            Error::Conflict("trace export staging member already exists".into())
+                        } else {
+                            internal(error)
+                        }
+                    })?
+            };
+            #[cfg(not(unix))]
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&target)
+                .map_err(internal)?;
+            file.write_all(bytes).map_err(internal)?;
+            file.sync_all().map_err(internal)?;
+            let mut permissions = file.metadata().map_err(internal)?.permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&target, permissions).map_err(internal)?;
+        }
+        let mut parents = std::collections::BTreeSet::new();
+        for (path, _) in &members {
+            let mut parent = Path::new(path).parent();
+            while let Some(directory) = parent {
+                if !directory.as_os_str().is_empty() {
+                    parents.insert(root.join(directory));
+                }
+                parent = directory.parent();
+            }
+        }
+        for parent in parents {
+            sync_directory_blocking(&parent)?;
+        }
+        sync_directory_blocking(&root)
+    })
+    .await
+    .map_err(internal)?
 }
 
 async fn verify_local_export_directory(
@@ -2717,6 +2859,207 @@ impl Store {
         session.audit(ctx, "e16.export.abort", export_id).await?;
         session.commit().await
     }
+
+    /// Publish the frozen trace export candidate tree under
+    /// `exports/<namespace-hash>/<export_id>`, sharing the E16 local export
+    /// private IO layer (staging, digest re-verification, identity checks,
+    /// NOREPLACE rename) without any of the attempt.v2 bookkeeping: this
+    /// method opens no database session and checks no fence or watermark —
+    /// the caller owns those in its own transactions. The blob lock is taken
+    /// only around the rename barrier and never while any database connection
+    /// is held. The caller's frozen digest is the authority: bytes hashing to
+    /// anything else are refused before the first staging write of a member.
+    pub async fn publish_trace_export_tree(
+        &self,
+        ctx: &Context,
+        export_id: &str,
+        files: &[LocalExportFile],
+        frozen_candidate_digest: &str,
+    ) -> Result<TraceExportTreePublication> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        validate_export_id(export_id)?;
+        let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
+        if tree_digest != frozen_candidate_digest {
+            return Err(Error::Conflict(
+                "trace export candidate bytes differ from the frozen candidate".into(),
+            ));
+        }
+        let receipt =
+            local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
+        let namespace_hash = hash(ctx.namespace().as_bytes());
+        let staging_root = self.root.join(".export-staging");
+        ensure_unlinked_directory(&staging_root).await?;
+        let staging_parent = staging_root.join(&namespace_hash);
+        ensure_unlinked_directory(&staging_parent).await?;
+        let staging_path = staging_parent.join(uuid::Uuid::new_v4().to_string());
+        // Controlled cleanup: the guard removes this attempt's own private
+        // staging residue on every failure path and is disarmed exactly when
+        // the directory has been renamed away. It never touches a published
+        // tree, another attempt's staging, or redacted history.
+        let mut staging = PrivateStagedDirectory::new(staging_path.clone());
+        {
+            #[cfg(unix)]
+            tokio::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&staging_path)
+                .await
+                .map_err(internal)?;
+            #[cfg(not(unix))]
+            tokio::fs::create_dir(&staging_path)
+                .await
+                .map_err(internal)?;
+        }
+        write_trace_export_staging(staging.path(), files).await?;
+        if verify_local_export_directory(staging.path(), files).await?
+            != (tree_digest.clone(), delivered_bytes)
+        {
+            return Err(Error::Conflict("staged trace export tree changed".into()));
+        }
+        let staging_identity = local_export_identity(staging.path()).await?;
+
+        let final_path = self.local_export_directory(ctx, export_id)?;
+        let final_parent = final_path.parent().ok_or(Error::Internal)?;
+        ensure_unlinked_directory(&self.root.join("exports")).await?;
+        ensure_unlinked_directory(final_parent).await?;
+        let mut preverified_final: Option<Vec<LocalExportIdentityEntry>> = None;
+        if tokio::fs::try_exists(&final_path).await.map_err(internal)? {
+            if verify_local_export_directory(&final_path, files).await?
+                != (tree_digest.clone(), delivered_bytes)
+            {
+                return Err(Error::Conflict("existing trace export tree differs".into()));
+            }
+            preverified_final = Some(local_export_identity(&final_path).await?);
+        }
+
+        let _guard = self.blob_lock.write().await;
+        if local_export_identity(staging.path()).await? != staging_identity {
+            return Err(Error::Conflict(
+                "staged trace export identity changed".into(),
+            ));
+        }
+        let published_now;
+        match &preverified_final {
+            Some(identity) => {
+                // An identical tree a prior (crashed) call already published:
+                // the rename is not repeated, only the equality under the
+                // lock. This attempt's staging temp is removed by its guard.
+                if local_export_identity(&final_path).await? != *identity {
+                    return Err(Error::Conflict(
+                        "existing trace export identity changed".into(),
+                    ));
+                }
+                published_now = false;
+            }
+            None => {
+                if tokio::fs::try_exists(&final_path).await.map_err(internal)? {
+                    return Err(Error::Conflict(
+                        "trace export target appeared after preflight".into(),
+                    ));
+                }
+                if !publish_blob_no_replace(staging.path(), &final_path)? {
+                    return Err(Error::Conflict(
+                        "trace export target raced after write fence".into(),
+                    ));
+                }
+                staging.disarm();
+                sync_directory(final_parent).await?;
+                if local_export_identity(&final_path).await? != staging_identity {
+                    return Err(Error::Conflict(
+                        "published trace export identity changed".into(),
+                    ));
+                }
+                published_now = true;
+            }
+        }
+        // The digest recorded as "verified" is the one recomputed from the
+        // published directory's real bytes, never the input's self-assertion.
+        let (verified_tree_digest, verified_bytes) =
+            verify_local_export_directory(&final_path, files).await?;
+        if (verified_tree_digest.clone(), verified_bytes) != (tree_digest, delivered_bytes) {
+            return Err(Error::Conflict(
+                "published trace export tree changed".into(),
+            ));
+        }
+        Ok(TraceExportTreePublication {
+            receipt,
+            verified_tree_digest,
+            tree_fsynced: true,
+            published_now,
+        })
+    }
+
+    /// Read-only proof that the published trace export tree is still the
+    /// exact frozen member set, returning the delivery receipt those bytes
+    /// earn. A missing or tampered tree is the `TRACE_EXPORT_TREE_UNAVAILABLE`
+    /// conflict, never a trigger to republish.
+    pub async fn verify_trace_export_tree(
+        &self,
+        ctx: &Context,
+        export_id: &str,
+        files: &[LocalExportFile],
+    ) -> Result<LocalExportReceipt> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        validate_export_id(export_id)?;
+        let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
+        let receipt =
+            local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
+        let path = self.local_export_directory(ctx, export_id)?;
+        if verify_local_export_directory(&path, files).await? != (tree_digest, delivered_bytes) {
+            return Err(Error::Conflict(TRACE_EXPORT_TREE_UNAVAILABLE.into()));
+        }
+        Ok(receipt)
+    }
+
+    /// A real durability pass over an already published tree: every member
+    /// file and every directory is fsynced now, so a completing writer
+    /// records a fact it observed itself instead of inheriting an unknown.
+    pub async fn fsync_trace_export_tree(
+        &self,
+        ctx: &Context,
+        export_id: &str,
+        files: &[LocalExportFile],
+    ) -> Result<()> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        validate_export_id(export_id)?;
+        local_export_tree_digest(files)?;
+        let root = self.local_export_directory(ctx, export_id)?;
+        let members: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            use std::collections::BTreeSet;
+            let mut directories: BTreeSet<PathBuf> = BTreeSet::new();
+            for path in &members {
+                let member = root.join(path);
+                let metadata = std::fs::symlink_metadata(&member).map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Error::Conflict(TRACE_EXPORT_TREE_UNAVAILABLE.into())
+                    } else {
+                        internal(error)
+                    }
+                })?;
+                if !metadata.file_type().is_file() {
+                    return Err(Error::Conflict(TRACE_EXPORT_TREE_UNAVAILABLE.into()));
+                }
+                File::open(&member)
+                    .and_then(|file| file.sync_all())
+                    .map_err(internal)?;
+                let mut parent = member.parent();
+                while let Some(directory) = parent {
+                    if !directory.as_os_str().is_empty() {
+                        directories.insert(directory.to_path_buf());
+                    }
+                    parent = directory.parent();
+                }
+            }
+            for directory in directories {
+                sync_directory_blocking(&directory)?;
+            }
+            sync_directory_blocking(&root)
+        })
+        .await
+        .map_err(internal)?
+    }
+
     /// Read a namespace-scoped content blob for a trusted management consumer.
     /// The path is derived from the authenticated context, and bytes are
     /// re-hashed so a replaced file cannot inherit authority from its name.
