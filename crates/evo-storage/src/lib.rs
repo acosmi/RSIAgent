@@ -671,13 +671,13 @@ pub struct ManagementJobV2 {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "management_backup_present"
     )]
-    pub backup: Option<lifecycle::BackupProgressV2>,
+    pub backup: Option<Box<lifecycle::BackupProgressV2>>,
 }
 
 fn management_backup_present<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> std::result::Result<Option<lifecycle::BackupProgressV2>, D::Error> {
-    lifecycle::BackupProgressV2::deserialize(deserializer).map(Some)
+) -> std::result::Result<Option<Box<lifecycle::BackupProgressV2>>, D::Error> {
+    lifecycle::BackupProgressV2::deserialize(deserializer).map(|v| Some(Box::new(v)))
 }
 
 fn management_optimization_present<'de, D: serde::Deserializer<'de>>(
