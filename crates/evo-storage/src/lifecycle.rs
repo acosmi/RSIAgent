@@ -97,11 +97,11 @@ impl BackupProgressV2 {
         self.manifest_sha256.as_deref()
     }
 
-    pub fn published(&self, durability: BackupDurability) -> Self {
+    pub fn published(&self, durability: BackupDurability) -> Box<Self> {
         let mut progress = self.clone();
         progress.phase = BackupPhase::Published;
         progress.durability = durability;
-        progress
+        Box::new(progress)
     }
 
     pub(crate) fn valid_wire(&self) -> bool {
@@ -374,8 +374,8 @@ impl BackupPreparation {
 }
 
 impl PreparingBackup {
-    pub fn progress(&self) -> BackupProgressV2 {
-        self.progress.clone()
+    pub fn progress(&self) -> Box<BackupProgressV2> {
+        Box::new(self.progress.clone())
     }
 
     pub async fn discard(self) -> Result<()> {
@@ -475,7 +475,7 @@ impl PreparingBackup {
 }
 
 impl PreparedBackup {
-    pub fn progress(&self) -> BackupProgressV2 {
+    pub fn progress(&self) -> Box<BackupProgressV2> {
         self.owned.progress()
     }
     pub async fn discard(self) -> Result<()> {
@@ -488,7 +488,7 @@ impl PreparedBackup {
 }
 
 impl BackupPublicationTask {
-    pub fn progress(&self) -> BackupProgressV2 {
+    pub fn progress(&self) -> Box<BackupProgressV2> {
         self.owned.progress()
     }
     pub async fn discard(self, _session: &mut super::Session) -> Result<()> {
