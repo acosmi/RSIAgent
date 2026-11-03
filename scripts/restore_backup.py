@@ -613,6 +613,16 @@ def protected_facts(con,namespaces):
             continue
         value=read_current_host_raw(body,ns,kind,id) if current_host else read_json(body)
         schema=value.get("schema_version","")
+        trace_redacted = schema == "rsia.redacted.v1" and value.get("original_schema") == "rsia.trace_export.v1"
+        if trace_redacted:
+            if (set(value) != {"id", "schema_version", "state", "original_kind", "original_schema", "original_digest", "metadata"}
+                    or kind != "artifact" or value.get("id") != id
+                    or value.get("state") != "source_revoked" or value.get("original_kind") != "artifact"
+                    or not isinstance(value.get("metadata"), dict)
+                    or not isinstance(value.get("original_digest"), str)
+                    or len(value["original_digest"]) != 64
+                    or any(char not in "0123456789abcdef" for char in value["original_digest"])):
+                raise IsolationError("trace export redaction shape differs")
         if kind in ("budget","reservation","evaluation","receipt") or schema in (
             "rsia.typed_artifact_envelope.v1","rsia.exploration_artifact_envelope.v1",
             "rsia.optimization.stage_fact.v1","rsia.budget_call_ref.v1",
@@ -626,7 +636,7 @@ def protected_facts(con,namespaces):
             "rsia.practice_attempt_set.v1","rsia.curriculum_artifact_envelope.v1",
             "rsia.management_job.v1","rsia.replay_economic_artifact_envelope.v1",
             "rsia.monitoring.consolidation_proposal.v2",
-            "rsia.management_job.v2"):
+            "rsia.management_job.v2", "rsia.trace_export.v1") or trace_redacted:
             facts.append((ns,kind,id,value))
     # Monetary state and irreversible dispatch counters must also agree.
     tables=[r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'root_budget%'")]

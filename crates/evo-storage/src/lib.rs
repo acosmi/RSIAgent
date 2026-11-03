@@ -31,6 +31,8 @@ pub const MVP_MAX_RUNS: u64 = 1_000;
 /// The engine's `capacity` module pins the same values and asserts equality.
 pub const MVP_MAX_REPLAY_WORLDS: u64 = 100;
 pub const MVP_MAX_ACTIVE_LEASES: u64 = 10;
+pub const TRACE_EXPORT_SCHEMA: &str = "rsia.trace_export.v1";
+pub const MVP_MAX_TRACE_EXPORTS: u64 = 1_000;
 /// Schema identifiers the capacity measurement recognises. They mirror the
 /// engine's persisted schema versions; the engine asserts they stay equal.
 pub const CAPACITY_MANAGEMENT_JOB_SCHEMA: &str = "rsia.management_job.v1";
@@ -184,6 +186,7 @@ pub enum ManagementResultV2 {
     Original(ManagementResult),
     Partial(ManagementPartialResultV2),
     Optimization(ManagementOptimizationResultV2),
+    Trace(ManagementTraceExportResultV2),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +195,26 @@ pub enum ManagementOptimizationResultV2 {
     OptimizationStepCompleted {
         stage_fact_id: String,
         input_digest: String,
+    },
+}
+
+/// Closed `trace.export` job results. They reference the real export record,
+/// its frozen candidate digest and the phase actually reached; the candidate
+/// artifacts themselves stay in the record, never a second copy here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementTraceExportResultV2 {
+    TraceExportPrepared {
+        export_id: String,
+        record_id: String,
+        candidate_digest: String,
+        phase: String,
+    },
+    TraceExportReviewed {
+        export_id: String,
+        record_id: String,
+        candidate_digest: String,
+        phase: String,
     },
 }
 
@@ -870,13 +893,84 @@ async fn count_management_job_capacity(
 async fn count_objects_all_namespaces(
     conn: &mut sqlx::SqliteConnection,
     kind: &str,
+    schema: Option<&str>,
 ) -> Result<u64> {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE kind=?")
-        .bind(kind)
-        .fetch_one(&mut *conn)
+    if kind == "artifact" && schema == Some(TRACE_EXPORT_SCHEMA) {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id,body FROM objects WHERE kind='artifact' AND (
+             json_extract(body,'$.schema_version')=? OR (
+               json_extract(body,'$.schema_version')='rsia.redacted.v1'
+               AND json_extract(body,'$.original_schema')=?))",
+        )
+        .bind(TRACE_EXPORT_SCHEMA)
+        .bind(TRACE_EXPORT_SCHEMA)
+        .fetch_all(&mut *conn)
         .await
         .map_err(internal)?;
+        for (id, raw) in &rows {
+            if !is_trace_export_record(id, &lifecycle::parse_strict_json(raw)?)? {
+                return Err(Error::Conflict(
+                    "trace export capacity identity differs".into(),
+                ));
+            }
+        }
+        return u64::try_from(rows.len()).map_err(|_| Error::Internal);
+    }
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE kind=?
+         AND (? IS NULL OR json_extract(body,'$.schema_version')=?)",
+    )
+    .bind(kind)
+    .bind(schema)
+    .bind(schema)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(internal)?;
     count_to_u64(count)
+}
+
+/// A retained class, never proof that its source or delivery is authorized.
+pub(crate) fn is_trace_export_record(id: &str, value: &Value) -> Result<bool> {
+    if value["schema_version"] == TRACE_EXPORT_SCHEMA {
+        if value["id"].as_str() != Some(id) {
+            return Err(Error::Conflict(
+                "trace export physical identity differs".into(),
+            ));
+        }
+        return Ok(true);
+    }
+    if value["schema_version"] != "rsia.redacted.v1"
+        || value["original_schema"] != TRACE_EXPORT_SCHEMA
+    {
+        return Ok(false);
+    }
+    let fields = [
+        "id",
+        "schema_version",
+        "state",
+        "original_kind",
+        "original_schema",
+        "original_digest",
+        "metadata",
+    ];
+    if value.as_object().is_none_or(|object| {
+        object.len() != fields.len() || fields.iter().any(|key| !object.contains_key(*key))
+    }) || value["id"].as_str() != Some(id)
+        || value["state"] != "source_revoked"
+        || value["original_kind"] != "artifact"
+        || !value["metadata"].is_object()
+        || value["original_digest"].as_str().is_none_or(|digest| {
+            digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+    {
+        return Err(Error::Conflict(
+            "trace export redaction shape differs".into(),
+        ));
+    }
+    Ok(true)
 }
 
 /// Imported events of every known result version, v1 and v2 alike, across all
@@ -2760,8 +2854,8 @@ impl Session {
             .map_err(|_| Error::Invalid("capacity clock is out of range".into()))?;
         let runs = count_runs_all_namespaces(&mut self.tx).await?;
         let imported_events = sum_imported_events_all_namespaces(&mut self.tx).await?;
-        let event_objects = count_objects_all_namespaces(&mut self.tx, "event").await?;
-        let skills = count_objects_all_namespaces(&mut self.tx, "candidate").await?;
+        let event_objects = count_objects_all_namespaces(&mut self.tx, "event", None).await?;
+        let skills = count_objects_all_namespaces(&mut self.tx, "candidate", None).await?;
         let exploration_nodes: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM objects WHERE kind='artifact'
                AND json_extract(body,'$.schema_version')=?
@@ -2977,7 +3071,7 @@ impl Session {
         }
         let used = sum_imported_events_all_namespaces(&mut self.tx)
             .await?
-            .checked_add(count_objects_all_namespaces(&mut self.tx, "event").await?)
+            .checked_add(count_objects_all_namespaces(&mut self.tx, "event", None).await?)
             .ok_or(Error::Internal)?;
         if used.checked_add(delta).is_none_or(|total| total > limit) {
             return Err(Error::Conflict(format!(
@@ -3137,11 +3231,105 @@ impl Session {
         if body.len() > 4 * 1024 * 1024 {
             return Err(Error::Invalid("object exceeds 4 MiB".into()));
         }
-        sqlx::query("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?) ON CONFLICT(namespace,kind,id) DO UPDATE SET owner=excluded.owner,body=excluded.body,revision=objects.revision+1")
-   .bind(ctx.namespace()).bind(kind).bind(id).bind(owner).bind(body).execute(&mut *self.tx).await.map_err(internal)?;
+        let value: Value = serde_json::from_str(&body).map_err(internal)?;
+        let trace_class = kind == "artifact" && is_trace_export_record(id, &value)?;
+        if trace_class {
+            ctx.require(&[Role::Admin])?;
+            let previous: Option<String> = sqlx::query_scalar(
+                "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+            )
+            .bind(ctx.namespace())
+            .bind(id)
+            .fetch_optional(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+            if let Some(previous) = previous {
+                let old = lifecycle::parse_strict_json(&previous)?;
+                if !is_trace_export_record(id, &old)? {
+                    return Err(Error::Conflict(
+                        "trace export identity belongs to another record class".into(),
+                    ));
+                }
+                if old["schema_version"] == "rsia.redacted.v1" && old != value {
+                    return Err(Error::Conflict(
+                        "redacted trace export history is read only".into(),
+                    ));
+                }
+                if old["schema_version"] == TRACE_EXPORT_SCHEMA
+                    && value["schema_version"] == "rsia.redacted.v1"
+                    && value["original_digest"].as_str() != Some(hash(previous.as_bytes()).as_str())
+                {
+                    return Err(Error::Conflict(
+                        "trace export redaction origin differs".into(),
+                    ));
+                }
+            } else {
+                if value["schema_version"] == "rsia.redacted.v1" {
+                    return Err(Error::Conflict(
+                        "trace export redaction requires its original record".into(),
+                    ));
+                }
+                let used = count_objects_all_namespaces(
+                    &mut self.tx,
+                    "artifact",
+                    Some(TRACE_EXPORT_SCHEMA),
+                )
+                .await?;
+                if used >= MVP_MAX_TRACE_EXPORTS {
+                    return Err(mvp_capacity_exceeded(
+                        "trace exports",
+                        used,
+                        MVP_MAX_TRACE_EXPORTS,
+                    ));
+                }
+            }
+        }
+        let changed = sqlx::query(
+            "INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?)
+             ON CONFLICT(namespace,kind,id) DO UPDATE SET owner=excluded.owner,
+             body=excluded.body,revision=objects.revision+1
+             WHERE NOT (objects.kind='artifact'
+               AND (json_extract(objects.body,'$.schema_version') IS ? OR (
+                 json_extract(objects.body,'$.schema_version') IS 'rsia.redacted.v1'
+                 AND json_extract(objects.body,'$.original_schema') IS ?))
+               AND ?=0)",
+        )
+        .bind(ctx.namespace())
+        .bind(kind)
+        .bind(id)
+        .bind(owner)
+        .bind(body)
+        .bind(TRACE_EXPORT_SCHEMA)
+        .bind(TRACE_EXPORT_SCHEMA)
+        .bind(trace_class)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        if changed.rows_affected() != 1 {
+            return Err(Error::Conflict(
+                "trace export history classification is immutable".into(),
+            ));
+        }
         Ok(())
     }
     pub async fn delete(&mut self, ctx: &Context, kind: &str, id: &str) -> Result<()> {
+        if kind == "artifact" {
+            let retained: Option<String> = sqlx::query_scalar(
+                "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+            )
+            .bind(ctx.namespace())
+            .bind(id)
+            .fetch_optional(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+            if let Some(raw) = retained {
+                if is_trace_export_record(id, &lifecycle::parse_strict_json(&raw)?)? {
+                    return Err(Error::Conflict(
+                        "trace export history must be retained".into(),
+                    ));
+                }
+            }
+        }
         sqlx::query("DELETE FROM objects WHERE namespace=? AND kind=? AND id=?")
             .bind(ctx.namespace())
             .bind(kind)

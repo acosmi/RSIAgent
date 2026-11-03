@@ -66,7 +66,7 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
             ctx.require(&[Role::Evaluator])
         }
         "exploration.start" | "replay.run" | "curriculum.step" | "meta.start"
-        | "optimization.step" => ctx.require(&[Role::Admin]),
+        | "optimization.step" | "trace.export" => ctx.require(&[Role::Admin]),
         _ => Err(Error::Invalid("management_operation_not_wired".into())),
     }
 }
@@ -76,7 +76,7 @@ pub use evo_storage::{
     ManagementJobV2, ManagementOptimizationCallProducer, ManagementOptimizationCallRef,
     ManagementOptimizationProgressV2, ManagementOptimizationResultV2,
     ManagementOptimizationStageRef, ManagementPartialResultV2, ManagementPendingTerminalState,
-    ManagementResult, ManagementResultV2, VersionedManagementJob,
+    ManagementResult, ManagementResultV2, ManagementTraceExportResultV2, VersionedManagementJob,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +183,31 @@ pub struct BlockedManagementRequest {
     pub request_key: String,
 }
 
+/// `trace.export` prepare: the strict Admin request that freezes the exact
+/// candidate. It carries no events, roles, exporter identity, coverage,
+/// booleans or absolute paths — only single-segment identifiers of sources
+/// the real authenticated loader already captured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceExportPrepareRequest {
+    pub schema_version: String,
+    pub request_key: String,
+    pub export_id: String,
+    pub source_ids: Vec<String>,
+}
+
+/// `trace.export` publish: a new request key referencing the same export and
+/// the exact frozen candidate digest. The candidate bytes are never sent, and
+/// no regenerated candidate is ever accepted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceExportPublishRequest {
+    pub schema_version: String,
+    pub request_key: String,
+    pub export_id: String,
+    pub candidate_digest: String,
+}
+
 /// Ordinary data and original references; never a decoded claim or Context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -209,6 +234,8 @@ enum ParsedRequest {
     ExplorationStart(Box<ExplorationStartRequest>),
     Blocked(BlockedManagementRequest),
     OptimizationStep(Box<OptimizationStepManagementRequest>),
+    TraceExportPrepare(Box<TraceExportPrepareRequest>),
+    TraceExportPublish(Box<TraceExportPublishRequest>),
 }
 
 impl<'de> Deserialize<'de> for ParsedRequest {
@@ -233,6 +260,8 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             ExplorationStart(Box<ExplorationStartRequest>),
             Blocked(BlockedManagementRequest),
             OptimizationStep(Box<OptimizationStepManagementRequest>),
+            TraceExportPrepare(Box<TraceExportPrepareRequest>),
+            TraceExportPublish(Box<TraceExportPublishRequest>),
         }
         Ok(
             match serde_json::from_value::<Other>(value).map_err(serde::de::Error::custom)? {
@@ -243,6 +272,8 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::ExplorationStart(value) => Self::ExplorationStart(value),
                 Other::Blocked(value) => Self::Blocked(value),
                 Other::OptimizationStep(value) => Self::OptimizationStep(value),
+                Other::TraceExportPrepare(value) => Self::TraceExportPrepare(value),
+                Other::TraceExportPublish(value) => Self::TraceExportPublish(value),
             },
         )
     }
@@ -577,6 +608,23 @@ impl ManagementDispatcher {
                     "exploration job succeeded without valid ExplorationStarted result".into(),
                 ));
             }
+        }
+        if job.identity().operation == "trace.export"
+            && job.identity().state == ManagementJobState::Succeeded
+        {
+            // A completed trace export job serves references only: the record
+            // it names is re-read through the live source closure and must
+            // still carry the stored phase and frozen candidate digest. Only
+            // actual phases, refs and the known-none fee view are served;
+            // private material, tokens and paths never enter this view.
+            let Some(ManagementResultV2::Trace(result)) = job.result() else {
+                return Err(Error::Conflict(
+                    "trace export job succeeded without valid trace result".into(),
+                ));
+            };
+            let mut session = self.store.session().await?;
+            crate::trace_export::verify_result_view(ctx, &mut session, &result).await?;
+            session.commit().await?;
         }
         Ok(job)
     }
@@ -1081,6 +1129,8 @@ impl ParsedRequest {
             Self::ExplorationStart(request) => &request.request_key,
             Self::Blocked(request) => &request.request_key,
             Self::OptimizationStep(request) => &request.request_key,
+            Self::TraceExportPrepare(request) => &request.request_key,
+            Self::TraceExportPublish(request) => &request.request_key,
         }
     }
 }
@@ -1294,6 +1344,7 @@ impl JobOutcome {
             // This is an audit result; the operation's joined reader proves
             // actual compiled or dispatched effects independently.
             Some(ManagementResultV2::Optimization(_)) => false,
+            Some(ManagementResultV2::Trace(_)) => true,
             Some(ManagementResultV2::Original(
                 ManagementResult::EvaluationStatus { .. }
                 | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -1998,6 +2049,12 @@ async fn execute_request(
             )
             .await
         }
+        ParsedRequest::TraceExportPrepare(request) => {
+            return run_trace_export_prepare(ctx, store, job, *request, control).await;
+        }
+        ParsedRequest::TraceExportPublish(request) => {
+            return run_trace_export_publish(ctx, store, job, *request, control).await;
+        }
         ParsedRequest::Blocked(_) => {
             control.admit_step()?;
             job.state = ManagementJobState::Blocked;
@@ -2391,6 +2448,191 @@ fn public_evaluation_status(status: &StreamingEvaluationStatus) -> ManagementRes
     }
 }
 
+/// `trace.export` prepare, one Session and one transaction from the live fence
+/// to the first record write and the terminal job state: the Admin gate, the
+/// authenticated source loader, the full snapshot/watermark verification and
+/// the storage put's own quota/classification gates all commit together, and
+/// a refusal (including a cancellation observed at the fence) rolls all of it
+/// back — no record, no download surface, zero export side effect.
+async fn run_trace_export_prepare(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: TraceExportPrepareRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    let mut session = store.session().await?;
+    let finished =
+        match trace_export_prepare_in_session(ctx, &mut session, &claimed, &request, control).await
+        {
+            Ok(finished) => finished,
+            Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
+            Err(error) => {
+                return execution_outcome(claimed, Err(error))
+                    .map(ObservedWorkerExit::BeforeCommitFailed);
+            }
+        };
+    session.commit().await?;
+    Ok(ObservedWorkerExit::Completed(JobOutcome {
+        state: ManagementJobState::Succeeded,
+        step: finished.step,
+        result: finished.result,
+        error_code: None,
+    }))
+}
+
+async fn trace_export_prepare_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    claimed: &ManagementJobV2,
+    request: &TraceExportPrepareRequest,
+    control: &WorkerControl,
+) -> Result<ManagementJobV2> {
+    let mut current = begin_management_step(ctx, session, claimed, control).await?;
+    current.step = "trace_export_preparing".into();
+    session
+        .put(ctx, "job", &current.id, ctx.actor(), &current)
+        .await?;
+    session
+        .audit(ctx, "management.job.checkpoint", &current.id)
+        .await?;
+
+    let started = now()?;
+    let members =
+        crate::trace_export::prepare_native_members(ctx, session, &request.source_ids).await?;
+    crate::trace_export::verify_native_source_snapshots(
+        ctx,
+        session,
+        &members.source_snapshots,
+        members.source_watermark.as_ref(),
+    )
+    .await?;
+    let record = crate::trace_export::write_prepared_record(
+        ctx,
+        session,
+        &request.export_id,
+        &current.id,
+        &members,
+        started,
+    )
+    .await?;
+
+    current.state = ManagementJobState::Succeeded;
+    current.step = "trace_export_prepared".into();
+    current.lease_token = None;
+    current.lease_until = 0;
+    current.result = Some(ManagementResultV2::Trace(
+        ManagementTraceExportResultV2::TraceExportPrepared {
+            export_id: record.export_id.clone(),
+            record_id: record.id.clone(),
+            candidate_digest: record.candidate_digest.clone(),
+            phase: crate::trace_export::trace_phase_wire(record.phase)?,
+        },
+    ));
+    session
+        .put(ctx, "job", &current.id, ctx.actor(), &current)
+        .await?;
+    session
+        .audit(ctx, "management.job.finish", &current.id)
+        .await?;
+    Ok(current)
+}
+
+/// `trace.export` publish, the same single-fenced transaction: the frozen
+/// candidate digest must equal the record's frozen value, the whole captured
+/// source closure, license, recipient scope and revocation watermark are
+/// re-verified through the real loader (candidate bytes are never
+/// regenerated), and only the record's one publish job advances it to the
+/// `reviewed` decision point. The flow then reaches the real staging
+/// boundary, which in this slice honestly refuses publication — the reviewed
+/// decision is the committed effect and no delivery is claimed.
+async fn run_trace_export_publish(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: TraceExportPublishRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    let mut session = store.session().await?;
+    let finished =
+        match trace_export_publish_in_session(ctx, &mut session, &claimed, &request, control).await
+        {
+            Ok(finished) => finished,
+            Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
+            Err(error) => {
+                return execution_outcome(claimed, Err(error))
+                    .map(ObservedWorkerExit::BeforeCommitFailed);
+            }
+        };
+    session.commit().await?;
+    Ok(ObservedWorkerExit::Completed(JobOutcome {
+        state: ManagementJobState::Succeeded,
+        step: finished.step,
+        result: finished.result,
+        error_code: None,
+    }))
+}
+
+async fn trace_export_publish_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    claimed: &ManagementJobV2,
+    request: &TraceExportPublishRequest,
+    control: &WorkerControl,
+) -> Result<ManagementJobV2> {
+    let mut current = begin_management_step(ctx, session, claimed, control).await?;
+    current.step = "trace_export_publish_recheck".into();
+    session
+        .put(ctx, "job", &current.id, ctx.actor(), &current)
+        .await?;
+    session
+        .audit(ctx, "management.job.checkpoint", &current.id)
+        .await?;
+
+    let started = now()?;
+    let record = crate::trace_export::advance_reviewed_record(
+        ctx,
+        session,
+        &request.export_id,
+        &current.id,
+        &request.candidate_digest,
+        started,
+    )
+    .await?;
+    // The publication chain starts at the real staging boundary. In this slice
+    // that boundary is honestly unwired: the reviewed decision above stays the
+    // only committed effect, delivery remains `not_delivered`, and it is the
+    // boundary's own refusal — not a silent skip — that stops this job here.
+    // When the publication slice lands, this same call performs the real
+    // private staging and the flow continues through the delivery receipt.
+    match crate::trace_export::stage_reviewed_candidate_for_publication(ctx, session, &record).await
+    {
+        Ok(()) => {}
+        Err(Error::Conflict(reason)) if reason == crate::trace_export::PUBLICATION_UNWIRED => {}
+        Err(error) => return Err(error),
+    }
+
+    current.state = ManagementJobState::Succeeded;
+    current.step = "trace_export_reviewed".into();
+    current.lease_token = None;
+    current.lease_until = 0;
+    current.result = Some(ManagementResultV2::Trace(
+        ManagementTraceExportResultV2::TraceExportReviewed {
+            export_id: record.export_id.clone(),
+            record_id: record.id.clone(),
+            candidate_digest: record.candidate_digest.clone(),
+            phase: crate::trace_export::trace_phase_wire(record.phase)?,
+        },
+    ));
+    session
+        .put(ctx, "job", &current.id, ctx.actor(), &current)
+        .await?;
+    session
+        .audit(ctx, "management.job.finish", &current.id)
+        .await?;
+    Ok(current)
+}
+
 async fn run_replay(
     ctx: &Context,
     store: &Store,
@@ -2535,7 +2777,59 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
         | ParsedRequest::ExplorationStart(_) => {
             ctx.require(&[Role::Admin])?;
         }
+        ParsedRequest::TraceExportPrepare(request) => {
+            ctx.require(&[Role::Admin])?;
+            validate_trace_export_prepare_request(request)?;
+        }
+        ParsedRequest::TraceExportPublish(request) => {
+            ctx.require(&[Role::Admin])?;
+            validate_trace_export_publish_request(request)?;
+        }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Trace export identifiers are exact single-segment identifiers: an `id` of
+/// the caller's choosing with no dotted or colon-separated compound inside.
+fn trace_export_segment_identifier(value: &str) -> Result<()> {
+    identifier(value)?;
+    if value.contains(['.', ':']) {
+        return Err(Error::Invalid(
+            "trace export identifiers are single segment".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trace_export_prepare_request(request: &TraceExportPrepareRequest) -> Result<()> {
+    trace_export_segment_identifier(&request.export_id)?;
+    if request.source_ids.is_empty() || request.source_ids.len() > crate::packages::MAX_FILES - 2 {
+        return Err(Error::Invalid(
+            "trace export source count is invalid".into(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for id in &request.source_ids {
+        trace_export_segment_identifier(id)?;
+        if !seen.insert(id.as_str()) {
+            return Err(Error::Invalid("duplicate trace export source".into()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_trace_export_publish_request(request: &TraceExportPublishRequest) -> Result<()> {
+    trace_export_segment_identifier(&request.export_id)?;
+    let digest = &request.candidate_digest;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::Invalid(
+            "trace export candidate digest is not sha256 hex".into(),
+        ));
     }
     Ok(())
 }
@@ -4224,6 +4518,64 @@ async fn consumer_progress(
                 error_code: None,
             })))
         }
+        ParsedRequest::TraceExportPrepare(request) => {
+            // Crash reconciliation: the record and the terminal job state were
+            // written by one transaction, so this job's own record with the
+            // frozen content is the proof its prepare committed.
+            let job_id = record.identity().id.to_owned();
+            let mut session = store.session().await?;
+            let record =
+                crate::trace_export::load_live_record(ctx, &mut session, &request.export_id)
+                    .await?;
+            session.commit().await?;
+            match record {
+                Some(record) if record.prepare_job_id == job_id => {
+                    Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                        state: ManagementJobState::Succeeded,
+                        step: "trace_export_prepared".into(),
+                        result: Some(ManagementResultV2::Trace(
+                            ManagementTraceExportResultV2::TraceExportPrepared {
+                                export_id: record.export_id.clone(),
+                                record_id: record.id.clone(),
+                                candidate_digest: record.candidate_digest.clone(),
+                                phase: crate::trace_export::trace_phase_wire(record.phase)?,
+                            },
+                        )),
+                        error_code: None,
+                    })))
+                }
+                _ => Ok(ConsumerProgress::NotCommitted),
+            }
+        }
+        ParsedRequest::TraceExportPublish(request) => {
+            let job_id = record.identity().id;
+            let mut session = store.session().await?;
+            let record =
+                crate::trace_export::load_live_record(ctx, &mut session, &request.export_id)
+                    .await?;
+            session.commit().await?;
+            match record {
+                Some(record)
+                    if record.publish_job_id.as_deref() == Some(job_id)
+                        && record.phase == crate::trace_export::TraceExportPhase::Reviewed =>
+                {
+                    Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                        state: ManagementJobState::Succeeded,
+                        step: "trace_export_reviewed".into(),
+                        result: Some(ManagementResultV2::Trace(
+                            ManagementTraceExportResultV2::TraceExportReviewed {
+                                export_id: record.export_id.clone(),
+                                record_id: record.id.clone(),
+                                candidate_digest: record.candidate_digest.clone(),
+                                phase: crate::trace_export::trace_phase_wire(record.phase)?,
+                            },
+                        )),
+                        error_code: None,
+                    })))
+                }
+                _ => Ok(ConsumerProgress::NotCommitted),
+            }
+        }
         ParsedRequest::OptimizationStep(_) => Err(Error::Internal),
         ParsedRequest::Blocked(request) => {
             if record.identity().operation != "meta.start"
@@ -4899,6 +5251,7 @@ fn stored_result_has_side_effect(result: Option<&ManagementResultV2>) -> bool {
     match result {
         Some(ManagementResultV2::Partial(_)) => true,
         Some(ManagementResultV2::Optimization(_)) => true,
+        Some(ManagementResultV2::Trace(_)) => true,
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }
             | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -4974,15 +5327,31 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         "optimization.step" => ParsedRequest::OptimizationStep(Box::new(
             serde_json::from_value(payload).map_err(|_| invalid())?,
         )),
+        "trace.export" => match payload["schema_version"].as_str() {
+            Some("rsia.management.trace_export.prepare.v1") => ParsedRequest::TraceExportPrepare(
+                Box::new(serde_json::from_value(payload).map_err(|_| invalid())?),
+            ),
+            Some("rsia.management.trace_export.publish.v1") => ParsedRequest::TraceExportPublish(
+                Box::new(serde_json::from_value(payload).map_err(|_| invalid())?),
+            ),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
         _ => return Err(Error::Invalid("unknown management operation".into())),
     };
-    let expected = if matches!(&parsed, ParsedRequest::ExperimentRegisterCurrent(_)) {
-        "rsia.management.experiment_register.v2".into()
-    } else {
-        format!("rsia.management.{}.v1", operation.replace('.', "_"))
+    let expected = match &parsed {
+        ParsedRequest::ExperimentRegisterCurrent(_) => {
+            "rsia.management.experiment_register.v2".into()
+        }
+        ParsedRequest::TraceExportPrepare(_) => "rsia.management.trace_export.prepare.v1".into(),
+        ParsedRequest::TraceExportPublish(_) => "rsia.management.trace_export.publish.v1".into(),
+        _ => format!("rsia.management.{}.v1", operation.replace('.', "_")),
     };
     let actual = match &parsed {
         ParsedRequest::ExperimentRegister(request) => &request.schema_version,
@@ -4994,6 +5363,8 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::ExplorationStart(request) => &request.schema_version,
         ParsedRequest::Blocked(request) => &request.schema_version,
         ParsedRequest::OptimizationStep(request) => &request.schema_version,
+        ParsedRequest::TraceExportPrepare(request) => &request.schema_version,
+        ParsedRequest::TraceExportPublish(request) => &request.schema_version,
     };
     if actual != &expected {
         return Err(Error::Invalid(
@@ -5129,6 +5500,20 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             ));
         }
         ParsedRequest::Blocked(_) => {}
+        ParsedRequest::TraceExportPrepare(request) => {
+            // The private input depends on every captured source run, so a
+            // revoked source redacts the request with the job that holds it.
+            for id in &request.source_ids {
+                trace_export_segment_identifier(id)?;
+                dependencies.push(("run".into(), id.clone()));
+            }
+        }
+        ParsedRequest::TraceExportPublish(request) => {
+            dependencies.push((
+                "artifact".into(),
+                crate::trace_export::trace_export_record_id(&request.export_id)?,
+            ));
+        }
     }
     dependencies.sort();
     dependencies.dedup();
@@ -5379,6 +5764,12 @@ pub enum ManagementCommittedEffect {
         policy_digest: String,
         caps_digest: String,
     },
+    TraceExport {
+        export_id: String,
+        record_id: String,
+        candidate_digest: String,
+        phase: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -5485,6 +5876,25 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
         )) => vec![ManagementCommittedEffect::OptimizationStep {
             stage_fact_id: stage_fact_id.clone(),
             input_digest: input_digest.clone(),
+        }],
+        Some(ManagementResultV2::Trace(
+            ManagementTraceExportResultV2::TraceExportPrepared {
+                export_id,
+                record_id,
+                candidate_digest,
+                phase,
+            }
+            | ManagementTraceExportResultV2::TraceExportReviewed {
+                export_id,
+                record_id,
+                candidate_digest,
+                phase,
+            },
+        )) => vec![ManagementCommittedEffect::TraceExport {
+            export_id: export_id.clone(),
+            record_id: record_id.clone(),
+            candidate_digest: candidate_digest.clone(),
+            phase: phase.clone(),
         }],
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }

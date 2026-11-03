@@ -3750,6 +3750,27 @@ pub fn redacted_object_body(
         .and_then(|value| value.as_str())
         .unwrap_or("");
     let mut metadata = minimal_metadata(value);
+    if schema == crate::TRACE_EXPORT_SCHEMA {
+        for key in [
+            "phase",
+            "prepare_job_id",
+            "publish_job_id",
+            "candidate_digest",
+            "members",
+            "candidate_storage",
+            "delivery",
+            "durability",
+            "local_cost",
+            "source_snapshots",
+            "source_watermark_seq",
+            "source_watermark_digest",
+            "owner_actor",
+        ] {
+            if let Some(kept) = value.get(key) {
+                metadata[key] = kept.clone();
+            }
+        }
+    }
     if schema == "rsia.optimization.stage_fact.v1"
         || schema == "rsia.exploration_artifact_envelope.v1"
     {
@@ -4037,7 +4058,7 @@ pub const PROTECTED_OBJECT_KINDS: [&str; 4] = ["budget", "reservation", "evaluat
 
 /// Body `schema_version` values `restore_backup.py::protected_facts` treats as
 /// consumed accounting regardless of the object kind.
-pub const PROTECTED_SCHEMA_VERSIONS: [&str; 9] = [
+pub const PROTECTED_SCHEMA_VERSIONS: [&str; 10] = [
     "rsia.typed_artifact_envelope.v1",
     "rsia.exploration_artifact_envelope.v1",
     "rsia.optimization.stage_fact.v1",
@@ -4047,6 +4068,7 @@ pub const PROTECTED_SCHEMA_VERSIONS: [&str; 9] = [
     "rsia.e16.delivery_audit.v1",
     "rsia.e16.export_attempt.v2",
     "rsia.e16.delivery_audit.v2",
+    "rsia.trace_export.v1",
 ];
 
 /// Body `schema_version` values of the durable facts of an action that already
@@ -4322,7 +4344,8 @@ async fn read_facts_from(connection: &mut sqlx::SqliteConnection) -> Result<Cont
         }
         if in_scope
             && (PROTECTED_OBJECT_KINDS.contains(&kind.as_str())
-                || schema.as_deref().is_some_and(is_protected_schema))
+                || schema.as_deref().is_some_and(is_protected_schema)
+                || (kind == "artifact" && crate::is_trace_export_record(&id, &value)?))
         {
             protected_objects.insert((namespace, kind, id), value);
         }
