@@ -947,13 +947,22 @@ impl Scenario {
         // the script refuses symlinks in any supplied path (`/var` on macOS)
         let root = guard.path().canonicalize().unwrap();
         let live = root.join("rsia.sqlite3");
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&live)
+                .unwrap();
+        }
         let store = Store::open(&live).await.unwrap();
         let experiment = prerequisites(&store).await;
         spend_before_the_backup(&store).await;
         store.close().await;
         Self {
             _guard: guard,
-            backup: root.join("backup"),
+            backup: root.join("backups/backup"),
             root,
             live,
             base: None,
@@ -967,7 +976,15 @@ impl Scenario {
     /// Take the real backup of the live database as it is now.
     async fn take_backup(&mut self) {
         let store = Store::open(&self.live).await.unwrap();
-        store.backup(&self.backup).await.unwrap();
+        store
+            .backup(
+                &admin(),
+                evo_storage::lifecycle::BackupName::parse("backup").unwrap(),
+            )
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
         store.close().await;
         self.manifest_bytes = std::fs::read(self.backup.join("backup-manifest.json")).unwrap();
         let manifest: BackupManifest = serde_json::from_slice(&self.manifest_bytes).unwrap();
@@ -1828,7 +1845,18 @@ async fn actual_parent_and_current_reports_remain_revoked_after_real_backup_rest
     // The existing restore CLI rejects symlinked path components on macOS.
     let root = directory.path().canonicalize().unwrap();
     let live = root.join("history-copy.sqlite3");
-    std::fs::write(&live, database_raw).unwrap();
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&live)
+            .unwrap()
+            .write_all(database_raw)
+            .unwrap();
+    }
     let store = Store::open(&live).await.unwrap();
     let administrator = Context::new("n", "admin", Role::Admin).unwrap();
     let evaluator = Context::new("n", "evaluator", Role::Evaluator).unwrap();
@@ -1878,8 +1906,16 @@ async fn actual_parent_and_current_reports_remain_revoked_after_real_backup_rest
         }
     };
     let protected_before = read_control_plane_facts(&live).await.unwrap();
-    let backup = root.join("backup-with-both-report-versions");
-    store.backup(&backup).await.unwrap();
+    let backup = root.join("backups/backup-with-both-report-versions");
+    store
+        .backup(
+            &admin(),
+            evo_storage::lifecycle::BackupName::parse("backup-with-both-report-versions").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     let manifest_raw = std::fs::read(backup.join("backup-manifest.json")).unwrap();
     let manifest: BackupManifest = serde_json::from_slice(&manifest_raw).unwrap();
     let base = manifest

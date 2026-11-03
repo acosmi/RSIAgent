@@ -1189,6 +1189,78 @@ class RustCurrentHostWireTests(unittest.TestCase):
 
 
 class ManagementJobVersionProtectionTests(unittest.TestCase):
+    def fixture_running_backup_job(self, scenario):
+        """Software row fixture only; physical numbers never authorize publication."""
+        identity = {"device": 1, "inode": 2, "uid": os.geteuid(), "mode": 448}
+        ident = "management-job-backup-software-fixture"
+        job = {
+            "id": ident, "schema_version": "rsia.management_job.v2",
+            "operation": "backup.create", "request_key": "backup-software-fixture",
+            "payload_digest": hashlib.sha256(b"software-only").hexdigest(),
+            "owner_actor": "admin", "owner_role": "admin", "state": "running",
+            "step": "claimed", "private_input_ref": "management-input-backup-software-fixture",
+            "result": None, "error_code": None, "cancel_requested": False,
+            "lease_token": "snapshot-claim", "lease_until": 300, "generation": 1,
+            "diagnostics": [], "created_at": 123,
+            "backup": {
+                "phase": "preparing", "durability": "unverified",
+                "snapshot_generation": 1, "snapshot_lease_token": "snapshot-claim",
+                "source": identity, "database": {**identity, "inode": 3, "mode": 384},
+                "parent": {**identity, "inode": 4}, "temporary": {**identity, "inode": 5},
+                "temporary_name": ".software-fixture.tmp-owned",
+                "manifest_utf8": None, "manifest_sha256": None,
+            },
+        }
+        raw = json.dumps(job, indent=2)
+        con = connect(scenario.history)
+        con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?)",
+                    ("legacy-a", "job", ident, "admin", raw))
+        con.commit()
+        con.close()
+        return ident, raw
+
+    def test_running_backup_job_progress_survives_restore_without_rewrite(self):
+        """Software restore fixture; Rust owns real Store/job/restore execution."""
+        scenario = Scenario(self, CURRENT)
+        ident, original = self.fixture_running_backup_job(scenario)
+        backup = scenario.backup()
+        anchor = scenario.anchor()
+        before = database_image(anchor)
+        dest, result = scenario.restore(backup, anchor, "running-backup-progress")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        con = connect(dest / "rsia.sqlite3")
+        copied, = con.execute("SELECT body FROM objects WHERE namespace=? AND kind='job' AND id=?",
+                              ("legacy-a", ident)).fetchone()
+        con.close()
+        self.assertEqual(copied, original)
+        self.assertEqual(json.loads(copied)["state"], "running")
+        self.assertEqual(json.loads(copied)["backup"]["phase"], "preparing")
+        self.assertEqual(database_image(anchor), before)
+        self.assertFalse((dest / "backups").exists())
+
+    def test_backup_job_manifest_keeps_watermarks_and_amounts(self):
+        """Software manifest fixture preserves full amounts and namespace watermarks."""
+        scenario = Scenario(self, CURRENT)
+        self.fixture_running_backup_job(scenario)
+        backup = scenario.backup()
+        raw = (backup / "backup-manifest.json").read_bytes()
+        manifest = json.loads(raw)
+        self.assertEqual(set(manifest), {"schema_version", "complete", "database", "blobs",
+                                         "migrations", "watermarks", "created_at"})
+        self.assertEqual(manifest["schema_version"], "rsia.backup.v2")
+        self.assertEqual({m["namespace"]: (m["seq"], m["digest"]) for m in manifest["watermarks"]}, WATERMARKS)
+        image = database_image(backup / "rsia.sqlite3")
+        anchor = scenario.anchor()
+        dest, result = scenario.restore(backup, anchor, "backup-amounts")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        restored = database_image(dest / "rsia.sqlite3")
+        self.assertEqual(restored, image)
+        con = connect(dest / "rsia.sqlite3")
+        self.assertEqual(con.execute("SELECT spent_micros,reserved_micros FROM root_budgets WHERE billing_scope='scope'").fetchone(), (11, 7))
+        self.assertEqual(con.execute("SELECT state,reserved_micros,lease_epoch FROM root_budget_calls WHERE call_id='call'").fetchone(), ("reserved", 7, 3))
+        con.close()
+        self.assertEqual((backup / "backup-manifest.json").read_bytes(), raw)
+
     def test_management_job_v1_v2_protection_matches_rust(self):
         import re
         rust = (ROOT / "crates/evo-storage/src/lifecycle.rs").read_text()

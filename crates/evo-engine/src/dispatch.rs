@@ -1,4 +1,5 @@
 //! Role-gated model and persistent management dispatch.
+mod backup;
 use crate::exploration::ExplorationWorldV1;
 use crate::revocation_gate;
 use crate::streaming_evaluator::{
@@ -66,17 +67,17 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
             ctx.require(&[Role::Evaluator])
         }
         "exploration.start" | "replay.run" | "curriculum.step" | "meta.start"
-        | "optimization.step" => ctx.require(&[Role::Admin]),
+        | "optimization.step" | "backup.create" => ctx.require(&[Role::Admin]),
         _ => Err(Error::Invalid("management_operation_not_wired".into())),
     }
 }
 
 pub use evo_storage::{
-    ManagementCancelArrival, ManagementDiagnostic, ManagementJob, ManagementJobState,
-    ManagementJobV2, ManagementOptimizationCallProducer, ManagementOptimizationCallRef,
-    ManagementOptimizationProgressV2, ManagementOptimizationResultV2,
-    ManagementOptimizationStageRef, ManagementPartialResultV2, ManagementPendingTerminalState,
-    ManagementResult, ManagementResultV2, VersionedManagementJob,
+    ManagementBackupResultV2, ManagementCancelArrival, ManagementDiagnostic, ManagementJob,
+    ManagementJobState, ManagementJobV2, ManagementOptimizationCallProducer,
+    ManagementOptimizationCallRef, ManagementOptimizationProgressV2,
+    ManagementOptimizationResultV2, ManagementOptimizationStageRef, ManagementPartialResultV2,
+    ManagementPendingTerminalState, ManagementResult, ManagementResultV2, VersionedManagementJob,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +210,7 @@ enum ParsedRequest {
     ExplorationStart(Box<ExplorationStartRequest>),
     Blocked(BlockedManagementRequest),
     OptimizationStep(Box<OptimizationStepManagementRequest>),
+    BackupCreate(backup::BackupCreateRequest),
 }
 
 impl<'de> Deserialize<'de> for ParsedRequest {
@@ -233,6 +235,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             ExplorationStart(Box<ExplorationStartRequest>),
             Blocked(BlockedManagementRequest),
             OptimizationStep(Box<OptimizationStepManagementRequest>),
+            BackupCreate(backup::BackupCreateRequest),
         }
         Ok(
             match serde_json::from_value::<Other>(value).map_err(serde::de::Error::custom)? {
@@ -243,6 +246,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::ExplorationStart(value) => Self::ExplorationStart(value),
                 Other::Blocked(value) => Self::Blocked(value),
                 Other::OptimizationStep(value) => Self::OptimizationStep(value),
+                Other::BackupCreate(value) => Self::BackupCreate(value),
             },
         )
     }
@@ -1081,6 +1085,7 @@ impl ParsedRequest {
             Self::ExplorationStart(request) => &request.request_key,
             Self::Blocked(request) => &request.request_key,
             Self::OptimizationStep(request) => &request.request_key,
+            Self::BackupCreate(request) => &request.request_key,
         }
     }
 }
@@ -1168,6 +1173,7 @@ async fn persist_management(
         cancel_arrival: None,
         pending_terminal_state: None,
         optimization: None,
+        backup: None,
     };
     session
         .put(ctx, "artifact", &private_id, ctx.actor(), &private)
@@ -1294,6 +1300,7 @@ impl JobOutcome {
             // This is an audit result; the operation's joined reader proves
             // actual compiled or dispatched effects independently.
             Some(ManagementResultV2::Optimization(_)) => false,
+            Some(ManagementResultV2::Backup(_)) => true,
             Some(ManagementResultV2::Original(
                 ManagementResult::EvaluationStatus { .. }
                 | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -1911,6 +1918,8 @@ impl ManagementOptimizationClaim {
 struct WorkerControl {
     stop_new_steps: Arc<AtomicBool>,
     stop_error: Arc<Mutex<Option<Error>>>,
+    #[cfg(test)]
+    backup_pause: Arc<Mutex<Option<backup::TestPause>>>,
 }
 
 impl WorkerControl {
@@ -1918,6 +1927,8 @@ impl WorkerControl {
         Self {
             stop_new_steps: Arc::new(AtomicBool::new(false)),
             stop_error: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            backup_pause: Arc::new(Mutex::new(None)),
         }
     }
     fn stop(&self) {
@@ -1997,6 +2008,9 @@ async fn execute_request(
                 optimization_runtime,
             )
             .await
+        }
+        ParsedRequest::BackupCreate(request) => {
+            return backup::execute(ctx, store, claimed, request, control).await;
         }
         ParsedRequest::Blocked(_) => {
             control.admit_step()?;
@@ -2530,6 +2544,7 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
             }
         }
         ParsedRequest::OptimizationStep(_)
+        | ParsedRequest::BackupCreate(_)
         | ParsedRequest::ReplayRun(_)
         | ParsedRequest::CurriculumStep(_)
         | ParsedRequest::ExplorationStart(_) => {
@@ -3719,6 +3734,9 @@ async fn consumer_progress(
     store: &Store,
     record: &VersionedManagementJob,
 ) -> Result<ConsumerProgress> {
+    if record.identity().operation == "backup.create" {
+        return backup::consumer_progress(ctx, store, record).await;
+    }
     if let VersionedManagementJob::V2(job) = record
         && job.operation == "experiment.register"
         && job.step == "current_holdout_registered"
@@ -4224,7 +4242,7 @@ async fn consumer_progress(
                 error_code: None,
             })))
         }
-        ParsedRequest::OptimizationStep(_) => Err(Error::Internal),
+        ParsedRequest::OptimizationStep(_) | ParsedRequest::BackupCreate(_) => Err(Error::Internal),
         ParsedRequest::Blocked(request) => {
             if record.identity().operation != "meta.start"
                 || request.schema_version != "rsia.management.meta_start.v1"
@@ -4475,6 +4493,9 @@ impl ManagementDispatcher {
         claimed: &ManagementJobV2,
         observed: &ObservedWorkerExit,
     ) -> Result<ManagementJobState> {
+        if claimed.operation == "backup.create" {
+            return backup::finish_observed(ctx, &self.store, claimed, observed).await;
+        }
         if claimed.operation == "optimization.step" {
             let current = load_job_record(ctx, &self.store, &claimed.id).await?;
             if is_terminal(current.identity().state) {
@@ -4814,6 +4835,21 @@ async fn cancel_job_atomic(
     identifier(job_id)?;
     let mut session = store.session().await?;
     let record = load_job_record_in_session(ctx, &mut session, job_id).await?;
+    if let VersionedManagementJob::V2(saved) = &record
+        && saved.operation == "backup.create"
+        && is_terminal(saved.state)
+        && !saved.cancel_requested
+        && matches!(saved.result, Some(ManagementResultV2::Backup(_)))
+    {
+        let mut job = saved.clone();
+        now()?;
+        job.cancel_requested = true;
+        job.cancel_arrival = Some(ManagementCancelArrival::AfterSideEffect);
+        session.put(ctx, "job", &job.id, ctx.actor(), &job).await?;
+        session.audit(ctx, "management.job.cancel", &job.id).await?;
+        session.commit().await?;
+        return Ok(VersionedManagementJob::V2(job));
+    }
     if is_terminal(record.identity().state) || record.cancel_requested() {
         // Includes old terminal v1 and already-requested Running/Draining:
         // logical zero-write, no new audit/revision/arrival and no migration.
@@ -4843,7 +4879,11 @@ async fn cancel_job_atomic(
     } else {
         // Cancellation prevents future checkpoints. Execution or fees may
         // still be in flight, so the actual worker exit/reconciler owns closure.
-        job.state = ManagementJobState::Draining;
+        job.state = if job.operation == "backup.create" {
+            ManagementJobState::Running
+        } else {
+            ManagementJobState::Draining
+        };
         if job.operation == "optimization.step" {
             if let Some(after) = optimization_effect {
                 job.cancel_arrival = Some(
@@ -4855,6 +4895,12 @@ async fn cancel_job_atomic(
                     },
                 );
             }
+        } else if job.operation == "backup.create" {
+            job.cancel_arrival = Some(if stored_result_has_side_effect(job.result.as_ref()) {
+                ManagementCancelArrival::AfterSideEffect
+            } else {
+                ManagementCancelArrival::BeforeSideEffect
+            });
         } else if job.step == "experiment_already_registered" {
             job.cancel_arrival = Some(ManagementCancelArrival::BeforeSideEffect);
         } else if stored_result_has_side_effect(job.result.as_ref()) {
@@ -4899,6 +4945,7 @@ fn stored_result_has_side_effect(result: Option<&ManagementResultV2>) -> bool {
     match result {
         Some(ManagementResultV2::Partial(_)) => true,
         Some(ManagementResultV2::Optimization(_)) => true,
+        Some(ManagementResultV2::Backup(_)) => true,
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }
             | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -4974,6 +5021,9 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         "optimization.step" => ParsedRequest::OptimizationStep(Box::new(
             serde_json::from_value(payload).map_err(|_| invalid())?,
         )),
+        "backup.create" => {
+            ParsedRequest::BackupCreate(serde_json::from_value(payload).map_err(|_| invalid())?)
+        }
         "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
@@ -4994,6 +5044,7 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::ExplorationStart(request) => &request.schema_version,
         ParsedRequest::Blocked(request) => &request.schema_version,
         ParsedRequest::OptimizationStep(request) => &request.schema_version,
+        ParsedRequest::BackupCreate(request) => &request.schema_version,
     };
     if actual != &expected {
         return Err(Error::Invalid(
@@ -5128,7 +5179,7 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
                 format!("formal-profile-{}", request.compiler.profile.id),
             ));
         }
-        ParsedRequest::Blocked(_) => {}
+        ParsedRequest::Blocked(_) | ParsedRequest::BackupCreate(_) => {}
     }
     dependencies.sort();
     dependencies.dedup();
@@ -5343,6 +5394,11 @@ pub struct ManagementFeeCallView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum ManagementCommittedEffect {
+    Backup {
+        relative_name: evo_storage::lifecycle::BackupName,
+        manifest_sha256: String,
+        durability: evo_storage::lifecycle::BackupDurability,
+    },
     Control {
         control_id: String,
         control_digest: String,
@@ -5407,6 +5463,8 @@ pub struct ManagementJobStatusV1 {
     pub pending_terminal_state: Option<ManagementPendingTerminalState>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub optimization_stage_refs: Option<Vec<ManagementOptimizationStageRef>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup: Option<backup::BackupStatus>,
     // None means unproven, not a proved empty list/zero amount.
     pub committed_side_effects: Option<Vec<ManagementCommittedEffect>>,
     pub fee_knowledge: ManagementFeeKnowledge,
@@ -5417,6 +5475,15 @@ pub struct ManagementJobStatusV1 {
 
 fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommittedEffect> {
     match result {
+        Some(ManagementResultV2::Backup(ManagementBackupResultV2::BackupCreated {
+            relative_name,
+            manifest_sha256,
+            durability,
+        })) => vec![ManagementCommittedEffect::Backup {
+            relative_name: relative_name.clone(),
+            manifest_sha256: manifest_sha256.clone(),
+            durability: *durability,
+        }],
         Some(ManagementResultV2::Partial(ManagementPartialResultV2::ControlRegistered {
             control_id,
             control_digest,
@@ -5534,6 +5601,7 @@ fn project_management_status(
                 .map(|progress| progress.stages.clone()),
             VersionedManagementJob::V1(_) => None,
         },
+        backup: backup::status(record),
         committed_side_effects: effects,
         fee_knowledge,
         pending_fees,
@@ -5703,6 +5771,10 @@ impl ManagementDispatcher {
                 }
             }
         }
+        if job.operation == "backup.create" {
+            fee_knowledge = ManagementFeeKnowledge::KnownNone;
+            pending_fees = Some(Vec::new());
+        }
         Ok(project_management_status(
             record,
             effects,
@@ -5761,6 +5833,7 @@ mod tests {
             cancel_arrival: None,
             pending_terminal_state: None,
             optimization: None,
+            backup: None,
         };
         assert!(matches!(ensure_fence(&job, &job), Err(Error::Conflict(_))));
     }
@@ -5795,6 +5868,7 @@ mod tests {
             cancel_arrival: None,
             pending_terminal_state: None,
             optimization: None,
+            backup: None,
         };
         let mut session = store.session().await.unwrap();
         session
@@ -6040,6 +6114,7 @@ print(json.dumps(result,sort_keys=True))
             cancel_arrival: None,
             pending_terminal_state: None,
             optimization: None,
+            backup: None,
         }
     }
 

@@ -97,6 +97,15 @@ impl Fixture {
         let guard = tempfile::tempdir().unwrap();
         let root = guard.path().canonicalize().unwrap();
         let live = root.join("rsia.sqlite3");
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(live.clone())
+                .unwrap();
+        }
         Store::open(&live).await.unwrap().close().await;
         sql(&live, ROOT_BUDGET_FACTS);
 
@@ -121,8 +130,16 @@ impl Fixture {
                 .unwrap();
         }
         session.commit().await.unwrap();
-        let backup = root.join("backup");
-        store.backup(&backup).await.unwrap();
+        let backup = root.join("backups/backup");
+        store
+            .backup(
+                &admin,
+                evo_storage::lifecycle::BackupName::parse("backup").unwrap(),
+            )
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
 
         let revoked = LifecycleStore::begin_revoke(
             &admin,
