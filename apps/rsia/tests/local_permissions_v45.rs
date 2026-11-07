@@ -233,15 +233,17 @@ async fn mcp_insecure_data_refuses_before_bootstrap_and_protocol_output() {
         .unwrap();
     let reply: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(reply["id"], 2);
-    let names: Vec<_> = reply["result"]["tools"]
+    // tools/list order is not part of the protocol contract (smoke_cli sorts too).
+    let mut names: Vec<_> = reply["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
+    names.sort_unstable();
     assert_eq!(
         names,
-        ["evo_prepare", "evo_feedback", "evo_propose", "evo_inspect"]
+        ["evo_feedback", "evo_inspect", "evo_prepare", "evo_propose"]
     );
     drop(input);
     let status = timeout(Duration::from_secs(20), healthy.wait())

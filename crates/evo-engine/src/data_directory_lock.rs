@@ -29,12 +29,6 @@ impl DataDirectoryLock {
                 }
             },
         )?;
-        Self::acquire_checked(data)
-    }
-
-    // mount_gate has already performed its read-only permission preflight.
-    // A separate public acquire still performs its own boundary check above.
-    fn acquire_checked(data: &Path) -> std::io::Result<Self> {
         let directory = data_directory(data);
         if !directory.try_exists()? {
             let mut builder = std::fs::DirBuilder::new();
@@ -68,7 +62,7 @@ pub async fn mount_gate(
 ) -> std::result::Result<(DataDirectoryLock, GateDecision), StartupGateError> {
     let gate = StartupGate::new(data, trusted_revocations_db);
     gate.evaluate().await?;
-    let lock = DataDirectoryLock::acquire_checked(data)
+    let lock = DataDirectoryLock::acquire(data)
         .map_err(|error| StartupGateError::Rejected(error.to_string()))?;
     let decision = gate.evaluate().await?;
     Ok((lock, decision))

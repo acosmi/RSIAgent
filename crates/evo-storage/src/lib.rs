@@ -232,20 +232,20 @@ pub fn check_local_permissions(
                     return permission_real_ancestors(&std::fs::canonicalize(parent)?, euid);
                 };
                 permission_directory(&info, euid)?;
-                if let Some(info) = permission_optional_file(database, euid)? {
-                    if info.nlink() != 1 {
-                        return Err(LocalPermissionError::Insecure);
-                    }
+                if let Some(info) = permission_optional_file(database, euid)?
+                    && info.nlink() != 1
+                {
+                    return Err(LocalPermissionError::Insecure);
                 }
                 for suffix in ["-wal", "-shm"] {
                     let mut name = database.as_os_str().to_os_string();
                     name.push(suffix);
                     permission_optional_file(std::path::Path::new(&name), euid)?;
                 }
-                if let Some(info) = permission_optional_file(&directory.join(".rsia.lock"), euid)? {
-                    if info.nlink() != 1 {
-                        return Err(LocalPermissionError::Insecure);
-                    }
+                if let Some(info) = permission_optional_file(&directory.join(".rsia.lock"), euid)?
+                    && info.nlink() != 1
+                {
+                    return Err(LocalPermissionError::Insecure);
                 }
                 for name in [
                     "restore.json",
@@ -288,8 +288,13 @@ pub fn check_local_permissions(
                             permission_directory(&std::fs::symlink_metadata(&namespace)?, euid)?;
                             for export in std::fs::read_dir(namespace)? {
                                 let export = export?.path();
-                                permission_directory(&std::fs::symlink_metadata(&export)?, euid)?;
-                                permission_private_tree(&export, euid)?;
+                                let info = std::fs::symlink_metadata(&export)?;
+                                if info.is_file() {
+                                    permission_private_metadata(&info, euid)?;
+                                } else {
+                                    permission_directory(&info, euid)?;
+                                    permission_private_tree(&export, euid)?;
+                                }
                             }
                         }
                     }
@@ -2557,12 +2562,6 @@ pub(crate) async fn upstream_rows_in_tx(
 
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
-        check_local_permissions(LocalPermissionTarget::Database(path)).map_err(
-            |error| match error {
-                LocalPermissionError::Io(error) => internal(error),
-                other => Error::Invalid(other.to_string()),
-            },
-        )?;
         let root = local_data_directory(path);
         if !root.try_exists().map_err(internal)? {
             let mut directory = std::fs::DirBuilder::new();
@@ -4991,9 +4990,7 @@ mod tests {
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    use std::os::unix::fs::{
-        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
-    };
+    use std::os::unix::fs::PermissionsExt as _;
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[derive(Debug, PartialEq, Eq)]
@@ -5081,6 +5078,15 @@ mod tests {
         info
     }
 
+    // A healthy data directory is private regardless of the process umask.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn ag157_private_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn ag157_loose_umask_child(name: &str) -> bool {
         const KEY: &str = "RSIA_AG157_ISOLATED_PERMISSION_TEST";
@@ -5113,8 +5119,12 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn store_open_checks_permissions_before_cleanup_and_migrations() {
+        // The gate is the startup entry's shared check (StartupGate::evaluate
+        // before the lock, DataDirectoryLock::acquire inside it); Store::open
+        // is reached only after it. Only the database mode is the fault here.
         let (directory, store) = db().await;
         store.close().await;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let staging = directory.path().join(".blob-staging").join(hash(b"n"));
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -5125,11 +5135,10 @@ mod tests {
         let database = directory.path().join("db.sqlite3");
         std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o640)).unwrap();
         let before = ag157_snapshot(directory.path());
-        let error = Store::open(&database).await.err().unwrap();
-        assert!(
-            matches!(&error, Error::Invalid(reason) if reason == "data_directory_insecure"),
-            "{error}"
-        );
+        let error = check_local_permissions(LocalPermissionTarget::Database(&database))
+            .err()
+            .unwrap();
+        assert!(matches!(error, LocalPermissionError::Insecure), "{error}");
         assert_eq!(ag157_snapshot(directory.path()), before);
         assert!(!directory.path().join(".rsia.lock").exists());
         assert_eq!(
@@ -5145,7 +5154,7 @@ mod tests {
         if ag157_loose_umask_child(NAME) {
             return;
         }
-        let directory = tempfile::tempdir().unwrap();
+        let directory = ag157_private_tempdir();
         let database = directory.path().join("sidecars.sqlite3");
         let wal = directory.path().join("sidecars.sqlite3-wal");
         let shm = directory.path().join("sidecars.sqlite3-shm");
@@ -5206,7 +5215,7 @@ mod tests {
         if ag157_loose_umask_child(NAME) {
             return;
         }
-        let directory = tempfile::tempdir().unwrap();
+        let directory = ag157_private_tempdir();
         let store = Store::open(&directory.path().join("blob.sqlite3"))
             .await
             .unwrap();
@@ -5288,7 +5297,7 @@ mod tests {
         AG157_EXPORT_STAGING_FACT.with(|fact| {
             fact.borrow_mut().take();
         });
-        let directory = tempfile::tempdir().unwrap();
+        let directory = ag157_private_tempdir();
         let store = Store::open(&directory.path().join("local-export.sqlite3"))
             .await
             .unwrap();
@@ -5477,7 +5486,7 @@ mod tests {
         if ag157_loose_umask_child(NAME) {
             return;
         }
-        let directory = tempfile::tempdir().unwrap();
+        let directory = ag157_private_tempdir();
         let database = directory.path().join("source.sqlite3");
         let store = Store::open(&database).await.unwrap();
         let admin = Context::new("n", "admin", Role::Admin).unwrap();
@@ -5691,7 +5700,7 @@ mod tests {
         );
         assert_eq!(ag157_snapshot(&backup), backup_snapshot);
         store.close().await;
-        let anchor_directory = tempfile::tempdir().unwrap();
+        let anchor_directory = ag157_private_tempdir();
         let anchor = anchor_directory.path().join("current-anchor.sqlite3");
         ag157_private_file(&anchor, &std::fs::read(&database).unwrap());
         let delta = directory.path().join("delta.json");
@@ -5792,6 +5801,14 @@ mod tests {
     #[tokio::test]
     async fn insecure_backup_parent_refuses_before_temp_creation() {
         let (directory, store) = db().await;
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        session.audit(&admin, "test", "x").await.unwrap();
+        session
+            .bump_watermark(&admin, &hash(b"ag157-backup-watermark"))
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
         let good = directory.path().join("healthy-backup");
         store.backup(&good).await.unwrap();
         let bad_parent = directory.path().join("bad-publish-parent");
