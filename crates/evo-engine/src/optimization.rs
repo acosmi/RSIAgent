@@ -1523,16 +1523,15 @@ async fn match_registered_job_claim(
                 "optimization fact request differs from its first claim".into(),
             ));
         }
-        if let Some(inputs) = inputs {
-            if claim.payload["compiler_request"]
+        if let Some(inputs) = inputs
+            && (claim.payload["compiler_request"]
                 != serde_json::to_value(&inputs.request).map_err(|_| Error::Internal)?
                 || claim.payload["compiler_binding"]
-                    != serde_json::to_value(&inputs.binding).map_err(|_| Error::Internal)?
-            {
-                return Err(Error::Conflict(
-                    "optimization fact compiler request differs from its first claim".into(),
-                ));
-            }
+                    != serde_json::to_value(&inputs.binding).map_err(|_| Error::Internal)?)
+        {
+            return Err(Error::Conflict(
+                "optimization fact compiler request differs from its first claim".into(),
+            ));
         }
     }
     Ok(())

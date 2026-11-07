@@ -461,7 +461,10 @@ fn the_exported_selectors_are_the_restore_scripts() {
     assert_eq!(PROTECTED_OBJECT_KINDS.len(), 4);
     assert_eq!(PROTECTED_SCHEMA_VERSIONS.len(), 11);
     assert_eq!(PROTECTED_SCHEMA_VERSIONS[9], "rsia.trace_export.v1");
-    assert_eq!(PROTECTED_SCHEMA_VERSIONS[10], "rsia.optimization.stage_fact.v2");
+    assert_eq!(
+        PROTECTED_SCHEMA_VERSIONS[10],
+        "rsia.optimization.stage_fact.v2"
+    );
     assert_eq!(PROTECTED_ACTION_SCHEMA_VERSIONS.len(), 14);
     assert_eq!(
         PROTECTED_ACTION_SCHEMA_VERSIONS[11],

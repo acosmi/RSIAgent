@@ -110,7 +110,7 @@ async fn async_main() -> std::process::ExitCode {
                 Error::Forbidden => "forbidden",
                 Error::NotFound => "missing",
                 Error::Budget => "budget",
-                Error::Invalid(ref reason) if reason == "data_directory_insecure" => {
+                Error::Invalid(reason) if reason == "data_directory_insecure" => {
                     "data_directory_insecure"
                 }
                 Error::Invalid(_) => "invalid",
