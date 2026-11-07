@@ -1029,12 +1029,15 @@ fn exact_delta(backup: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn restore(backup: &std::path::Path, dest: &std::path::Path, delta: &std::path::Path) -> i32 {
-    restore_anchor(
-        backup,
-        dest,
-        delta,
-        Some(&backup.parent().unwrap().join("rsia.sqlite3")),
-    )
+    // The live anchor is D/rsia.sqlite3: real backups sit in D/backups/<name>,
+    // copied packages in D/<name>.
+    let parent = backup.parent().unwrap();
+    let root = if parent.ends_with("backups") {
+        parent.parent().unwrap()
+    } else {
+        parent
+    };
+    restore_anchor(backup, dest, delta, Some(&root.join("rsia.sqlite3")))
 }
 
 #[tokio::test]
