@@ -1672,7 +1672,6 @@ pub const IMPORT_SOURCE_SCHEMA: &str = "rsia.e16.import_source.v1";
 /// The current result schema; v1 results stay readable as legacy history.
 pub const IMPORT_RESULT_SCHEMA: &str = IMPORT_RESULT_SCHEMA_V2;
 const IMPORT_ARTIFACT_KIND: &str = "artifact";
-const IMPORT_EVENT_CAPACITY: u64 = evo_core::capacity::MAX_EVENTS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2617,7 +2616,6 @@ impl PersistentImportService {
                 ctx.actor(),
                 &result,
                 result.payload.aggregate_summary.total_events as u64,
-                IMPORT_EVENT_CAPACITY,
             )
             .await?;
         session

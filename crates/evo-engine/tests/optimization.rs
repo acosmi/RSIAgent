@@ -2385,11 +2385,13 @@ async fn ag138_run_stage_case<'a>(
                 .unwrap(),
                 prepared
             );
+            // The uncertain terminal closes the group: its fixture dispatch
+            // carries no bill, so nothing is left to reconcile.
             assert_eq!(
                 s.capacity_used(CapacityItem::ConcurrentOptimizationJob)
                     .await
                     .unwrap(),
-                1
+                0
             );
             s.commit().await.unwrap();
             let before = ag138_stage_sql_image(path);
@@ -2408,8 +2410,8 @@ async fn ag138_run_stage_case<'a>(
                     .capacity_used(CapacityItem::ConcurrentOptimizationJob)
                     .await
                     .unwrap(),
-                1,
-                "cleanup cannot release a group which actually dispatched with unknown outcome"
+                0,
+                "the closed uncertain group stays closed after its sources are cleaned up"
             );
             check.commit().await.unwrap();
             drop(journal);

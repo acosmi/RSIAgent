@@ -94,9 +94,15 @@ fn typed_capacity_error_roundtrips_item_used_limit_and_delta() {
     assert!(serde_json::from_value::<CapacityConflict>(unknown).is_err());
 }
 
+/// The engine and storage re-exports and the group bound are pinned to these
+/// names by the engine's own capacity unit test; core cannot depend on them.
 #[test]
 fn legacy_constants_reexport_the_single_authority() {
     use evo_core::capacity::*;
+    assert_eq!(
+        evo_core::curriculum::MAX_FAILURE_RECORDS as u64,
+        I::FailureRecord.limit()
+    );
     for (item, constant) in [
         (I::Run, MAX_RUNS),
         (I::Event, MAX_EVENTS),

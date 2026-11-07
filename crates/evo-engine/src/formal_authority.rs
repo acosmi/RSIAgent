@@ -371,6 +371,7 @@ pub(crate) fn compiler_dependency_schema(kind: &str, schema: &str) -> bool {
                 | "rsia.host_execution_receipt.v1"
                 | "rsia.exploration_artifact_envelope.v1"
                 | "rsia.optimization.stage_fact.v1"
+                | "rsia.optimization.stage_fact.v2"
                 | "rsia.optimization.compiler_use.v1"
                 | "rsia.optimization.compiler_use.v2"
                 | "rsia.monitoring.environment.v1"
@@ -445,6 +446,7 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
                 | "rsia.typed_artifact_envelope.v1"
                 | "rsia.exploration_artifact_envelope.v1"
                 | "rsia.optimization.stage_fact.v1"
+                | "rsia.optimization.stage_fact.v2"
                 | "rsia.optimization.compiler_use.v1"
                 | "rsia.optimization.compiler_use.v2"
                 | "rsia.monitoring.environment.v1"
@@ -612,7 +614,7 @@ fn supported_node_schema(kind: &str, id: &str, body: &Value) -> Result<String> {
         "rsia.host_execution_receipt.v1" => {
             let _: crate::release_store::TrustedHostExecutionReceipt = decode(body.clone())?;
         }
-        "rsia.optimization.stage_fact.v1" => {
+        "rsia.optimization.stage_fact.v1" | "rsia.optimization.stage_fact.v2" => {
             let f: crate::optimization::StageFact = decode(body.clone())?;
             f.validate()?;
         }

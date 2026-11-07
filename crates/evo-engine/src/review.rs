@@ -1512,6 +1512,18 @@ fn validate_fact(fact: &StageFact, ctx: &Context, root: &StageFact) -> ReadResul
     Ok(())
 }
 
+/// Both stage fact versions belong to one closure: a current first claim is
+/// a v2 `StepPrepared` that the later v1 facts of its step depend on.
+fn is_stage_fact(value: &Value) -> bool {
+    matches!(
+        value.get("schema_version").and_then(Value::as_str),
+        Some(
+            crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA
+                | crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+        )
+    )
+}
+
 async fn read_stage(
     ctx: &Context,
     session: &mut Session,
@@ -1522,9 +1534,7 @@ async fn read_stage(
     let raw = capture(ctx, session, set, "artifact", id)
         .await
         .map_err(primary_error)?;
-    if raw.get("schema_version").and_then(Value::as_str)
-        != Some(crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA)
-    {
+    if !is_stage_fact(&raw) {
         return Err(ReadFailure::Unavailable);
     }
     let root: StageFact = decode(&raw)?;
@@ -1587,10 +1597,7 @@ async fn read_stage(
                 }
                 "artifact" => {
                     let reference = capture(ctx, session, set, "artifact", &dependency.id).await?;
-                    if reference.get("schema_version").and_then(Value::as_str)
-                        == Some(crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA)
-                        && queued.insert(dependency.id.clone())
-                    {
+                    if is_stage_fact(&reference) && queued.insert(dependency.id.clone()) {
                         queue.push_back(dependency.id.clone());
                     }
                 }
@@ -1862,11 +1869,20 @@ async fn read_prepared(
     facts: &BTreeMap<String, StageFact>,
     fact: &StageFact,
 ) -> ReadResult<(PreparedMaterial, Option<ReviewCompilerInputs>)> {
-    let material: PreparedMaterial = decode(&fact.payload)?;
+    // A v2 fact carries its job scope beside the material; the scope is bound by
+    // `StageFact::validate`, the material and its input digest exclude it.
+    let mut payload = fact.payload.clone();
+    if fact.schema_version == crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2 {
+        payload
+            .as_object_mut()
+            .ok_or(ReadFailure::Gap(ReviewGap::MaterialInvalid))?
+            .remove("job_scope");
+    }
+    let material: PreparedMaterial = decode(&payload)?;
     let context = &material.context;
     let expected_input = match (&material.compiler_request, &material.compiler_binding) {
         (Some(_), Some(binding)) => {
-            let mut raw = fact.payload.clone();
+            let mut raw = payload.clone();
             let fields = raw
                 .as_object_mut()
                 .ok_or(ReadFailure::Gap(ReviewGap::MaterialInvalid))?;
@@ -1875,7 +1891,7 @@ async fn read_prepared(
             fingerprint(&(fingerprint(&raw).map_err(material_error)?, binding))
                 .map_err(material_error)?
         }
-        (None, None) => fingerprint(&fact.payload).map_err(material_error)?,
+        (None, None) => fingerprint(&payload).map_err(material_error)?,
         _ => return Err(ReadFailure::Gap(ReviewGap::MaterialInvalid)),
     };
     if fact.input_digest != expected_input

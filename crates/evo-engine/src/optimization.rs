@@ -564,8 +564,6 @@ impl StageFact {
             {
                 return Err(Error::Forbidden);
             }
-            evo_core::capacity::CapacityItem::SkillGroupPerJob
-                .admit(0, scope.groups.len() as u64)?;
         }
         for value in [
             &self.artifact_id,
@@ -739,12 +737,15 @@ fn seal_job_intent(
     mut members: Vec<(OptimizationGroupScopeV2, OptimizationJobMember)>,
 ) -> Result<OptimizationJobIntent> {
     let namespace = members[0].1.fact.namespace.clone();
+    let groups: Vec<_> = members.iter().map(|(group, _)| group.clone()).collect();
+    // The server id binds the whole member list: a caller label reused with
+    // other members names another job and can never adopt this one's claims.
     let scope = OptimizationJobScopeV2 {
         job_id: format!(
             "optjob-{}",
-            fingerprint(&("rsia.optimization.job.v2", &namespace, job_id))?
+            fingerprint(&("rsia.optimization.job.v2", &namespace, job_id, &groups))?
         ),
-        groups: members.iter().map(|(group, _)| group.clone()).collect(),
+        groups,
     };
     for (_, member) in &mut members {
         member.fact.payload["job_scope"] =
@@ -764,14 +765,26 @@ pub(crate) async fn prepare_group_job(
 ) -> Result<()> {
     let mut members = Vec::with_capacity(groups.len());
     for (group_id, request) in groups {
-        let resolved = journal
-            .current_compiler_inputs(&request.compiler_input_request())
-            .await?;
-        let inputs = crate::model::CurrentCompilerInputUse::new(
-            request.compiler_input_request(),
-            resolved.binding().clone(),
-        );
-        members.push(optimization_job_member(group_id, request, inputs)?);
+        let member: Result<_> = async {
+            let resolved = journal
+                .current_compiler_inputs(&request.compiler_input_request())
+                .await?;
+            let inputs = crate::model::CurrentCompilerInputUse::new(
+                request.compiler_input_request(),
+                resolved.binding().clone(),
+            );
+            optimization_job_member(group_id, request, inputs)
+        }
+        .await;
+        match member {
+            Ok(member) => members.push(member),
+            Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
+            // Same rule as the claim: the group's own step reports its error.
+            Err(_) => {}
+        }
+    }
+    if members.is_empty() {
+        return Ok(());
     }
     journal
         .claim_optimization_job(seal_job_intent(
@@ -1322,6 +1335,45 @@ mod verified_development_tests {
 }
 
 impl StoreOptimizationJournal {
+    /// One new first claim of a job, written with its Current material, content
+    /// edges, cache entry and audit inside the claiming transaction.
+    async fn persist_job_member(
+        &self,
+        session: &mut Session,
+        member: &OptimizationJobMember,
+    ) -> Result<()> {
+        let fact = &member.fact;
+        if let Some(claim) = &self.management {
+            claim
+                .record_prepared_stage(session, fact, &self.owner)
+                .await?;
+        }
+        persist_fact_current_material(session, &self.context, fact, Some(&member.inputs)).await?;
+        session
+            .put(
+                &self.context,
+                "artifact",
+                &fact.artifact_id,
+                &self.owner,
+                fact,
+            )
+            .await?;
+        put_stage_content_edges(session, &self.context, fact).await?;
+        session
+            .cache(
+                &self.context,
+                "optimization.stage",
+                &fact.artifact_id,
+                fact,
+                &fact.artifact_id,
+                fact,
+            )
+            .await?;
+        session
+            .audit(&self.context, "optimization.stage.claim", &fact.artifact_id)
+            .await
+    }
+
     pub fn new(store: Store, context: Context, owner: impl Into<String>) -> Result<Self> {
         context.require(&[Role::Worker, Role::Admin])?;
         let owner = owner.into();
@@ -1924,27 +1976,30 @@ impl OptimizationJournal for StoreOptimizationJournal {
             if member.fact.namespace != self.context.namespace() {
                 return Err(Error::Forbidden);
             }
-            verify_optimization_sources_in_session(
-                &mut session,
-                &self.context,
-                &member.selection,
-                &member.evidence,
-                &member.bindings,
-                &member.traces,
-                member.inputs.request.revoke_watermark,
-            )
-            .await?;
-            verify_compiler_use_boxed(&member.inputs, &mut session, &self.context).await?;
-            prepare_fact_compiler_use(
-                &mut session,
-                &self.context,
-                &mut member.fact,
-                &member.inputs,
-            )
-            .await?;
-            if let Some(existing) =
-                read_stage_fact(&mut session, &self.context, &member.fact.artifact_id).await?
-            {
+            let checked: Result<Option<StageFact>> = async {
+                verify_optimization_sources_in_session(
+                    &mut session,
+                    &self.context,
+                    &member.selection,
+                    &member.evidence,
+                    &member.bindings,
+                    &member.traces,
+                    member.inputs.request.revoke_watermark,
+                )
+                .await?;
+                verify_compiler_use_boxed(&member.inputs, &mut session, &self.context).await?;
+                prepare_fact_compiler_use(
+                    &mut session,
+                    &self.context,
+                    &mut member.fact,
+                    &member.inputs,
+                )
+                .await?;
+                let Some(existing) =
+                    read_stage_fact(&mut session, &self.context, &member.fact.artifact_id).await?
+                else {
+                    return Ok(None);
+                };
                 existing.validate()?;
                 let mut old_input = existing.payload.clone();
                 old_input
@@ -1956,14 +2011,25 @@ impl OptimizationJournal for StoreOptimizationJournal {
                     .as_object_mut()
                     .ok_or(Error::Forbidden)?
                     .remove("job_scope");
-                if existing.input_digest != member.fact.input_digest
-                    || old_input != new_input
-                    || (matches!(intent.entry, OptimizationJobEntry::Groups)
-                        && existing.payload["job_scope"]
-                            != serde_json::to_value(&intent.scope).map_err(|_| Error::Internal)?)
-                {
+                if existing.input_digest != member.fact.input_digest || old_input != new_input {
                     return Err(Error::Conflict("optimization job scope changed".into()));
                 }
+                Ok(Some(existing))
+            }
+            .await;
+            let existing = match checked {
+                Ok(existing) => existing,
+                // A group whose own inputs fail stays out of the job's claim; its
+                // own step answers that error as the group's outcome.
+                Err(error)
+                    if matches!(intent.entry, OptimizationJobEntry::Groups)
+                        && !matches!(error, Error::ClockRegressed) =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(existing) = existing {
                 if let Some(claim) = &self.management {
                     claim.require_stage(&mut session, &existing).await?;
                     claim.admit_new(&mut session).await?;
@@ -1976,90 +2042,15 @@ impl OptimizationJournal for StoreOptimizationJournal {
             }
         }
         if !missing.is_empty() {
-            // A different member list cannot reuse a completed/free job label.
-            let mut cursor = None;
-            loop {
-                let rows = session
-                    .object_rows_page(&self.context, "artifact", cursor)
-                    .await?;
-                if rows.is_empty() {
-                    break;
-                }
-                cursor = rows.last().map(|row| row.rowid);
-                for row in rows {
-                    if !row.id.starts_with("optstage-") {
-                        continue;
-                    }
-                    #[derive(Deserialize)]
-                    struct StageSchema {
-                        schema_version: Option<String>,
-                    }
-                    // Header routing skips unrelated payloads; only actual
-                    // Stage candidates go through the full strict decoder.
-                    let header: StageSchema =
-                        serde_json::from_str(&row.body).map_err(|_| Error::Internal)?;
-                    if header.schema_version.as_deref() != Some(OPTIMIZATION_STAGE_FACT_SCHEMA_V2) {
-                        continue;
-                    }
-                    let value = evo_storage::lifecycle::parse_strict_json(&row.body)?;
-                    if value["schema_version"] == OPTIMIZATION_STAGE_FACT_SCHEMA_V2
-                        && value["payload"]["job_scope"]["job_id"] == intent.scope.job_id
-                        && value["payload"]["job_scope"]
-                            != serde_json::to_value(&intent.scope).map_err(|_| Error::Internal)?
-                    {
-                        return Err(Error::Conflict("optimization job members changed".into()));
-                    }
-                }
-            }
             session
                 .admit_capacity(&[(
                     evo_core::capacity::CapacityItem::ConcurrentOptimizationJob,
                     u64::from(!known_job),
                 )])
                 .await?;
-            evo_core::capacity::CapacityItem::SkillGroupPerJob
-                .admit(0, intent.scope.groups.len() as u64)?;
         }
         for index in missing {
-            let member = &intent.members[index];
-            if let Some(claim) = &self.management {
-                claim
-                    .record_prepared_stage(&mut session, &member.fact, &self.owner)
-                    .await?;
-            }
-            persist_fact_current_material(
-                &mut session,
-                &self.context,
-                &member.fact,
-                Some(&member.inputs),
-            )
-            .await?;
-            session
-                .put(
-                    &self.context,
-                    "artifact",
-                    &member.fact.artifact_id,
-                    &self.owner,
-                    &member.fact,
-                )
-                .await?;
-            put_stage_content_edges(&mut session, &self.context, &member.fact).await?;
-            session
-                .cache(
-                    &self.context,
-                    "optimization.stage",
-                    &member.fact.artifact_id,
-                    &member.fact,
-                    &member.fact.artifact_id,
-                    &member.fact,
-                )
-                .await?;
-            session
-                .audit(
-                    &self.context,
-                    "optimization.stage.claim",
-                    &member.fact.artifact_id,
-                )
+            self.persist_job_member(&mut session, &intent.members[index])
                 .await?;
         }
         session.commit().await?;

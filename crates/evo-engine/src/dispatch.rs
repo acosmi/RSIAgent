@@ -908,22 +908,10 @@ impl ManagementDispatcher {
             // One trusted clock observation precedes every new timing write.
             let at = now()?;
             let capacity_at = u64::try_from(at).map_err(|_| Error::ClockRegressed)?;
-            let usage: crate::capacity::V41CapacityUsage =
-                session.capacity_usage_v41(capacity_at).await?.into();
-            let limits = crate::capacity::CapacityLimits::default();
-            let admitted = crate::capacity::admit_field(
-                crate::capacity::CapacityField::ConcurrentDispatches,
-                usage.concurrent_dispatches.saturating_add(1),
-                &limits,
-            )
-            .and_then(|()| {
-                crate::capacity::admit_field(
-                    crate::capacity::CapacityField::ActiveLeases,
-                    usage.active_leases,
-                    &limits,
-                )
-            });
-            admitted?;
+            let usage = session.capacity_usage_v41(capacity_at).await?;
+            evo_core::capacity::CapacityItem::ConcurrentManagementDispatch
+                .admit(usage.concurrent_dispatches, 1)?;
+            evo_core::capacity::CapacityItem::ActiveLease.admit(usage.active_leases, 1)?;
             let claim_at = now()?;
             job.generation = job
                 .generation
@@ -4310,6 +4298,7 @@ async fn consumer_progress_or_unknown(
             | Error::Forbidden
             | Error::NotFound
             | Error::Conflict(_)
+            | Error::Capacity(_)
             | Error::Budget
             | Error::Cancelled,
         ) => Ok(ConsumerProgress::Unknown),

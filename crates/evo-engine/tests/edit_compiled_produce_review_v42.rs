@@ -38,8 +38,8 @@ use evo_engine::model::{
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentSelectionDecision, DevelopmentTask,
-    OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournalStage, OptimizationStepOutcome,
-    OptimizationStepRequest, PairedTaskResult, StageFact, StageFactKind,
+    OPTIMIZATION_STAGE_FACT_SCHEMA, OPTIMIZATION_STAGE_FACT_SCHEMA_V2, OptimizationJournalStage,
+    OptimizationStepOutcome, OptimizationStepRequest, PairedTaskResult, StageFact, StageFactKind,
     edit_compiled_input_digest, run_optimization_step,
 };
 use evo_engine::review::{
@@ -563,8 +563,10 @@ async fn stage_facts(store: &Store, admin: &Context) -> Vec<StageFact> {
     bodies
         .into_iter()
         .filter(|body| {
-            body.get("schema_version").and_then(Value::as_str)
-                == Some(OPTIMIZATION_STAGE_FACT_SCHEMA)
+            matches!(
+                body.get("schema_version").and_then(Value::as_str),
+                Some(OPTIMIZATION_STAGE_FACT_SCHEMA | OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
+            )
         })
         .map(|body| serde_json::from_value(body).unwrap())
         .collect()

@@ -30,10 +30,6 @@ pub use evo_core::capacity::{
     MAX_ACTIVE_LEASES as MVP_MAX_ACTIVE_LEASES, MAX_REPLAY_WORLDS as MVP_MAX_REPLAY_WORLDS,
     MAX_RUNS as MVP_MAX_RUNS,
 };
-/// Storage-side mirrors of the E16.5 MVP capacity bounds enforced inside this
-/// crate (`Session::put_world`, `Store::reserve_budget_call_with_sources`).
-/// The engine's `capacity` module pins the same values and asserts equality.
-
 /// Schema identifiers the capacity measurement recognises. They mirror the
 /// engine's persisted schema versions; the engine asserts they stay equal.
 pub const CAPACITY_MANAGEMENT_JOB_SCHEMA: &str = "rsia.management_job.v1";
@@ -699,48 +695,25 @@ pub struct CapacityUsageV41 {
     /// Sum of `$.payload.aggregate_summary.total_events` over live import
     /// results plus any `event` objects.
     pub events: u64,
-    /// Stored Skill candidates (`kind='candidate'`). This is the one Skill asset
-    /// table: release candidates are frozen artifacts derived from these rows
-    /// and the disposable `skill_fts` index is keyed by candidate id.
+    /// Skill births: non-Improver candidates, release candidates and staged
+    /// Skill packages, a proven Current projection counted once.
     pub skills: u64,
     /// Exploration node envelopes (`rsia.exploration_artifact_envelope.v1`
-    /// with `record_kind = exploration_node_v1`).
+    /// with `record_kind = exploration_node_v1`) plus claimed dispatches whose
+    /// node is not written yet.
     pub exploration_nodes: u64,
-    /// Rows in `replay_worlds` (drafts and sealed worlds alike).
+    /// Rows in `replay_worlds` (drafts and sealed worlds alike) that no lawful
+    /// cleanup has redacted.
     pub replay_worlds: u64,
     /// Live leases: root budget calls that are reserved, dispatched, uncertain
     /// or finalized-but-not-closed with `lease_until > now`, plus unclosed
     /// management jobs whose real persisted lease is still live.
     pub active_leases: u64,
-    /// Staged assets in `prepared`, `staged` or `quarantined` state.
+    /// Staged assets in any state until a lawful cleanup redacts them.
     pub staged_packages: u64,
     /// Running/Draining management jobs or jobs retaining an execution lease;
     /// lease expiry alone does not prove that their execution has ended.
     pub concurrent_dispatches: u64,
-}
-
-/// Build the typed refusal every MVP capacity gate reports. The message names
-/// the exhausted counter and both numbers; it never truncates anything.
-pub fn mvp_capacity_exceeded(label: &str, used: u64, limit: u64) -> Error {
-    use evo_core::capacity::{CapacityConflict, CapacityItem};
-    let item = match label {
-        "runs" => CapacityItem::Run,
-        "events" => CapacityItem::Event,
-        "skills" => CapacityItem::Skill,
-        "active leases" => CapacityItem::ActiveLease,
-        "replay worlds" => CapacityItem::ReplayWorld,
-        _ => {
-            return Error::Conflict(format!(
-                "MVP capacity exceeded: {label} {used} >= limit {limit}"
-            ));
-        }
-    };
-    Error::Capacity(CapacityConflict {
-        item,
-        used,
-        limit,
-        delta: 1,
-    })
 }
 
 fn count_to_u64(count: i64) -> Result<u64> {
@@ -2695,8 +2668,6 @@ impl Session {
         let now = i64::try_from(now_secs)
             .map_err(|_| Error::Invalid("capacity clock is out of range".into()))?;
         use evo_core::capacity::CapacityItem::*;
-        let counts = capacity::counts(&mut self.tx).await?;
-        let used = |item| counts.get(&item).copied().unwrap_or(0);
         let replay_worlds = self.replay_world_count().await?;
         let management_jobs = count_management_job_capacity(&mut self.tx, now).await?;
         let active_leases = count_budget_active_leases(&mut self.tx, now)
@@ -2705,13 +2676,13 @@ impl Session {
             .ok_or(Error::Internal)?;
         let concurrent_dispatches = management_jobs.concurrent_dispatches;
         Ok(CapacityUsageV41 {
-            runs: used(Run),
-            events: used(Event),
-            skills: used(Skill),
-            exploration_nodes: used(ExplorationNode),
+            runs: self.capacity_used(Run).await?,
+            events: self.capacity_used(Event).await?,
+            skills: self.capacity_used(Skill).await?,
+            exploration_nodes: self.capacity_used(ExplorationNode).await?,
             replay_worlds,
             active_leases,
-            staged_packages: used(StagingPackage),
+            staged_packages: self.capacity_used(StagingPackage).await?,
             concurrent_dispatches,
         })
     }
@@ -2735,37 +2706,8 @@ impl Session {
         u64::try_from(count).map_err(|_| Error::Internal)
     }
 
-    /// Insert a new object only when the current namespace count is below the
-    /// bound. Count and insert share this transaction and the Store serializes
-    /// writers, so concurrent callers cannot both cross the limit.
-    pub async fn put_new_below_capacity<T: Serialize>(
-        &mut self,
-        ctx: &Context,
-        kind: &str,
-        id: &str,
-        owner: &str,
-        body: &T,
-        limit: u64,
-    ) -> Result<()> {
-        if limit == 0 {
-            return Err(Error::Invalid("capacity limit must be positive".into()));
-        }
-        if self.get::<Value>(ctx, kind, id).await?.is_some() {
-            return Err(Error::Conflict(
-                "bounded creation requires a new object identity".into(),
-            ));
-        }
-        let count = self.namespace_object_count(ctx, kind).await?;
-        if count >= limit {
-            return Err(Error::Conflict(format!(
-                "namespace {kind} capacity exceeded: {count} >= {limit}"
-            )));
-        }
-        self.put(ctx, kind, id, owner, body).await
-    }
-
-    /// Atomically sum a nonnegative integer from strict versioned objects and
-    /// create a new object only when its authoritative delta fits the bound.
+    /// Legacy event gate: create a strict versioned object whose integer is its
+    /// event delta only when the instance-wide event count still fits `limit`.
     #[allow(clippy::too_many_arguments)]
     pub async fn put_new_below_json_sum_capacity<T: Serialize>(
         &mut self,
@@ -2816,28 +2758,15 @@ impl Session {
                 "existing capacity records contain an invalid numeric fact".into(),
             ));
         }
-        let used: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(json_extract(body,?)),0) FROM objects
-             WHERE namespace=? AND kind=? AND json_extract(body,'$.schema_version')=?",
-        )
-        .bind(numeric_path)
-        .bind(ctx.namespace())
-        .bind(kind)
-        .bind(schema_version)
-        .fetch_one(&mut *self.tx)
-        .await
-        .map_err(internal)?;
-        let used = u64::try_from(used).map_err(|_| Error::Internal)?;
-        if used.checked_add(delta).is_none_or(|total| total > limit) {
-            return Err(Error::Conflict(format!(
-                "namespace event capacity exceeded: {used} + {delta} > {limit}"
-            )));
-        }
+        let used = self
+            .capacity_used(evo_core::capacity::CapacityItem::Event)
+            .await?;
+        evo_core::capacity::CapacityItem::Event.admit_within(limit, used, delta)?;
         self.put(ctx, kind, id, owner, body).await
     }
 
     /// Create a new import result artifact only when the deployment-wide E16.5
-    /// event count stays within `limit` (§3.3.2): imported events of v1 and v2
+    /// event count admits its delta (§3.3.2): imported events of v1 and v2
     /// results in every namespace plus event objects, the count
     /// `capacity_usage_v41` reports. Count and insert share this transaction; a
     /// stored count that is not a nonnegative integer fails closed.
@@ -2848,11 +2777,7 @@ impl Session {
         owner: &str,
         body: &T,
         delta: u64,
-        limit: u64,
     ) -> Result<()> {
-        if limit == 0 || delta > limit {
-            return Err(Error::Invalid("invalid capacity limit or delta".into()));
-        }
         let value = serde_json::to_value(body).map_err(internal)?;
         if value.get("schema_version").and_then(Value::as_str)
             != Some(CAPACITY_IMPORT_RESULT_SCHEMA)
@@ -2886,17 +2811,8 @@ impl Session {
                 "existing capacity records contain an invalid numeric fact".into(),
             ));
         }
-        let used = self
-            .capacity_used(evo_core::capacity::CapacityItem::Event)
+        self.admit_capacity(&[(evo_core::capacity::CapacityItem::Event, delta)])
             .await?;
-        if delta != 0 && (used > limit || delta > limit - used) {
-            return Err(Error::Capacity(evo_core::capacity::CapacityConflict {
-                item: evo_core::capacity::CapacityItem::Event,
-                used,
-                limit,
-                delta,
-            }));
-        }
         self.put(ctx, "artifact", id, owner, body).await
     }
 
@@ -3040,12 +2956,8 @@ impl Session {
             if exists == 0 {
                 // E16.5 / F24: the run bound is instance-wide, like every other
                 // MVP counter; a new run id anywhere counts against it.
-                let used = self
-                    .capacity_used(evo_core::capacity::CapacityItem::Run)
+                self.admit_capacity(&[(evo_core::capacity::CapacityItem::Run, 1)])
                     .await?;
-                if used >= MVP_MAX_RUNS {
-                    return Err(mvp_capacity_exceeded("runs", used, MVP_MAX_RUNS));
-                }
             }
         }
         if kind == "event" && self.object_row(ctx, kind, id).await?.is_none() {
@@ -3622,14 +3534,8 @@ impl Session {
         } else {
             // E16.5: a new world id is a new derivation. Sealing or updating an
             // existing draft creates no world and is never refused here.
-            let worlds = self.replay_world_count().await?;
-            if worlds >= MVP_MAX_REPLAY_WORLDS {
-                return Err(mvp_capacity_exceeded(
-                    "replay worlds",
-                    worlds,
-                    MVP_MAX_REPLAY_WORLDS,
-                ));
-            }
+            self.admit_capacity(&[(evo_core::capacity::CapacityItem::ReplayWorld, 1)])
+                .await?;
         }
         sqlx::query("INSERT INTO replay_worlds(namespace,id,sealed,manifest) VALUES(?,?,?,?) ON CONFLICT(namespace,id) DO UPDATE SET sealed=excluded.sealed,manifest=excluded.manifest")
             .bind(ctx.namespace())

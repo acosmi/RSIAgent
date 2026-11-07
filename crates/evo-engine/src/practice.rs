@@ -1433,10 +1433,14 @@ async fn run_attempts(
 /// `Incomplete` (finished attempts are kept, nothing is resent; trying again
 /// means a new set id, a new deliberate practice that never hits the stopped
 /// attempts, and for K=3 also a new registration, because a registration
-/// authorizes one set only and a stopped set has spent it). The set is written
-/// as an immutable artifact with dependency edges to the control's source runs,
-/// the control, every attempt's receipts and the registration, so a source
-/// revocation reaches it. No stage fact of any kind is written.
+/// authorizes one set only and a stopped set has spent it). A new set is first
+/// admitted against the instance practice capacity and persisted as a v2
+/// `Prepared` set, with its registration binding and dependency edges to the
+/// control's source runs, the control and the registration, before the first
+/// runner call; each attempt then records its receipts on that set, and a
+/// resumed set reuses the verified receipts and never resends a started
+/// attempt. A source revocation reaches the set through those edges. No stage
+/// fact of any kind is written.
 pub async fn run_practice_set(
     ctx: &Context,
     store: &Store,

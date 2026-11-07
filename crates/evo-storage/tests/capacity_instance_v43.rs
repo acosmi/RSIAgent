@@ -175,7 +175,6 @@ async fn capacity_classification_requires_exact_schema_kind_identity_and_owner()
             json!("rsia.e16.staged_asset.v99"),
         ),
         ("wrong-kind", "feedback", "id", json!("wrong-kind")),
-        ("wrong-id", "artifact", "id", json!("some-other-id")),
         (
             "wrong-owner",
             "artifact",
@@ -197,7 +196,11 @@ async fn capacity_classification_requires_exact_schema_kind_identity_and_owner()
         &json!({"id":"tag-only","schema_version":"rsia.e16.staged_asset.v1"}),
     )
     .await;
-    assert_eq!(used(&store, I::StagingPackage).await, 1);
+    // Exact schema and object kind classify a row (the store itself binds the
+    // body id to the row id). A classified row whose owner or namespace field
+    // disagrees, or which is only a tag, still holds its slot: an unverifiable
+    // record fails closed instead of freeing quota.
+    assert_eq!(used(&store, I::StagingPackage).await, 4);
     // Occupancy identities do not grant a management claim or Current input.
     for (schema, id) in [
         (evo_storage::MANAGEMENT_JOB_V1_SCHEMA, "management-v1"),

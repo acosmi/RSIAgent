@@ -2023,13 +2023,22 @@ async fn an_uncertain_call_of_one_stream_holds_the_roots_concurrency_slot_agains
     assert_eq!(failed.outcome, "model_usage_unknown", "{}", failed.outcome);
     assert_eq!(env.executions.load(Ordering::SeqCst), 1);
 
-    // The ledger refuses the new stream before dispatch. Its own reservation
-    // is released while the old stream's unknown bill remains held.
-    let blocked = env.step(TRIAL, MetaStream::New, 1).await;
-    assert_eq!(
-        blocked.outcome, "model_rejected_budget_unavailable",
-        "{}",
-        blocked.outcome
+    // One optimization job runs at a time in the instance (§3.3.1): the old
+    // stream's job keeps that slot while its unknown bill is not reconciled, so
+    // the new stream is refused before it writes or reserves anything.
+    let blocked = env
+        .try_step(
+            TRIAL,
+            MetaStream::New,
+            1,
+            &stream_request_id(TRIAL, MetaStream::New, 1),
+        )
+        .await;
+    assert!(
+        matches!(&blocked, Err(Error::Capacity(c)) if c.item
+            == evo_core::capacity::CapacityItem::ConcurrentOptimizationJob
+            && (c.used, c.limit, c.delta) == (1, 1, 1)),
+        "{blocked:?}"
     );
     assert_eq!(
         env.executions.load(Ordering::SeqCst),
@@ -2038,8 +2047,8 @@ async fn an_uncertain_call_of_one_stream_holds_the_roots_concurrency_slot_agains
     );
 
     // The view reports both streams as they are: the old stream's call is
-    // uncertain (its cost unknown, its reservation held), the new stream's
-    // call was reserved, refused, and released; nothing was settled.
+    // uncertain (its cost unknown, its reservation held), the new stream has
+    // no call; nothing was settled.
     let view = env.view(TRIAL).await.unwrap();
     let (old, new) = (view.old_stream().spend(), view.new_stream().spend());
     assert_eq!(
@@ -2060,12 +2069,12 @@ async fn an_uncertain_call_of_one_stream_holds_the_roots_concurrency_slot_agains
             new.actual_cost_micros,
             new.unsettled_reserved_micros
         ),
-        (1, 0, 0, 0, 0)
+        (0, 0, 0, 0, 0)
     );
-    // Both mechanisms were used under their policies: the old call dispatched
-    // with unknown usage, while the new step observed a determinate refusal.
+    // Only the old stream's mechanism was used: its call dispatched with
+    // unknown usage, while the new stream never started a step.
     assert_eq!(view.old_stream().verified_usage(), 1);
-    assert_eq!(view.new_stream().verified_usage(), 1);
+    assert_eq!(view.new_stream().verified_usage(), 0);
     assert_eq!(view.status(), MetaTrialStatus::UsageObserved);
     let wire = serde_json::to_value(&view).unwrap();
     assert_eq!(wire["old"]["spend"]["uncertain_calls"], 1);
@@ -3374,9 +3383,21 @@ async fn a_trial_without_a_verified_usage_record_is_only_a_candidate_change() {
         MetaTrialStatus::CandidateOnly
     );
 
+    // A real dispatch of the new stream makes it a trial with observed usage.
+    env.step(TRIAL, MetaStream::New, 1).await;
+    let view = env.view(TRIAL).await.unwrap();
+    assert_eq!(view.status(), MetaTrialStatus::UsageObserved);
+    assert_eq!(
+        serde_json::to_value(&view).unwrap()["status"],
+        "usage_observed"
+    );
+    assert_eq!(view.new_stream().verified_usage(), 1);
+    assert_eq!(view.old_stream().verified_usage(), 0);
+
     // A dispatch that was claimed and never observed is not usage either: it
     // is not proven that a call was made. (The status counts only what
-    // `verified_mechanism_usage` yields.)
+    // `verified_mechanism_usage` yields.) It runs last: one optimization job
+    // runs at a time in the instance (§3.3.1) and this claim keeps that slot.
     env.fork("trial-claimed").await;
     let claimed_world = stream_world_id("trial-claimed", MetaStream::New);
     let entered = Arc::new(Notify::new());
@@ -3408,17 +3429,6 @@ async fn a_trial_without_a_verified_usage_record_is_only_a_candidate_change() {
         env.view("trial-claimed").await.unwrap().status(),
         MetaTrialStatus::CandidateOnly
     );
-
-    // A real dispatch of the new stream makes it a trial with observed usage.
-    env.step(TRIAL, MetaStream::New, 1).await;
-    let view = env.view(TRIAL).await.unwrap();
-    assert_eq!(view.status(), MetaTrialStatus::UsageObserved);
-    assert_eq!(
-        serde_json::to_value(&view).unwrap()["status"],
-        "usage_observed"
-    );
-    assert_eq!(view.new_stream().verified_usage(), 1);
-    assert_eq!(view.old_stream().verified_usage(), 0);
 
     // The status is derived on every read and cannot be set: the view cannot be
     // built from JSON and there is no stored status to rewrite.

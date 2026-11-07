@@ -229,11 +229,17 @@ impl CapacityItem {
 
     /// A zero-delta replay or terminal close remains legal at a full bound.
     pub fn admit(self, used: u64, delta: u64) -> Result<()> {
-        if delta != 0 && (used > self.limit() || delta > self.limit() - used) {
+        self.admit_within(self.limit(), used, delta)
+    }
+
+    /// The same gate against an explicit bound, which only the legacy pure
+    /// capacity API and its event writer still supply.
+    pub fn admit_within(self, limit: u64, used: u64, delta: u64) -> Result<()> {
+        if delta != 0 && (used > limit || delta > limit - used) {
             return Err(Error::Capacity(CapacityConflict {
                 item: self,
                 used,
-                limit: self.limit(),
+                limit,
                 delta,
             }));
         }
