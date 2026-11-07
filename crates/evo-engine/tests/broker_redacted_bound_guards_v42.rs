@@ -1931,7 +1931,8 @@ async fn q03_unsettled_or_missing_response_refusal_is_zero_write() {
         .unwrap();
         let original = world.call(&bound).await;
         assert!(original.response_artifact.is_none());
-        assert!(!original.execution_closed);
+        // A reservation opens no execution; only its dispatch opens one.
+        assert_eq!(original.execution_closed, phase == "reserved", "{phase}");
         let before = ag121_fixed_lossless_snapshot(&world.path);
         let error = world.replay_current(&bound).await.unwrap_err();
         assert_conflict(&error, BINDING_MISMATCH);

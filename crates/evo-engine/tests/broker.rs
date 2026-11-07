@@ -1,8 +1,7 @@
 use async_trait::async_trait;
-use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
+use evo_core::evidence::Purpose;
 use evo_core::optimization::{
     ModelInputPart, ModelInputRole, ModelRequest, ModelRequestContext, ModelStage,
-    OptimizationTrace, TraceOutcome,
 };
 use evo_core::skill_edit::EvidenceRef;
 use evo_core::{Context, Error, Result, Role, hash};
@@ -10,7 +9,6 @@ use evo_engine::broker::{
     BrokerConfig, DisabledModelTransport, ModelTransport, PersistentModelBroker,
     TransportCompletion,
 };
-use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::model::{
     ModelExecutionProvenance, ModelPort, ModelRejectionKind, ModelResponse, RejectedDispatch,
 };
@@ -180,37 +178,6 @@ fn config() -> BrokerConfig {
 async fn store() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("rsia.sqlite3")).await.unwrap();
-    let host = Context::new("ns-a", "trusted-broker", Role::Host).unwrap();
-    // 完整本地软件来源，仅供预算门测试，不声明真实 Host 或 P 权限。
-    store_trace_authority(
-        &store,
-        &host,
-        &StoredTraceAuthority {
-            schema_version: "rsia.optimization.source.v1".into(),
-            record: StoredRunRecord {
-                id: "evidence-1".into(),
-                body: b"evidence".to_vec(),
-                parent_family: "broker-fixture".into(),
-                task_origin: TaskOrigin::TrustedRun,
-                execution_attestation: ExecutionAttestation::TrustedHost,
-                purpose: Purpose::Development,
-            },
-            trace: OptimizationTrace {
-                run_id: "evidence-1".into(),
-                parent_family: "broker-fixture".into(),
-                source_digest: hash(b"evidence"),
-                purpose: Purpose::Development,
-                outcome: TraceOutcome::Success,
-                diagnosis: None,
-                excerpt: "evidence".into(),
-                seed: 1,
-            },
-            excerpt_start: 0,
-            excerpt_end: b"evidence".len(),
-        },
-    )
-    .await
-    .unwrap();
     (dir, store)
 }
 
@@ -1099,10 +1066,23 @@ async fn ag054_begin_root_group_and_revoked_source_release_and_replay_after_rest
             fixed_clock(),
         )
         .unwrap();
-        assert_eq!(
-            serde_json::to_value(disabled.dispatch(req).await.unwrap()).unwrap(),
-            serde_json::to_value(first).unwrap()
-        );
+        let replay = serde_json::to_value(disabled.dispatch(req).await.unwrap()).unwrap();
+        if mode == "source_revoked" {
+            // Q03：预留保留为 Reserved，因此停用的传输先于来源门判定；
+            // 不再回放 source_revoked 释放原因。
+            assert_eq!(
+                replay,
+                serde_json::to_value(ModelResponse::Rejected {
+                    request_id: "pending".into(),
+                    kind: ModelRejectionKind::Unauthorized,
+                    reason: "model transport is disabled".into(),
+                    dispatch: RejectedDispatch::NotDispatched,
+                })
+                .unwrap()
+            );
+        } else {
+            assert_eq!(replay, serde_json::to_value(first).unwrap());
+        }
     }
 }
 

@@ -368,7 +368,10 @@ pub(crate) async fn snapshots_live_in_tx(
         .iter()
         .map(|r| (r.kind.as_str(), r.id.as_str()))
         .collect();
-    crate::revocation::dependencies_live_in_tx(tx, namespace, &seeds, true).await
+    Ok(
+        crate::revocation::status_in_tx(tx, namespace, &seeds, true).await?
+            == crate::revocation::RevocationStatus::Live,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

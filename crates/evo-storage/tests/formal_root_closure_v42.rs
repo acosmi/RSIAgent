@@ -280,34 +280,6 @@ async fn fixture_money_never_becomes_ordinary_p_and_incompatible_charge_keeps_it
 #[tokio::test]
 async fn reservation_candidate_proposal_edges_and_audit_share_one_commit_or_rollback() {
     let (_dir, store, admin, worker, _) = setup().await;
-    // 软件来源先独立落库，不占用被测 proposal 事务的审计计数。
-    let mut session = store.session().await.unwrap();
-    let id = "source-run";
-    session
-        .put(
-            &admin,
-            "run",
-            id,
-            admin.actor(),
-            &serde_json::json!({
-                "schema_version": "rsia.optimization.source.v1",
-                "record": {
-                    "id": id, "body": id.as_bytes().to_vec(),
-                    "parent_family": format!("family-{id}"),
-                    "task_origin": "trusted_run", "execution_attestation": "trusted_host",
-                    "purpose": "development"
-                },
-                "trace": {
-                    "run_id": id, "parent_family": format!("family-{id}"),
-                    "source_digest": hash(id.as_bytes()), "purpose": "development",
-                    "outcome": "success", "diagnosis": null, "excerpt": id, "seed": 1
-                },
-                "excerpt_start": 0, "excerpt_end": id.len()
-            }),
-        )
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
     for commit in [false, true] {
         let mut session = store.session().await.unwrap();
         session

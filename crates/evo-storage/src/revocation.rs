@@ -1,8 +1,11 @@
 //! One raw, kind-exact revocation judgement for content consumers. No state is
 //! written here: namespace isolation is derived from the conflicting source rows.
 
-use crate::lifecycle::{REVOKE_TOMBSTONE_SCHEMA, RevokeTombstone, parse_strict_json};
-use crate::{RawUpstreamNode, Session, internal, upstream_rows_in_tx};
+use crate::lifecycle::{
+    REVOKE_TOMBSTONE_SCHEMA, RevokeTombstone, TypedObjectRef, parse_strict_json,
+    registered_import_source, valid_native_trace_authority,
+};
+use crate::{REDACTED_SCHEMA, Session, internal, upstream_rows_in_tx};
 use evo_core::evidence::RevocableSourceKind;
 use evo_core::{Context, Error, Result, identifier, text};
 use sqlx::{Row, Sqlite, Transaction};
@@ -14,7 +17,6 @@ pub enum RevocationCause {
     Revoked,
     Unreadable,
     Redacted,
-    NamespaceConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,93 +56,59 @@ fn valid_digest(digest: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-pub(crate) fn judge_node(node: RawUpstreamNode) -> Option<RevocationFinding> {
-    let cause = if let Some(body) = node.tombstone {
-        match strict_tombstone(&body, &node.id) {
-            Some(tombstone) if tombstone.source_kind == node.kind => Some(RevocationCause::Revoked),
-            Some(_) => None,
-            None => Some(RevocationCause::Unreadable),
-        }
-    } else {
-        None
+/// A tombstone written for this node's own kind revokes it; a valid tombstone of
+/// the other kind belongs to another object; an invalid one fails closed.
+fn judge(
+    kind: String,
+    id: String,
+    tombstone: Option<String>,
+    redacted: bool,
+) -> Option<RevocationFinding> {
+    let cause = match tombstone.map(|body| strict_tombstone(&body, &id)) {
+        Some(Some(tombstone)) if tombstone.source_kind == kind => Some(RevocationCause::Revoked),
+        Some(None) => Some(RevocationCause::Unreadable),
+        _ => redacted.then_some(RevocationCause::Redacted),
     };
-    cause
-        .or(node.redacted.then_some(RevocationCause::Redacted))
-        .map(|cause| RevocationFinding {
-            kind: node.kind,
-            id: node.id,
-            cause,
-        })
+    cause.map(|cause| RevocationFinding { kind, id, cause })
 }
 
-pub(crate) async fn qualified_run_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    namespace: &str,
-    id: &str,
-) -> Result<bool> {
-    let body: Option<String> =
-        sqlx::query_scalar("SELECT body FROM objects WHERE namespace=? AND kind='run' AND id=?")
-            .bind(namespace)
-            .bind(id)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(internal)?;
-    let Some(body) = body else { return Ok(false) };
-    let Ok(value) = parse_strict_json(&body) else {
-        return Ok(false);
-    };
-    Ok(crate::lifecycle::valid_native_trace_authority(
-        &crate::lifecycle::TypedObjectRef {
-            kind: "run".into(),
-            id: id.into(),
-        },
-        &value,
-    ))
-}
-
+/// One registered-source definition for both physical kinds: a run carrying the
+/// complete trusted-host trace authority, or a strict E16 import_source envelope.
 pub(crate) async fn registered_source_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     namespace: &str,
     kind: RevocableSourceKind,
     id: &str,
 ) -> Result<bool> {
-    if kind == RevocableSourceKind::TrustedRun {
-        let present: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM objects WHERE namespace=? AND kind='run' AND id=?)",
-        )
-        .bind(namespace)
-        .bind(id)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(internal)?;
-        return Ok(present != 0);
-    }
-    let body: Option<String> = sqlx::query_scalar(
-        "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
-    )
-    .bind(namespace)
-    .bind(id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(internal)?;
-    let Some(body) = body else { return Ok(false) };
-    let Ok(value) = parse_strict_json(&body) else {
+    let body: Option<String> =
+        sqlx::query_scalar("SELECT body FROM objects WHERE namespace=? AND kind=? AND id=?")
+            .bind(namespace)
+            .bind(kind.physical_kind())
+            .bind(id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(internal)?;
+    let Some(value) = body.and_then(|body| parse_strict_json(&body).ok()) else {
         return Ok(false);
     };
-    Ok(crate::lifecycle::registered_import_source(
-        namespace,
-        &crate::lifecycle::TypedObjectRef {
-            kind: "artifact".into(),
-            id: id.into(),
-        },
-        &value,
-    ))
+    let node = TypedObjectRef {
+        kind: kind.physical_kind().into(),
+        id: id.into(),
+    };
+    Ok(match kind {
+        RevocableSourceKind::TrustedRun => valid_native_trace_authority(&node, &value),
+        RevocableSourceKind::ImportSource => registered_import_source(namespace, &node, &value),
+    })
 }
 
+/// The id of a stored pair of registered sources (a trusted run and a strict
+/// import_source) that share one tombstone key. Only such a pair isolates the
+/// namespace; an ordinary artifact or an unqualified run never does. The import
+/// side is read first, so a run body is read only for a real import_source id.
 pub(crate) async fn namespace_collision_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     namespace: &str,
-) -> Result<Option<RevocationFinding>> {
+) -> Result<Option<String>> {
     let ids: Vec<String> = sqlx::query_scalar(
         "SELECT r.id FROM objects r JOIN objects a
            ON a.namespace=r.namespace AND a.kind='artifact' AND a.id=r.id
@@ -151,45 +119,43 @@ pub(crate) async fn namespace_collision_in_tx(
     .await
     .map_err(internal)?;
     for id in ids {
-        if registered_source_in_tx(tx, namespace, RevocableSourceKind::ImportSource, &id).await? {
-            return Ok(Some(RevocationFinding {
-                kind: "namespace".into(),
-                id,
-                cause: RevocationCause::NamespaceConflict,
-            }));
+        if registered_source_in_tx(tx, namespace, RevocableSourceKind::ImportSource, &id).await?
+            && registered_source_in_tx(tx, namespace, RevocableSourceKind::TrustedRun, &id).await?
+        {
+            return Ok(Some(id));
         }
     }
     Ok(None)
 }
 
-pub(crate) async fn dependencies_live_in_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    namespace: &str,
-    roots: &[(&str, &str)],
-    require_existing: bool,
-) -> Result<bool> {
-    Ok(status_in_tx(tx, namespace, roots, require_existing).await? == RevocationStatus::Live)
+fn namespace_conflict(namespace: &str, id: &str) -> Error {
+    Error::Conflict(format!(
+        "revocation source id collision isolates namespace {namespace}: {id}"
+    ))
 }
 
+/// Complete-closure status. `typed_e16` is the stricter E16 snapshot contract:
+/// every node must exist and run-body redaction counts. Direct gates read only
+/// artifact redaction, as `Session::upstream_closure` always has.
 pub(crate) async fn status_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     namespace: &str,
     roots: &[(&str, &str)],
-    require_existing: bool,
+    typed_e16: bool,
 ) -> Result<RevocationStatus> {
     if namespace_collision_in_tx(tx, namespace).await?.is_some() {
         return Ok(RevocationStatus::Unverifiable);
     }
     let Some(nodes) =
-        upstream_rows_in_tx(tx, namespace, roots, MAX_UPSTREAM_CLOSURE_NODES, true).await?
+        upstream_rows_in_tx(tx, namespace, roots, MAX_UPSTREAM_CLOSURE_NODES, typed_e16).await?
     else {
         return Ok(RevocationStatus::Unverifiable);
     };
     for node in nodes {
-        if require_existing && !node.exists {
+        if typed_e16 && !node.exists {
             return Ok(RevocationStatus::Unverifiable);
         }
-        if judge_node(node).is_some() {
+        if judge(node.kind, node.id, node.tombstone, node.redacted).is_some() {
             return Ok(RevocationStatus::Blocked);
         }
     }
@@ -210,7 +176,10 @@ impl Session {
             identifier(id)?;
             seeds.push((kind.as_str(), id.as_str()));
         }
-        dependencies_live_in_tx(&mut self.tx, ctx.namespace(), &seeds, false).await
+        Ok(
+            status_in_tx(&mut self.tx, ctx.namespace(), &seeds, false).await?
+                == RevocationStatus::Live,
+        )
     }
 
     /// Registered revocation identity, not permission to consume its content.
@@ -229,17 +198,14 @@ impl Session {
     /// quarantine format. Accounting and the D4 close path do not call this gate.
     #[doc(hidden)]
     pub async fn ensure_revocation_namespace_live(&mut self, ctx: &Context) -> Result<()> {
-        if let Some(conflict) = namespace_collision_in_tx(&mut self.tx, ctx.namespace()).await? {
-            return Err(Error::Conflict(format!(
-                "revocation source id collision isolates namespace {}: {}",
-                ctx.namespace(),
-                conflict.id
-            )));
+        match namespace_collision_in_tx(&mut self.tx, ctx.namespace()).await? {
+            Some(id) => Err(namespace_conflict(ctx.namespace(), &id)),
+            None => Ok(()),
         }
-        Ok(())
     }
 
-    /// Direct check used before a consumer's existing digest/permission checks.
+    /// The node itself: a tombstone of its own kind (run or artifact), or a
+    /// redacted body for any kind but a run. A run body is never read here.
     #[doc(hidden)]
     pub async fn revocation_dependency(
         &mut self,
@@ -248,33 +214,30 @@ impl Session {
         id: &str,
     ) -> Result<Option<RevocationFinding>> {
         identifier(id)?;
-        if let Some(conflict) = namespace_collision_in_tx(&mut self.tx, ctx.namespace()).await? {
-            return Ok(Some(conflict));
-        }
         let row = sqlx::query(
             "SELECT t.body AS tombstone,
-                    COALESCE(json_extract(o.body,'$.schema_version')='rsia.redacted.v1',0) AS redacted,
-                    o.id IS NOT NULL AS present
+                    COALESCE(json_extract(o.body,'$.schema_version')=?4,0) AS redacted
              FROM (SELECT 1) LEFT JOIN objects t
                ON ?1 IN ('run','artifact') AND t.namespace=?2 AND t.kind='tombstone' AND t.id=?3
-             LEFT JOIN objects o ON o.namespace=?2 AND o.kind=?1 AND o.id=?3",
+             LEFT JOIN objects o ON ?1<>'run' AND o.namespace=?2 AND o.kind=?1 AND o.id=?3",
         )
         .bind(kind)
         .bind(ctx.namespace())
         .bind(id)
+        .bind(REDACTED_SCHEMA)
         .fetch_one(&mut *self.tx)
         .await
         .map_err(internal)?;
-        Ok(judge_node(RawUpstreamNode {
-            kind: kind.into(),
-            id: id.into(),
-            tombstone: row.try_get("tombstone").map_err(internal)?,
-            redacted: row.try_get::<i64, _>("redacted").map_err(internal)? != 0,
-            exists: row.try_get::<i64, _>("present").map_err(internal)? != 0,
-        }))
+        Ok(judge(
+            kind.into(),
+            id.into(),
+            row.try_get("tombstone").map_err(internal)?,
+            row.try_get::<i64, _>("redacted").map_err(internal)? != 0,
+        ))
     }
 
     /// Complete raw closure; intermediate kinds count and cycles/diamonds dedupe.
+    /// An isolated namespace is its own refusal, not a finding about a node.
     #[doc(hidden)]
     pub async fn revocation_upstream(
         &mut self,
@@ -282,20 +245,20 @@ impl Session {
         roots: &[(String, String)],
         limit: usize,
     ) -> Result<Option<RevocationFinding>> {
-        if let Some(conflict) = namespace_collision_in_tx(&mut self.tx, ctx.namespace()).await? {
-            return Ok(Some(conflict));
-        }
+        self.ensure_revocation_namespace_live(ctx).await?;
         let mut seeds = Vec::with_capacity(roots.len());
         for (kind, id) in roots {
             identifier(id)?;
             seeds.push((kind.as_str(), id.as_str()));
         }
-        let nodes = upstream_rows_in_tx(&mut self.tx, ctx.namespace(), &seeds, limit, true)
+        let nodes = upstream_rows_in_tx(&mut self.tx, ctx.namespace(), &seeds, limit, false)
             .await?
             .ok_or_else(|| Error::Conflict(format!(
                 "upstream dependency closure exceeds {limit} nodes; it is refused, not truncated"
             )))?;
-        Ok(nodes.into_iter().find_map(judge_node))
+        Ok(nodes
+            .into_iter()
+            .find_map(|node| judge(node.kind, node.id, node.tombstone, node.redacted)))
     }
 }
 

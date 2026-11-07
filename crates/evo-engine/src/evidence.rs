@@ -428,20 +428,6 @@ pub(crate) async fn store_trace_authority_in_session(
         return Err(Error::Forbidden);
     }
     if session
-        .registered_revocable_source(
-            context,
-            evo_core::evidence::RevocableSourceKind::ImportSource,
-            &authority.record.id,
-        )
-        .await?
-    {
-        return Err(Error::Conflict(format!(
-            "run {} cannot be stored: an E16 import_source artifact already has this id \
-             (a revocation tombstone is keyed by id)",
-            authority.record.id
-        )));
-    }
-    if session
         .get::<serde_json::Value>(context, "run", &authority.record.id)
         .await?
         .is_some()
@@ -457,14 +443,24 @@ pub(crate) async fn store_trace_authority_in_session(
         // whichever was revoked first would make the other unrevocable. The id of an
         // import source is derived from its selection, the id of a run is chosen by
         // the caller, so refuse here, before anything is written. An object of any
-        // other kind with this id is a different object and does not matter.
-        crate::revocation_gate::ensure_dependencies_live(
-            context,
-            &mut session,
-            &[("run".to_string(), authority.record.id.clone())],
-            "source authority",
-        )
-        .await?;
+        // other kind with this id is a different object and does not matter, and
+        // neither does an artifact that only claims the import_source schema. A
+        // stored conflicting pair isolates the namespace from new sources.
+        if session
+            .registered_revocable_source(
+                context,
+                evo_core::evidence::RevocableSourceKind::ImportSource,
+                &authority.record.id,
+            )
+            .await?
+        {
+            return Err(Error::Conflict(format!(
+                "run {} cannot be stored: an E16 import_source artifact already has this id \
+                 (a revocation tombstone is keyed by id)",
+                authority.record.id
+            )));
+        }
+        session.ensure_revocation_namespace_live(context).await?;
         // Cache tombstones prevent a deleted source from being silently reintroduced.
         if session
             .cached::<StoredTraceAuthority, _>(
@@ -641,15 +637,8 @@ pub async fn validate_stored_sources(
     if u64::try_from(actual.0).ok() != Some(expected_watermark) {
         return Err(Error::Conflict("source revoke watermark changed".into()));
     }
-    for id in source_ids {
-        if crate::revocation_gate::judge_dependency(context, session, "run", id)
-            .await?
-            .is_some()
-        {
-            return Err(Error::Forbidden);
-        }
-        load_stored_source(session, context, id).await?;
-    }
+    // The closure walk starts at the sources, so their own tombstones are judged
+    // before a missing (cleaned-up) run could answer NotFound.
     let roots: Vec<_> = source_ids
         .iter()
         .map(|id| ("run".to_string(), id.clone()))
@@ -659,6 +648,9 @@ pub async fn validate_stored_sources(
         .is_some()
     {
         return Err(Error::Forbidden);
+    }
+    for id in source_ids {
+        load_stored_source(session, context, id).await?;
     }
     Ok(())
 }
