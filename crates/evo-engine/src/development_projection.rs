@@ -1753,7 +1753,9 @@ impl DevRunner for ConfigProjectionDevelopmentRunner {
         let mut usages = BTreeSet::new();
         for (task, case) in c.record.tasks.iter().zip(&c.cases) {
             for side in [DevelopmentSide::Parent, DevelopmentSide::Candidate] {
-                let receipt = execute_side(
+                // Both issuers are boxed: unoptimized builds otherwise keep their
+                // large futures on every polling caller's stack.
+                let receipt = Box::pin(execute_side(
                     &self.store,
                     &self.executor,
                     &c,
@@ -1765,20 +1767,20 @@ impl DevRunner for ConfigProjectionDevelopmentRunner {
                     side,
                     self.lease_seconds,
                     self.now()?,
-                )
+                ))
                 .await?;
                 executions.insert(receipt.execution.receipt_id);
                 calls.insert(receipt.execution.budget_call_id);
                 usages.insert(receipt.execution.usage_record_id);
             }
-            let grader = issue_grader(
+            let grader = Box::pin(issue_grader(
                 &self.grader,
                 &self.store,
                 &c,
                 &request,
                 &task.task_id,
                 self.now()?,
-            )
+            ))
             .await?;
             graders.insert(grader.receipt_id.clone());
             results.push(PairedTaskResult {

@@ -1626,11 +1626,23 @@ async fn verify_current_development_cache_in_session(
         // observes it, fresh or reused: a forged or legacy report keeps that
         // gate's rejection instead of failing here as a step error.
     } else if fact.kind == StageFactKind::StepCompleted {
-        let prepared_id = canonical_stage_artifact_id(&StageFact {
-            kind: StageFactKind::StepPrepared,
-            ..fact.clone()
-        })?;
-        let Some(prepared) = read_stage_fact(session, ctx, &prepared_id).await? else {
+        // A v1 step keeps its legacy prepared fact; a new step's is the v2 job member.
+        let mut prepared = None;
+        for schema in [
+            OPTIMIZATION_STAGE_FACT_SCHEMA,
+            OPTIMIZATION_STAGE_FACT_SCHEMA_V2,
+        ] {
+            let prepared_id = canonical_stage_artifact_id(&StageFact {
+                schema_version: schema.into(),
+                kind: StageFactKind::StepPrepared,
+                ..fact.clone()
+            })?;
+            prepared = read_stage_fact(session, ctx, &prepared_id).await?;
+            if prepared.is_some() {
+                break;
+            }
+        }
+        let Some(prepared) = prepared else {
             // A rejected grant can be terminal before a step was prepared.
             return if fact.payload["status"] == "candidate" {
                 Err(Error::NotFound)
