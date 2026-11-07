@@ -904,6 +904,17 @@ impl HangingJournal {
 
 #[async_trait]
 impl OptimizationJournal for HangingJournal {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> evo_core::Result<Vec<StageFact>> {
+        if intent.members().any(|(fact, _)| fact.kind == self.hang_on) {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,

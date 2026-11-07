@@ -604,19 +604,46 @@ class RestoreTests(unittest.TestCase):
     def test_current_proposal_restore_protection_matches_rust(self):
         import re
         rust=(ROOT / "crates/evo-storage/src/lifecycle.rs").read_text()
-        body=re.search(r"PROTECTED_ACTION_SCHEMA_VERSIONS: \[&str; 13\] = \[(.*?)\];",rust,re.S).group(1)
+        body=re.search(r"PROTECTED_ACTION_SCHEMA_VERSIONS: \[&str; 14\] = \[(.*?)\];",rust,re.S).group(1)
         schemas=re.findall(r'"([^"]+)"',body)
-        self.assertEqual(len(schemas),13)
+        self.assertEqual(len(schemas),14)
         self.assertEqual(schemas[11],"rsia.monitoring.consolidation_proposal.v2")
         self.assertEqual(schemas[12],"rsia.management_job.v2")
+        self.assertEqual(schemas[-1],"rsia.practice_attempt_set.v2")
+        self.assertEqual(schemas[-3:],["rsia.monitoring.consolidation_proposal.v2","rsia.management_job.v2","rsia.practice_attempt_set.v2"])
         con=sqlite3.connect(":memory:")
         self.addCleanup(con.close)
         con.execute("CREATE TABLE objects(namespace,kind,id,body)")
         for index,schema in enumerate(schemas):
             con.execute("INSERT INTO objects VALUES('n','artifact',?,?)",(str(index),json.dumps({"id":str(index),"schema_version":schema,"content":"fixture content"})))
         facts=restore.protected_facts(con,{"n"})
-        self.assertEqual(len(facts),13)
+        self.assertEqual(len(facts),14)
         self.assertEqual({fact[3]["schema_version"] for fact in facts},set(schemas))
+
+    def test_practice_v2_stage_v2_restore_protection_and_tamper_isolation(self):
+        scenario=Scenario(self,CURRENT)
+        con=connect(scenario.history)
+        raw={"practice-v1":'{"id":"practice-v1","schema_version":"rsia.practice_attempt_set.v1","attempts":[]}',
+             "practice-v2":'{"id":"practice-v2","schema_version":"rsia.practice_attempt_set.v2","state":"running","started":{"request_id":"bound-request"}}',
+             "stage-v1":'{"artifact_id":"stage-v1","schema_version":"rsia.optimization.stage_fact.v1","payload":{"legacy":true}}',
+             "stage-v2":'{"artifact_id":"stage-v2","schema_version":"rsia.optimization.stage_fact.v2","payload":{"job_scope":{"job_id":"bound-job","groups":[]}}}'}
+        for identity,body in raw.items():
+            con.execute("INSERT INTO objects(namespace,kind,id,owner,body) VALUES('legacy-a','artifact',?,'admin',?)",(identity,body))
+        con.close()
+        anchor=scenario.anchor()
+        before=database_image(anchor)
+        backup=scenario.backup("healthy-practice-stage")
+        dest,result=scenario.restore(backup,anchor,"healthy-practice-stage-restore")
+        self.assert_restored(dest,result,0,"none")
+        con=connect(dest / "rsia.sqlite3")
+        for identity,body in raw.items():
+            self.assertEqual(con.execute("SELECT body FROM objects WHERE id=?",(identity,)).fetchone()[0],body)
+        con.close()
+        for identity,path in (("practice-v2","$.started.request_id"),("stage-v2","$.payload.job_scope.job_id")):
+            changed=scenario.backup("changed-"+identity,db_sql="UPDATE objects SET body=json_set(body,'"+path+"','substituted') WHERE id='"+identity+"'")
+            dest,result=scenario.restore(changed,anchor,"refused-"+identity)
+            self.assert_isolated(scenario,dest,result,"consumed query/alpha/dispatch/accounting facts changed; make a fresh backup")
+            self.assertEqual(database_image(anchor),before)
 
     def test_current_proposal_tamper_isolates_restore(self):
         scenario=Scenario(self,CURRENT)
@@ -1297,7 +1324,7 @@ class ManagementJobVersionProtectionTests(unittest.TestCase):
         rust = (ROOT / "crates/evo-storage/src/lifecycle.rs").read_text()
         action = re.search(r"PROTECTED_ACTION_SCHEMA_VERSIONS: \[&str; \d+\] = \[(.*?)\];", rust, re.S).group(1)
         schemas = re.findall(r'"([^"]+)"', action)
-        self.assertEqual(schemas[-1], "rsia.management_job.v2")
+        self.assertEqual(schemas[12], "rsia.management_job.v2")
         self.assertIn("rsia.management_job.v1", schemas)
         con = sqlite3.connect(":memory:")
         self.addCleanup(con.close)

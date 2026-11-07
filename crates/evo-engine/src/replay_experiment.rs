@@ -153,6 +153,12 @@ impl PersistentReplayEconomicCoordinator {
             session.commit().await?;
             return Ok(digest);
         }
+        session
+            .admit_capacity(&[(
+                evo_core::capacity::CapacityItem::ReplayEconomicExperiment,
+                1,
+            )])
+            .await?;
         put_record(
             &mut session,
             ctx,

@@ -1677,7 +1677,8 @@ async fn full_capacity_allows_existing_result_replay() {
     let before = artifacts(&store, &admin).await;
     assert!(matches!(
         service.execute(&admin, &over.id).await,
-        Err(Error::Conflict(message)) if message.starts_with("event capacity exceeded")
+        Err(Error::Capacity(detail)) if detail.item == evo_core::capacity::CapacityItem::Event
+            && (detail.used, detail.limit, detail.delta) == (10_000, 10_000, 1)
     ));
     assert_eq!(artifacts(&store, &admin).await, before);
 }

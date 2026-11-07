@@ -38,7 +38,6 @@ async fn create(store: &Store, ctx: &Context, id: &str, events: u64) -> evo_core
             ctx.actor(),
             &result(CAPACITY_IMPORT_RESULT_SCHEMA, id, json!(events)),
             events,
-            LIMIT,
         )
         .await?;
     session.commit().await
@@ -53,9 +52,9 @@ async fn used(store: &Store) -> u64 {
 
 #[track_caller]
 fn exceeded(outcome: evo_core::Result<()>, used: u64, delta: u64) {
-    let expected = format!("event capacity exceeded: {used} + {delta} > {LIMIT}");
     assert!(
-        matches!(&outcome, Err(Error::Conflict(message)) if *message == expected),
+        matches!(&outcome, Err(Error::Capacity(detail)) if detail.item == evo_core::capacity::CapacityItem::Event
+            && (detail.used, detail.limit, detail.delta) == (used, LIMIT, delta)),
         "{outcome:?}"
     );
 }
@@ -91,7 +90,7 @@ async fn result_versions_share_one_event_capacity() {
     ] {
         let mut session = store.session().await.unwrap();
         let outcome = session
-            .put_new_import_result_below_event_capacity(&ctx, "new", "admin", &body, delta, LIMIT)
+            .put_new_import_result_below_event_capacity(&ctx, "new", "admin", &body, delta)
             .await;
         assert!(
             matches!(&outcome, Err(Error::Invalid(message)) if message == "created object does not match its capacity schema or delta"),
@@ -106,7 +105,6 @@ async fn result_versions_share_one_event_capacity() {
             "admin",
             &result(CAPACITY_IMPORT_RESULT_SCHEMA, "current", json!(0)),
             0,
-            LIMIT,
         )
         .await;
     assert!(

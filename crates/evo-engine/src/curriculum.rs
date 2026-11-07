@@ -807,6 +807,18 @@ impl PersistentCurriculumCoordinator {
         verify_watermark(&mut session, &self.context, &state).await?;
         let sources = verify_state_sources(&mut session, &self.context, &state).await?;
         require_profile_sources(&profile, &sources)?;
+        let existing_failures = session.capacity_failure_ids(&self.context).await?;
+        let added_failures = state
+            .failure_records
+            .iter()
+            .filter(|f| !existing_failures.contains(&f.record_id))
+            .count() as u64;
+        session
+            .admit_capacity(&[(
+                evo_core::capacity::CapacityItem::FailureRecord,
+                added_failures,
+            )])
+            .await?;
         put_record(
             &mut session,
             &self.context,
@@ -972,6 +984,29 @@ impl PersistentCurriculumCoordinator {
         state.completed_cycles.push(observation);
         state.cooldown_remaining_cycles = state.cooldown_remaining_cycles.saturating_sub(1);
         state.validate()?;
+        let cycle_delta = u64::from(
+            !session
+                .capacity_cycle_exists(&self.context, &receipt.development_observed_fact_id)
+                .await?,
+        );
+        let old_failure_ids = session.capacity_failure_ids(&self.context).await?;
+        let added_failures = state
+            .failure_records
+            .iter()
+            .filter(|f| !old_failure_ids.contains(&f.record_id))
+            .count() as u64;
+        session
+            .admit_capacity(&[
+                (
+                    evo_core::capacity::CapacityItem::DevelopmentCycle,
+                    cycle_delta,
+                ),
+                (
+                    evo_core::capacity::CapacityItem::FailureRecord,
+                    added_failures,
+                ),
+            ])
+            .await?;
         put_record(
             &mut session,
             &self.context,
@@ -1191,6 +1226,9 @@ impl PersistentCurriculumCoordinator {
             }
             _ => None,
         };
+        session
+            .admit_capacity(&[(evo_core::capacity::CapacityItem::CurriculumProbeJob, 1)])
+            .await?;
         let job = ProbeJobV1 {
             schema_version: "rsia.coverage_probe_job.v1".into(),
             id: job_id.clone(),
@@ -1740,6 +1778,20 @@ impl PersistentCurriculumCoordinator {
             state.consume_retest_priority_mark(&chosen.parent_family, &asset.release_id)?;
         }
         state.validate()?;
+        let missing_selection = session
+            .object_row(
+                &self.context,
+                "artifact",
+                &storage_id(SELECTION_KIND, &decision.id)?,
+            )
+            .await?
+            .is_none();
+        session
+            .admit_capacity(&[(
+                evo_core::capacity::CapacityItem::SelectionRecord,
+                u64::from(missing_selection),
+            )])
+            .await?;
         put_record(
             &mut session,
             &self.context,

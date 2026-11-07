@@ -709,8 +709,11 @@ async fn replay_world_capacity_cannot_be_split_across_namespaces() {
     let other = Context::new("other", "worker", Role::Worker).unwrap();
     seed_replay_worlds(&store, &other, evo_storage::MVP_MAX_REPLAY_WORLDS).await;
     match put_replay_world_draft(&ctx, &store, &world()).await {
-        Err(Error::Conflict(msg)) => {
-            assert_eq!(msg, "MVP capacity exceeded: replay worlds 100 >= limit 100")
+        Err(Error::Capacity(detail)) => {
+            assert_eq!(
+                (detail.item, detail.used, detail.limit, detail.delta),
+                (evo_core::capacity::CapacityItem::ReplayWorld, 100, 100, 1)
+            );
         }
         other => panic!("expected the MVP replay world conflict, got {other:?}"),
     }
@@ -741,8 +744,11 @@ async fn replay_world_capacity_refuses_a_new_draft_at_the_limit_and_writes_nothi
     let (_dir, store, ctx) = setup().await;
     seed_replay_worlds(&store, &ctx, evo_storage::MVP_MAX_REPLAY_WORLDS).await;
     match put_replay_world_draft(&ctx, &store, &world()).await {
-        Err(Error::Conflict(msg)) => {
-            assert_eq!(msg, "MVP capacity exceeded: replay worlds 100 >= limit 100")
+        Err(Error::Capacity(detail)) => {
+            assert_eq!(
+                (detail.item, detail.used, detail.limit, detail.delta),
+                (evo_core::capacity::CapacityItem::ReplayWorld, 100, 100, 1)
+            );
         }
         other => panic!("expected the MVP replay world conflict, got {other:?}"),
     }
@@ -771,8 +777,11 @@ async fn hundredth_replay_world_is_admitted_and_sealing_it_is_not_a_new_world() 
         .put_world(&ctx, "one-too-many", false, &json!({"seed": 100}))
         .await
     {
-        Err(Error::Conflict(msg)) => {
-            assert_eq!(msg, "MVP capacity exceeded: replay worlds 100 >= limit 100")
+        Err(Error::Capacity(detail)) => {
+            assert_eq!(
+                (detail.item, detail.used, detail.limit, detail.delta),
+                (evo_core::capacity::CapacityItem::ReplayWorld, 100, 100, 1)
+            );
         }
         other => panic!("expected the MVP replay world conflict, got {other:?}"),
     }

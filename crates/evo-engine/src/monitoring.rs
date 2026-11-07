@@ -1331,6 +1331,17 @@ impl MonitoringCoordinator {
             scope_id: scope_id.clone(),
             cycle_id: cycle.id.clone(),
         };
+        let cycle_delta = u64::from(
+            !session
+                .capacity_cycle_exists(ctx, &request.report_fact_id)
+                .await?,
+        );
+        session
+            .admit_capacity(&[(
+                evo_core::capacity::CapacityItem::DevelopmentCycle,
+                cycle_delta,
+            )])
+            .await?;
         put_immutable(&mut session, ctx, &binding.id, &binding).await?;
         put_immutable(&mut session, ctx, &cycle.id, &cycle).await?;
         // The binding names the report fact and cycle of a completed cycle; without
@@ -1495,6 +1506,9 @@ impl MonitoringCoordinator {
             },
             execution_input_digest: None,
         };
+        session
+            .admit_capacity(&[(evo_core::capacity::CapacityItem::ConsolidationClaim, 1)])
+            .await?;
         put_immutable(&mut session, ctx, &claim.id, &claim).await?;
         for cycle_id in &claim.cycle_ids {
             session
@@ -1804,6 +1818,12 @@ impl MonitoringCoordinator {
             verify_compiler_use_boxed(&compiler_use, &mut session, ctx).await?;
             match current.state {
                 ConsolidationClaimState::Claimed => {
+                    evo_core::capacity::CapacityItem::ProposalPerClaim.admit(
+                        session
+                            .capacity_proposals_for_claim(ctx, &current.id)
+                            .await?,
+                        1,
+                    )?;
                     current.state = ConsolidationClaimState::Running;
                     current.execution_input_digest = Some(input_digest.clone());
                     session
@@ -3239,7 +3259,7 @@ fn error_category(error: &Error) -> &'static str {
         Error::Forbidden => "forbidden",
         Error::NotFound => "not_found",
         Error::Budget => "budget",
-        Error::Conflict(_) => "conflict",
+        Error::Conflict(_) | Error::Capacity(_) => "conflict",
         Error::Cancelled => "cancelled",
         Error::ClockRegressed => "clock_regressed",
         Error::Internal => "internal",
@@ -3408,15 +3428,26 @@ async fn historical_consolidation_input_matches(
     let Some(input_digest) = terminal.input_digest.as_deref() else {
         return Ok(false);
     };
-    let id = optimization_step_fact_id(
-        &request.model_context,
-        input_digest,
-        StageFactKind::StepPrepared,
-    )?;
-    let Some(body) = session
-        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &id)
-        .await?
-    else {
+    let mut prepared = None;
+    for schema in [
+        OPTIMIZATION_STAGE_FACT_SCHEMA,
+        crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2,
+    ] {
+        let id = optimization_step_fact_id(
+            &request.model_context,
+            input_digest,
+            StageFactKind::StepPrepared,
+            schema,
+        )?;
+        if let Some(body) = session
+            .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &id)
+            .await?
+        {
+            prepared = Some((id, body));
+            break;
+        }
+    }
+    let Some((id, body)) = prepared else {
         return Ok(false);
     };
     if body.get("schema_version").and_then(|value| value.as_str()) == Some(REDACTED_SCHEMA) {
@@ -3513,16 +3544,22 @@ fn optimization_terminal_fact_id(
     context: &ModelRequestContext,
     input_digest: &str,
 ) -> Result<String> {
-    optimization_step_fact_id(context, input_digest, StageFactKind::StepCompleted)
+    optimization_step_fact_id(
+        context,
+        input_digest,
+        StageFactKind::StepCompleted,
+        OPTIMIZATION_STAGE_FACT_SCHEMA,
+    )
 }
 
 fn optimization_step_fact_id(
     context: &ModelRequestContext,
     input_digest: &str,
     kind: StageFactKind,
+    schema: &str,
 ) -> Result<String> {
-    Ok(StageFact {
-        schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
+    crate::optimization::canonical_stage_artifact_id(&StageFact {
+        schema_version: schema.into(),
         artifact_id: String::new(),
         namespace: context.namespace.clone(),
         episode_id: context.episode_id.clone(),
@@ -3535,9 +3572,7 @@ fn optimization_step_fact_id(
         output_digest: None,
         dependencies: vec![],
         payload: serde_json::json!({}),
-    }
-    .seal()?
-    .artifact_id)
+    })
 }
 
 struct CandidateMaterial<'a> {
@@ -3759,6 +3794,12 @@ async fn persist_consolidation_proposal(
         .get::<CurrentConsolidationProposal>(ctx, ARTIFACT_KIND, &proposal.id)
         .await?
         .is_some();
+    if !already_written {
+        evo_core::capacity::CapacityItem::ProposalPerClaim.admit(
+            session.capacity_proposals_for_claim(ctx, &claim.id).await?,
+            1,
+        )?;
+    }
     put_immutable(&mut session, ctx, &proposal.id, &proposal).await?;
     if already_written {
         session.commit().await?;
@@ -4252,6 +4293,7 @@ async fn reserve_staging_identity(
     candidate_id: &str,
 ) -> Result<bool> {
     let binding_id = consolidation_staging_id(proposal_id);
+    let mut release_previous = false;
     if let Some(stored) = session
         .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &binding_id)
         .await?
@@ -4277,21 +4319,32 @@ async fn reserve_staging_identity(
                 )));
             }
             Some(_) => {
-                session.delete(ctx, ARTIFACT_KIND, &binding_id).await?;
-                session
-                    .audit(ctx, "monitoring.consolidation.stage.release", &binding_id)
-                    .await?;
+                release_previous = true;
             }
         }
     }
-    if let Some(existing) = session
+    let existing = session
         .get::<serde_json::Value>(ctx, ARTIFACT_KIND, candidate_id)
-        .await?
-        && !holds_bundle(&existing, bundle_digest)
+        .await?;
+    if existing
+        .as_ref()
+        .is_some_and(|holder| !holds_bundle(holder, bundle_digest))
     {
         return Err(Error::Conflict(format!(
             "candidate id {candidate_id} already holds other content"
         )));
+    }
+    session
+        .admit_capacity(&[(
+            evo_core::capacity::CapacityItem::Skill,
+            u64::from(existing.is_none()),
+        )])
+        .await?;
+    if release_previous {
+        session.delete(ctx, ARTIFACT_KIND, &binding_id).await?;
+        session
+            .audit(ctx, "monitoring.consolidation.stage.release", &binding_id)
+            .await?;
     }
     let binding = ConsolidationStagingBinding {
         id: binding_id,

@@ -1010,6 +1010,17 @@ impl HangingJournal {
 
 #[async_trait]
 impl OptimizationJournal for HangingJournal {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> evo_core::Result<Vec<StageFact>> {
+        if intent.members().any(|(fact, _)| fact.kind == self.hang_on) {
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,
@@ -1927,8 +1938,13 @@ async fn stage_facts(store: &Store, episode: &str, step: u32) -> Vec<StageFact> 
     values
         .into_iter()
         .filter(|value| {
-            value.get("schema_version").and_then(Value::as_str)
-                == Some(OPTIMIZATION_STAGE_FACT_SCHEMA)
+            matches!(
+                value.get("schema_version").and_then(Value::as_str),
+                Some(
+                    OPTIMIZATION_STAGE_FACT_SCHEMA
+                        | evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+                )
+            )
         })
         .map(|value| serde_json::from_value::<StageFact>(value).unwrap())
         .filter(|fact| fact.episode_id == episode && fact.step == step)

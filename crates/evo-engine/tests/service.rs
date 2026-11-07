@@ -617,9 +617,9 @@ async fn prepare_refuses_the_run_past_mvp_capacity_and_writes_nothing() {
             )
             .await
         {
-            Err(Error::Conflict(msg)) => assert_eq!(
-                msg,
-                format!("MVP capacity exceeded: runs {MAX_RUNS} >= limit {MAX_RUNS}")
+            Err(Error::Capacity(detail)) => assert_eq!(
+                (detail.item, detail.used, detail.limit, detail.delta),
+                (evo_core::capacity::CapacityItem::Run, MAX_RUNS, MAX_RUNS, 1)
             ),
             other => panic!("expected the MVP runs conflict, got {other:?}"),
         }
@@ -686,9 +686,9 @@ async fn prepare_run_capacity_cannot_be_split_across_namespaces() {
         )
         .await
     {
-        Err(Error::Conflict(msg)) => assert_eq!(
-            msg,
-            format!("MVP capacity exceeded: runs {MAX_RUNS} >= limit {MAX_RUNS}")
+        Err(Error::Capacity(detail)) => assert_eq!(
+            (detail.item, detail.used, detail.limit, detail.delta),
+            (evo_core::capacity::CapacityItem::Run, MAX_RUNS, MAX_RUNS, 1)
         ),
         other => panic!("expected the MVP runs conflict, got {other:?}"),
     }
@@ -715,10 +715,13 @@ async fn inflight_prepare_slots_refuse_the_sixth_prepare_and_release_on_every_pa
     }
     assert_eq!(service.inflight_prepare(), MAX_PREPARE);
     match service.begin_inflight_prepare() {
-        Err(Error::Conflict(msg)) => assert_eq!(
-            msg,
-            format!(
-                "MVP capacity exceeded: in-flight prepare {MAX_PREPARE} >= limit {MAX_PREPARE}"
+        Err(Error::Capacity(detail)) => assert_eq!(
+            (detail.item, detail.used, detail.limit, detail.delta),
+            (
+                evo_core::capacity::CapacityItem::InflightPrepare,
+                MAX_PREPARE,
+                MAX_PREPARE,
+                1
             )
         ),
         other => panic!("expected the in-flight prepare conflict, got {other:?}"),
@@ -731,10 +734,13 @@ async fn inflight_prepare_slots_refuse_the_sixth_prepare_and_release_on_every_pa
         )
         .await
     {
-        Err(Error::Conflict(msg)) => assert_eq!(
-            msg,
-            format!(
-                "MVP capacity exceeded: in-flight prepare {MAX_PREPARE} >= limit {MAX_PREPARE}"
+        Err(Error::Capacity(detail)) => assert_eq!(
+            (detail.item, detail.used, detail.limit, detail.delta),
+            (
+                evo_core::capacity::CapacityItem::InflightPrepare,
+                MAX_PREPARE,
+                MAX_PREPARE,
+                1
             )
         ),
         other => panic!("expected the in-flight prepare conflict, got {other:?}"),

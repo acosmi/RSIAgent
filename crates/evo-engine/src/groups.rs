@@ -41,7 +41,7 @@ use serde::Serialize;
 
 /// The default bound of plan section 7.7, the same as
 /// `evo_core::strategy::validate_skill_groups` enforces on the marker.
-pub const MAX_SKILL_GROUPS_PER_JOB: usize = 2;
+pub const MAX_SKILL_GROUPS_PER_JOB: usize = evo_core::capacity::MAX_SKILL_GROUPS_PER_JOB as usize;
 
 /// One group of a job: the group's name and its complete single-skill request.
 /// The request's `edit_context`, `edit_batch_template` and `parent_skill` are
@@ -130,11 +130,12 @@ pub async fn run_skill_group_job(
 ) -> Result<SkillGroupJobOutcome> {
     let SkillGroupJobRequest { job_id, mut groups } = request;
     identifier(&job_id)?;
-    if groups.is_empty() || groups.len() > MAX_SKILL_GROUPS_PER_JOB {
+    if groups.is_empty() {
         return Err(Error::Invalid(
             "skill group job must contain one or two groups".into(),
         ));
     }
+    evo_core::capacity::CapacityItem::SkillGroupPerJob.admit(0, groups.len() as u64)?;
     for group in &groups {
         identifier(&group.group_id)?;
     }
@@ -148,12 +149,12 @@ pub async fn run_skill_group_job(
     let scopes = groups.iter().map(group_scope).collect::<Result<Vec<_>>>()?;
     validate_group_separation(&scopes)?;
     let journal = journal.ok_or(Error::NotFound)?;
-    // Validate every group before the first group's model, runner or claim.
-    for group in &groups {
-        journal
-            .current_compiler_inputs(&group.request.compiler_input_request())
-            .await?;
-    }
+    // The real member requests determine the persisted server scope together.
+    let group_requests = groups
+        .iter()
+        .map(|g| (g.group_id.clone(), &g.request))
+        .collect::<Vec<_>>();
+    crate::optimization::prepare_group_job(journal, &job_id, &group_requests).await?;
 
     let mut outcomes = Vec::with_capacity(groups.len());
     for (group, scope) in groups.into_iter().zip(scopes) {
