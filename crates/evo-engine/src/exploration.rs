@@ -1,9 +1,6 @@
 //! generate → execute_dev → observe → decide. Intermediate nodes are not published.
 //! A dispatched candidate is observed as a valid node only when E03's observation gate
 //! verified the development report behind it ([`ExplorationEvidenceV1`]).
-use crate::capacity::{
-    CapacityField, CapacityLimits, V41CapacityUsage, admit_field, unix_now_secs,
-};
 use crate::development::CandidateConsumption;
 use crate::evidence::validate_stored_sources;
 use crate::model::ModelPort;
@@ -650,6 +647,9 @@ impl PersistentCoordinator {
         {
             return Err(Error::Conflict("exploration world already exists".into()));
         }
+        session
+            .admit_capacity(&[(evo_core::capacity::CapacityItem::ExplorationWorld, 1)])
+            .await?;
         self.persist_world_registration(&mut session, &world)
             .await?;
         session.commit().await
@@ -695,13 +695,16 @@ impl PersistentCoordinator {
             session.commit().await?;
             return Ok(RegisterWorldOutcome::AlreadyRegistered);
         }
+        session
+            .admit_capacity(&[(evo_core::capacity::CapacityItem::ExplorationWorld, 1)])
+            .await?;
         self.persist_world_registration(&mut session, &world)
             .await?;
         session.commit().await?;
         Ok(RegisterWorldOutcome::Registered)
     }
 
-    async fn persist_world_registration(
+    pub(crate) async fn persist_world_registration(
         &self,
         session: &mut Session,
         world: &ExplorationWorldV1,
@@ -913,6 +916,9 @@ impl PersistentCoordinator {
         {
             return Err(Error::Conflict("history entry already exists".into()));
         }
+        session
+            .admit_capacity(&[(evo_core::capacity::CapacityItem::OptimizationHistory, 1)])
+            .await?;
         world.history_ids.push(entry.entry_id.clone());
         put_record(
             &mut session,
@@ -1239,16 +1245,18 @@ impl PersistentCoordinator {
                 if world.remaining_root_micros < cost {
                     return Err(Error::Budget);
                 }
-                // E16.5: this dispatch derives one new exploration node. Refuse
-                // inside the session, before the dispatch fact and before any
-                // model call, when the namespace already holds the MVP maximum.
-                let usage: V41CapacityUsage =
-                    session.capacity_usage_v41(unix_now_secs()?).await?.into();
-                admit_field(
-                    CapacityField::ExplorationNodes,
-                    usage.exploration_nodes,
-                    &CapacityLimits::default(),
-                )?;
+                // E16.5: this dispatch derives one new exploration node and starts
+                // one optimization job. Refuse inside the session, before the
+                // dispatch fact and before any model call, at either instance bound.
+                session
+                    .admit_capacity(&[
+                        (evo_core::capacity::CapacityItem::ExplorationNode, 1),
+                        (
+                            evo_core::capacity::CapacityItem::ConcurrentOptimizationJob,
+                            1,
+                        ),
+                    ])
+                    .await?;
                 let fact = ExplorationDispatchFact {
                     schema_version: DISPATCH_SCHEMA.into(),
                     id: dispatch_id.clone(),
@@ -2128,9 +2136,11 @@ fn verdict_for_gate_error(error: &Error) -> CandidateVerdict {
         Error::Forbidden | Error::Conflict(_) | Error::NotFound | Error::Invalid(_) => {
             CandidateVerdict::Rejected
         }
-        Error::ClockRegressed | Error::Budget | Error::Cancelled | Error::Internal => {
-            CandidateVerdict::Unverified
-        }
+        Error::ClockRegressed
+        | Error::Budget
+        | Error::Capacity(_)
+        | Error::Cancelled
+        | Error::Internal => CandidateVerdict::Unverified,
     }
 }
 
@@ -2943,7 +2953,7 @@ fn update_waits(
     world.waits.sort_by_key(|wait| wait.action_seq);
 }
 
-async fn check_world_live(
+pub(crate) async fn check_world_live(
     session: &mut Session,
     context: &Context,
     world: &ExplorationWorldV1,
@@ -3320,7 +3330,7 @@ async fn registered_budget(
 /// was registered with, rebuilt from its dispatch facts (`registered_budget`),
 /// is the one `requested` declares. Anything else is a `Conflict` with a fixed
 /// message, and so are facts that do not account for the world.
-async fn ensure_registered_as(
+pub(crate) async fn ensure_registered_as(
     session: &mut Session,
     ctx: &Context,
     stored: &ExplorationWorldV1,

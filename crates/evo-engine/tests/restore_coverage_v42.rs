@@ -65,9 +65,10 @@ use evo_engine::optimization::{
     DevelopmentManifest, DevelopmentTask, OPTIMIZATION_STAGE_FACT_SCHEMA,
 };
 use evo_engine::practice::{
-    PRACTICE_ATTEMPT_SET_SCHEMA, PRACTICE_REGISTRATION_BINDING_SCHEMA,
-    PRACTICE_REGISTRATION_SCHEMA, PracticeAttemptSetV1, PracticeOutcomeV1,
-    PracticeRegistrationBindingV1, PracticeRegistrationV1, practice_attempt_set_storage_id,
+    PRACTICE_ATTEMPT_SET_SCHEMA, PRACTICE_ATTEMPT_SET_SCHEMA_V2,
+    PRACTICE_REGISTRATION_BINDING_SCHEMA, PRACTICE_REGISTRATION_SCHEMA, PracticeAttemptSetV1,
+    PracticeOutcomeV1, PracticeRegistrationBindingV1, PracticeRegistrationV1,
+    practice_attempt_set_storage_id, practice_attempt_set_storage_id_v2,
     practice_registration_binding_storage_id,
 };
 use evo_engine::release_store::{
@@ -406,6 +407,29 @@ fn attempt_set_fact() -> Fact {
     )
 }
 
+/// A prepared v2 attempt set as AG-138 writes it before its first dispatch.
+fn attempt_set_v2_fact() -> Fact {
+    let id = practice_attempt_set_storage_id_v2("practice-set-2").unwrap();
+    Fact::new(
+        "practice attempt set v2",
+        "artifact",
+        id.clone(),
+        &json!({
+            "schema_version": PRACTICE_ATTEMPT_SET_SCHEMA_V2,
+            "id": id,
+            "set_id": "practice-set-2",
+            "namespace": NS,
+            "control_id": "dev-control",
+            "request_digest": d("request-v2"),
+            "registration_id": null,
+            "state": "prepared",
+            "started": null,
+            "attempts": [],
+            "result": null
+        }),
+    )
+}
+
 fn curriculum_storage_id(record_kind: &str, id: &str) -> String {
     format!("e12-{}", fingerprint(&(record_kind, id)).unwrap())
 }
@@ -571,7 +595,7 @@ fn stage_fact() -> Fact {
     )
 }
 
-/// One fact of every class this change protects (twelve schemas, thirteen facts: the
+/// One fact of every class this change protects (thirteen schemas, fourteen facts: the
 /// curriculum envelope twice, for its two record kinds that carry scheduling
 /// idempotency and quota facts).
 fn every_class() -> Vec<Fact> {
@@ -584,6 +608,7 @@ fn every_class() -> Vec<Fact> {
         registration_fact(),
         binding_fact(),
         attempt_set_fact(),
+        attempt_set_v2_fact(),
         probe_job_fact(false),
         schedule_receipt_fact(),
         job_fact(ManagementJobState::Queued),
@@ -1272,6 +1297,7 @@ fn engine_action_schemas() -> BTreeSet<String> {
         CURRICULUM_ENVELOPE_SCHEMA,
         CAPACITY_MANAGEMENT_JOB_SCHEMA,
         MANAGEMENT_JOB_V2_SCHEMA,
+        PRACTICE_ATTEMPT_SET_SCHEMA_V2,
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1281,7 +1307,7 @@ fn engine_action_schemas() -> BTreeSet<String> {
 #[test]
 fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
     let expected = engine_action_schemas();
-    assert_eq!(expected.len(), 12, "twelve distinct schemas");
+    assert_eq!(expected.len(), 13, "thirteen distinct schemas");
     let listed: BTreeSet<String> = PROTECTED_ACTION_SCHEMA_VERSIONS
         .iter()
         .map(|schema| (*schema).to_owned())
@@ -1291,7 +1317,7 @@ fn the_action_schemas_are_listed_once_in_rust_and_in_the_restore_script() {
         listed.len(),
         "a schema is listed twice"
     );
-    // the list is the twelve schemas of this round plus the economic envelope (AG-051)
+    // the list is the thirteen schemas of this round plus the economic envelope (AG-051)
     let without_economic: BTreeSet<String> = listed
         .iter()
         .filter(|schema| schema.as_str() != ECONOMIC_ENVELOPE_SCHEMA)
@@ -1456,7 +1482,7 @@ async fn the_script_and_the_reader_select_the_same_objects_in_a_database_holding
     let from_script: BTreeSet<String> = script_selection(&scenario.live).into_iter().collect();
     assert_eq!(from_rust, all_keys, "the Rust reader's selection");
     assert_eq!(from_script, all_keys, "the script's selection");
-    // the thirteen fixtures are all in it, under both kinds
+    // the fourteen fixtures are all in it, under both kinds
     assert!(protected_keys.iter().all(|key| from_rust.contains(key)));
     assert!(from_rust.iter().any(|key| key.starts_with("n/job/")));
     assert!(!from_rust.iter().any(|key| key.contains("legacy-job")));

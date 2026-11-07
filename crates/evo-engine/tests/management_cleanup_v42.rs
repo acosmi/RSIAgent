@@ -150,43 +150,23 @@ async fn submit_capacity_wait_unclaimed(
 ) -> ManagementJobV2 {
     let submit_store = store.clone();
     let submit_context = ctx.clone();
-    let (accepted, deferred) = tokio::task::spawn_blocking(move || {
+    let accepted = tokio::task::spawn_blocking(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let accepted = runtime.block_on(async {
             let dispatcher =
-                ManagementDispatcher::new(submit_store.clone(), vec![submit_context.clone()])
-                    .unwrap();
+                ManagementDispatcher::new(submit_store, vec![submit_context.clone()]).unwrap();
             let accepted = dispatcher
                 .submit(&submit_context, "exploration.start", payload)
                 .await
                 .map(current_management_job)
                 .unwrap();
-            let mut deferred = None;
-            for _ in 0..2_000 {
-                let actual = job_record(&submit_store, &submit_context, &accepted.id).await;
-                if actual.step == ManagementDispatcher::CAPACITY_WAIT_STEP {
-                    deferred = Some(actual);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            let actual = deferred.expect("real claim never reached the capacity gate");
-            assert_eq!(actual.state, ManagementJobState::Queued);
-            assert_eq!(actual.generation, 0);
-            assert_eq!(actual.lease_token, None);
-            assert_eq!(actual.diagnostics.len(), 1);
-            assert_eq!(actual.diagnostics[0].code, "conflict");
-            let mut expected = accepted.clone();
-            expected.step = actual.step.clone();
-            expected.diagnostics = actual.diagnostics.clone();
-            assert_eq!(
-                serde_json::to_value(&actual).unwrap(),
-                serde_json::to_value(&expected).unwrap()
-            );
-            (accepted, actual)
+            // The spawned claim meets the capacity bound and retries; a capacity
+            // refusal writes nothing, so the job stays exactly as accepted.
+            tokio::time::sleep(ManagementDispatcher::CAPACITY_WAIT_RETRY * 2).await;
+            accepted
         });
         drop(runtime);
         accepted
@@ -205,12 +185,13 @@ async fn submit_capacity_wait_unclaimed(
     session.commit().await.unwrap();
     assert_eq!(
         serde_json::to_value(&actual).unwrap(),
-        serde_json::to_value(&deferred).unwrap()
+        serde_json::to_value(&accepted).unwrap()
     );
     assert_eq!(actual.state, ManagementJobState::Queued);
-    assert_eq!(actual.step, ManagementDispatcher::CAPACITY_WAIT_STEP);
+    assert_eq!(actual.step, "accepted");
     assert_eq!(actual.generation, 0);
     assert_eq!(actual.lease_token, None);
+    assert!(actual.diagnostics.is_empty());
     accepted
 }
 
@@ -2407,18 +2388,12 @@ async fn a_queued_job_whose_input_was_redacted_fails_with_source_revoked_and_is_
     )
     .await;
     assert_eq!(queued.state, ManagementJobState::Queued);
-    // The spawned claim is deferred by the capacity bound: the job has not run.
-    let mut waiting = job_record(&store, &admin, &queued.id).await;
-    for _ in 0..1_000 {
-        if waiting.step == ManagementDispatcher::CAPACITY_WAIT_STEP {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        waiting = job_record(&store, &admin, &queued.id).await;
-    }
-    assert_eq!(waiting.state, ManagementJobState::Queued);
-    assert_eq!(waiting.step, ManagementDispatcher::CAPACITY_WAIT_STEP);
-    assert_eq!(waiting.generation, 0);
+    // The spawned claim was refused by the capacity bound: the job has not run.
+    let waiting = job_record(&store, &admin, &queued.id).await;
+    assert_eq!(
+        serde_json::to_value(&waiting).unwrap(),
+        serde_json::to_value(&queued).unwrap()
+    );
 
     // The runs of the request are revoked and cleaned while the job waits.
     let cleanup = revoke_and_clean(&store, &admin, "run-failure").await;

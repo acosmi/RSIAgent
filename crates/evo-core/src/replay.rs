@@ -2185,7 +2185,7 @@ impl ReplayFailureKind {
             Error::Invalid(_) => Self::Invalid,
             Error::Forbidden => Self::Forbidden,
             Error::NotFound => Self::Missing,
-            Error::Conflict(_) => Self::Conflict,
+            Error::Conflict(_) | Error::Capacity(_) => Self::Conflict,
             Error::Budget => Self::Budget,
             Error::Cancelled => Self::Cancelled,
             Error::ClockRegressed => Self::ClockRegressed,

@@ -486,8 +486,10 @@ pub const DRIFT_NOTE: &str = "environment_or_grader_drift";
 /// Reason of the v3 trigger when every active absolute failure lies outside
 /// the registered task space and no other entry applies (plan §8.1.1).
 pub const UNSUPPORTED_SCOPE_REASON: &str = "failure_cluster_outside_registered_task_space";
-/// Upper bound of the failure records one learner state carries.
-pub const MAX_FAILURE_RECORDS: usize = 10_000;
+/// Upper bound of the failure records one learner state carries: the
+/// registered instance bound of `CapacityItem::FailureRecord`.
+pub const MAX_FAILURE_RECORDS: usize =
+    crate::capacity::CapacityItem::FailureRecord.limit() as usize;
 
 /// The verified pass that resolved a failure record (plan §8.1.1: 转resolved，
 /// 原记录保留). It is stored next to the original failure evidence, which a

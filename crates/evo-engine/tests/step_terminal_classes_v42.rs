@@ -845,6 +845,38 @@ impl FaultyJournal {
 
 #[async_trait]
 impl OptimizationJournal for FaultyJournal {
+    async fn claim_optimization_job(
+        &self,
+        intent: evo_engine::optimization::OptimizationJobIntent,
+    ) -> evo_core::Result<Vec<StageFact>> {
+        for (fact, _) in intent.members() {
+            match &self.fault {
+                JournalFault::FailOnce {
+                    kind,
+                    stage,
+                    message,
+                } if fact.kind == *kind
+                    && stage.is_none_or(|stage| stage == fact.stage)
+                    && !self.tripped.swap(true, Ordering::SeqCst) =>
+                {
+                    return Err(Error::Conflict(message.clone()));
+                }
+                JournalFault::Crash {
+                    kind,
+                    stage,
+                    message,
+                } if (fact.kind == *kind && stage.is_none_or(|stage| stage == fact.stage))
+                    || self.tripped.load(Ordering::SeqCst) =>
+                {
+                    self.tripped.store(true, Ordering::SeqCst);
+                    return Err(Error::Conflict(message.clone()));
+                }
+                _ => {}
+            }
+        }
+        self.inner.claim_optimization_job(intent).await
+    }
+
     async fn current_compiler_inputs(
         &self,
         request: &evo_engine::formal_authority::CompilerInputRequest,
@@ -1076,8 +1108,13 @@ async fn stage_facts(store: &Store) -> Vec<StageFact> {
     values
         .into_iter()
         .filter(|value| {
-            value.get("schema_version").and_then(Value::as_str)
-                == Some(OPTIMIZATION_STAGE_FACT_SCHEMA)
+            matches!(
+                value.get("schema_version").and_then(Value::as_str),
+                Some(
+                    OPTIMIZATION_STAGE_FACT_SCHEMA
+                        | evo_engine::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+                )
+            )
         })
         .map(|value| serde_json::from_value::<StageFact>(value).unwrap())
         .collect()

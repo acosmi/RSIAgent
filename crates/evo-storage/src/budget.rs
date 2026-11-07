@@ -4,9 +4,7 @@
 //! version. No floating-point conversion occurs here.
 
 use super::lifecycle::{BudgetRequestSources, RevokeTombstone, budget_request_source_ids};
-use super::{
-    MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal, mvp_capacity_exceeded,
-};
+use super::{MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal};
 use crate::typed_budget::{self, E16CallMode};
 use evo_core::evaluation::OptimizationStage;
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
@@ -193,7 +191,12 @@ impl BudgetPreDispatchRefusal {
             | Self::RootBudgetExhausted
             | Self::BudgetArithmeticOverflow => Error::Budget,
             Self::ActiveLeaseCapacity { used, limit } => {
-                mvp_capacity_exceeded("active leases", used, limit)
+                Error::Capacity(evo_core::capacity::CapacityConflict {
+                    item: evo_core::capacity::CapacityItem::ActiveLease,
+                    used,
+                    limit,
+                    delta: 1,
+                })
             }
             Self::Unauthorized => Error::Forbidden,
             Self::CallNamespaceMismatch => Error::NotFound,
@@ -2274,6 +2277,8 @@ async fn refence_reserved_budget_call_in_tx(
     {
         return Err(Error::Cancelled);
     }
+    evo_core::capacity::CapacityItem::ActiveLease
+        .admit(count_active_leases(tx, request.now).await?, 1)?;
     let next_epoch = request
         .expected_epoch
         .checked_add(1)
@@ -2799,41 +2804,47 @@ async fn reserve_budget_call_with_sources_in_tx_typed(
     if committed > total_limit {
         return Ok(Err(BudgetPreDispatchRefusal::RootBudgetExhausted));
     }
-    match load_dispatch_group(tx, &request.billing_scope, &request.dispatch_group_id).await? {
-        Some(group) => {
-            if group.owner_namespace != ctx.namespace() {
-                return Ok(Err(BudgetPreDispatchRefusal::GroupNamespaceMismatch));
-            }
-            if group.stopped {
-                return Ok(Err(BudgetPreDispatchRefusal::GroupStopped));
-            }
+    let group = load_dispatch_group(tx, &request.billing_scope, &request.dispatch_group_id).await?;
+    if let Some(group) = &group {
+        if group.owner_namespace != ctx.namespace() {
+            return Ok(Err(BudgetPreDispatchRefusal::GroupNamespaceMismatch));
         }
-        None => {
-            sqlx::query(
-                "INSERT INTO root_budget_dispatch_groups(
+        if group.stopped {
+            return Ok(Err(BudgetPreDispatchRefusal::GroupStopped));
+        }
+    }
+    let active_leases = count_active_leases(tx, request.now).await?;
+    if active_leases >= MVP_MAX_ACTIVE_LEASES {
+        return Ok(Err(BudgetPreDispatchRefusal::ActiveLeaseCapacity {
+            used: active_leases,
+            limit: MVP_MAX_ACTIVE_LEASES,
+        }));
+    }
+    if group.is_none() {
+        sqlx::query(
+            "INSERT INTO root_budget_dispatch_groups(
                        billing_scope,dispatch_group_id,owner_namespace,created_at
                      ) VALUES(?,?,?,?)",
-            )
-            .bind(&request.billing_scope)
-            .bind(&request.dispatch_group_id)
-            .bind(ctx.namespace())
-            .bind(request.now)
-            .execute(&mut **tx)
-            .await
-            .map_err(internal)?;
-            insert_event(
-                tx,
-                &request.billing_scope,
-                None,
-                "dispatch_group_created",
-                request.now,
-                json!({
-                    "dispatch_group_id": request.dispatch_group_id,
-                    "owner_namespace": ctx.namespace(),
-                }),
-            )
-            .await?;
-        }
+        )
+        .bind(&request.billing_scope)
+        .bind(&request.dispatch_group_id)
+        .bind(ctx.namespace())
+        .bind(request.now)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+        insert_event(
+            tx,
+            &request.billing_scope,
+            None,
+            "dispatch_group_created",
+            request.now,
+            json!({
+                "dispatch_group_id": request.dispatch_group_id,
+                "owner_namespace": ctx.namespace(),
+            }),
+        )
+        .await?;
     }
     let (request_schema, request_digest, request_body) = request
         .request_artifact
@@ -2846,17 +2857,6 @@ async fn reserve_budget_call_with_sources_in_tx_typed(
             )
         })
         .unwrap_or((None, None, None));
-    // E16.5: a reserved call holds a lease until `lease_until`. Refuse the
-    // new lease when the instance already holds the MVP maximum (counted
-    // across every namespace, F24); nothing below this point runs, so no
-    // reservation or event row is written.
-    let active_leases = count_active_leases(tx, request.now).await?;
-    if active_leases >= MVP_MAX_ACTIVE_LEASES {
-        return Ok(Err(BudgetPreDispatchRefusal::ActiveLeaseCapacity {
-            used: active_leases,
-            limit: MVP_MAX_ACTIVE_LEASES,
-        }));
-    }
     let Some(next_reserved) = reserved.checked_add(request.max_cost_micros) else {
         return Ok(Err(BudgetPreDispatchRefusal::BudgetArithmeticOverflow));
     };
