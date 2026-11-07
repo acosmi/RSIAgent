@@ -371,7 +371,14 @@ impl HostService {
                 &prepared,
             )
             .await?;
-        session.audit(caller, "service.prepare", &run_id).await?;
+        session
+            .audit_service_success(
+                caller,
+                &run_id,
+                evo_storage::ServiceSuccessKind::Prepare,
+                &run_id,
+            )
+            .await?;
         session.commit().await?;
         Ok(prepared)
     }
@@ -428,7 +435,14 @@ impl HostService {
                 &record,
             )
             .await?;
-        session.audit(caller, "service.feedback", &id).await?;
+        session
+            .audit_service_success(
+                caller,
+                &run.id,
+                evo_storage::ServiceSuccessKind::Feedback,
+                &id,
+            )
+            .await?;
         session.commit().await?;
         Ok(record)
     }
@@ -570,7 +584,14 @@ impl HostService {
                 &candidate,
             )
             .await?;
-        session.audit(caller, "service.propose", &id).await?;
+        session
+            .audit_service_success(
+                caller,
+                &run.id,
+                evo_storage::ServiceSuccessKind::Propose,
+                &id,
+            )
+            .await?;
         session.commit().await?;
         Ok(candidate)
     }
@@ -710,6 +731,80 @@ impl HostService {
     ) -> Result<()> {
         self.authorize_host_caller(caller)?;
         store_trace_authority(&self.store, &self.trusted_host, authority).await
+    }
+
+    /// Capture a service run's authenticated service-success facts exactly once:
+    /// the source id is fixed per (namespace, run), so a replay over the same
+    /// facts returns the same immutable source, and a later capture after new
+    /// facts is the `immutable source authority differs` conflict, never a
+    /// second source or a rewrite. This is not a dialogue recorder, Native
+    /// writer, Skill-use receipt, feedback verification or score.
+    pub async fn record_service_facts(
+        &self,
+        caller: &Context,
+        service_run_id: &str,
+    ) -> Result<StoredTraceAuthority> {
+        self.authorize_host_caller(caller)?;
+        identifier(service_run_id)?;
+        let mut session = self.store.session().await?;
+        let row = session
+            .object_row(caller, SERVICE_RUN_KIND, service_run_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let run: Run = serde_json::from_str(&row.body)
+            .map_err(|_| Error::Conflict("invalid service run".into()))?;
+        if run.id != service_run_id
+            || row.owner != run.owner
+            || run.source != "trusted_host_snapshot"
+        {
+            return Err(Error::Conflict("service run binding differs".into()));
+        }
+        let snapshot = ReleaseStore::validate_run_snapshot_live_in_session(
+            &self.trusted_host,
+            &mut session,
+            service_run_id,
+        )
+        .await?;
+        if snapshot.id != run.snapshot_id {
+            return Err(Error::Conflict("service run snapshot differs".into()));
+        }
+        crate::revocation_gate::ensure_dependencies_live(
+            &self.trusted_host,
+            &mut session,
+            &[(SERVICE_RUN_KIND.into(), service_run_id.into())],
+            "service fact source",
+        )
+        .await?;
+        let facts = session
+            .service_success_facts(caller, service_run_id)
+            .await?;
+        if facts.iter().any(|(actor, _)| actor != &run.owner) {
+            return Err(Error::Conflict(
+                "service facts belong to another caller".into(),
+            ));
+        }
+        let authority = crate::evidence::service_fact_authority(
+            caller.namespace(),
+            service_run_id,
+            facts.into_iter().map(|(_, fact)| fact).collect(),
+        )?;
+        crate::evidence::store_trace_authority_in_session(
+            &mut session,
+            &self.trusted_host,
+            &authority,
+        )
+        .await?;
+        session
+            .put_edge(
+                caller,
+                "run",
+                &authority.record.id,
+                SERVICE_RUN_KIND,
+                service_run_id,
+            )
+            .await?;
+        session.commit().await?;
+        Ok(authority)
     }
 
     pub async fn record_application(

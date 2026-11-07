@@ -31,6 +31,15 @@ pub const MVP_MAX_RUNS: u64 = 1_000;
 /// The engine's `capacity` module pins the same values and asserts equality.
 pub const MVP_MAX_REPLAY_WORLDS: u64 = 100;
 pub const MVP_MAX_ACTIVE_LEASES: u64 = 10;
+pub const TRACE_EXPORT_SCHEMA: &str = "rsia.trace_export.v1";
+/// The exact `Conflict` reason [`Store::verify_trace_export_tree`] returns for
+/// a published trace export tree that is missing or no longer the frozen
+/// member set. The engine string-matches this one reason so crash recovery can
+/// tell "no proof of publication" apart from a drifted source closure.
+pub const TRACE_EXPORT_TREE_UNAVAILABLE: &str = "published trace export tree is unavailable";
+pub const MVP_MAX_TRACE_EXPORTS: u64 = 1_000;
+/// The directory root of published trace export trees under the store root.
+pub const TRACE_EXPORT_ROOT: &str = "trace-exports";
 /// Schema identifiers the capacity measurement recognises. They mirror the
 /// engine's persisted schema versions; the engine asserts they stay equal.
 pub const CAPACITY_MANAGEMENT_JOB_SCHEMA: &str = "rsia.management_job.v1";
@@ -184,6 +193,7 @@ pub enum ManagementResultV2 {
     Original(ManagementResult),
     Partial(ManagementPartialResultV2),
     Optimization(ManagementOptimizationResultV2),
+    Trace(ManagementTraceExportResultV2),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +202,26 @@ pub enum ManagementOptimizationResultV2 {
     OptimizationStepCompleted {
         stage_fact_id: String,
         input_digest: String,
+    },
+}
+
+/// Closed `trace.export` job results: the real export record, its frozen
+/// candidate digest and, for the publish job, the delivery receipt the
+/// published bytes earned. The variant is the phase the job completed; the
+/// candidate artifacts stay in the record, never a second copy here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementTraceExportResultV2 {
+    TraceExportPrepared {
+        export_id: String,
+        record_id: String,
+        candidate_digest: String,
+    },
+    TraceExportDelivered {
+        export_id: String,
+        record_id: String,
+        candidate_digest: String,
+        receipt_digest: String,
     },
 }
 
@@ -566,6 +596,47 @@ fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
 pub const MAX_LOCAL_EXPORT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_LOCAL_EXPORT_FILES: usize = 101;
 
+/// Only bounded references to an actual successful service commit; no request text.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSuccessFactV1 {
+    pub schema_version: String,
+    pub run_id: String,
+    pub sequence: u64,
+    pub role: evo_core::Role,
+    pub kind: String,
+    pub subject_id: String,
+    pub audit_digest: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ServiceSuccessKind {
+    Prepare,
+    Feedback,
+    Propose,
+}
+
+impl ServiceSuccessKind {
+    fn operation(self) -> &'static str {
+        match self {
+            Self::Prepare => "service.prepare",
+            Self::Feedback => "service.feedback",
+            Self::Propose => "service.propose",
+        }
+    }
+}
+
+enum AuditReadSubject<'a> {
+    RoleWitness {
+        role: evo_core::Role,
+        operation: &'a str,
+        entity: &'a str,
+    },
+    ServiceFacts {
+        run_id: &'a str,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalExportFile {
     pub path: String,
@@ -580,6 +651,29 @@ pub struct LocalExportReceipt {
     pub package_tree_digest: String,
     pub delivered_bytes: u64,
     pub completion_receipt_digest: String,
+}
+
+/// One frozen member of a trace export candidate: its package path, content
+/// digest and size. The bytes themselves never enter a record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceExportMember {
+    pub path: String,
+    pub digest_sha256: String,
+    pub size_bytes: u64,
+}
+
+/// A frozen trace export candidate in private staging, already verified
+/// against its frozen digest. It is never downloadable: dropping it removes
+/// the staging directory, and only [`Store::publish_staged_trace_export`]
+/// moves it to the formal location.
+pub struct StagedTraceExport {
+    staging: PrivateStagedDirectory,
+    identity: Vec<LocalExportIdentityEntry>,
+    record_id: String,
+    export_id: String,
+    candidate_digest: String,
+    receipt: LocalExportReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -838,6 +932,93 @@ async fn count_objects_all_namespaces(
     count_to_u64(count)
 }
 
+/// Trace export records across every namespace, live or redacted: redacted
+/// history keeps its slot, so the instance bound is never freed by revocation.
+async fn count_trace_exports_all_namespaces(conn: &mut sqlx::SqliteConnection) -> Result<u64> {
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE kind='artifact' AND (
+           json_extract(body,'$.schema_version')=?1 OR (
+             json_extract(body,'$.schema_version')='rsia.redacted.v1'
+             AND json_extract(body,'$.original_schema')=?1))",
+    )
+    .bind(TRACE_EXPORT_SCHEMA)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(internal)?;
+    count_to_u64(count)
+}
+
+/// The retained trace export class, live or redacted; never proof that its
+/// source or delivery is authorized.
+pub(crate) fn is_trace_export_record(id: &str, value: &Value) -> Result<bool> {
+    let class = value["schema_version"] == TRACE_EXPORT_SCHEMA
+        || (value["schema_version"] == "rsia.redacted.v1"
+            && value["original_schema"] == TRACE_EXPORT_SCHEMA);
+    if class && value["id"].as_str() != Some(id) {
+        return Err(Error::Conflict(
+            "trace export physical identity differs".into(),
+        ));
+    }
+    Ok(class)
+}
+
+/// The publication fence of one trace export record inside the caller's
+/// transaction. A no-op write takes the database write lock first, so no
+/// revocation can commit between this check and the caller's next step. The
+/// record must be the live `reviewed` publication, and no run or artifact of
+/// its typed source closure may carry a revocation tombstone or a redaction —
+/// the closure, not the namespace watermark, so an unrelated revocation never
+/// blocks it. Returns the record's export id and frozen candidate digest.
+async fn trace_export_publication_fence(
+    session: &mut Session,
+    ctx: &Context,
+    record_id: &str,
+) -> Result<(String, String)> {
+    let fenced = sqlx::query(
+        "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
+    )
+    .bind(ctx.namespace())
+    .bind(record_id)
+    .execute(&mut *session.tx)
+    .await
+    .map_err(internal)?;
+    if fenced.rows_affected() != 1 {
+        return Err(Error::NotFound);
+    }
+    let record: Value = session.need(ctx, "artifact", record_id).await?;
+    let (Some(export_id), Some(candidate_digest)) = (
+        record["export_id"].as_str(),
+        record["candidate_digest"].as_str(),
+    ) else {
+        return Err(Error::Conflict(
+            "trace export record is not a reviewed publication".into(),
+        ));
+    };
+    if record["schema_version"] != TRACE_EXPORT_SCHEMA || record["phase"] != "reviewed" {
+        return Err(Error::Conflict(
+            "trace export record is not a reviewed publication".into(),
+        ));
+    }
+    let closure = upstream_rows_in_tx(
+        &mut session.tx,
+        ctx.namespace(),
+        &[("artifact", record_id)],
+        10_000,
+        true,
+    )
+    .await?
+    .ok_or_else(|| Error::Conflict("trace export source closure is unbounded".into()))?;
+    if closure
+        .iter()
+        .any(|node| node.tombstone.is_some() || node.redacted)
+    {
+        return Err(Error::Conflict(
+            "trace export source closure was revoked".into(),
+        ));
+    }
+    Ok((export_id.into(), candidate_digest.into()))
+}
+
 /// Imported events of every known result version, v1 and v2 alike, across all
 /// namespaces: one E16.5 event count, never a separate quota per version.
 async fn sum_imported_events_all_namespaces(conn: &mut sqlx::SqliteConnection) -> Result<u64> {
@@ -1035,7 +1216,37 @@ pub fn local_export_receipt(
     tree_digest: &str,
     delivered_bytes: u64,
 ) -> Result<LocalExportReceipt> {
-    let local_export_ref = local_export_ref(namespace, export_id);
+    directory_receipt(
+        local_export_ref(namespace, export_id),
+        export_id,
+        tree_digest,
+        delivered_bytes,
+    )
+}
+
+fn trace_export_receipt(
+    namespace: &str,
+    export_id: &str,
+    tree_digest: &str,
+    delivered_bytes: u64,
+) -> Result<LocalExportReceipt> {
+    directory_receipt(
+        format!(
+            "{TRACE_EXPORT_ROOT}/{}/{export_id}",
+            hash(namespace.as_bytes())
+        ),
+        export_id,
+        tree_digest,
+        delivered_bytes,
+    )
+}
+
+fn directory_receipt(
+    local_export_ref: String,
+    export_id: &str,
+    tree_digest: &str,
+    delivered_bytes: u64,
+) -> Result<LocalExportReceipt> {
     let completion_receipt_digest = fingerprint(&(
         "local_directory_v1",
         export_id,
@@ -1464,15 +1675,33 @@ async fn verify_local_export_directory(
     root: &Path,
     expected: &[LocalExportFile],
 ) -> Result<(String, u64)> {
+    verify_local_export_members(
+        root,
+        expected
+            .iter()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    (hash(&file.bytes), file.bytes.len() as u64),
+                )
+            })
+            .collect(),
+    )
+    .await
+}
+
+/// The published-tree verifier over expected `path -> (digest, size)`: every
+/// member must be a read-only, unlinked regular file with exactly that digest
+/// and size, with no extra member or directory; the tree digest is recomputed
+/// from the real bytes read.
+async fn verify_local_export_members(
+    root: &Path,
+    expected_map: std::collections::BTreeMap<String, (String, u64)>,
+) -> Result<(String, u64)> {
     let root = root.to_path_buf();
-    let mut expected_map = std::collections::BTreeMap::new();
     let mut expected_directories = std::collections::BTreeSet::new();
-    for file in expected {
-        expected_map.insert(
-            file.path.clone(),
-            (hash(&file.bytes), file.bytes.len() as u64),
-        );
-        let mut parent = Path::new(&file.path).parent();
+    for path in expected_map.keys() {
+        let mut parent = Path::new(path).parent();
         while let Some(directory) = parent {
             if directory.as_os_str().is_empty() {
                 break;
@@ -2189,6 +2418,19 @@ impl Store {
             .join(export_id))
     }
 
+    /// Trace export trees live under their own root,
+    /// `trace-exports/<namespace-hash>/<export_id>`, so a trace export id never
+    /// shares a directory space with an E16 package export id.
+    pub fn trace_export_directory(&self, ctx: &Context, export_id: &str) -> Result<PathBuf> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        validate_export_id(export_id)?;
+        Ok(self
+            .root
+            .join(TRACE_EXPORT_ROOT)
+            .join(hash(ctx.namespace().as_bytes()))
+            .join(export_id))
+    }
+
     pub async fn snapshot_local_export_dependencies(
         &self,
         ctx: &Context,
@@ -2582,6 +2824,146 @@ impl Store {
         session.audit(ctx, "e16.export.abort", export_id).await?;
         session.commit().await
     }
+
+    /// Stage the frozen candidate of one `reviewed` trace export record. The
+    /// publication fence is checked before the first filesystem write, so a
+    /// record that is not the reviewed one or whose source closure was revoked
+    /// leaves no filesystem effect at all. The bytes must hash to the record's
+    /// frozen candidate digest; they are then written to private staging and
+    /// re-verified. The result is private material, never downloadable.
+    pub async fn stage_trace_export(
+        &self,
+        ctx: &Context,
+        record_id: &str,
+        files: &[LocalExportFile],
+    ) -> Result<StagedTraceExport> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        let (export_id, candidate_digest) = {
+            let mut session = self.session().await?;
+            // Dropping the session rolls back the fence's no-op write.
+            trace_export_publication_fence(&mut session, ctx, record_id).await?
+        };
+        let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
+        if tree_digest != candidate_digest {
+            return Err(Error::Conflict(
+                "trace export candidate bytes differ from the frozen candidate".into(),
+            ));
+        }
+        let receipt =
+            trace_export_receipt(ctx.namespace(), &export_id, &tree_digest, delivered_bytes)?;
+        let staging_root = self.root.join(".export-staging");
+        ensure_unlinked_directory(&staging_root).await?;
+        let staging_parent = staging_root.join(hash(ctx.namespace().as_bytes()));
+        ensure_unlinked_directory(&staging_parent).await?;
+        let staging_path = staging_parent.join(uuid::Uuid::new_v4().to_string());
+        let staging = PrivateStagedDirectory::new(staging_path.clone());
+        tokio::fs::create_dir(&staging_path)
+            .await
+            .map_err(internal)?;
+        write_local_export_staging(staging.path(), files).await?;
+        if verify_local_export_directory(staging.path(), files).await?
+            != (tree_digest, delivered_bytes)
+        {
+            return Err(Error::Conflict("staged trace export tree changed".into()));
+        }
+        let identity = local_export_identity(staging.path()).await?;
+        Ok(StagedTraceExport {
+            staging,
+            identity,
+            record_id: record_id.into(),
+            export_id,
+            candidate_digest,
+            receipt,
+        })
+    }
+
+    /// Move a staged trace export to its formal directory. Under the blob lock
+    /// and a write-fenced transaction (no revocation can commit between this
+    /// check and the rename) the record must still be the same reviewed
+    /// publication with a live source closure, and the staged tree must be
+    /// unchanged; only then is it renamed NOREPLACE, never over an existing
+    /// tree. A refusal releases the staging through its guard. Nothing is
+    /// written to the database here: the caller records the delivery.
+    pub async fn publish_staged_trace_export(
+        &self,
+        ctx: &Context,
+        mut staged: StagedTraceExport,
+    ) -> Result<LocalExportReceipt> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        let final_path = self.trace_export_directory(ctx, &staged.export_id)?;
+        let final_parent = final_path.parent().ok_or(Error::Internal)?;
+        ensure_unlinked_directory(&self.root.join(TRACE_EXPORT_ROOT)).await?;
+        ensure_unlinked_directory(final_parent).await?;
+        let _guard = self.blob_lock.write().await;
+        let mut session = self.session().await?;
+        if trace_export_publication_fence(&mut session, ctx, &staged.record_id).await?
+            != (staged.export_id.clone(), staged.candidate_digest.clone())
+        {
+            return Err(Error::Conflict(
+                "trace export record changed after staging".into(),
+            ));
+        }
+        if local_export_identity(staged.staging.path()).await? != staged.identity {
+            return Err(Error::Conflict(
+                "staged trace export identity changed".into(),
+            ));
+        }
+        if !publish_blob_no_replace(staged.staging.path(), &final_path)? {
+            return Err(Error::Conflict("trace export target already exists".into()));
+        }
+        staged.staging.disarm();
+        sync_directory(final_parent).await?;
+        drop(session);
+        Ok(staged.receipt)
+    }
+
+    /// Read-only proof that a published trace export tree is still exactly the
+    /// frozen members (path, digest and size) and that the tree digest
+    /// recomputed from its real bytes is the frozen candidate digest; returns
+    /// the receipt those bytes earn. Nothing is regenerated: a missing,
+    /// partial, extra or tampered tree is `TRACE_EXPORT_TREE_UNAVAILABLE`,
+    /// never repaired and never a trigger to republish.
+    pub async fn verify_trace_export_tree(
+        &self,
+        ctx: &Context,
+        export_id: &str,
+        members: &[TraceExportMember],
+        candidate_digest: &str,
+    ) -> Result<LocalExportReceipt> {
+        let path = self.trace_export_directory(ctx, export_id)?;
+        let unavailable = || Error::Conflict(TRACE_EXPORT_TREE_UNAVAILABLE.into());
+        match tokio::fs::symlink_metadata(&path).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(unavailable()),
+            Err(error) => return Err(internal(error)),
+            Ok(_) => {}
+        }
+        let expected = members
+            .iter()
+            .map(|member| {
+                (
+                    member.path.clone(),
+                    (member.digest_sha256.clone(), member.size_bytes),
+                )
+            })
+            .collect();
+        match verify_local_export_members(&path, expected).await {
+            Ok((tree_digest, delivered_bytes)) if tree_digest == candidate_digest => {
+                trace_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)
+            }
+            Ok(_) | Err(Error::Conflict(_)) => Err(unavailable()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Make an already published trace export rename durable: the tree and
+    /// its parent directory are fsynced, so crash recovery records a delivery
+    /// whose directory entry it has itself made durable.
+    pub async fn sync_trace_export_tree(&self, ctx: &Context, export_id: &str) -> Result<()> {
+        let path = self.trace_export_directory(ctx, export_id)?;
+        sync_directory(&path).await?;
+        sync_directory(path.parent().ok_or(Error::Internal)?).await
+    }
+
     /// Read a namespace-scoped content blob for a trusted management consumer.
     /// The path is derived from the authenticated context, and bytes are
     /// re-hashed so a replaced file cannot inherit authority from its name.
@@ -3096,11 +3478,108 @@ impl Session {
         if body.len() > 4 * 1024 * 1024 {
             return Err(Error::Invalid("object exceeds 4 MiB".into()));
         }
-        sqlx::query("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?) ON CONFLICT(namespace,kind,id) DO UPDATE SET owner=excluded.owner,body=excluded.body,revision=objects.revision+1")
-   .bind(ctx.namespace()).bind(kind).bind(id).bind(owner).bind(body).execute(&mut *self.tx).await.map_err(internal)?;
+        // Only an artifact body that names the trace export schema can be in
+        // that class (serde never escapes its ASCII), so no other put parses.
+        let trace_value = if kind == "artifact" && body.contains(TRACE_EXPORT_SCHEMA) {
+            let value: Value = serde_json::from_str(&body).map_err(internal)?;
+            is_trace_export_record(id, &value)?.then_some(value)
+        } else {
+            None
+        };
+        let trace_class = trace_value.is_some();
+        if let Some(value) = trace_value {
+            ctx.require(&[Role::Admin])?;
+            let previous: Option<String> = sqlx::query_scalar(
+                "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+            )
+            .bind(ctx.namespace())
+            .bind(id)
+            .fetch_optional(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+            if let Some(previous) = previous {
+                let old = lifecycle::parse_strict_json(&previous)?;
+                if !is_trace_export_record(id, &old)? {
+                    return Err(Error::Conflict(
+                        "trace export identity belongs to another record class".into(),
+                    ));
+                }
+                if old["schema_version"] == "rsia.redacted.v1" && old != value {
+                    return Err(Error::Conflict(
+                        "redacted trace export history is read only".into(),
+                    ));
+                }
+                if old["schema_version"] == TRACE_EXPORT_SCHEMA
+                    && value["schema_version"] == "rsia.redacted.v1"
+                    && value["original_digest"].as_str() != Some(hash(previous.as_bytes()).as_str())
+                {
+                    return Err(Error::Conflict(
+                        "trace export redaction origin differs".into(),
+                    ));
+                }
+            } else {
+                if value["schema_version"] == "rsia.redacted.v1" {
+                    return Err(Error::Conflict(
+                        "trace export redaction requires its original record".into(),
+                    ));
+                }
+                let used = count_trace_exports_all_namespaces(&mut self.tx).await?;
+                if used >= MVP_MAX_TRACE_EXPORTS {
+                    return Err(mvp_capacity_exceeded(
+                        "trace exports",
+                        used,
+                        MVP_MAX_TRACE_EXPORTS,
+                    ));
+                }
+            }
+        }
+        let changed = sqlx::query(
+            "INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,?,?,?,?)
+             ON CONFLICT(namespace,kind,id) DO UPDATE SET owner=excluded.owner,
+             body=excluded.body,revision=objects.revision+1
+             WHERE NOT (objects.kind='artifact'
+               AND (json_extract(objects.body,'$.schema_version') IS ? OR (
+                 json_extract(objects.body,'$.schema_version') IS 'rsia.redacted.v1'
+                 AND json_extract(objects.body,'$.original_schema') IS ?))
+               AND ?=0)",
+        )
+        .bind(ctx.namespace())
+        .bind(kind)
+        .bind(id)
+        .bind(owner)
+        .bind(body)
+        .bind(TRACE_EXPORT_SCHEMA)
+        .bind(TRACE_EXPORT_SCHEMA)
+        .bind(trace_class)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        if changed.rows_affected() != 1 {
+            return Err(Error::Conflict(
+                "trace export history classification is immutable".into(),
+            ));
+        }
         Ok(())
     }
     pub async fn delete(&mut self, ctx: &Context, kind: &str, id: &str) -> Result<()> {
+        if kind == "artifact" {
+            let retained: Option<String> = sqlx::query_scalar(
+                "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
+            )
+            .bind(ctx.namespace())
+            .bind(id)
+            .fetch_optional(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+            if let Some(raw) = retained
+                && raw.contains(TRACE_EXPORT_SCHEMA)
+                && is_trace_export_record(id, &lifecycle::parse_strict_json(&raw)?)?
+            {
+                return Err(Error::Conflict(
+                    "trace export history must be retained".into(),
+                ));
+            }
+        }
         sqlx::query("DELETE FROM objects WHERE namespace=? AND kind=? AND id=?")
             .bind(ctx.namespace())
             .bind(kind)
@@ -3230,6 +3709,38 @@ impl Session {
                 "audit witness entity must be a content digest".into(),
             ));
         }
+        let (matched, _) = self
+            .verified_audit_selection(
+                ctx,
+                AuditReadSubject::RoleWitness {
+                    role,
+                    operation,
+                    entity,
+                },
+            )
+            .await?;
+        Ok(matched)
+    }
+
+    /// Authenticated references only. A Host captures them; Admin export rechecks them.
+    pub async fn service_success_facts(
+        &mut self,
+        ctx: &Context,
+        run_id: &str,
+    ) -> Result<Vec<(String, ServiceSuccessFactV1)>> {
+        ctx.require(&[evo_core::Role::Host, evo_core::Role::Admin])?;
+        identifier(run_id)?;
+        let (_, facts) = self
+            .verified_audit_selection(ctx, AuditReadSubject::ServiceFacts { run_id })
+            .await?;
+        Ok(facts)
+    }
+
+    async fn verified_audit_selection(
+        &mut self,
+        ctx: &Context,
+        subject: AuditReadSubject<'_>,
+    ) -> Result<(bool, Vec<(String, ServiceSuccessFactV1)>)> {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct AuditPayload<'a> {
@@ -3261,6 +3772,8 @@ impl Session {
         let mut after = 0_i64;
         let mut previous = String::new();
         let mut latest_matches = false;
+        let mut service_facts = Vec::new();
+        let mut previous_row: Option<(i64, String, evo_core::Role, String, String, String)> = None;
         loop {
             // Only bounded metadata is fetched in a page. Payload allocation
             // is checked against the actual row's byte length; chunks prevent
@@ -3350,8 +3863,65 @@ impl Session {
                 if payload.timestamp < 0 || identifier(payload.actor.as_ref()).is_err() {
                     return Err(invalid_chain());
                 }
-                if payload.role == role && payload.operation.as_ref() == operation {
-                    latest_matches = payload.entity.as_ref() == entity;
+                match &subject {
+                    AuditReadSubject::RoleWitness {
+                        role,
+                        operation,
+                        entity,
+                    } => {
+                        if payload.role == *role && payload.operation.as_ref() == *operation {
+                            latest_matches = payload.entity.as_ref() == *entity;
+                        }
+                    }
+                    AuditReadSubject::ServiceFacts { run_id }
+                        if payload.operation == "service.success_fact.v1" =>
+                    {
+                        let fact: ServiceSuccessFactV1 = serde_json::from_value(
+                            lifecycle::parse_strict_json(payload.entity.as_ref())
+                                .map_err(|_| invalid_chain())?,
+                        )
+                        .map_err(|_| invalid_chain())?;
+                        let prior = previous_row.as_ref().ok_or_else(invalid_chain)?;
+                        if fact.schema_version != "rsia.service_success_fact.v1"
+                            || payload.role != evo_core::Role::Agent
+                            || fact.role != payload.role
+                            || prior.2 != payload.role
+                            || prior.3 != payload.actor.as_ref()
+                            || fact.sequence
+                                != u64::try_from(prior.0).map_err(|_| invalid_chain())?
+                            || fact.audit_digest != prior.1
+                            || fact.kind != prior.4
+                            || fact.subject_id != prior.5
+                            || !matches!(
+                                fact.kind.as_str(),
+                                "service.prepare" | "service.feedback" | "service.propose"
+                            )
+                            || identifier(&fact.run_id).is_err()
+                            || identifier(&fact.subject_id).is_err()
+                            || (fact.kind == "service.prepare" && fact.subject_id != fact.run_id)
+                        {
+                            return Err(invalid_chain());
+                        }
+                        if fact.run_id == *run_id {
+                            if service_facts.len() >= 10_000 {
+                                return Err(Error::Invalid(
+                                    "service fact capture exceeds the event bound".into(),
+                                ));
+                            }
+                            service_facts.push((payload.actor.to_string(), fact));
+                        }
+                    }
+                    AuditReadSubject::ServiceFacts { .. } => {}
+                }
+                if matches!(&subject, AuditReadSubject::ServiceFacts { .. }) {
+                    previous_row = Some((
+                        sequence,
+                        digest.clone(),
+                        payload.role,
+                        payload.actor.into_owned(),
+                        payload.operation.into_owned(),
+                        payload.entity.into_owned(),
+                    ));
                 }
                 previous = digest;
                 after = sequence;
@@ -3361,10 +3931,46 @@ impl Session {
         if scanned != count || after != watermark {
             return Err(invalid_chain());
         }
-        Ok(latest_matches)
+        Ok((latest_matches, service_facts))
     }
 
     pub async fn audit(&mut self, ctx: &Context, operation: &str, entity: &str) -> Result<()> {
+        self.append_audit(ctx, operation, entity).await?;
+        Ok(())
+    }
+
+    /// Called only at the successful service commit, after its result/cache writes.
+    pub async fn audit_service_success(
+        &mut self,
+        ctx: &Context,
+        run_id: &str,
+        kind: ServiceSuccessKind,
+        subject_id: &str,
+    ) -> Result<()> {
+        ctx.require(&[evo_core::Role::Agent])?;
+        identifier(run_id)?;
+        identifier(subject_id)?;
+        let operation = kind.operation();
+        let (sequence, digest) = self.append_audit(ctx, operation, subject_id).await?;
+        let fact = ServiceSuccessFactV1 {
+            schema_version: "rsia.service_success_fact.v1".into(),
+            run_id: run_id.into(),
+            sequence: u64::try_from(sequence).map_err(internal)?,
+            role: ctx.role(),
+            kind: operation.into(),
+            subject_id: subject_id.into(),
+            audit_digest: digest,
+        };
+        let entity = serde_json::to_string(&fact).map_err(internal)?;
+        self.audit(ctx, "service.success_fact.v1", &entity).await
+    }
+
+    async fn append_audit(
+        &mut self,
+        ctx: &Context,
+        operation: &str,
+        entity: &str,
+    ) -> Result<(i64, String)> {
         let timestamp = now()?;
         let prev: Option<String> = sqlx::query_scalar(
             "SELECT digest FROM audit WHERE namespace=? ORDER BY seq DESC LIMIT 1",
@@ -3376,15 +3982,17 @@ impl Session {
         let prev = prev.unwrap_or_default();
         let payload=json!({"actor":ctx.actor(),"role":ctx.role(),"operation":operation,"entity":entity,"timestamp":timestamp}).to_string();
         let digest = hash(format!("{prev}\n{payload}").as_bytes());
-        sqlx::query("INSERT INTO audit(namespace,payload,previous_hash,digest) VALUES(?,?,?,?)")
-            .bind(ctx.namespace())
-            .bind(payload)
-            .bind(prev)
-            .bind(digest)
-            .execute(&mut *self.tx)
-            .await
-            .map_err(internal)?;
-        Ok(())
+        let inserted = sqlx::query(
+            "INSERT INTO audit(namespace,payload,previous_hash,digest) VALUES(?,?,?,?)",
+        )
+        .bind(ctx.namespace())
+        .bind(payload)
+        .bind(prev)
+        .bind(&digest)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        Ok((inserted.last_insert_rowid(), digest))
     }
     pub async fn replace_search_index(
         &mut self,

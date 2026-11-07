@@ -459,7 +459,8 @@ fn the_exported_selectors_are_the_restore_scripts() {
     // Pinned here; the engine's startup_gate_v42 test asserts these against the
     // script source itself.
     assert_eq!(PROTECTED_OBJECT_KINDS.len(), 4);
-    assert_eq!(PROTECTED_SCHEMA_VERSIONS.len(), 9);
+    assert_eq!(PROTECTED_SCHEMA_VERSIONS.len(), 10);
+    assert_eq!(PROTECTED_SCHEMA_VERSIONS[9], "rsia.trace_export.v1");
     assert_eq!(PROTECTED_ACTION_SCHEMA_VERSIONS.len(), 13);
     assert_eq!(
         PROTECTED_ACTION_SCHEMA_VERSIONS[11],

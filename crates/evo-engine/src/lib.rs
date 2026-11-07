@@ -37,4 +37,5 @@ pub mod seeds;
 pub mod service;
 pub mod startup_gate;
 pub mod streaming_evaluator;
+pub mod trace_export;
 pub mod zip_reader;

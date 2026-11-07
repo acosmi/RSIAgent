@@ -410,6 +410,16 @@ pub async fn store_trace_authority(
     context.require(&[evo_core::Role::Host])?;
     authority.validate()?;
     let mut session = store.session().await?;
+    store_trace_authority_in_session(&mut session, context, authority).await?;
+    session.commit().await
+}
+
+// Both actual Host entrypoints validate the complete authority before this shared writer.
+pub(crate) async fn store_trace_authority_in_session(
+    session: &mut evo_storage::Session,
+    context: &evo_core::Context,
+    authority: &StoredTraceAuthority,
+) -> Result<()> {
     if session
         .get::<serde_json::Value>(context, "tombstone", &authority.record.id)
         .await?
@@ -422,7 +432,7 @@ pub async fn store_trace_authority(
         .await?
         .is_some()
     {
-        let old = load_stored_source(&mut session, context, &authority.record.id).await?;
+        let old = load_stored_source(session, context, &authority.record.id).await?;
         if evo_core::fingerprint(&old)? != evo_core::fingerprint(authority)? {
             return Err(Error::Conflict("immutable source authority differs".into()));
         }
@@ -486,7 +496,79 @@ pub async fn store_trace_authority(
             .audit(context, "optimization.source.host", &authority.record.id)
             .await?;
     }
-    session.commit().await
+    Ok(())
+}
+
+pub(crate) const SERVICE_FACTS_LICENSE: &str = "rsia.service_facts.summary.local.v1";
+pub(crate) const SERVICE_FACTS_RECIPIENT: &str = "origin_instance_local_namespace_only";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ServiceFactSourceV1 {
+    pub schema_version: String,
+    pub service_run_id: String,
+    pub captured_through_sequence: u64,
+    pub license: String,
+    pub recipient_scope: String,
+    pub facts: Vec<evo_storage::ServiceSuccessFactV1>,
+}
+
+// Inputs are the authenticated service facts selected by the Host entrypoint,
+// or the same authenticated prefix re-read by the Admin exporter; never caller events.
+pub(crate) fn service_fact_authority(
+    namespace: &str,
+    service_run_id: &str,
+    facts: Vec<evo_storage::ServiceSuccessFactV1>,
+) -> Result<StoredTraceAuthority> {
+    let first = facts.first().ok_or(Error::NotFound)?;
+    if first.kind != "service.prepare"
+        || first.subject_id != service_run_id
+        || facts.iter().any(|fact| fact.run_id != service_run_id)
+    {
+        return Err(Error::Forbidden);
+    }
+    let captured_through_sequence = facts.last().ok_or(Error::NotFound)?.sequence;
+    let source = ServiceFactSourceV1 {
+        schema_version: "rsia.service_fact_source.v1".into(),
+        service_run_id: service_run_id.into(),
+        captured_through_sequence,
+        license: SERVICE_FACTS_LICENSE.into(),
+        recipient_scope: SERVICE_FACTS_RECIPIENT.into(),
+        facts,
+    };
+    let body = serde_json::to_string(&source).map_err(|_| Error::Internal)?;
+    // One immutable source per (namespace, run): a run is captured once and is
+    // revoked as that one source.
+    let source_id = format!(
+        "service-facts-{}",
+        &evo_core::fingerprint(&(namespace, service_run_id))?[..32]
+    );
+    let family = "rsia-service-facts".to_string();
+    let authority = StoredTraceAuthority {
+        schema_version: "rsia.optimization.source.v1".into(),
+        record: StoredRunRecord {
+            id: source_id.clone(),
+            body: body.as_bytes().to_vec(),
+            parent_family: family.clone(),
+            task_origin: TaskOrigin::TrustedRun,
+            execution_attestation: ExecutionAttestation::TrustedHost,
+            purpose: Purpose::Development,
+        },
+        trace: evo_core::optimization::OptimizationTrace {
+            run_id: source_id,
+            parent_family: family,
+            source_digest: evo_core::hash(body.as_bytes()),
+            purpose: Purpose::Development,
+            outcome: evo_core::optimization::TraceOutcome::Incomplete,
+            diagnosis: None,
+            excerpt: body.clone(),
+            seed: 0,
+        },
+        excerpt_start: 0,
+        excerpt_end: body.len(),
+    };
+    authority.validate()?;
+    Ok(authority)
 }
 
 /// What the grant calls itself in the `Conflict` it refuses with.
