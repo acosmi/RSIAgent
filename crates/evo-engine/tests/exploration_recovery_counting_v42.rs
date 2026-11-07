@@ -32,7 +32,12 @@
 //!   `replay_v41` pins), and a test pins exactly that difference.
 //!
 //! Since AG-187 (§6.7.4 Q-29) a candidate the gate verifies is refused as identity-only
-//! Skill content: a `Valid` repair is a terminal `HardFailure` labelled `EvidenceRejected`.
+//! Skill content, and since AG-183 an execution receipt is issued only for the output
+//! its frozen target computes. A `Valid` repair is therefore a real content improvement:
+//! its world starts from the config projection control's complete LOW parent and the
+//! repair's HIGH candidate is executed by `ConfigProjectionDevelopmentRunner` behind the
+//! optimization chain's own `Prepared` fact. Every other step either proposes no
+//! candidate or runs the registered runner on a repair whose target is gone.
 //!
 //! No step produces a repairable failure yet (B4b), so the failures here are written by
 //! hand: a failed root is rewritten into one, as `exploration_legal_actions_v42` does. Not
@@ -85,13 +90,9 @@ use evo_engine::development::projection::{
     register_config_projection_control,
 };
 use evo_engine::development::{
-    DEVELOPMENT_RUN_RECEIPT_SCHEMA, DevelopmentControlV1, DevelopmentEvidenceScope,
-    DevelopmentExecutionReceiptV1, DevelopmentRunReceiptV1, DevelopmentSide, DevelopmentTaskSpecV1,
-    EXECUTION_RECEIPT_KIND, ExecutionReceiptIssueRequest, GraderReceiptIssueRequest,
-    RUN_RECEIPT_KIND, RegisteredExecutionRequestV1, RegisteredTargetInputV1,
-    execution_budget_call_id, execution_request_digest, issue_execution_receipt,
-    issue_grader_receipt, load_development_control, register_development_control,
-    registered_runner_digest, run_receipt_id, storage_id,
+    DevelopmentControlV1, DevelopmentEvidenceScope, DevelopmentTaskSpecV1,
+    RegisteredDevelopmentRunner, RegisteredTargetInputV1, register_development_control,
+    registered_runner_digest,
 };
 use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState, ManagementJobV2};
 use evo_engine::evidence::{
@@ -105,19 +106,13 @@ use evo_engine::model::{
     ModelExecutionProvenance, ModelExecutionReceipt, ModelPort, ModelResponse,
 };
 use evo_engine::optimization::{
-    BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
-    DevelopmentRunReport, DevelopmentRunRequest, OptimizationJournal, OptimizationStepRequest,
-    PairedTaskResult, StageFact, StageFactKind,
+    BundleCompileContext, DevRunner, DevelopmentManifest, DevelopmentRunReport,
+    DevelopmentRunRequest, OptimizationJournal, OptimizationStepRequest, StageFact, StageFactKind,
 };
 use evo_engine::replay::{LiveWorldAuthority, run_replay};
 use evo_engine::streaming_evaluator::{FixedGraderMethod, FixedGraderSpec};
 use evo_storage::Store;
-use evo_storage::budget::{
-    BudgetArtifact, BudgetCallFence, BudgetCallReservation, BudgetStage,
-    REGISTERED_EXECUTION_REQUEST_SCHEMA, REGISTERED_EXECUTION_SETTLEMENT_SCHEMA,
-    RegisteredExecutionProvenance, RegisteredExecutionSettlement, RootBudgetAuthorization,
-    UsageCharge,
-};
+use evo_storage::budget::RootBudgetAuthorization;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -133,10 +128,6 @@ const RUNS: [&str; 2] = ["run-failure", "run-success"];
 const WORLD: &str = "exploration_world_v1";
 const NODE: &str = "exploration_node_v1";
 const DISPATCH: &str = "exploration_dispatch_v1";
-/// An answer the grader scores 0 for every registered task.
-const WRONG_ANSWER: &str = "{\"answer\":{\"clamped\":12345}}";
-/// The fixed code of a verified candidate refused as identity-only Skill content.
-const REJECTED_REASON: &str = "development_evidence_rejected";
 
 fn d(label: &str) -> String {
     hash(label.as_bytes())
@@ -423,6 +414,10 @@ async fn seeded_store(with_control: bool) -> (tempfile::TempDir, Store) {
 // The model port and the development runners
 // ---------------------------------------------------------------------------
 
+// The owned configuration workspace admits one execution per process: the config
+// worlds of this binary hold it in turn.
+static CONFIG_WORKSPACE_TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const CONFIG_LOW: &str = "config_precedence.v1: lowest_layer_first";
 const CONFIG_HIGH: &str = "config_precedence.v1: highest_layer_first";
 
@@ -567,7 +562,8 @@ impl ModelPort for EditingFixtureModel {
     }
 }
 
-/// Counts every model dispatch: a reconnect and a replay must not reach one.
+/// Counts every model dispatch of the config edit: a reconnect and a replay must
+/// not reach one.
 #[derive(Default)]
 struct CountingModel(AtomicUsize);
 
@@ -605,7 +601,7 @@ impl ModelPort for CountingModel {
 
     async fn dispatch(&self, request: ModelRequest) -> Result<ModelResponse> {
         self.0.fetch_add(1, Ordering::SeqCst);
-        EditingFixtureModel.dispatch(request).await
+        ConfigEditingModel.dispatch(request).await
     }
 }
 
@@ -689,262 +685,6 @@ impl ModelPort for NoChangeModel {
                 usage_record_id: "usage".into(),
                 provenance: ModelExecutionProvenance::Fixture,
             },
-        })
-    }
-}
-
-/// A runner whose parent never answers a task correctly and whose candidate
-/// answers the tasks `candidate_correct` names correctly. It issues honest E03
-/// evidence (budget rows, settlements, execution and grader receipts through the
-/// public issuing functions, the run receipt as a typed envelope), so the gate
-/// verifies it exactly like a registered runner's; only the outputs, and so the
-/// scores, differ between the sides. The deterministic registered runner cannot do
-/// that (`practice_v42`'s `ContrastRunner` is the same device).
-struct ContrastRunner {
-    store: Store,
-    executor: Context,
-    grader: Context,
-    candidate_correct: fn(&str) -> bool,
-}
-
-impl ContrastRunner {
-    async fn issue_side(
-        &self,
-        control: &DevelopmentControlV1,
-        request: &DevelopmentRunRequest,
-        task: &DevelopmentTaskSpecV1,
-        side: DevelopmentSide,
-        output: &str,
-    ) -> Result<DevelopmentExecutionReceiptV1> {
-        let bundle_digest = match side {
-            DevelopmentSide::Parent => request.parent_bundle_digest.clone(),
-            DevelopmentSide::Candidate => request.candidate_bundle_digest.clone(),
-        };
-        let request_digest = execution_request_digest(control, request, task, side)?;
-        let call_id = execution_budget_call_id(&request.request_id, &task.task_id, side)?;
-        let stored = RegisteredExecutionRequestV1 {
-            schema_version: REGISTERED_EXECUTION_REQUEST_SCHEMA.into(),
-            control_id: control.id.clone(),
-            request_id: request.request_id.clone(),
-            episode_id: request.episode_id.clone(),
-            task_id: task.task_id.clone(),
-            side,
-            input: task.input,
-            input_digest: task.input_digest.clone(),
-            bundle_digest,
-            environment_digest: request.environment_digest.clone(),
-            request_digest: request_digest.clone(),
-            target_id: task.target_id.clone(),
-            target_digest: control.target_digest.clone(),
-            runner_digest: control.runner_digest.clone(),
-            source_ids: control.source_ids.clone(),
-        };
-        let call = self
-            .store
-            .reserve_budget_call_with_sources(
-                &self.executor,
-                &BudgetCallReservation {
-                    billing_scope: control.billing_scope.clone(),
-                    call_id: call_id.clone(),
-                    dispatch_group_id: request.episode_id.clone(),
-                    stage: BudgetStage::DevelopmentExecution,
-                    actual_input_digest: request_digest.clone(),
-                    request_artifact: Some(BudgetArtifact::from_serializable(
-                        REGISTERED_EXECUTION_REQUEST_SCHEMA,
-                        &stored,
-                    )?),
-                    max_cost_micros: 1,
-                    lease_token: format!("lease-{}", &fingerprint(&call_id)?[..32]),
-                    lease_until: 700,
-                    now: 100,
-                },
-                &control.source_ids,
-            )
-            .await?;
-        let fence = BudgetCallFence {
-            billing_scope: control.billing_scope.clone(),
-            call_id: call_id.clone(),
-            actual_input_digest: request_digest.clone(),
-            lease_token: call.lease_token.clone(),
-            lease_epoch: call.lease_epoch,
-            now: 101,
-        };
-        let dispatch_id = self
-            .store
-            .begin_budget_dispatch(&self.executor, &fence)
-            .await?
-            .call
-            .dispatch_id
-            .ok_or(Error::Internal)?;
-        let output_digest = hash(output.as_bytes());
-        self.store
-            .settle_registered_execution_call(
-                &self.executor,
-                &fence,
-                &UsageCharge {
-                    amount_micros: 0,
-                    currency: "USD".into(),
-                    pricing_version: "pricing-v1".into(),
-                    provider_request_id: format!("registered-pure-function:{dispatch_id}"),
-                    usage_record_id: format!("usage-{}", &fingerprint(&call_id)?[..32]),
-                    output_digest: output_digest.clone(),
-                },
-                &RegisteredExecutionSettlement {
-                    schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA.into(),
-                    provenance: RegisteredExecutionProvenance::RegisteredPureFunction,
-                    call_id: call_id.clone(),
-                    dispatch_id,
-                    request_digest,
-                    output_digest,
-                    target_id: task.target_id.clone(),
-                    target_digest: control.target_digest.clone(),
-                    runner_digest: control.runner_digest.clone(),
-                },
-            )
-            .await?;
-        issue_execution_receipt(
-            &self.executor,
-            &self.store,
-            ExecutionReceiptIssueRequest {
-                control_id: control.id.clone(),
-                request: request.clone(),
-                task_id: task.task_id.clone(),
-                side,
-                output_utf8: output.into(),
-                budget_call_id: call_id,
-                issued_at_unix_seconds: 100,
-            },
-        )
-        .await
-    }
-}
-
-#[async_trait]
-impl DevRunner for ContrastRunner {
-    async fn run(&self, request: DevelopmentRunRequest) -> Result<DevelopmentRunReport> {
-        let control = load_development_control(&self.store, &self.executor, CONTROL_ID).await?;
-        let mut results = Vec::new();
-        let mut execution_ids = Vec::new();
-        let mut grader_ids = Vec::new();
-        let mut call_ids = Vec::new();
-        let mut usage_ids = Vec::new();
-        for manifest_task in &request.manifest.tasks {
-            let task = control.task(&manifest_task.id)?;
-            let candidate_output = if (self.candidate_correct)(&task.task_id) {
-                format!("{{\"answer\":{}}}", task.expected_answer_json)
-            } else {
-                WRONG_ANSWER.to_string()
-            };
-            let parent = self
-                .issue_side(
-                    &control,
-                    &request,
-                    task,
-                    DevelopmentSide::Parent,
-                    WRONG_ANSWER,
-                )
-                .await?;
-            let candidate = self
-                .issue_side(
-                    &control,
-                    &request,
-                    task,
-                    DevelopmentSide::Candidate,
-                    &candidate_output,
-                )
-                .await?;
-            let grader = issue_grader_receipt(
-                &self.grader,
-                &self.store,
-                GraderReceiptIssueRequest {
-                    control_id: control.id.clone(),
-                    request: request.clone(),
-                    task_id: task.task_id.clone(),
-                    parent_execution_receipt_id: parent.receipt_id.clone(),
-                    candidate_execution_receipt_id: candidate.receipt_id.clone(),
-                    scoring_budget_call_id: None,
-                    issued_at_unix_seconds: 100,
-                },
-            )
-            .await?;
-            results.push(PairedTaskResult {
-                task_id: task.task_id.clone(),
-                parent_score_micros: grader.parent_score_micros,
-                candidate_score_micros: grader.candidate_score_micros,
-                parent_passed: grader.parent_passed,
-                candidate_passed: grader.candidate_passed,
-                parent_execution_id: parent.receipt_id.clone(),
-                candidate_execution_id: candidate.receipt_id.clone(),
-                grader_receipt_digest: fingerprint(&grader)?,
-            });
-            for receipt in [&parent, &candidate] {
-                execution_ids.push(receipt.receipt_id.clone());
-                call_ids.push(receipt.budget_call_id.clone());
-                usage_ids.push(receipt.usage_record_id.clone());
-            }
-            grader_ids.push(grader.receipt_id.clone());
-        }
-        let run_id = run_receipt_id(&request.request_id)?;
-        let run = DevelopmentRunReceiptV1 {
-            schema_version: DEVELOPMENT_RUN_RECEIPT_SCHEMA.into(),
-            id: run_id.clone(),
-            control_id: control.id.clone(),
-            namespace: control.namespace.clone(),
-            request_id: request.request_id.clone(),
-            episode_id: request.episode_id.clone(),
-            step: request.step,
-            attempt: request.attempt,
-            execution_receipt_ids: execution_ids.clone(),
-            grader_receipt_ids: grader_ids,
-            budget_call_ids: call_ids,
-            usage_record_ids: usage_ids.clone(),
-            executor_actor: self.executor.actor().into(),
-            issued_at_unix_seconds: 100,
-        };
-        let run_storage = storage_id(RUN_RECEIPT_KIND, &run_id)?;
-        let mut session = self.store.session().await?;
-        session
-            .put(
-                &self.executor,
-                "artifact",
-                &run_storage,
-                self.executor.actor(),
-                &json!({
-                    "schema_version": "rsia.typed_artifact_envelope.v1",
-                    "id": run_storage,
-                    "record_kind": RUN_RECEIPT_KIND,
-                    "payload": run,
-                }),
-            )
-            .await?;
-        for source in &control.source_ids {
-            session
-                .put_edge(&self.executor, "artifact", &run_storage, "run", source)
-                .await?;
-        }
-        for id in &execution_ids {
-            session
-                .put_edge(
-                    &self.executor,
-                    "artifact",
-                    &run_storage,
-                    "artifact",
-                    &storage_id(EXECUTION_RECEIPT_KIND, id)?,
-                )
-                .await?;
-        }
-        session.commit().await?;
-        Ok(DevelopmentRunReport {
-            request_id: request.request_id,
-            manifest_digest: request.manifest.digest,
-            parent_bundle_digest: request.parent_bundle_digest,
-            candidate_bundle_digest: request.candidate_bundle_digest,
-            environment_digest: request.environment_digest,
-            grader_digest: request.grader_digest,
-            results,
-            execution_receipt_id: run_id,
-            usage_record_ids: usage_ids,
-            provenance: DevelopmentExecutionProvenance::RegisteredPureFunction,
         })
     }
 }
@@ -1401,11 +1141,6 @@ fn world(id: &str, slots: &[u32], baseline_micros: u32) -> ExplorationWorldV1 {
     world
 }
 
-/// A candidate that answers every task: quality 1000000.
-fn answers_all(_: &str) -> bool {
-    true
-}
-
 /// Counts the runs of the runner it wraps: a recovered step must not reach it.
 struct CallCounting<R> {
     inner: R,
@@ -1436,8 +1171,8 @@ impl<R: DevRunner> DevRunner for CallCounting<R> {
 /// What the step that repairs a failure ends in.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Repair {
-    /// A candidate the gate verifies (the runner answers every task), which AG-187
-    /// refuses as identity-only Skill content.
+    /// A real content improvement: the config projection runner executes the
+    /// frozen parent and candidate Bundles and the gate verifies it as Trusted.
     Valid,
     /// The model suggests nothing: a plain failure.
     HardFailure,
@@ -1460,7 +1195,8 @@ impl Repair {
 
     fn model(self) -> &'static dyn ModelPort {
         match self {
-            Self::Valid | Self::TargetGone => &EditingFixtureModel,
+            Self::Valid => &ConfigEditingModel,
+            Self::TargetGone => &EditingFixtureModel,
             Self::HardFailure => &NoChangeModel,
             Self::Uncertain => &FailingModel,
         }
@@ -1469,7 +1205,8 @@ impl Repair {
     /// The status the node of the dispatch is stored with.
     fn status(self) -> Value {
         match self {
-            Self::Valid | Self::HardFailure => json!({"status": "hard_failure"}),
+            Self::Valid => json!({"status": "valid", "quality_micros": FULL}),
+            Self::HardFailure => json!({"status": "hard_failure"}),
             Self::Uncertain | Self::TargetGone => json!({"status": "usage_uncertain"}),
         }
     }
@@ -1485,7 +1222,7 @@ impl Repair {
     /// The label the gate gives the node.
     fn evidence(self) -> &'static str {
         match self {
-            Self::Valid => "evidence_rejected",
+            Self::Valid => "trusted",
             Self::HardFailure | Self::Uncertain | Self::TargetGone => "not_observed",
         }
     }
@@ -1544,14 +1281,19 @@ impl Env {
         start_job(&self.dispatcher, &admin(), request_key, world).await
     }
 
-    /// A runner whose candidate answers the tasks `candidate_correct` names correctly.
-    fn runner(&self, candidate_correct: fn(&str) -> bool) -> ContrastRunner {
-        ContrastRunner {
-            store: self.store.clone(),
-            executor: Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
-            grader: Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
-            candidate_correct,
-        }
+    /// The registered runner: it executes both sides of the frozen pure-function
+    /// target. The steps that hand it to `run_next` either propose no candidate or
+    /// repair a target that is gone; a content improvement runs on `config_runner`.
+    fn runner(&self) -> RegisteredDevelopmentRunner {
+        RegisteredDevelopmentRunner::with_clock(
+            self.store.clone(),
+            Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
+            Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
+            CONTROL_ID,
+            600,
+            Arc::new(|| 100),
+        )
+        .unwrap()
     }
 
     /// The decisions the world has completed: the number of its nodes.
@@ -1639,17 +1381,160 @@ impl Env {
             .await
     }
 
+    /// Registers (idempotently) the config projection control and the complete LOW
+    /// parent Bundle, and makes `registered` start from them: a world whose steps
+    /// can carry current content evidence.
+    async fn config_world(&self, registered: &mut ExplorationWorldV1) -> ConfigWorld {
+        let workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
+        let control = ConfigProjectionControlV1::registered(
+            "config-recovery-control",
+            NAMESPACE,
+            SCOPE,
+            "dev-root",
+            "dev-executor",
+            "dev-grader",
+            "optimizer",
+            "config-recovery-manifest",
+            vec![
+                ConfigProjectionTaskV1::registered(
+                    "config-family",
+                    json!({"template":"F","layer_count":2,"key_type":"B","placement":"E","seed":1}),
+                )
+                .unwrap(),
+            ],
+            d("environment"),
+            d("rules"),
+            d("tools"),
+            RUNS.iter().map(|run| (*run).into()).collect(),
+            1,
+        )
+        .unwrap();
+        register_config_projection_control(&admin(), &self.store, control.clone())
+            .await
+            .unwrap();
+        let skill = SkillSnapshot {
+            content: CONFIG_LOW.into(),
+            ..parent_skill()
+        };
+        let bundle = trusted_compiler_inputs::bundle_current(
+            &self.store,
+            &worker(),
+            evo_core::contract::CompileParts {
+                profile: &self.fixture.profile,
+                parent: &skill,
+                baseline: &self.fixture.baseline,
+                parent_strategy: &self.fixture.parent_strategy,
+                baseline_strategy: &self.fixture.baseline_strategy,
+                skill_patch: &Default::default(),
+                improver_patch: &self.fixture.improver,
+                caps: &self.fixture.caps,
+                revoked: &self.fixture.revoked,
+            },
+            &control.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
+        trusted_compiler_inputs::persist_bundle_current(
+            &self.store,
+            &worker(),
+            &bundle,
+            &control.environment_digest,
+            1,
+        )
+        .await
+        .unwrap();
+        registered.parent_skill_digest = skill_snapshot_digest(&bundle.skill).unwrap();
+        registered.parent_bundle_digest = bundle.digest.clone();
+        registered.grader_digest = control.grader_digest.clone();
+        registered.context_signature = fingerprint(&(
+            &registered.parent_skill_digest,
+            &registered.parent_bundle_digest,
+            &registered.environment_digest,
+            &registered.model_digest,
+            &registered.tools_digest,
+            &registered.grader_digest,
+            &registered.rules_digest,
+            registered.source_watermark,
+        ))
+        .unwrap();
+        ConfigWorld {
+            parent: self.fixture.parent(bundle.skill, bundle.digest),
+            control,
+            _workspace: workspace,
+        }
+    }
+
+    /// The config projection runner of `config`: it executes the frozen parent and
+    /// candidate Bundles of a request and grades both sides.
+    fn config_runner(&self, config: &ConfigWorld) -> ConfigProjectionDevelopmentRunner {
+        ConfigProjectionDevelopmentRunner::with_clock(
+            self.store.clone(),
+            Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
+            Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
+            config.control.id.clone(),
+            600,
+            Arc::new(|| 100),
+        )
+        .unwrap()
+    }
+
+    /// One dispatch of a config world through `run_next` against the world's own
+    /// parent: the failed nodes of these worlds name no candidate, so a root and a
+    /// `Recover` alike start from it.
+    async fn config_step(
+        &self,
+        world: &str,
+        config: &ConfigWorld,
+        model: &dyn ModelPort,
+        runner: &dyn DevRunner,
+    ) -> Result<CoordinatorStepResult> {
+        let step = self.round(world).await + 1;
+        self.coordinator
+            .run_next(
+                Some(model),
+                Some(runner),
+                Some(&self.journal),
+                config.request(&self.fixture, world, step),
+            )
+            .await
+    }
+
     /// `count` roots opened in a row, each of which fails without a candidate.
     async fn open_failed_roots(&self, world: &str, count: usize) -> Vec<CoordinatorStepResult> {
         let mut steps = Vec::new();
         for _ in 0..count {
             steps.push(
-                self.step(world, &NoChangeModel, &self.runner(answers_all))
+                self.step(world, &NoChangeModel, &self.runner())
                     .await
                     .unwrap(),
             );
         }
         steps
+    }
+}
+
+/// A world's config projection control and the complete Bundle it starts from. It
+/// holds the configuration workspace gate for as long as its test runs.
+struct ConfigWorld {
+    control: ConfigProjectionControlV1,
+    parent: Parent,
+    _workspace: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl ConfigWorld {
+    /// The request of step `step` of `world` against the world's own parent, naming
+    /// the control's tasks and grader.
+    fn request<'a>(
+        &'a self,
+        fixture: &'a Fixture,
+        world: &str,
+        step: u32,
+    ) -> OptimizationStepRequest<'a> {
+        let mut request = fixture.request(&self.parent, world, step, &format!("{world}-{step}"));
+        request.development_request.manifest = self.control.manifest().unwrap();
+        request.development_request.grader_digest = self.control.grader_digest.clone();
+        request
     }
 }
 
@@ -2019,7 +1904,7 @@ async fn run_to_stop(env: &Env, world: &str, job: &ManagementJobV2) -> Vec<u32> 
             }
             BatchActionV1::Dispatch { action_seqs, .. } => dispatched.push(action_seqs[0]),
         }
-        env.step(world, &NoChangeModel, &env.runner(answers_all))
+        env.step(world, &NoChangeModel, &env.runner())
             .await
             .unwrap_or_else(|error| {
                 panic!("{world}: round {round} could not dispatch ({error:?}) after {dispatched:?}")
@@ -2487,12 +2372,28 @@ async fn assert_counted_as_replayed(env: &Env, world: &str, replayed: &PrefixVie
 async fn assert_repair_settled(repair: Repair) {
     let env = Env::new().await;
     let id = format!("world-repair-{}", repair.name());
-    let registered = world(&id, &[1], HALF);
+    let mut registered = world(&id, &[1], HALF);
+    // A valid repair is a real content improvement: its world starts from the config
+    // control's complete LOW parent, which the repair's HIGH candidate improves on.
+    let config = if repair == Repair::Valid {
+        Some(env.config_world(&mut registered).await)
+    } else {
+        None
+    };
     let job = env.start(&format!("start-{id}"), &registered).await;
     assert_eq!(job.state, ManagementJobState::Succeeded, "{id}: {job:?}");
     // The only root fails without a candidate and is rewritten into a repairable
     // failure whose environment was reset: no step produces one yet.
-    env.open_failed_roots(&id, 1).await;
+    match &config {
+        Some(config) => {
+            env.config_step(&id, config, &NoChangeModel, &env.config_runner(config))
+                .await
+                .unwrap();
+        }
+        None => {
+            env.open_failed_roots(&id, 1).await;
+        }
+    }
     make_repairable(&env, &id, 1, "compile", EPISODE, true).await;
     let gone = repair == Repair::TargetGone;
     let failed_seq = if gone { 2 } else { 1 };
@@ -2513,13 +2414,17 @@ async fn assert_repair_settled(repair: Repair) {
         "{id}: the repair is what the world decides"
     );
 
-    let step = if gone {
+    let step = if let Some(config) = &config {
+        env.config_step(&id, config, repair.model(), &env.config_runner(config))
+            .await
+    } else if gone {
+        // The registered runner executes the identity candidate legally; the repair it
+        // paid for still has no node to be recorded against.
         let parent = env.fixture.root_parent();
-        env.step_against(&id, repair.model(), &env.runner(answers_all), &parent)
+        env.step_against(&id, repair.model(), &env.runner(), &parent)
             .await
     } else {
-        env.step(&id, repair.model(), &env.runner(answers_all))
-            .await
+        env.step(&id, repair.model(), &env.runner()).await
     }
     .expect("a step that was paid for never ends in an error");
 
@@ -2581,9 +2486,14 @@ async fn assert_repair_settled(repair: Repair) {
     // reads, registers and is served by `status`.
     assert_world_reads(&env, &id, &job).await;
     assert_still_registered(&env, &registered, &job, &id).await;
-    // The repair is spent, and only a valid repair would have a successor: none of
-    // these is valid (AG-187 refuses the verified candidate as identity-only content).
-    assert_offered(&env, &id, &[]).await;
+    // The repair is spent, and only the valid repair has a successor: the Deepen of
+    // its node, one level further down the branch.
+    let successors = if config.is_some() {
+        vec![deepen(2, 1, 2)]
+    } else {
+        vec![]
+    };
+    assert_offered(&env, &id, &successors).await;
 }
 
 #[tokio::test]
@@ -2621,7 +2531,7 @@ async fn a_repair_that_ends_in_a_hard_failure_is_counted_as_the_replay_counts_it
     let job = env.start("start-replay-hard", &registered).await;
     env.open_failed_roots(id, 1).await;
     make_repairable(&env, id, 1, "compile", EPISODE, true).await;
-    env.step(id, Repair::HardFailure.model(), &env.runner(answers_all))
+    env.step(id, Repair::HardFailure.model(), &env.runner())
         .await
         .unwrap();
 
@@ -2652,20 +2562,28 @@ async fn historical_two_repairs_are_counted_but_replay_rejects_the_second() {
     // a fresh replay must reject the second repair of that failed line.
     let env = Env::new().await;
     let id = "world-replay-two";
-    let registered = world(id, &[1, 2, 3], HALF);
+    let mut registered = world(id, &[1, 2, 3], HALF);
+    let config = env.config_world(&mut registered).await;
     let job = env.start("start-replay-two", &registered).await;
-    let mut steps = env.open_failed_roots(id, 2).await;
-    steps.push(
-        env.step(id, &EditingFixtureModel, &env.runner(answers_all))
-            .await
-            .unwrap(),
-    );
+    let mut steps = Vec::new();
+    for model in [
+        &NoChangeModel as &dyn ModelPort,
+        &NoChangeModel,
+        &ConfigEditingModel,
+    ] {
+        steps.push(
+            env.config_step(id, &config, model, &env.config_runner(&config))
+                .await
+                .unwrap(),
+        );
+    }
     let original = Stored::load(&env, id, &steps).await;
     let mut history = original.clone();
     // The first node is a repairable failure of the first episode; the second, written as
     // the repair of it, is a repairable failure of another episode; the third, written as
-    // the repair of that, is the node the third root produced (since AG-187 the content
-    // refusal of its verified candidate; only the counts below depend on it).
+    // the repair of that, is the node the third root produced: the valid improvement of
+    // the world's own parent the replay also records (only the counts below depend on
+    // it, and the failed nodes name no candidate, so its parent is the same).
     history.nodes[0]["payload"]["node"]["status"] = repairable_status(EPISODE, "compile", true, 0);
     history.nodes[1]["payload"]["node"]["status"] =
         repairable_status("episode-2", "compile", true, 0);
@@ -2759,7 +2677,7 @@ async fn rewriting_the_stored_counters_of_a_node_neither_gives_a_repair_back_nor
     let job = env.start("start-counters-spent", &registered).await;
     env.open_failed_roots(id, 1).await;
     make_repairable(&env, id, 1, "compile", EPISODE, true).await;
-    env.step(id, Repair::HardFailure.model(), &env.runner(answers_all))
+    env.step(id, Repair::HardFailure.model(), &env.runner())
         .await
         .unwrap();
     let spent = env.coordinator.decide_next(id).await.unwrap();
@@ -2781,7 +2699,7 @@ async fn rewriting_the_stored_counters_of_a_node_neither_gives_a_repair_back_nor
     assert_offered(&env, id, &[]).await;
     // `run_next` reports the stop: the world does not meet the spent dispatch id.
     let stopped = env
-        .step(id, &NoChangeModel, &env.runner(answers_all))
+        .step(id, &NoChangeModel, &env.runner())
         .await
         .expect("the world stops, it does not meet the dispatch id of the repair");
     assert_eq!(stopped.dispatch_id, None);
@@ -2802,7 +2720,7 @@ async fn rewriting_the_stored_counters_of_a_node_neither_gives_a_repair_back_nor
     .await;
     assert_offered(&env, id, &[recover(1, 1, 1, EPISODE)]).await;
     let step = env
-        .step(id, Repair::HardFailure.model(), &env.runner(answers_all))
+        .step(id, Repair::HardFailure.model(), &env.runner())
         .await
         .unwrap();
     assert_eq!(dispatched_seqs(&step.decision.action), vec![1_000_003]);
@@ -2833,7 +2751,7 @@ async fn a_repair_that_fails_again_in_a_repairable_way_is_offered_no_second_repa
         make_repairable(&env, &id, 1, "compile", EPISODE, true).await;
         // The repair is dispatched for real; what it produced is rewritten into a
         // repairable failure (no step produces one yet).
-        env.step(&id, Repair::HardFailure.model(), &env.runner(answers_all))
+        env.step(&id, Repair::HardFailure.model(), &env.runner())
             .await
             .unwrap();
         make_repairable(&env, &id, 2, "compile", again, true).await;
@@ -2871,7 +2789,7 @@ async fn an_episode_is_repaired_once_whichever_of_its_failures_is_repaired() {
     )
     .await;
     let step = env
-        .step(id, Repair::HardFailure.model(), &env.runner(answers_all))
+        .step(id, Repair::HardFailure.model(), &env.runner())
         .await
         .unwrap();
     assert_eq!(dispatched_seqs(&step.decision.action), vec![1_000_003]);
@@ -2887,7 +2805,7 @@ async fn an_episode_is_repaired_once_whichever_of_its_failures_is_repaired() {
     env.open_failed_roots(id, 2).await;
     make_repairable(&env, id, 1, "compile", EPISODE, true).await;
     make_repairable(&env, id, 2, "compile", "episode-2", true).await;
-    env.step(id, Repair::HardFailure.model(), &env.runner(answers_all))
+    env.step(id, Repair::HardFailure.model(), &env.runner())
         .await
         .unwrap();
     assert_offered(&env, id, &[recover(2, 2, 1, "episode-2")]).await;
@@ -2916,10 +2834,7 @@ async fn a_failure_of_a_kind_that_cannot_be_repaired_is_offered_no_recover_and_s
 
         assert_decisions_read(&env, &id, &job).await;
         assert_offered(&env, &id, &[]).await;
-        let stopped = env
-            .step(&id, &NoChangeModel, &env.runner(answers_all))
-            .await
-            .unwrap();
+        let stopped = env.step(&id, &NoChangeModel, &env.runner()).await.unwrap();
         assert_eq!(stopped.dispatch_id, None, "{id}");
         assert_eq!(stopped.node_id, None, "{id}");
         assert_eq!(stopped.outcome, STOP_REASON, "{id}");
@@ -2965,9 +2880,14 @@ async fn a_failure_of_a_kind_that_cannot_be_repaired_is_offered_no_recover_and_s
 async fn a_claimed_recover_stays_legal_and_resumes_without_paying_again() {
     let env = Env::new().await;
     let id = "world-claimed-recover";
-    let registered = world(id, &[1], HALF);
+    let mut registered = world(id, &[1], HALF);
+    // The repair is a real content improvement over the config control's complete
+    // LOW parent, which the failed root names no candidate against.
+    let config = env.config_world(&mut registered).await;
     let job = env.start("start-claimed-recover", &registered).await;
-    env.open_failed_roots(id, 1).await;
+    env.config_step(id, &config, &NoChangeModel, &env.config_runner(&config))
+        .await
+        .unwrap();
     make_repairable(&env, id, 1, "compile", EPISODE, true).await;
     let before = env.coordinator.decide_next(id).await.unwrap();
     assert_eq!(dispatched_seqs(&before.action), vec![1_000_003]);
@@ -2975,16 +2895,15 @@ async fn a_claimed_recover_stays_legal_and_resumes_without_paying_again() {
     // The Recover is dispatched and the process is lost after the runner's report was
     // saved and before the step observed it: the dispatch stays claimed and no node
     // names the failed node as its parent yet.
-    let parent = env.parent_of(id, 1_000_003).await;
     let (hanging, entered) = HangingJournal::new(&env.store, StageFactKind::DevelopmentObserved);
-    let runner = CallCounting::new(env.runner(answers_all));
+    let runner = CallCounting::new(env.config_runner(&config));
     tokio::select! {
         biased;
         result = env.coordinator.run_next(
             Some(&env.model),
             Some(&runner),
             Some(&hanging),
-            env.fixture.request(&parent, id, 2, "claimed-recover-2"),
+            config.request(&env.fixture, id, 2),
         ) => panic!("the hanging journal must not answer: {result:?}"),
         () = entered.notified() => {}
     }
@@ -3009,23 +2928,23 @@ async fn a_claimed_recover_stays_legal_and_resumes_without_paying_again() {
 
     // A new `run_next` of the same request finishes the claimed dispatch: the saved
     // report and the model answers are replayed, nothing is paid for again, and the step
-    // ends in its one terminal state, the content refusal of the identity-only candidate
-    // (AG-187), not a claim whose inputs changed.
+    // ends in its one terminal state, the observed improvement the config runner's
+    // receipts prove, not a claim whose inputs changed.
     let model_calls = env.model.calls();
-    let replay = CallCounting::new(env.runner(answers_all));
+    let replay = CallCounting::new(env.config_runner(&config));
     let finished = env
         .coordinator
         .run_next(
             Some(&env.model),
             Some(&replay),
             Some(&env.journal),
-            env.fixture.request(&parent, id, 2, "claimed-recover-2"),
+            config.request(&env.fixture, id, 2),
         )
         .await
         .unwrap();
     assert_eq!(replay.calls(), 0, "the recovery journal replays the report");
     assert_eq!(env.model.calls(), model_calls);
-    assert_eq!(finished.outcome, REJECTED_REASON);
+    assert_eq!(finished.outcome, "candidate_observed");
     assert_eq!(finished.dispatch_id.as_deref(), claimed["id"].as_str());
 
     // The resumed step wrote the node the claimed Recover was to derive, and the dispatch
@@ -3033,15 +2952,15 @@ async fn a_claimed_recover_stays_legal_and_resumes_without_paying_again() {
     let child = env.node(id, 2).await;
     assert_eq!(child["node"]["search_parent_seq"], 1);
     assert_eq!(child["node"]["depth"], 2);
-    assert_eq!(child["node"]["status"], json!({"status": "hard_failure"}));
-    assert_eq!(child["evidence"], "evidence_rejected");
+    assert_eq!(child["node"]["status"], Repair::Valid.status());
+    assert_eq!(child["evidence"], "trusted");
     assert_eq!(child["node"]["repair_failures_dispatched"], 0);
     let consumed = payload(&env.store, DISPATCH, dispatch_ids[1].as_str().unwrap()).await;
     assert_eq!(consumed["state"], "observed");
     assert_eq!(consumed["node_id"], finished.node_id.clone().unwrap());
 
-    // Now the repair is spent, and the refused repair has no successor.
-    assert_offered(&env, id, &[]).await;
+    // Now the repair is spent, and the valid repair's one successor is its Deepen.
+    assert_offered(&env, id, &[deepen(2, 1, 2)]).await;
     assert_world_reads(&env, id, &job).await;
     assert_still_registered(&env, &registered, &job, id).await;
 }
@@ -3283,120 +3202,35 @@ async fn a_world_without_a_repairable_failure_does_not_depend_on_its_dispatch_fa
     for repair in [Repair::HardFailure, Repair::Valid, Repair::Uncertain] {
         let id = format!("world-no-failure-{}", repair.name());
         let mut registered = world(&id, &[1], HALF);
-        // Only this Valid prerequisite needs current content. Freeze the control,
-        // complete LOW parent and grader before the world's first registration.
+        // Only a Valid node needs current content: its world starts from the config
+        // control's complete LOW parent, frozen before the world's first registration.
         let config = if repair == Repair::Valid {
-            let control = ConfigProjectionControlV1::registered(
-                "config-recovery-control", NAMESPACE, SCOPE, "dev-root",
-                "dev-executor", "dev-grader", "optimizer", "config-recovery-manifest",
-                vec![ConfigProjectionTaskV1::registered("config-family",
-                    json!({"template":"F","layer_count":2,"key_type":"B","placement":"E","seed":1})).unwrap()],
-                d("environment"), d("rules"), d("tools"),
-                RUNS.iter().map(|run| (*run).into()).collect(), 1,
-            ).unwrap();
-            register_config_projection_control(&admin(), &env.store, control.clone())
-                .await
-                .unwrap();
-            Some(control)
+            Some(env.config_world(&mut registered).await)
         } else {
             None
         };
-        let parent = if let Some(control) = &config {
-            let skill = SkillSnapshot {
-                content: CONFIG_LOW.into(),
-                ..parent_skill()
-            };
-            let bundle = trusted_compiler_inputs::bundle_current(
-                &env.store,
-                &worker(),
-                evo_core::contract::CompileParts {
-                    profile: &env.fixture.profile,
-                    parent: &skill,
-                    baseline: &env.fixture.baseline,
-                    parent_strategy: &env.fixture.parent_strategy,
-                    baseline_strategy: &env.fixture.baseline_strategy,
-                    skill_patch: &Default::default(),
-                    improver_patch: &env.fixture.improver,
-                    caps: &env.fixture.caps,
-                    revoked: &env.fixture.revoked,
-                },
-                &control.environment_digest,
-                1,
-            )
-            .await
-            .unwrap();
-            trusted_compiler_inputs::persist_bundle_current(
-                &env.store,
-                &worker(),
-                &bundle,
-                &control.environment_digest,
-                1,
-            )
-            .await
-            .unwrap();
-            registered.parent_skill_digest = skill_snapshot_digest(&bundle.skill).unwrap();
-            registered.parent_bundle_digest = bundle.digest.clone();
-            registered.grader_digest = control.grader_digest.clone();
-            registered.context_signature = fingerprint(&(
-                &registered.parent_skill_digest,
-                &registered.parent_bundle_digest,
-                &registered.environment_digest,
-                &registered.model_digest,
-                &registered.tools_digest,
-                &registered.grader_digest,
-                &registered.rules_digest,
-                registered.source_watermark,
-            ))
-            .unwrap();
-            env.fixture.parent(bundle.skill, bundle.digest)
-        } else {
-            env.fixture.root_parent()
-        };
         let job = env.start(&format!("start-{id}"), &registered).await;
-        let step = if let Some(control) = &config {
-            let runner = ConfigProjectionDevelopmentRunner::with_clock(
-                env.store.clone(),
-                Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
-                Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
-                control.id.clone(),
-                600,
-                Arc::new(|| 100),
-            )
-            .unwrap();
-            let mut request = env.fixture.request(&parent, &id, 1, &format!("{id}-1"));
-            request.development_request.manifest = control.manifest().unwrap();
-            request.development_request.grader_digest = control.grader_digest.clone();
+        let step = if let Some(config) = &config {
             let result = env
-                .coordinator
-                .run_next(
-                    Some(&ConfigEditingModel),
-                    Some(&runner),
-                    Some(&env.journal),
-                    request,
-                )
+                .config_step(&id, config, repair.model(), &env.config_runner(config))
                 .await
                 .unwrap();
             let node = env.node(&id, 1).await;
             assert_eq!(node["evidence"], "trusted");
-            assert_eq!(
-                node["node"]["status"],
-                json!({"status":"valid", "quality_micros":FULL})
-            );
+            assert_eq!(node["node"]["status"], repair.status());
             result
         } else {
-            env.step(&id, repair.model(), &env.runner(answers_all))
-                .await
-                .unwrap()
+            env.step(&id, repair.model(), &env.runner()).await.unwrap()
         };
         let dispatch_id = step.dispatch_id.clone().unwrap();
         let decision = env.coordinator.decide_next(&id).await.unwrap();
         let original = raw_record(&env.store, DISPATCH, &dispatch_id).await;
+        let root = env.fixture.root_parent();
         let reconnect = || async {
-            let mut request = env.fixture.request(&parent, &id, 1, &format!("{id}-1"));
-            if let Some(control) = &config {
-                request.development_request.manifest = control.manifest().unwrap();
-                request.development_request.grader_digest = control.grader_digest.clone();
-            }
+            let request = match &config {
+                Some(config) => config.request(&env.fixture, &id, 1),
+                None => env.fixture.request(&root, &id, 1, &format!("{id}-1")),
+            };
             env.coordinator.run_next(None, None, None, request).await
         };
 
@@ -3447,10 +3281,7 @@ async fn an_episode_that_spans_two_nodes_has_the_same_full_online_and_replay_pre
     let job = env.start("start-episode-spans", &registered).await;
     let mut dispatched = Vec::new();
     for round in 0..3 {
-        let step = env
-            .step(id, &NoChangeModel, &env.runner(answers_all))
-            .await
-            .unwrap();
+        let step = env.step(id, &NoChangeModel, &env.runner()).await.unwrap();
         dispatched.extend(dispatched_seqs(&step.decision.action));
         match round {
             // The first root fails a repairable episode ...

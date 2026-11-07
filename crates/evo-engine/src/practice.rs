@@ -35,7 +35,11 @@
 //! `record_cycle` and the E13 cycle close can neither see nor count it
 //! (V093.c). Everything an attempt proves is reloaded from the E03 receipts by
 //! the E03 verifier, fed with a transient carrier that is never sealed,
-//! committed or stored.
+//! committed or stored. What authorizes an attempt's execution is its
+//! [`PracticeRequestClosureV1`], recorded with the registration claim before
+//! the first runner call; a runner that requires a persisted request
+//! authorization (the config projection runner, which otherwise needs a
+//! `DevelopmentRequestPrepared` fact) accepts the attempt only through it.
 //!
 //! # Known limits (disclosed, not hidden)
 //!
@@ -46,9 +50,10 @@
 //! * Budget rows stay `DevelopmentExecution`: `BudgetStage::Practice` is not
 //!   used because the registered settlement accepts development stages only.
 //!   The curriculum's 20 % share is not charged here either.
-//! * The registered runner is a deterministic pure function, so K attempts of
-//!   one control always agree and the real outcome is `no_contrast`. There is
-//!   no model sampling, hence no sampling configuration and no real cost.
+//! * The registered runners (the pure function and the config projection
+//!   consumer) are deterministic, so K attempts of one control always agree and
+//!   the real outcome is `no_contrast`. There is no model sampling, hence no
+//!   sampling configuration and no real cost.
 //! * A contrast does not feed the bounded edit chain (§6.7/§5.3.1), and there
 //!   is no management entry point.
 //! * A registration is spent when its set claims it, before the first runner
@@ -60,6 +65,7 @@
 //!   Admin: like every engine artifact, a raw storage write that bypasses it
 //!   cannot be told apart, because the store has no owner readback.
 
+use crate::development::projection::{ConfigProjectionControlV1, load_config_projection_control};
 use crate::development::{
     CONTROL_KIND, DevelopmentControlV1, DevelopmentCostState, DevelopmentEvidenceScope,
     DevelopmentExecutionReceiptV1, DevelopmentGraderReceiptV1, DevelopmentRunReceiptV1,
@@ -69,9 +75,10 @@ use crate::development::{
 };
 use crate::evidence::validate_stored_sources;
 use crate::optimization::{
-    DevRunner, DevelopmentExecutionProvenance, DevelopmentRunReport, DevelopmentRunRequest,
-    OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournalStage, PairedTaskResult, StageFact,
-    StageFactKind, select_development, validate_development_request,
+    DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest, DevelopmentRunReport,
+    DevelopmentRunRequest, OPTIMIZATION_STAGE_FACT_SCHEMA, OptimizationJournalStage,
+    PairedTaskResult, StageDependency, StageFact, StageFactKind, select_development,
+    validate_development_request,
 };
 use evo_core::evidence::Purpose;
 use evo_core::strategy::PracticePlan;
@@ -84,6 +91,7 @@ pub const PRACTICE_REGISTRATION_SCHEMA: &str = "rsia.practice_registration.v1";
 pub const PRACTICE_ATTEMPT_SET_SCHEMA: &str = "rsia.practice_attempt_set.v1";
 pub const PRACTICE_ATTEMPT_SET_SCHEMA_V2: &str = "rsia.practice_attempt_set.v2";
 pub const PRACTICE_REGISTRATION_BINDING_SCHEMA: &str = "rsia.practice_registration_binding.v1";
+pub const PRACTICE_REQUEST_CLOSURE_SCHEMA: &str = "rsia.practice.request_closure.v1";
 /// The only expanded K. K=1 is the default and needs no registration.
 pub const REGISTERED_PRACTICE_ATTEMPTS: u8 = 3;
 
@@ -434,26 +442,261 @@ pub fn practice_attempt_request(
     request: &PracticeRunRequest,
     attempt: u32,
 ) -> Result<DevelopmentRunRequest> {
-    let request_id = practice_attempt_request_id(&request.set_id, attempt)?;
+    attempt_request(
+        &PracticeControl::pure(control)?,
+        &request.set_id,
+        &request.episode_id,
+        request.step,
+        &request.bundle_digest,
+        request.revoke_watermark,
+        attempt,
+    )
+}
+
+fn attempt_request(
+    control: &PracticeControl,
+    set_id: &str,
+    episode_id: &str,
+    step: u32,
+    bundle_digest: &str,
+    revoke_watermark: u64,
+    attempt: u32,
+) -> Result<DevelopmentRunRequest> {
+    let request_id = practice_attempt_request_id(set_id, attempt)?;
     let development = DevelopmentRunRequest {
         request_id: request_id.clone(),
         namespace: control.namespace.clone(),
         purpose: Purpose::Development,
-        episode_id: request.episode_id.clone(),
-        step: request.step,
+        episode_id: episode_id.into(),
+        step,
         attempt,
-        manifest: control.manifest()?,
-        parent_bundle_digest: request.bundle_digest.clone(),
-        candidate_bundle_digest: request.bundle_digest.clone(),
+        manifest: control.manifest.clone(),
+        parent_bundle_digest: bundle_digest.into(),
+        candidate_bundle_digest: bundle_digest.into(),
         environment_digest: control.environment_digest.clone(),
         grader_digest: control.grader_digest.clone(),
         rules_digest: control.rules_digest.clone(),
         tools_digest: control.tools_digest.clone(),
-        revoke_watermark: request.revoke_watermark,
+        revoke_watermark,
         idempotency_key: format!("{request_id}-idem"),
     };
     validate_development_request(&development)?;
     Ok(development)
+}
+
+/// What practice reads of its registered control, pure or config. Each control
+/// is decoded by its own strict reader first; the view carries no authority.
+struct PracticeControl {
+    id: String,
+    namespace: String,
+    source_ids: Vec<String>,
+    evidence_scope: DevelopmentEvidenceScope,
+    /// `(task_id, parent_family)` in control order.
+    tasks: Vec<(String, String)>,
+    manifest: DevelopmentManifest,
+    environment_digest: String,
+    grader_digest: String,
+    rules_digest: String,
+    tools_digest: String,
+}
+
+impl PracticeControl {
+    fn pure(control: &DevelopmentControlV1) -> Result<Self> {
+        Ok(Self {
+            id: control.id.clone(),
+            namespace: control.namespace.clone(),
+            source_ids: control.source_ids.clone(),
+            evidence_scope: control.evidence_scope,
+            tasks: control
+                .tasks
+                .iter()
+                .map(|task| (task.task_id.clone(), task.parent_family.clone()))
+                .collect(),
+            manifest: control.manifest()?,
+            environment_digest: control.environment_digest.clone(),
+            grader_digest: control.grader_digest.clone(),
+            rules_digest: control.rules_digest.clone(),
+            tools_digest: control.tools_digest.clone(),
+        })
+    }
+
+    fn config(control: &ConfigProjectionControlV1) -> Result<Self> {
+        Ok(Self {
+            id: control.id.clone(),
+            namespace: control.namespace.clone(),
+            source_ids: control.source_ids.clone(),
+            evidence_scope: control.evidence_scope,
+            tasks: control
+                .tasks
+                .iter()
+                .map(|task| (task.task_id.clone(), task.parent_family.clone()))
+                .collect(),
+            manifest: control.manifest()?,
+            environment_digest: control.environment_digest.clone(),
+            grader_digest: control.grader_digest.clone(),
+            rules_digest: control.rules_digest.clone(),
+            tools_digest: control.tools_digest.clone(),
+        })
+    }
+
+    // The stored schema selects exactly one strict reader; no fallback between them.
+    async fn load(store: &Store, ctx: &Context, id: &str) -> Result<Self> {
+        let mut session = store.session().await?;
+        let config =
+            crate::development::projection::is_config_control(&mut session, ctx, id).await?;
+        session.commit().await?;
+        if config {
+            Self::config(&load_config_projection_control(store, ctx, id).await?)
+        } else {
+            Self::pure(&load_development_control(store, ctx, id).await?)
+        }
+    }
+}
+
+/// Execution authorization of one attempt of a set: written, for every attempt
+/// of the set, in the transaction that claims a K=3 registration and after the
+/// whole request was checked, before the first runner call. It is immutable and
+/// only ever names values the control and the set request already fix; it is not
+/// a stage fact, a cycle or a sample. A runner that needs a persisted request
+/// authorization (the config projection runner) accepts a practice attempt only
+/// through it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PracticeRequestClosureV1 {
+    pub schema_version: String,
+    pub id: String,
+    pub namespace: String,
+    pub control_id: String,
+    pub set_id: String,
+    pub attempt: u32,
+    pub request_id: String,
+    pub episode_id: String,
+    pub step: u32,
+    pub bundle_digest: String,
+    pub environment_digest: String,
+    pub revoke_watermark: u64,
+    /// [`PracticeRunRequest::digest`] of the set request.
+    pub request_digest: String,
+    pub plan_digest: String,
+    pub attempts_per_task: u8,
+    /// The K=3 registration spent on this set; K=1 has none.
+    pub registration_id: Option<String>,
+    pub created_at: i64,
+}
+
+// Derived from the attempt's request id, itself a pure function of the set id
+// and the attempt, so a runner holding only the request finds its authorization.
+fn practice_request_closure_storage_id(request_id: &str) -> Result<String> {
+    identifier(request_id)?;
+    Ok(format!(
+        "practice-closure-{}",
+        fingerprint(&(PRACTICE_REQUEST_CLOSURE_SCHEMA, request_id))?
+    ))
+}
+
+fn request_closure(
+    ctx: &Context,
+    control: &PracticeControl,
+    request: &PracticeRunRequest,
+    registration_id: Option<&str>,
+    attempt: u32,
+) -> Result<PracticeRequestClosureV1> {
+    let request_id = practice_attempt_request_id(&request.set_id, attempt)?;
+    Ok(PracticeRequestClosureV1 {
+        schema_version: PRACTICE_REQUEST_CLOSURE_SCHEMA.into(),
+        id: practice_request_closure_storage_id(&request_id)?,
+        namespace: ctx.namespace().into(),
+        control_id: control.id.clone(),
+        set_id: request.set_id.clone(),
+        attempt,
+        request_id,
+        episode_id: request.episode_id.clone(),
+        step: request.step,
+        bundle_digest: request.bundle_digest.clone(),
+        environment_digest: control.environment_digest.clone(),
+        revoke_watermark: request.revoke_watermark,
+        request_digest: request.digest()?,
+        plan_digest: fingerprint(&request.plan)?,
+        attempts_per_task: request.plan.attempts_per_task,
+        registration_id: registration_id.map(str::to_string),
+        created_at: request.created_at,
+    })
+}
+
+async fn read_request_closure(
+    session: &mut Session,
+    ctx: &Context,
+    request_id: &str,
+) -> Result<Option<PracticeRequestClosureV1>> {
+    let id = practice_request_closure_storage_id(request_id)?;
+    let Some(value) = session
+        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let closure: PracticeRequestClosureV1 = serde_json::from_value(value)
+        .map_err(|_| Error::Conflict("practice request closure is not strict".into()))?;
+    if closure.schema_version != PRACTICE_REQUEST_CLOSURE_SCHEMA
+        || closure.id != id
+        || closure.request_id != request_id
+        || closure.namespace != ctx.namespace()
+    {
+        return Err(Error::Conflict(
+            "practice request closure identity mismatch".into(),
+        ));
+    }
+    Ok(Some(closure))
+}
+
+// The exact attempt request the closure authorizes, rebuilt from the control.
+fn closure_request(
+    control: &PracticeControl,
+    closure: &PracticeRequestClosureV1,
+) -> Result<DevelopmentRunRequest> {
+    if closure.control_id != control.id
+        || closure.environment_digest != control.environment_digest
+        || closure.attempt > u32::from(closure.attempts_per_task)
+    {
+        return Err(Error::Conflict(
+            "practice request differs from its request closure".into(),
+        ));
+    }
+    let development = attempt_request(
+        control,
+        &closure.set_id,
+        &closure.episode_id,
+        closure.step,
+        &closure.bundle_digest,
+        closure.revoke_watermark,
+        closure.attempt,
+    )?;
+    if development.request_id != closure.request_id {
+        return Err(Error::Conflict(
+            "practice request differs from its request closure".into(),
+        ));
+    }
+    Ok(development)
+}
+
+/// The id of the persisted practice closure that authorizes `request` under
+/// `control`, or `None` when the request has none. Reads only this Session.
+pub(crate) async fn verify_request_closure_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    control: &ConfigProjectionControlV1,
+    request: &DevelopmentRunRequest,
+) -> Result<Option<String>> {
+    let Some(closure) = read_request_closure(session, ctx, &request.request_id).await? else {
+        return Ok(None);
+    };
+    let expected = closure_request(&PracticeControl::config(control)?, &closure)?;
+    if fingerprint(&expected)? != fingerprint(request)? {
+        return Err(Error::Conflict(
+            "practice request differs from its request closure".into(),
+        ));
+    }
+    Ok(Some(closure.id))
 }
 
 /// The adopted (Candidate side) result of one task in one attempt.
@@ -1184,12 +1427,12 @@ async fn verify_registration(
 /// The plan's tasks must be exactly the control's tasks: a practice set cannot
 /// spend the shared root budget on a task nobody registered, and a control with
 /// more than two tasks cannot be practised under a two-task plan.
-fn ensure_plan_matches_control(plan: &PracticePlan, control: &DevelopmentControlV1) -> Result<()> {
+fn ensure_plan_matches_control(plan: &PracticePlan, control: &PracticeControl) -> Result<()> {
     let planned: BTreeSet<&str> = plan.task_ids.iter().map(String::as_str).collect();
     let registered: BTreeSet<&str> = control
         .tasks
         .iter()
-        .map(|task| task.task_id.as_str())
+        .map(|(task_id, _)| task_id.as_str())
         .collect();
     if planned != registered {
         return Err(Error::Conflict(
@@ -1204,9 +1447,15 @@ fn ensure_plan_matches_control(plan: &PracticePlan, control: &DevelopmentControl
 /// that closure so the same verifier is reused rather than copied. It is never
 /// sealed, committed or stored: a practice attempt has no stage fact (V093.c).
 fn verification_carrier(
+    control: &PracticeControl,
     request: &DevelopmentRunRequest,
     report: &DevelopmentRunReport,
 ) -> Result<StageFact> {
+    let mut dependencies = typed_receipt_closure(report)?;
+    dependencies.extend(control.source_ids.iter().map(|source| StageDependency {
+        kind: "run".into(),
+        id: source.clone(),
+    }));
     Ok(StageFact {
         schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
         artifact_id: String::new(),
@@ -1219,7 +1468,7 @@ fn verification_carrier(
         request_id: request.request_id.clone(),
         input_digest: request.manifest.digest.clone(),
         output_digest: None,
-        dependencies: typed_receipt_closure(report)?,
+        dependencies,
         payload: serde_json::Value::Null,
     })
 }
@@ -1231,7 +1480,7 @@ fn verification_carrier(
 async fn record_attempt(
     ctx: &Context,
     store: &Store,
-    control_id: &str,
+    control: &PracticeControl,
     request: &DevelopmentRunRequest,
     report: &DevelopmentRunReport,
     cache_hit: bool,
@@ -1247,23 +1496,41 @@ async fn record_attempt(
     select_development(request, report)?;
     let mut session = store.session().await?;
     let (attempt, _) =
-        record_attempt_in_session(ctx, &mut session, control_id, request, report, cache_hit)
-            .await?;
+        record_attempt_in_session(ctx, &mut session, control, request, report, cache_hit).await?;
     session.commit().await?;
     Ok(attempt)
+}
+
+/// Data of an execution receipt the E03 verifier has already checked in this
+/// Session: a config wrapper carries the shared execution fields inside.
+fn execution_receipt_data(payload: serde_json::Value) -> Result<DevelopmentExecutionReceiptV1> {
+    if payload["schema_version"]
+        == crate::development::projection::CONFIG_PROJECTION_EXECUTION_SCHEMA
+        || payload["schema_version"]
+            == crate::development::projection::CONFIG_PROJECTION_EXECUTION_SCHEMA_V2
+    {
+        let wrapper: crate::development::projection::ConfigProjectionExecutionReceiptV1 =
+            serde_json::from_value(payload).map_err(|_| Error::Internal)?;
+        return Ok(wrapper.execution);
+    }
+    serde_json::from_value(payload).map_err(|_| Error::Internal)
 }
 
 async fn record_attempt_in_session(
     ctx: &Context,
     session: &mut Session,
-    control_id: &str,
+    control: &PracticeControl,
     request: &DevelopmentRunRequest,
     report: &DevelopmentRunReport,
     cache_hit: bool,
 ) -> Result<(PracticeAttemptV1, Vec<String>)> {
-    let carrier = verification_carrier(request, report)?;
-    let outcomes =
-        verify_observed_report_in_session(ctx, session, &carrier, request, report).await?;
+    let carrier = verification_carrier(control, request, report)?;
+    // Keep the receipt verifier's state out of the practice futures, as the
+    // shared gate does.
+    let outcomes = Box::pin(verify_observed_report_in_session(
+        ctx, session, &carrier, request, report,
+    ))
+    .await?;
     let mut tasks = Vec::with_capacity(outcomes.len());
     let mut costs = Vec::with_capacity(outcomes.len() * 2);
     let mut candidate_ids = Vec::with_capacity(outcomes.len());
@@ -1278,25 +1545,13 @@ async fn record_attempt_in_session(
             let body: serde_json::Value = session
                 .need(ctx, ARTIFACT_KIND, &storage_id(EXECUTION_RECEIPT_KIND, id)?)
                 .await?;
-            let payload = body["payload"].clone();
-            let receipt: DevelopmentExecutionReceiptV1 = if payload["schema_version"]
-                == crate::development::projection::CONFIG_PROJECTION_EXECUTION_SCHEMA
-                || payload["schema_version"]
-                    == crate::development::projection::CONFIG_PROJECTION_EXECUTION_SCHEMA_V2
-            {
-                let wrapper: crate::development::projection::ConfigProjectionExecutionReceiptV1 =
-                    serde_json::from_value(payload).map_err(|_| Error::Internal)?;
-                wrapper.execution
-            } else {
-                serde_json::from_value(payload).map_err(|_| Error::Internal)?
-            };
-            receipts.push(receipt);
+            receipts.push(execution_receipt_data(body["payload"].clone())?);
         }
         let candidate = receipts.pop().ok_or(Error::Internal)?;
         let parent = receipts.pop().ok_or(Error::Internal)?;
         // The set names one control and so one root budget: executions that a
         // runner bound to another control paid for are not this set's evidence.
-        if parent.control_id != control_id || candidate.control_id != control_id {
+        if parent.control_id != control.id || candidate.control_id != control.id {
             return Err(Error::Conflict(
                 "practice attempt receipts belong to another control".into(),
             ));
@@ -1330,7 +1585,7 @@ async fn record_attempt_in_session(
 async fn cached_attempt_in_session(
     ctx: &Context,
     session: &mut Session,
-    control: &DevelopmentControlV1,
+    control: &PracticeControl,
     request: &DevelopmentRunRequest,
     cache_hit: bool,
 ) -> Result<Option<(PracticeAttemptV1, Vec<String>)>> {
@@ -1369,19 +1624,7 @@ async fn cached_attempt_in_session(
     let execution_storage = storage_id(EXECUTION_RECEIPT_KIND, first)?;
     let execution: serde_json::Value = session.need(ctx, ARTIFACT_KIND, &execution_storage).await?;
     validate_content_envelope(&execution_storage, &execution)?;
-    let payload = execution["payload"].clone();
-    let execution: DevelopmentExecutionReceiptV1 = if payload["schema_version"]
-        == crate::development::projection::CONFIG_PROJECTION_EXECUTION_SCHEMA
-        || payload["schema_version"]
-            == crate::development::projection::CONFIG_PROJECTION_EXECUTION_SCHEMA_V2
-    {
-        let wrapper: crate::development::projection::ConfigProjectionExecutionReceiptV1 =
-            serde_json::from_value(payload).map_err(|_| Error::Internal)?;
-        wrapper.execution
-    } else {
-        serde_json::from_value(payload).map_err(|_| Error::Internal)?
-    };
-    let provenance = execution.execution_provenance;
+    let provenance = execution_receipt_data(execution["payload"].clone())?.execution_provenance;
     let report = DevelopmentRunReport {
         request_id: run.request_id,
         manifest_digest: request.manifest.digest.clone(),
@@ -1398,7 +1641,7 @@ async fn cached_attempt_in_session(
         return Err(Error::Forbidden);
     }
     select_development(request, &report)?;
-    record_attempt_in_session(ctx, session, &control.id, request, &report, cache_hit)
+    record_attempt_in_session(ctx, session, control, request, &report, cache_hit)
         .await
         .map(Some)
 }
@@ -1407,7 +1650,7 @@ async fn cached_attempt_in_session(
 async fn attempt_already_executed(
     store: &Store,
     ctx: &Context,
-    control: &DevelopmentControlV1,
+    control: &PracticeControl,
     request: &DevelopmentRunRequest,
 ) -> Result<bool> {
     let mut session = store.session().await?;
@@ -1421,13 +1664,21 @@ async fn attempt_already_executed(
 async fn verify_set_attempts_in_session(
     ctx: &Context,
     session: &mut Session,
-    control: &DevelopmentControlV1,
+    control: &PracticeControl,
     request: &PracticeRunRequest,
     set: &PracticeAttemptSetV1,
 ) -> Result<Vec<Vec<String>>> {
     let mut candidate_ids = Vec::with_capacity(set.attempts.len());
     for attempt in &set.attempts {
-        let development = practice_attempt_request(control, request, attempt.attempt)?;
+        let development = attempt_request(
+            control,
+            &request.set_id,
+            &request.episode_id,
+            request.step,
+            &request.bundle_digest,
+            request.revoke_watermark,
+            attempt.attempt,
+        )?;
         let (current, receipts) =
             cached_attempt_in_session(ctx, session, control, &development, attempt.cache_hit)
                 .await?
@@ -1457,14 +1708,33 @@ async fn run_attempts(
     ctx: &Context,
     store: &Store,
     runner: &dyn DevRunner,
-    control: &DevelopmentControlV1,
+    control: &PracticeControl,
     request: &PracticeRunRequest,
     k: u32,
     prepared: &mut PracticeAttemptSetV2,
 ) -> Result<(Vec<PracticeAttemptV1>, Option<String>)> {
     let mut attempts = prepared.attempts.clone();
     for number in (attempts.len() as u32 + 1)..=k {
-        let development = practice_attempt_request(control, request, number)?;
+        let development = attempt_request(
+            control,
+            &request.set_id,
+            &request.episode_id,
+            request.step,
+            &request.bundle_digest,
+            request.revoke_watermark,
+            number,
+        )?;
+        // Every attempt is sent only as the exact request its closure froze.
+        {
+            let mut session = store.session().await?;
+            let closure = read_request_closure(&mut session, ctx, &development.request_id)
+                .await?
+                .ok_or(Error::Internal)?;
+            session.commit().await?;
+            if fingerprint(&closure_request(control, &closure)?)? != fingerprint(&development)? {
+                return Err(Error::Internal);
+            }
+        }
         let binding = PracticeAttemptBindingV2 {
             attempt: number,
             request_id: development.request_id.clone(),
@@ -1517,7 +1787,7 @@ async fn run_attempts(
             }
         };
         let attempt =
-            match record_attempt(ctx, store, &control.id, &development, &report, cache_hit).await {
+            match record_attempt(ctx, store, control, &development, &report, cache_hit).await {
                 Ok(attempt) => attempt,
                 Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
                 Err(error) => {
@@ -1610,7 +1880,7 @@ async fn run_practice_set_unboxed(
     ctx.require(&[Role::Worker, Role::Admin])?;
     request.validate()?;
     let request_digest = request.digest()?;
-    let control = load_development_control(store, ctx, &request.control_id).await?;
+    let control = PracticeControl::load(store, ctx, &request.control_id).await?;
     if let Some(existing) = load_existing_set(store, ctx, &request.set_id).await? {
         if existing.request_digest != request_digest {
             return Err(Error::Conflict(
@@ -1664,6 +1934,20 @@ async fn run_practice_set_unboxed(
             if let Some(registration) = &registration_id {
                 bind_registration(&mut session, ctx, registration, &request.set_id).await?;
             }
+            // Every attempt's request closure is recorded with the registration
+            // claim and the prepared set, after the whole request was checked and
+            // before the first runner call. A reconnect finds the prepared set and
+            // so the same closures, never rewritten (V094.b).
+            for attempt in 1..=u32::from(request.plan.attempts_per_task) {
+                let closure =
+                    request_closure(ctx, &control, &request, registration_id.as_deref(), attempt)?;
+                session
+                    .put(ctx, ARTIFACT_KIND, &closure.id, ctx.actor(), &closure)
+                    .await?;
+            }
+            session
+                .audit(ctx, "practice.request_closure.record", &request.set_id)
+                .await?;
             let prepared = PracticeAttemptSetV2 {
                 schema_version: PRACTICE_ATTEMPT_SET_SCHEMA_V2.into(),
                 id: storage.clone(),
@@ -1733,7 +2017,7 @@ async fn run_practice_set_unboxed(
     let families: BTreeSet<&str> = control
         .tasks
         .iter()
-        .map(|task| task.parent_family.as_str())
+        .map(|(_, family)| family.as_str())
         .collect();
     let set = PracticeAttemptSetV1 {
         schema_version: PRACTICE_ATTEMPT_SET_SCHEMA_V2.into(),
@@ -1768,7 +2052,7 @@ async fn run_practice_set_unboxed(
 async fn persist_set(
     ctx: &Context,
     store: &Store,
-    control: &DevelopmentControlV1,
+    control: &PracticeControl,
     request: &PracticeRunRequest,
     set: PracticeAttemptSetV1,
     prepared: &mut PracticeAttemptSetV2,
@@ -1814,6 +2098,20 @@ async fn persist_set(
             &storage_id(CONTROL_KIND, &control.id)?,
         )
         .await?;
+    for attempt in 1..=u32::from(set.plan.attempts_per_task) {
+        session
+            .put_edge(
+                ctx,
+                ARTIFACT_KIND,
+                &storage,
+                ARTIFACT_KIND,
+                &practice_request_closure_storage_id(&practice_attempt_request_id(
+                    &set.set_id,
+                    attempt,
+                )?)?,
+            )
+            .await?;
+    }
     for (attempt, candidates) in set.attempts.iter().zip(candidate_ids) {
         session
             .put_edge(
