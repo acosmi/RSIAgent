@@ -199,7 +199,7 @@ pub(super) async fn execute(
     let mut current = match begin_management_step(ctx, &mut session, claimed, control).await {
         Ok(current) => current,
         Err(error) => {
-            publication.discard(&mut session).await?;
+            publication.discard().await?;
             return Ok(before_publication(error));
         }
     };
@@ -207,7 +207,7 @@ pub(super) async fn execute(
         // A changed receipt cannot authorize deletion of the old owned temp.
         return Ok(ObservedWorkerExit::Failed(UNVERIFIED.into()));
     }
-    let published = match publication.publish(&mut session).await {
+    let published = match publication.publish().await {
         Ok(published) => published,
         Err(error) => return Ok(before_publication(error)),
     };
