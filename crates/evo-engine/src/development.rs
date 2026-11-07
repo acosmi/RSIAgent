@@ -2717,7 +2717,7 @@ impl RegisteredDevelopmentRunner {
             // Keep the original typed priority, but never commit a source
             // refusal or its compensation from this transaction.
             let result = self
-                .begin_execution_in_session(&mut session, original_call, fence, source_ids)
+                .begin_execution_in_session(&mut session, original_call, fence)
                 .await?;
             return match result {
                 Err(error) => Err(error),
@@ -2805,25 +2805,22 @@ impl RegisteredDevelopmentRunner {
             }
         }
         let result = self
-            .begin_execution_in_session(&mut session, original_call, fence, source_ids)
+            .begin_execution_in_session(&mut session, original_call, fence)
             .await?;
         session.commit().await?;
         result
     }
 
     /// The shared budget boundary distinguishes typed, proven pre-dispatch
-    /// refusals from outer errors. Its caller owns the single transaction commit.
+    /// refusals from outer errors. Its caller owns the single transaction commit;
+    /// `begin_bound_execution` judged the source closure first in this transaction
+    /// and never commits a release made over a revoked one.
     async fn begin_execution_in_session(
         &self,
         session: &mut Session,
         original_call: &BudgetCallRecord,
         fence: &BudgetCallFence,
-        source_ids: &[String],
     ) -> Result<Result<BudgetDispatchDecision>> {
-        let roots = source_ids
-            .iter()
-            .map(|id| ("run".to_string(), id.clone()))
-            .collect::<Vec<_>>();
         match session
             .begin_budget_dispatch_typed(&self.executor, fence)
             .await?
@@ -2832,9 +2829,6 @@ impl RegisteredDevelopmentRunner {
             Err(refusal) => {
                 if original_call.state == BudgetCallState::Reserved
                     && refusal != evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked
-                    && session
-                        .revocation_sources_live(&self.executor, &roots)
-                        .await?
                 {
                     session
                         .release_undispatched_budget_call(
@@ -2859,7 +2853,7 @@ impl RegisteredDevelopmentRunner {
     ) -> Result<BudgetDispatchDecision> {
         let mut session = self.store.session().await?;
         let result = self
-            .begin_execution_in_session(&mut session, original_call, fence, &["source".to_string()])
+            .begin_execution_in_session(&mut session, original_call, fence)
             .await?;
         session.commit().await?;
         result

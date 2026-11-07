@@ -868,6 +868,12 @@ async fn q03_source_graph() -> (tempfile::TempDir, Store, String) {
         ImportSourceSpec, PersistentImportService, SourceFormat,
     };
     let (dir, store) = broker_store().await;
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&broker_admin(), "q03-initial-watermark")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
     let bytes = b"{\"type\":\"user\",\"message\":{\"content\":\"local fixture\"}}\n";
     let path = dir.path().join("q03-history.jsonl");
     tokio::fs::write(&path, bytes).await.unwrap();
@@ -981,7 +987,8 @@ async fn q03_legacy_reserve_refuses_revoked_transitive_source_without_writes() {
         .release_undispatched_budget_call(&broker_host(), &q03_fence(&healthy), "healthy-control")
         .await
         .unwrap();
-    // Full authority is required even when no tombstone exists.
+    // Qualification is not revocation: a missing, bare or claimed run is not
+    // refused as revoked and keeps the reservation's existing refusal order.
     for source in ["q03-missing-run", "q03-bare-run", "q03-claimed-run"] {
         if source != "q03-missing-run" {
             let value = if source == "q03-bare-run" {
@@ -1007,27 +1014,21 @@ async fn q03_legacy_reserve_refuses_revoked_transitive_source_without_writes() {
         request.actual_input_digest = model.cache_key_digest.clone();
         request.request_artifact =
             Some(BudgetArtifact::from_serializable(MODEL_REQUEST_SCHEMA, &model).unwrap());
-        let path = dir.path().join("rsia.sqlite3");
-        let before = q03_lossless_snapshot(&path);
-        assert!(matches!(
-            store
-                .reserve_budget_call_with_sources(&broker_host(), &request, &[source.into()])
-                .await,
-            Err(Error::Forbidden)
-        ));
-        let mut session = store.session().await.unwrap();
-        assert_eq!(
-            session
-                .reserve_budget_call_with_sources_typed(&broker_host(), &request, &[source.into()])
-                .await
-                .unwrap(),
-            Err(evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked)
-        );
-        session.commit().await.unwrap();
-        assert_eq!(q03_lossless_snapshot(&path), before);
+        let call = store
+            .reserve_budget_call_with_sources(&broker_host(), &request, &[source.into()])
+            .await
+            .unwrap();
+        store
+            .release_undispatched_budget_call(
+                &broker_host(),
+                &q03_fence(&call),
+                "qualification-control",
+            )
+            .await
+            .unwrap();
     }
     for kind in ["run", "artifact"] {
-        let (fault_dir, fault_store, _) = q03_source_graph().await;
+        let (_fault_dir, fault_store, _) = q03_source_graph().await;
         let admin = broker_admin();
         let mut session = fault_store.session().await.unwrap();
         if kind == "artifact" {
@@ -1086,19 +1087,19 @@ async fn q03_legacy_reserve_refuses_revoked_transitive_source_without_writes() {
                 .unwrap();
         }
         session.commit().await.unwrap();
-        let path = fault_dir.path().join("rsia.sqlite3");
-        let before = q03_lossless_snapshot(&path);
-        assert!(matches!(
-            fault_store
-                .reserve_budget_call_with_sources(
-                    &broker_host(),
-                    &q03_reservation("q03-incomplete-upstream"),
-                    &[RUN.into()]
-                )
-                .await,
-            Err(Error::Forbidden)
-        ));
-        assert_eq!(q03_lossless_snapshot(&path), before);
+        // An unqualified or missing upstream node is not a revoked one.
+        let call = fault_store
+            .reserve_budget_call_with_sources(
+                &broker_host(),
+                &q03_reservation("q03-incomplete-upstream"),
+                &[RUN.into()],
+            )
+            .await
+            .unwrap();
+        fault_store
+            .release_undispatched_budget_call(&broker_host(), &q03_fence(&call), "upstream-control")
+            .await
+            .unwrap();
     }
     q03_revoke_upstream(&store, &upstream).await;
     let path = dir.path().join("rsia.sqlite3");
@@ -1150,24 +1151,17 @@ async fn q03_legacy_dispatch_refuses_revoked_transitive_source_without_release()
                 .unwrap();
         }
         session.commit().await.unwrap();
-        let path = dir.path().join("rsia.sqlite3");
-        let before = q03_lossless_snapshot(&path);
-        assert!(matches!(
-            store
-                .begin_budget_dispatch(&broker_host(), &q03_fence(&call))
-                .await,
-            Err(Error::Cancelled)
-        ));
+        // A missing or unqualified run is not a revocation; the probe's
+        // transaction is dropped, so the call stays Reserved for the control below.
         let mut session = store.session().await.unwrap();
-        assert_eq!(
+        assert!(
             session
                 .begin_budget_dispatch_typed(&broker_host(), &q03_fence(&call))
                 .await
-                .unwrap(),
-            Err(evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked)
+                .unwrap()
+                .is_ok()
         );
-        session.commit().await.unwrap();
-        assert_eq!(q03_lossless_snapshot(&path), before);
+        drop(session);
         assert_eq!(broker_call(&store, &call.call_id).await.unwrap(), call);
     }
     let mut session = store.session().await.unwrap();
@@ -1234,25 +1228,33 @@ async fn q03_existing_call_missing_ref_cannot_repair_over_revoked_closure() {
         &call.call_id,
     ))
     .unwrap();
+    let reference = format!("budget-ref-{}", &digest[..32]);
     let mut session = store.session().await.unwrap();
     session
-        .delete(
-            &broker_admin(),
-            "artifact",
-            &format!("budget-ref-{}", &digest[..32]),
-        )
+        .delete(&broker_admin(), "artifact", &reference)
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let before = q03_lossless_snapshot(&path);
-    assert!(matches!(
+    // A missing run is not a revocation: the lost ref is repaired.
+    assert_eq!(
         store
             .reserve_budget_call_with_sources(&broker_host(), &request, &[RUN.into()])
-            .await,
-        Err(Error::Forbidden)
-    ));
-    assert_eq!(q03_lossless_snapshot(&path), before);
+            .await
+            .unwrap(),
+        call
+    );
     let mut session = store.session().await.unwrap();
+    assert!(
+        session
+            .get::<serde_json::Value>(&broker_admin(), "artifact", &reference)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    session
+        .delete(&broker_admin(), "artifact", &reference)
+        .await
+        .unwrap();
     session
         .put(
             &broker_admin(),

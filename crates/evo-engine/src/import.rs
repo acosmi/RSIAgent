@@ -2056,6 +2056,7 @@ impl PersistentImportService {
             };
             // Every id is checked before the first row is written, so a refusal
             // leaves nothing behind (not even a half-prepared selection).
+            session.ensure_revocation_namespace_live(ctx).await?;
             for record in &prepared_sources {
                 ensure_import_source_id_is_free(&mut session, ctx, &record.id).await?;
             }
@@ -2601,7 +2602,7 @@ impl PersistentImportService {
             &source_records,
         )?;
         let mut session = self.store.session().await?;
-        validate_live_import_sources(&mut session, ctx, &selection, &source_records).await?;
+        validate_live_import_sources(&mut session, ctx, None, &selection, &source_records).await?;
         if let Some(existing) = session
             .get::<ImportResultRecord>(ctx, IMPORT_ARTIFACT_KIND, &result.id)
             .await?
@@ -2735,7 +2736,7 @@ impl PersistentImportService {
             .await?;
         let source_records =
             load_and_validate_source_records(&mut session, ctx, &selection).await?;
-        validate_live_import_sources(&mut session, ctx, &selection, &source_records).await?;
+        validate_import_sources_own(&mut session, ctx, &selection, &source_records).await?;
         let expected_id = match &stored {
             StoredImportResult::V2(_) => {
                 import_result_id_v2(&selection.id, &selection.input_digest)?
@@ -2795,7 +2796,7 @@ impl PersistentImportService {
             }
         }
         let mut session = self.store.session().await?;
-        validate_live_import_sources(&mut session, ctx, &selection, &source_records).await?;
+        validate_import_sources_own(&mut session, ctx, &selection, &source_records).await?;
         session.commit().await?;
         Ok(StaticImportResult {
             stored,
@@ -3052,26 +3053,8 @@ impl PersistentImportService {
                 "local import result closure mismatch".into(),
             ));
         }
-        validate_live_import_sources(&mut session, ctx, &selection, &sources).await?;
-        let roots: Vec<_> = std::iter::once(result.id.clone())
-            .chain(std::iter::once(selection.id.clone()))
-            .chain(sources.iter().map(|source| source.id.clone()))
-            .map(|id| ("artifact".to_string(), id))
-            .collect();
-        for (kind, id) in &roots {
-            if crate::revocation_gate::judge_dependency(ctx, &mut session, kind, id)
-                .await?
-                .is_some()
-            {
-                return Err(Error::Forbidden);
-            }
-        }
-        if crate::revocation_gate::judge_upstream(ctx, &mut session, &roots)
-            .await?
-            .is_some()
-        {
-            return Err(Error::Forbidden);
-        }
+        validate_live_import_sources(&mut session, ctx, Some(&result.id), &selection, &sources)
+            .await?;
         session.commit().await?;
         Ok(LocalImportSnapshot {
             result,
@@ -3207,7 +3190,7 @@ impl PersistentImportService {
             .await?;
         validate_selection_record(ctx, &selection)?;
         let sources = load_and_validate_source_records(&mut session, ctx, &selection).await?;
-        validate_live_import_sources(&mut session, ctx, &selection, &sources).await?;
+        validate_live_import_sources(&mut session, ctx, None, &selection, &sources).await?;
         session.commit().await?;
         Ok((selection, sources))
     }
@@ -3529,14 +3512,10 @@ async fn ensure_import_source_id_is_free(
     ctx: &Context,
     id: &str,
 ) -> Result<()> {
-    session.ensure_revocation_namespace_live(ctx).await?;
     if session.get::<Value>(ctx, "tombstone", id).await?.is_some() {
         return Err(Error::Forbidden);
     }
-    if session
-        .registered_revocable_source(ctx, evo_core::evidence::RevocableSourceKind::TrustedRun, id)
-        .await?
-    {
+    if session.get::<Value>(ctx, "run", id).await?.is_some() {
         return Err(Error::Conflict(format!(
             "import source {id} cannot be created: a run already has this id \
              (a revocation tombstone is keyed by id)"
@@ -3592,7 +3571,38 @@ async fn load_and_validate_source_records(
     Ok(records)
 }
 
+/// Content use and new derivation: the current watermark and the complete
+/// revocation closure of the result (when given), its selection and sources.
+/// The walk starts at these artifacts, so it also judges their own tombstones.
 async fn validate_live_import_sources(
+    session: &mut evo_storage::Session,
+    ctx: &Context,
+    result_id: Option<&str>,
+    selection: &SourceSelectionRecord,
+    sources: &[ImportSourceRecord],
+) -> Result<()> {
+    if current_watermark(session, ctx).await? != selection.revoke_watermark {
+        return Err(Error::Conflict("source revoke watermark changed".into()));
+    }
+    let roots: Vec<_> = result_id
+        .map(str::to_string)
+        .into_iter()
+        .chain(std::iter::once(selection.id.clone()))
+        .chain(sources.iter().map(|source| source.id.clone()))
+        .map(|id| ("artifact".to_string(), id))
+        .collect();
+    if crate::revocation_gate::judge_upstream(ctx, session, &roots)
+        .await?
+        .is_some()
+    {
+        return Err(Error::Forbidden);
+    }
+    Ok(())
+}
+
+/// A stored result's static read: the current watermark and the selection's and
+/// sources' own revocation. Reading its content goes through the closure above.
+async fn validate_import_sources_own(
     session: &mut evo_storage::Session,
     ctx: &Context,
     selection: &SourceSelectionRecord,
@@ -3601,23 +3611,13 @@ async fn validate_live_import_sources(
     if current_watermark(session, ctx).await? != selection.revoke_watermark {
         return Err(Error::Conflict("source revoke watermark changed".into()));
     }
-    let roots: Vec<_> = std::iter::once(selection.id.clone())
-        .chain(sources.iter().map(|source| source.id.clone()))
-        .map(|id| ("artifact".to_string(), id))
-        .collect();
-    for (kind, id) in &roots {
-        if crate::revocation_gate::judge_dependency(ctx, session, kind, id)
+    for id in std::iter::once(&selection.id).chain(sources.iter().map(|source| &source.id)) {
+        if crate::revocation_gate::judge_dependency(ctx, session, "artifact", id)
             .await?
             .is_some()
         {
             return Err(Error::Forbidden);
         }
-    }
-    if crate::revocation_gate::judge_upstream(ctx, session, &roots)
-        .await?
-        .is_some()
-    {
-        return Err(Error::Forbidden);
     }
     Ok(())
 }

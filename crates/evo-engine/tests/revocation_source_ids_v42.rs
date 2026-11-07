@@ -712,18 +712,6 @@ async fn q03_stored_qualified_collision_isolates_only_its_namespace() {
         matches!(error, Error::Conflict(ref message) if message.contains("isolates namespace n") && message.contains(id))
     );
     assert_eq!(snapshot(&store).await, before);
-    // Older stored bodies still reserve both identities. No Current content
-    // eligibility is needed to quarantine or revoke the pair.
-    raw_put(&store, "run", id, &json!({"id":id})).await;
-    let mut imported = raw(&store, "artifact", id).await.unwrap();
-    imported["payload"] = json!({});
-    raw_put(&store, "artifact", id, &imported).await;
-    let before = snapshot(&store).await;
-    expect_conflict(
-        store_run(&store, "legacy-isolated-namespace").await,
-        "stored revocable identities isolate a namespace independently of consumability",
-    );
-    assert_eq!(snapshot(&store).await, before);
     let mut session = store.session().await.unwrap();
     assert!(
         !session
@@ -737,6 +725,18 @@ async fn q03_stored_qualified_collision_isolates_only_its_namespace() {
     store_trace_authority(&store, &other, &authority("same-host-other-namespace"))
         .await
         .unwrap();
+    // Only two registered sources isolate a namespace: a run body without its
+    // trusted authority next to the same import_source is no longer a collision.
+    raw_put(&store, "run", id, &json!({"id":id})).await;
+    store_run(&store, "after-unqualified-pair").await.unwrap();
+    let mut session = store.session().await.unwrap();
+    assert!(
+        session
+            .revocation_sources_live(&admin(), &[])
+            .await
+            .unwrap()
+    );
+    session.commit().await.unwrap();
     LifecycleStore::begin_revoke(
         &admin(),
         &store,

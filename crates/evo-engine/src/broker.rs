@@ -973,21 +973,19 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
             Ok(call) => call,
             Err(refusal) => return Ok(pre_dispatch_refusal(&request, &refusal)),
         };
-        if call.state == BudgetCallState::Reserved {
+        if call.state == BudgetCallState::Reserved && now > call.lease_until {
             let roots = source_ids
                 .iter()
                 .map(|id| ("run".to_string(), id.clone()))
                 .collect::<Vec<_>>();
-            // Refencing is a write too. Judge the full closure before it, on
-            // the same connection that reserves, refences and begins dispatch.
+            // Refencing is the one write between the reservation's gate and the
+            // dispatch gate. Judge the full closure before it, on this connection.
             if !session.revocation_sources_live(&ctx, &roots).await? {
                 return Ok(pre_dispatch_refusal(
                     &request,
                     &BudgetPreDispatchRefusal::SourceRevoked,
                 ));
             }
-        }
-        if call.state == BudgetCallState::Reserved && now > call.lease_until {
             call = session
                 .refence_reserved_budget_call(
                     &ctx,

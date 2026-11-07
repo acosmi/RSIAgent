@@ -1636,7 +1636,6 @@ impl PersistentPackageStore {
                 "staged asset changed before blob finalization".into(),
             ));
         }
-        verify_sources(&mut session, ctx, &current.source_refs).await?;
         current.payload.state = if quarantine.is_some() {
             StagedAssetState::Quarantined
         } else {

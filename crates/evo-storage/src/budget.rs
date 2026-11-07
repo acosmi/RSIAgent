@@ -2761,18 +2761,26 @@ async fn reserve_budget_call_with_sources_in_tx_typed(
         if !same_reservation(ctx, &existing, request) {
             return Ok(Err(BudgetPreDispatchRefusal::CallIdReused));
         }
-        if !source_ids.is_empty()
-            && let Err(refusal) =
+        if !source_ids.is_empty() {
+            // A historical call whose ref is intact stays a read. Repairing a
+            // lost ref is a new content-dependent write and passes the gate first.
+            if registered_source_ids(tx, &existing).await?.is_none()
+                && source_closure_blocked(tx, ctx.namespace(), &source_ids).await?
+            {
+                return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
+            }
+            if let Err(refusal) =
                 ensure_budget_call_ref_typed(tx, ctx, &existing, &source_ids).await?
-        {
-            return Ok(Err(refusal));
+            {
+                return Ok(Err(refusal));
+            }
         }
         return Ok(Ok(existing));
     }
     // The revocation tombstone is committed before its cleanup runs, so it is
     // read here, in the transaction that would write the reservation and its
     // request body: nothing below has run when a source is refused.
-    if any_run_source_revoked(tx, ctx.namespace(), &source_ids).await? {
+    if source_closure_blocked(tx, ctx.namespace(), &source_ids).await? {
         return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
     }
     let row = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
@@ -3255,7 +3263,7 @@ async fn begin_budget_dispatch_in_tx_typed(
             registered_source_ids(tx, &call).await?.unwrap_or_default()
         }
     };
-    if any_run_source_revoked(tx, &call.namespace, &source_ids).await? {
+    if source_closure_blocked(tx, &call.namespace, &source_ids).await? {
         return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
     }
     let active: i64 = sqlx::query_scalar(
@@ -3827,11 +3835,6 @@ async fn ensure_budget_call_ref_typed(
         }
         return Ok(Ok(old));
     }
-    // A historical call with its existing ref remains a read. Repairing a lost
-    // ref is a new content-dependent write and must pass the same full gate.
-    if any_run_source_revoked(tx, &call.namespace, &reference.source_ids).await? {
-        return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
-    }
     sqlx::query("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,'artifact',?,?,?)")
         .bind(ctx.namespace())
         .bind(&reference.id)
@@ -3855,44 +3858,21 @@ async fn ensure_budget_call_ref_typed(
     Ok(Ok(reference))
 }
 
-/// The legacy run roots and their complete typed upstream closure use the same
-/// raw judgement as dispatch, publication and E16 snapshots. An incomplete
-/// closure cannot authorize a new reservation or dispatch.
-async fn any_run_source_revoked(
+/// Whether new use of the legacy run roots is refused: a revoked or unreadable
+/// node anywhere in their complete upstream closure, or a closure that cannot be
+/// completed (an isolated namespace, an overflowing walk). The same raw rule as
+/// publication and E16 snapshots. A missing or unqualified run is not a
+/// revocation: it keeps the reservation's existing refusal order.
+async fn source_closure_blocked(
     tx: &mut Transaction<'_, Sqlite>,
     namespace: &str,
     source_ids: &[String],
 ) -> Result<bool> {
-    if crate::revocation::namespace_collision_in_tx(tx, namespace)
-        .await?
-        .is_some()
-    {
-        return Ok(true);
-    }
     let roots: Vec<(&str, &str)> = source_ids.iter().map(|id| ("run", id.as_str())).collect();
-    let Some(nodes) = crate::upstream_rows_in_tx(
-        tx,
-        namespace,
-        &roots,
-        crate::revocation::MAX_UPSTREAM_CLOSURE_NODES,
-        true,
+    Ok(
+        crate::revocation::status_in_tx(tx, namespace, &roots, false).await?
+            != crate::revocation::RevocationStatus::Live,
     )
-    .await?
-    else {
-        return Ok(true);
-    };
-    for node in nodes {
-        if !node.exists
-            || (node.kind == "run"
-                && !crate::revocation::qualified_run_in_tx(tx, namespace, &node.id).await?)
-        {
-            return Ok(true);
-        }
-        if crate::revocation::judge_node(node).is_some() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// What the budget call reference of a legacy call registers as its source
@@ -3989,7 +3969,7 @@ async fn registered_source_ids(
 /// The sources a legacy call is judged by, at its dispatch and at its model
 /// settlement.
 enum LegacyCallSources {
-    /// Checked against the revocation tombstones (`any_run_source_revoked`).
+    /// Judged with their complete closure (`source_closure_blocked`).
     Named(Vec<String>),
     /// The reference is missing and the request cannot be read for a closure:
     /// whether the call is free of a revoked source cannot be told.

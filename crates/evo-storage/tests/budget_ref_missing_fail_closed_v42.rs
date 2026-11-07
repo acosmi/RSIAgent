@@ -92,12 +92,7 @@ async fn put_run(store: &Store, id: &str) {
         store,
         "run",
         id,
-        &json!({
-            "schema_version":"rsia.optimization.source.v1",
-            "record":{"id":id,"body":id.as_bytes().to_vec(),"parent_family":format!("family-{id}"),"task_origin":"trusted_run","execution_attestation":"trusted_host","purpose":"development"},
-            "trace":{"run_id":id,"parent_family":format!("family-{id}"),"source_digest":hash(id.as_bytes()),"purpose":"development","outcome":"success","diagnosis":null,"excerpt":id,"seed":1},
-            "excerpt_start":0,"excerpt_end":id.len(),
-        }),
+        &json!({"id": id, "schema_version": "rsia.optimization.source.v1", "body": "run-body"}),
     )
     .await;
 }

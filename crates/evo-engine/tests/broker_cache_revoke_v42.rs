@@ -559,7 +559,14 @@ async fn same_id_artifact_revocation_does_not_refuse_live_run_cache() {
             begin(&fixture.store, NS, "artifact", B).await;
         }
         let before = sqlite_snapshot(&fixture.path);
-        assert_unavailable(fixture.broker().dispatch(cached_request.clone()).await);
+        // The isolated namespace is its own refusal, not a revoked source.
+        match fixture.broker().dispatch(cached_request.clone()).await {
+            Err(Error::Conflict(reason)) => assert_eq!(
+                reason,
+                format!("revocation source id collision isolates namespace {NS}: {B}")
+            ),
+            other => panic!("expected the namespace isolation, got {other:?}"),
+        }
         for refused in [&pending_request, &new_request] {
             let response = fixture.broker().dispatch(refused.clone()).await.unwrap();
             match response {

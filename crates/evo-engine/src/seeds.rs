@@ -955,46 +955,43 @@ impl PersistentSeedStore {
                     "seed install changed before blob finalization".into(),
                 ));
             }
-            verify_sources(&mut session, ctx, &current.source_refs).await?;
             current.payload.status = SeedStatus::Installed;
             current.updated_at = now()?;
             put_envelope(&mut session, ctx, &current).await?;
             session.audit(ctx, "e16.seed_install.finalize", &id).await?;
         }
         let has_staged = stage_bytes.is_some();
-        if let (Some(bytes), Some(stage_input)) = (stage_bytes, stage_input) {
-            if previous_stage
+        if let (Some(bytes), Some(stage_input)) = (stage_bytes, stage_input)
+            && previous_stage
                 .as_ref()
                 .is_none_or(|envelope| envelope.payload.state == StagedAssetState::Prepared)
+        {
+            session
+                .publish_registered_blob(
+                    ctx,
+                    &stage_id,
+                    E16_STAGED_ASSET_SCHEMA,
+                    "content_blob_digest",
+                    bytes,
+                    MAX_FILE as usize,
+                )
+                .await?;
+            let mut current: E16Envelope<StagedAssetPayload> =
+                session.need(ctx, "artifact", &stage_id).await?;
+            if current.input_digest != stage_input
+                || current.payload.state != StagedAssetState::Prepared
+                || current.revoke_watermark != current_watermark(&mut session, ctx).await?
             {
-                session
-                    .publish_registered_blob(
-                        ctx,
-                        &stage_id,
-                        E16_STAGED_ASSET_SCHEMA,
-                        "content_blob_digest",
-                        bytes,
-                        MAX_FILE as usize,
-                    )
-                    .await?;
-                let mut current: E16Envelope<StagedAssetPayload> =
-                    session.need(ctx, "artifact", &stage_id).await?;
-                if current.input_digest != stage_input
-                    || current.payload.state != StagedAssetState::Prepared
-                    || current.revoke_watermark != current_watermark(&mut session, ctx).await?
-                {
-                    return Err(Error::Conflict(
-                        "seed update changed before blob finalization".into(),
-                    ));
-                }
-                verify_sources(&mut session, ctx, &current.source_refs).await?;
-                current.payload.state = StagedAssetState::Staged;
-                current.updated_at = now()?;
-                put_envelope(&mut session, ctx, &current).await?;
-                session
-                    .audit(ctx, "e16.seed_update.finalize", &stage_id)
-                    .await?;
+                return Err(Error::Conflict(
+                    "seed update changed before blob finalization".into(),
+                ));
             }
+            current.payload.state = StagedAssetState::Staged;
+            current.updated_at = now()?;
+            put_envelope(&mut session, ctx, &current).await?;
+            session
+                .audit(ctx, "e16.seed_update.finalize", &stage_id)
+                .await?;
         }
         session.commit().await?;
         let install = Self::read_install(ctx, store, &id).await?;

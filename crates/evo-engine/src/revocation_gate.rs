@@ -72,9 +72,6 @@ impl Revoked {
                 "whose revocation tombstone cannot be read; the source is treated as revoked"
             }
             Cause::Redacted => "which was redacted because its source was revoked",
-            Cause::NamespaceConflict => {
-                "whose qualified source id conflicts and isolates its namespace"
-            }
         };
         Error::Conflict(format!("{lead}{reason}"))
     }
