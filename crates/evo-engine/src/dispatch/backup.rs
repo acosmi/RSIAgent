@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 const UNVERIFIED: &str = "backup_publication_unverified";
 
 #[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TestPoint {
     Preparing,
     BeforePublication,
@@ -449,7 +449,20 @@ mod tests {
             )
             .await
         });
-        reached.notified().await;
+        // A worker that fails before the checkpoint never notifies; fail fast
+        // with its actual exit instead of parking the test forever.
+        if tokio::time::timeout(Duration::from_secs(30), reached.notified())
+            .await
+            .is_err()
+        {
+            if handle.is_finished() {
+                panic!(
+                    "backup worker exited before checkpoint {point:?}: {:?}",
+                    handle.await
+                );
+            }
+            panic!("backup worker did not reach checkpoint {point:?} within 30s");
+        }
         (fixture, claimed, control, handle, resume)
     }
 
