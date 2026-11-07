@@ -477,7 +477,7 @@ async fn seed_update_staging_capacity_refuses_without_partial_install_or_active_
     request.baseline_identity.as_mut().unwrap().asset_id = "new-seed".into();
     request.local_identity.as_mut().unwrap().asset_id = "new-seed".into();
     assert!(
-        matches!(PersistentSeedStore::install_current(&fx.admin, &fx.store, request).await, Err(Error::Conflict(message)) if message.contains("staged packages") && message.contains("20"))
+        matches!(PersistentSeedStore::install_current(&fx.admin, &fx.store, request).await, Err(Error::Capacity(detail)) if detail.item == evo_core::capacity::CapacityItem::StagingPackage && detail.limit == 20)
     );
     assert_eq!(fx.shape().await, before);
     let replay = PersistentSeedStore::install_current(

@@ -2007,7 +2007,7 @@ async fn f17_run_source(store: &Store, ctx: &Context, id: &str) -> E16SourceRef 
     E16SourceRef {
         kind: "run".into(),
         id: id.into(),
-        digest: fingerprint(&authority).unwrap(),
+        digest: fingerprint(&serde_json::to_value(&authority).unwrap()).unwrap(),
     }
 }
 
@@ -2252,6 +2252,12 @@ async fn staged_package_usage(store: &Store, admin: &Context) -> (u64, u64) {
 async fn staged_package_capacity_cannot_be_split_across_namespaces() {
     let (_directory, store, admin, sources) = persistent_store().await;
     let other = Context::new("other", "admin", Role::Admin).unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&other, "other-package-watermark")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
     for index in 0..MAX_STAGED_PACKAGES {
         put_seeded_staged_asset(&store, &other, index, "staged").await;
     }

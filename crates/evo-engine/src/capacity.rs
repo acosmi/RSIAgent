@@ -5,7 +5,7 @@ use evo_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
-use evo_core::capacity::{CapacityConflict, CapacityItem};
+use evo_core::capacity::CapacityItem;
 pub use evo_core::capacity::{
     MAX_ACTIVE_LEASES, MAX_CONCURRENT_DISPATCH, MAX_EVENTS, MAX_EXPLORATION_NODES, MAX_PREPARE,
     MAX_REPLAY_WORLDS, MAX_RUNS, MAX_SKILLS, MAX_STAGED_PACKAGES,
@@ -140,18 +140,23 @@ impl CapacityField {
         CapacityField::InflightPrepare,
     ];
 
-    pub fn label(self) -> &'static str {
+    /// The registered item this legacy counter names.
+    pub fn item(self) -> CapacityItem {
         match self {
-            CapacityField::Runs => "runs",
-            CapacityField::Events => "events",
-            CapacityField::Skills => "skills",
-            CapacityField::InflightPrepare => "inflight_prepare",
-            CapacityField::ExplorationNodes => "exploration_nodes",
-            CapacityField::ReplayWorlds => "replay_worlds",
-            CapacityField::ActiveLeases => "active_leases",
-            CapacityField::StagedPackages => "staged_packages",
-            CapacityField::ConcurrentDispatches => "concurrent_dispatches",
+            CapacityField::Runs => CapacityItem::Run,
+            CapacityField::Events => CapacityItem::Event,
+            CapacityField::Skills => CapacityItem::Skill,
+            CapacityField::InflightPrepare => CapacityItem::InflightPrepare,
+            CapacityField::ExplorationNodes => CapacityItem::ExplorationNode,
+            CapacityField::ReplayWorlds => CapacityItem::ReplayWorld,
+            CapacityField::ActiveLeases => CapacityItem::ActiveLease,
+            CapacityField::StagedPackages => CapacityItem::StagingPackage,
+            CapacityField::ConcurrentDispatches => CapacityItem::ConcurrentManagementDispatch,
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.item().label()
     }
 
     pub fn limit(self, limits: &CapacityLimits) -> u64 {
@@ -189,40 +194,15 @@ impl CapacityField {
 /// would be running (including the one being admitted): exactly the limit is
 /// admitted and `used > limit` is refused.
 ///
-/// The refusal is `Error::Conflict` (HTTP 409 / MCP `conflict` / job error
-/// code `conflict`) and names the counter and both numbers.
+/// The refusal is the typed `Error::Capacity` of [`CapacityItem::admit_within`]
+/// (HTTP 409 / MCP `conflict` / job error code `conflict`).
 pub fn admit_field(field: CapacityField, used: u64, limits: &CapacityLimits) -> Result<()> {
-    let item = match field {
-        CapacityField::Runs => CapacityItem::Run,
-        CapacityField::Events => CapacityItem::Event,
-        CapacityField::Skills => CapacityItem::Skill,
-        CapacityField::InflightPrepare => CapacityItem::InflightPrepare,
-        CapacityField::ExplorationNodes => CapacityItem::ExplorationNode,
-        CapacityField::ReplayWorlds => CapacityItem::ReplayWorld,
-        CapacityField::ActiveLeases => CapacityItem::ActiveLease,
-        CapacityField::StagedPackages => CapacityItem::StagingPackage,
-        CapacityField::ConcurrentDispatches => CapacityItem::ConcurrentManagementDispatch,
-    };
-    let limit = field.limit(limits);
     let existing = if field == CapacityField::ConcurrentDispatches {
         used.saturating_sub(1)
     } else {
         used
     };
-    let refused = if field == CapacityField::ConcurrentDispatches {
-        used > limit
-    } else {
-        used >= limit
-    };
-    if refused {
-        return Err(Error::Capacity(CapacityConflict {
-            item,
-            used: existing,
-            limit,
-            delta: 1,
-        }));
-    }
-    Ok(())
+    field.item().admit_within(field.limit(limits), existing, 1)
 }
 
 /// Admit every counter of `usage` against `limits`.
@@ -462,7 +442,14 @@ mod tests {
         assert_eq!(evo_storage::MVP_MAX_REPLAY_WORLDS, MAX_REPLAY_WORLDS);
         assert_eq!(evo_storage::MVP_MAX_ACTIVE_LEASES, MAX_ACTIVE_LEASES);
         assert_eq!(
-            evo_storage::mvp_capacity_exceeded("replay worlds", 100, MAX_REPLAY_WORLDS).to_string(),
+            crate::groups::MAX_SKILL_GROUPS_PER_JOB as u64,
+            CapacityItem::SkillGroupPerJob.limit()
+        );
+        assert_eq!(
+            CapacityItem::ReplayWorld
+                .admit(100, 1)
+                .unwrap_err()
+                .to_string(),
             admit_field(CapacityField::ReplayWorlds, 100, &CapacityLimits::default())
                 .unwrap_err()
                 .to_string()

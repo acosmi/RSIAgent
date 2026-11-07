@@ -1515,7 +1515,7 @@ mod groups {
     };
     use evo_engine::optimization::{
         BundleCompileContext, DevRunner, DevelopmentManifest, DevelopmentRunReport,
-        DevelopmentRunRequest, DevelopmentTask, OptimizationJournal, OptimizationStepRequest,
+        DevelopmentRunRequest, DevelopmentTask, OptimizationStepRequest,
     };
     use evo_storage::Store;
     use serde_json::Value;
@@ -2052,6 +2052,14 @@ mod groups {
             499
         );
         session.commit().await.unwrap();
+        // The fixture journal registers a group's formal authority on first use;
+        // registering the refused group's now keeps that write out of the image.
+        evo_engine::optimization::OptimizationJournal::current_compiler_inputs(
+            &journal,
+            &groups[2].request().compiler_input_request(),
+        )
+        .await
+        .unwrap();
         let hanging = HangingModel(tokio::sync::Notify::new());
         let held = coordinator.run_next(
             Some(&hanging),
@@ -2199,9 +2207,9 @@ mod monitoring {
             source_digest: d("surface-source"),
             items: vec![SurfaceItem {
                 name: "model".into(),
-                coverage: SurfaceCoverage::Supported,
-                mapped_field: Some("host.model".into()),
-                consumer: Some("runner".into()),
+                coverage: SurfaceCoverage::RuntimeOwned,
+                mapped_field: None,
+                consumer: None,
                 reason: "fixture projection".into(),
             }],
         }
@@ -2310,7 +2318,6 @@ mod monitoring {
     struct Fixture {
         _dir: tempfile::TempDir,
         store: Store,
-        admin: Context,
         host: Context,
         worker: Context,
         environment: RecordedEnvironment,
@@ -2416,7 +2423,6 @@ mod monitoring {
             Self {
                 _dir: dir,
                 store,
-                admin,
                 host,
                 worker,
                 environment,
@@ -4109,64 +4115,74 @@ mod curriculum {
         let actual_state = load_state(&fixture).await;
         assert_eq!(actual_state.completed_cycles.len(), 1);
         // A fresh state isolates probe admission from selection's learner-state digest.
-        let fixture = Fixture::new().await;
-        let coordinator = curriculum(&fixture, None, &[]).await;
-        let first = coordinator
-            .schedule_probe_idempotent("healthy", PROFILE_ID, STATE_ID, 1_000_000)
-            .await
-            .unwrap();
-        let mut session = fixture.store.session().await.unwrap();
-        let original: Value = session
-            .need(
-                &fixture.admin,
-                "artifact",
-                &storage_id("coverage_probe_job_v1", &first.id),
-            )
-            .await
-            .unwrap();
-        let other = Context::new("old-probes", "admin", Role::Admin).unwrap();
-        for i in 0..98 {
-            let mut row = original.clone();
-            let logical = format!("old-probe-{i}");
-            let id = storage_id("coverage_probe_job_v1", &logical);
-            row["id"] = json!(id);
-            row["payload"]["id"] = json!(logical);
-            session
-                .put(&other, "artifact", &id, other.actor(), &row)
+        // A second schedule of one state answers its recorded job, so the slots are
+        // filled by other namespaces' persisted jobs.
+        let template = {
+            let fixture = Fixture::new().await;
+            let coordinator = curriculum(&fixture, None, &[]).await;
+            let first = coordinator
+                .schedule_probe_idempotent("healthy", PROFILE_ID, STATE_ID, 1_000_000)
                 .await
                 .unwrap();
+            let mut session = fixture.store.session().await.unwrap();
+            let original: Value = session
+                .need(
+                    &fixture.admin,
+                    "artifact",
+                    &storage_id("coverage_probe_job_v1", &first.id),
+                )
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+            original
+        };
+        for (seeded, admitted) in [(99, true), (100, false)] {
+            let fixture = Fixture::new().await;
+            let coordinator = curriculum(&fixture, None, &[]).await;
+            let other = Context::new("old-probes", "admin", Role::Admin).unwrap();
+            let mut session = fixture.store.session().await.unwrap();
+            for i in 0..seeded {
+                let mut row = template.clone();
+                let logical = format!("old-probe-{i}");
+                let id = storage_id("coverage_probe_job_v1", &logical);
+                row["id"] = json!(id);
+                row["payload"]["id"] = json!(logical);
+                session
+                    .put(&other, "artifact", &id, other.actor(), &row)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                session
+                    .capacity_used(CapacityItem::CurriculumProbeJob)
+                    .await
+                    .unwrap(),
+                seeded
+            );
+            session.commit().await.unwrap();
+            let before = image(fixture._dir.path());
+            let result = coordinator
+                .schedule_probe_idempotent("probe", PROFILE_ID, STATE_ID, 1_000_000)
+                .await;
+            if admitted {
+                let job = result.unwrap();
+                assert_eq!(
+                    coordinator
+                        .schedule_probe_idempotent("probe", PROFILE_ID, STATE_ID, 1_000_000)
+                        .await
+                        .unwrap()
+                        .id,
+                    job.id
+                );
+            } else {
+                capacity(
+                    result.unwrap_err(),
+                    CapacityItem::CurriculumProbeJob,
+                    100,
+                    1,
+                );
+                assert_eq!(image(fixture._dir.path()), before);
+            }
         }
-        assert_eq!(
-            session
-                .capacity_used(CapacityItem::CurriculumProbeJob)
-                .await
-                .unwrap(),
-            99
-        );
-        session.commit().await.unwrap();
-        let last = coordinator
-            .schedule_probe_idempotent("last", PROFILE_ID, STATE_ID, 1_000_000)
-            .await
-            .unwrap();
-        let before = image(fixture._dir.path());
-        capacity(
-            coordinator
-                .schedule_probe_idempotent("excess", PROFILE_ID, STATE_ID, 1_000_000)
-                .await
-                .unwrap_err(),
-            CapacityItem::CurriculumProbeJob,
-            100,
-            1,
-        );
-        assert_eq!(image(fixture._dir.path()), before);
-        assert_eq!(
-            coordinator
-                .schedule_probe_idempotent("last", PROFILE_ID, STATE_ID, 1_000_000)
-                .await
-                .unwrap()
-                .id,
-            last.id
-        );
-        assert_eq!(image(fixture._dir.path()), before);
     }
 }

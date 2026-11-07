@@ -5,9 +5,6 @@
 //! host identity and one namespace at startup; request payloads cannot change
 //! either value.
 
-use crate::capacity::{
-    CapacityField, CapacityLimits, V41CapacityUsage, admit_field, unix_now_secs,
-};
 use crate::evidence::{StoredTraceAuthority, load_stored_source, store_trace_authority};
 use crate::release_store::{
     CompletePrepareRunRequest, HostApplicationRecord,
@@ -87,20 +84,16 @@ impl HostService {
     }
 
     /// E16.5 / plan §3.3.1: a prepare derives a new run. Refuse it, inside the
-    /// caller's session, once any MVP counter (runs, events, skills, other
-    /// in-flight prepares) is at its limit. Counters are instance-wide (F24):
-    /// a cap reached in any namespace refuses new runs in every namespace.
-    /// Nothing is truncated; the caller is told which counter to scale or
-    /// clean up.
+    /// caller's session, once any MVP counter (runs, events, skills) is at its
+    /// limit; the held prepare slot already admitted the in-flight bound.
+    /// Counters are instance-wide (F24): a cap reached in any namespace refuses
+    /// new runs in every namespace. Nothing is truncated; the caller is told
+    /// which counter to scale or clean up.
     async fn admit_new_run(&self, session: &mut Session) -> Result<()> {
-        let others_in_flight = self.inflight_prepare().saturating_sub(1);
-        let usage: V41CapacityUsage = session.capacity_usage_v41(unix_now_secs()?).await?.into();
-        let usage = usage.with_inflight_prepare(others_in_flight);
-        let limits = CapacityLimits::default();
-        for field in CapacityField::MVP_DERIVE {
-            admit_field(field, field.usage(&usage), &limits)?;
-        }
-        Ok(())
+        use evo_core::capacity::CapacityItem::{Event, Run, Skill};
+        session
+            .admit_capacity(&[(Run, 1), (Event, 1), (Skill, 1)])
+            .await
     }
 
     pub fn trusted_namespace(&self) -> &str {

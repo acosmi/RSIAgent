@@ -2336,6 +2336,9 @@ async fn an_uncertain_dispatch_spent_its_cost_and_a_claimed_one_has_spent_nothin
     let claimed = raw_fact(&env.store, stored["dispatch_ids"][1].as_str().unwrap()).await;
     assert_eq!(claimed["payload"]["state"], "claimed");
     expect_already_registered(env.register(&mixed).await, "a claimed dispatch");
+    // One optimization job runs at a time in the instance (§3.3.1): the claimed
+    // `mixed-2` holds that slot until it ends, so it is resumed to its terminal.
+    env.step("world-mixed", 2, "mixed-2").await;
 
     // A world whose only dispatch is claimed has not spent anything either.
     let claimed_only = world_for("world-claimed-only");

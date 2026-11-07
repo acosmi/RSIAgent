@@ -4,9 +4,7 @@
 //! version. No floating-point conversion occurs here.
 
 use super::lifecycle::{BudgetRequestSources, budget_request_source_ids};
-use super::{
-    MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal, mvp_capacity_exceeded,
-};
+use super::{MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal};
 use crate::typed_budget::{self, E16CallMode};
 use evo_core::evaluation::OptimizationStage;
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
@@ -193,7 +191,12 @@ impl BudgetPreDispatchRefusal {
             | Self::RootBudgetExhausted
             | Self::BudgetArithmeticOverflow => Error::Budget,
             Self::ActiveLeaseCapacity { used, limit } => {
-                mvp_capacity_exceeded("active leases", used, limit)
+                Error::Capacity(evo_core::capacity::CapacityConflict {
+                    item: evo_core::capacity::CapacityItem::ActiveLease,
+                    used,
+                    limit,
+                    delta: 1,
+                })
             }
             Self::Unauthorized => Error::Forbidden,
             Self::CallNamespaceMismatch => Error::NotFound,

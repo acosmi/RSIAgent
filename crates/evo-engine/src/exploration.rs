@@ -1,9 +1,6 @@
 //! generate → execute_dev → observe → decide. Intermediate nodes are not published.
 //! A dispatched candidate is observed as a valid node only when E03's observation gate
 //! verified the development report behind it ([`ExplorationEvidenceV1`]).
-use crate::capacity::{
-    CapacityField, CapacityLimits, V41CapacityUsage, admit_field, unix_now_secs,
-};
 use crate::development::CandidateConsumption;
 use crate::evidence::validate_stored_sources;
 use crate::model::ModelPort;
@@ -1248,16 +1245,18 @@ impl PersistentCoordinator {
                 if world.remaining_root_micros < cost {
                     return Err(Error::Budget);
                 }
-                // E16.5: this dispatch derives one new exploration node. Refuse
-                // inside the session, before the dispatch fact and before any
-                // model call, when the namespace already holds the MVP maximum.
-                let usage: V41CapacityUsage =
-                    session.capacity_usage_v41(unix_now_secs()?).await?.into();
-                admit_field(
-                    CapacityField::ExplorationNodes,
-                    usage.exploration_nodes,
-                    &CapacityLimits::default(),
-                )?;
+                // E16.5: this dispatch derives one new exploration node and starts
+                // one optimization job. Refuse inside the session, before the
+                // dispatch fact and before any model call, at either instance bound.
+                session
+                    .admit_capacity(&[
+                        (evo_core::capacity::CapacityItem::ExplorationNode, 1),
+                        (
+                            evo_core::capacity::CapacityItem::ConcurrentOptimizationJob,
+                            1,
+                        ),
+                    ])
+                    .await?;
                 let fact = ExplorationDispatchFact {
                     schema_version: DISPATCH_SCHEMA.into(),
                     id: dispatch_id.clone(),
@@ -2137,9 +2136,11 @@ fn verdict_for_gate_error(error: &Error) -> CandidateVerdict {
         Error::Forbidden | Error::Conflict(_) | Error::NotFound | Error::Invalid(_) => {
             CandidateVerdict::Rejected
         }
-        Error::ClockRegressed | Error::Budget | Error::Cancelled | Error::Internal => {
-            CandidateVerdict::Unverified
-        }
+        Error::ClockRegressed
+        | Error::Budget
+        | Error::Capacity(_)
+        | Error::Cancelled
+        | Error::Internal => CandidateVerdict::Unverified,
     }
 }
 

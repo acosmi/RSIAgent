@@ -39,8 +39,8 @@ use evo_engine::model::{
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
     DevelopmentRunReport, DevelopmentRunRequest, DevelopmentTask, OPTIMIZATION_STAGE_FACT_SCHEMA,
-    OptimizationStepOutcome, OptimizationStepRequest, PairedTaskResult, StepTerminalClass,
-    run_optimization_step,
+    OptimizationJournal, OptimizationStepOutcome, OptimizationStepRequest, PairedTaskResult,
+    StageFact, StageFactKind, StepTerminalClass, run_optimization_step,
 };
 use evo_storage::Store;
 use evo_storage::budget::RootBudgetAuthorization;
@@ -2128,7 +2128,11 @@ async fn ag129_two_groups_stop_on_real_broker_clock_refusal_before_second_group(
     assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
     assert_eq!(result.unwrap_err().to_string(), "clock_regressed");
     let facts = world.stage_facts().await;
-    assert!(facts_of(&facts, &world.groups[1].episode_id).is_empty());
+    // The job claimed both groups at its admission; the second holds only that claim.
+    assert_eq!(
+        fact_kinds(&facts_of(&facts, &world.groups[1].episode_id)),
+        BTreeSet::from(["step_prepared".to_string()])
+    );
     let root = world
         .store
         .root_budget(&world.worker, "scope-1")
@@ -2139,6 +2143,64 @@ async fn ag129_two_groups_stop_on_real_broker_clock_refusal_before_second_group(
     assert_eq!(root.spent_micros, 0);
     assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
     world.store.close().await;
+}
+
+/// While group b of the two-group job is still in flight, a direct step is
+/// refused at its claim, before any model call or write.
+struct DirectEntryWhileJobOpen<'a> {
+    inner: &'a ScriptedModel,
+    journal: &'a StoreOptimizationJournal,
+    store: Store,
+    worker: Context,
+    path: PathBuf,
+    direct: &'a GroupFixture,
+    refused: AtomicUsize,
+}
+#[async_trait]
+impl ModelPort for DirectEntryWhileJobOpen<'_> {
+    async fn dispatch(&self, _request: ModelRequest) -> Result<ModelResponse> {
+        Err(Error::Forbidden)
+    }
+    async fn dispatch_compiler_bound(
+        &self,
+        request: evo_engine::model::ReadBoundModelRequest,
+    ) -> Result<ModelResponse> {
+        if request.request.episode_id == "episode-b" && self.refused.load(SeqCst) == 0 {
+            use evo_core::capacity::CapacityItem;
+            let mut session = self.store.session().await?;
+            assert_eq!(
+                session
+                    .capacity_used(CapacityItem::ConcurrentOptimizationJob)
+                    .await?,
+                1
+            );
+            let all: Vec<Value> = session.list(&self.worker, "artifact").await?;
+            assert!(
+                all.iter()
+                    .any(|v| v["episode_id"] == "episode-a" && v["kind"] == "step_completed")
+            );
+            session.commit().await?;
+            let before = ag129_r7_sqlite_snapshot(&self.path);
+            let calls = self.inner.calls();
+            let runner = ScriptedRunner::default();
+            let error = evo_engine::optimization::run_optimization_step(
+                Some(self.inner),
+                Some(&runner),
+                Some(self.journal),
+                self.direct.request(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error,Error::Capacity(ref c) if c.item==CapacityItem::ConcurrentOptimizationJob && c.used==1 && c.limit==1 && c.delta==1),
+                "{error:?}"
+            );
+            assert_eq!(ag129_r7_sqlite_snapshot(&self.path), before);
+            assert_eq!((self.inner.calls(), runner.calls()), (calls, 0));
+            self.refused.fetch_add(1, SeqCst);
+        }
+        self.inner.dispatch_compiler_bound(request).await
+    }
 }
 
 #[tokio::test]
@@ -2159,7 +2221,24 @@ async fn one_job_owns_both_groups_and_direct_entry_cannot_bypass_limit() {
         .script("episode-b", ModelScript::NoSuggestions);
     let runner = ScriptedRunner::default();
     let both = [&world.groups[0], &world.groups[1]];
-    let outcome = world.run(&model, &runner, &both).await.unwrap();
+    let guarded = DirectEntryWhileJobOpen {
+        inner: &model,
+        journal: &world.journal,
+        store: world.store.clone(),
+        worker: world.worker.clone(),
+        path: world.path.clone(),
+        direct: &world.groups[2],
+        refused: AtomicUsize::new(0),
+    };
+    let outcome = run_skill_group_job(
+        Some(&guarded),
+        Some(&runner),
+        Some(&world.journal),
+        job(both),
+    )
+    .await
+    .unwrap();
+    assert_eq!(guarded.refused.load(SeqCst), 1);
     assert_eq!(group(&outcome, "group-a").kind, GroupOutcomeKind::Uncertain);
     assert_eq!(group(&outcome, "group-b").kind, GroupOutcomeKind::NoChange);
     let prepared = world
@@ -2182,44 +2261,38 @@ async fn one_job_owns_both_groups_and_direct_entry_cannot_bypass_limit() {
             .len(),
         2
     );
+    // Every declared group reached a terminal and the fixture dispatches
+    // carry no bill: the job, uncertain member included, is closed.
     let mut session = world.store.session().await.unwrap();
     assert_eq!(
         session
             .capacity_used(CapacityItem::ConcurrentOptimizationJob)
             .await
             .unwrap(),
-        1
+        0
     );
     session.commit().await.unwrap();
     let before = ag129_r7_sqlite_snapshot(&world.path);
     let calls = (model.calls(), runner.calls());
-    let error = evo_engine::optimization::run_optimization_step(
-        Some(&model),
-        Some(&runner),
-        Some(&world.journal),
-        world.groups[2].request(),
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        matches!(error,Error::Capacity(ref c) if c.item==CapacityItem::ConcurrentOptimizationJob && c.used==1 && c.limit==1 && c.delta==1),
-        "{error:?}"
-    );
-    assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
-    assert_eq!((model.calls(), runner.calls()), calls);
     assert_eq!(
         as_json(&world.run(&model, &runner, &both).await.unwrap()),
         as_json(&outcome)
     );
     assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
     assert_eq!((model.calls(), runner.calls()), calls);
+    // Another label over the same members replays their recorded results: it
+    // claims nothing new and writes nothing.
     let mut changed = job(both);
     changed.job_id = "changed-job".into();
-    assert!(matches!(
-        run_skill_group_job(Some(&model), Some(&runner), Some(&world.journal), changed).await,
-        Err(Error::Conflict(_))
-    ));
+    let replayed = run_skill_group_job(Some(&model), Some(&runner), Some(&world.journal), changed)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&replayed.groups).unwrap(),
+        serde_json::to_value(&outcome.groups).unwrap()
+    );
     assert_eq!(ag129_r7_sqlite_snapshot(&world.path), before);
+    assert_eq!((model.calls(), runner.calls()), calls);
     world.store.close().await;
 }
 
