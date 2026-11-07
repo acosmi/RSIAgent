@@ -343,8 +343,8 @@ async fn a_trusted_run_cannot_be_stored_under_the_id_of_an_import_source() {
 #[tokio::test]
 async fn an_artifact_that_is_not_an_import_source_does_not_block_a_run_of_the_same_id() {
     // AG-032: an object of another kind that shares a run's id is a different
-    // object, unless it is a revocation source of its own. Only the E16
-    // import_source schema is.
+    // object, unless it has a registered revocation identity of its own. An E16
+    // import_source needs its strict outer identity, not a schema label.
     let (_dir, store) = open().await;
     for (id, schema) in [
         ("shared-with-a-pool-row", "rsia.replay_pool.fixture.v1"),
@@ -624,4 +624,169 @@ async fn a_run_revoked_after_an_import_source_of_its_id_is_a_named_conflict() {
         status_before
     );
     assert!(raw(&store, "run", "run-failure").await.is_some());
+}
+
+#[tokio::test]
+async fn q03_claimed_source_schema_without_complete_identity_is_not_authority() {
+    let (dir, store) = open().await;
+    raw_put(
+        &store,
+        "artifact",
+        "claimed-import",
+        &json!({
+            "id":"claimed-import", "schema_version":IMPORT_SOURCE_SCHEMA,
+            "execution_attestation":"trusted_host"
+        }),
+    )
+    .await;
+    store_run(&store, "claimed-import").await.unwrap();
+    let mut session = store.session().await.unwrap();
+    assert!(
+        !session
+            .registered_revocable_source(
+                &admin(),
+                evo_core::evidence::RevocableSourceKind::ImportSource,
+                "claimed-import"
+            )
+            .await
+            .unwrap()
+    );
+    session.commit().await.unwrap();
+    write_history(dir.path()).await;
+    let request = registration(dir.path(), "claimed-run", &["one"]);
+    let source = derived_source_id(&request, "one");
+    raw_put(&store, "run", &source, &json!({"id":source,"schema_version":"rsia.optimization.source.v1","task_origin":"trusted_run","execution_attestation":"trusted_host"})).await;
+    let before = snapshot(&store).await;
+    expect_conflict(
+        PersistentImportService::new(store.clone())
+            .register(&admin(), request.clone())
+            .await,
+        "an existing run identity reserves its id even when it cannot be consumed",
+    );
+    assert_eq!(snapshot(&store).await, before);
+    assert_no_registration_trace(&store, &request, std::slice::from_ref(&source)).await;
+    // Revocation only removes authority: this legacy run body can be blocked
+    // even though it cannot authorize a new content-dependent budget write.
+    LifecycleStore::begin_revoke(
+        &admin(),
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: source.clone(),
+        },
+        "legacy source control",
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        raw(&store, "tombstone", &source).await.unwrap()["source_kind"],
+        "run"
+    );
+}
+
+#[tokio::test]
+async fn q03_stored_qualified_collision_isolates_only_its_namespace() {
+    let (dir, store) = open().await;
+    write_history(dir.path()).await;
+    let selection = PersistentImportService::new(store.clone())
+        .register(
+            &admin(),
+            registration(dir.path(), "stored-collision", &["one"]),
+        )
+        .await
+        .unwrap();
+    let id = &selection.payload.import_source_ids[0];
+    raw_put(
+        &store,
+        "run",
+        id,
+        &serde_json::to_value(authority(id)).unwrap(),
+    )
+    .await;
+    let before = snapshot(&store).await;
+    let error = store_run(&store, "new-in-isolated-namespace")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::Conflict(ref message) if message.contains("isolates namespace n") && message.contains(id))
+    );
+    assert_eq!(snapshot(&store).await, before);
+    let mut session = store.session().await.unwrap();
+    assert!(
+        !session
+            .revocation_sources_live(&admin(), &[])
+            .await
+            .unwrap()
+    );
+    let other = Context::new("unaffected", "host", Role::Host).unwrap();
+    assert!(session.revocation_sources_live(&other, &[]).await.unwrap());
+    session.commit().await.unwrap();
+    store_trace_authority(&store, &other, &authority("same-host-other-namespace"))
+        .await
+        .unwrap();
+    // Only two registered sources isolate a namespace: a run body without its
+    // trusted authority next to the same import_source is no longer a collision.
+    raw_put(&store, "run", id, &json!({"id":id})).await;
+    store_run(&store, "after-unqualified-pair").await.unwrap();
+    let mut session = store.session().await.unwrap();
+    assert!(
+        session
+            .revocation_sources_live(&admin(), &[])
+            .await
+            .unwrap()
+    );
+    session.commit().await.unwrap();
+    LifecycleStore::begin_revoke(
+        &admin(),
+        &store,
+        TypedObjectRef {
+            kind: "artifact".into(),
+            id: id.clone(),
+        },
+        "legacy import control",
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        raw(&store, "tombstone", id).await.unwrap()["source_kind"],
+        "artifact"
+    );
+}
+
+#[tokio::test]
+async fn q03_source_creation_checks_both_qualified_kinds_before_write() {
+    let (dir, store) = open().await;
+    write_history(dir.path()).await;
+    let request = registration(dir.path(), "all-source-ids", &["first", "second"]);
+    let second = derived_source_id(&request, "second");
+    store_run(&store, &second).await.unwrap();
+    let before = snapshot(&store).await;
+    expect_conflict(
+        PersistentImportService::new(store.clone())
+            .register(&admin(), request.clone())
+            .await,
+        "qualified run collision",
+    );
+    assert_eq!(snapshot(&store).await, before);
+    assert_no_registration_trace(
+        &store,
+        &request,
+        &[derived_source_id(&request, "first"), second],
+    )
+    .await;
+    let healthy = PersistentImportService::new(store.clone())
+        .register(
+            &admin(),
+            registration(dir.path(), "other-qualified-kind", &["one"]),
+        )
+        .await
+        .unwrap();
+    let before = snapshot(&store).await;
+    expect_conflict(
+        store_run(&store, &healthy.payload.import_source_ids[0]).await,
+        "qualified import collision",
+    );
+    assert_eq!(snapshot(&store).await, before);
 }

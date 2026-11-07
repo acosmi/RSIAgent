@@ -985,7 +985,7 @@ async fn ag054_begin_root_group_and_revoked_source_release_and_replay_after_rest
         authorize(&store).await;
         let admin = Context::new("ns-a", "admin", Role::Admin).unwrap();
         let req = request("pending", ModelStage::Merge);
-        reserve_model_request(&store, &req).await;
+        let reserved = reserve_model_request(&store, &req).await;
         match mode {
             "root_stopped" => {
                 store
@@ -1030,12 +1030,19 @@ async fn ag054_begin_root_group_and_revoked_source_release_and_replay_after_rest
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(persisted.state, BudgetCallState::Released);
+        if mode == "source_revoked" {
+            // Q03：撤销拒绝新 dispatch，保留预留账务，不以退款冒充拒前零写。
+            assert_eq!(persisted, reserved);
+            assert_eq!(persisted.state, BudgetCallState::Reserved);
+            assert_eq!(persisted.terminal_reason, None);
+        } else {
+            assert_eq!(persisted.state, BudgetCallState::Released);
+            assert_eq!(
+                persisted.terminal_reason,
+                Some(format!("broker_pre_dispatch_v1.{mode}"))
+            );
+        }
         assert_eq!(persisted.dispatch_id, None);
-        assert_eq!(
-            persisted.terminal_reason,
-            Some(format!("broker_pre_dispatch_v1.{mode}"))
-        );
         assert_eq!(
             store
                 .root_budget(&admin, "scope-1")
@@ -1043,7 +1050,7 @@ async fn ag054_begin_root_group_and_revoked_source_release_and_replay_after_rest
                 .unwrap()
                 .unwrap()
                 .reserved_micros,
-            0
+            if mode == "source_revoked" { 20 } else { 0 }
         );
         assert_eq!(
             serde_json::to_value(broker.dispatch(req.clone()).await.unwrap()).unwrap(),
@@ -1059,10 +1066,23 @@ async fn ag054_begin_root_group_and_revoked_source_release_and_replay_after_rest
             fixed_clock(),
         )
         .unwrap();
-        assert_eq!(
-            serde_json::to_value(disabled.dispatch(req).await.unwrap()).unwrap(),
-            serde_json::to_value(first).unwrap()
-        );
+        let replay = serde_json::to_value(disabled.dispatch(req).await.unwrap()).unwrap();
+        if mode == "source_revoked" {
+            // Q03：预留保留为 Reserved，因此停用的传输先于来源门判定；
+            // 不再回放 source_revoked 释放原因。
+            assert_eq!(
+                replay,
+                serde_json::to_value(ModelResponse::Rejected {
+                    request_id: "pending".into(),
+                    kind: ModelRejectionKind::Unauthorized,
+                    reason: "model transport is disabled".into(),
+                    dispatch: RejectedDispatch::NotDispatched,
+                })
+                .unwrap()
+            );
+        } else {
+            assert_eq!(replay, serde_json::to_value(first).unwrap());
+        }
     }
 }
 

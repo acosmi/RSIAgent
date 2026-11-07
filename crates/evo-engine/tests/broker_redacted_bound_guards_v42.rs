@@ -1845,3 +1845,106 @@ async fn ag121_session_different_lowercase_original_digest_refuses_zero_logical_
 async fn ag121_session_plain_identity_retains_original_fingerprint_guard() {
     ag121_session_identity_control("ag121-session-plain", None).await;
 }
+
+#[tokio::test]
+async fn q03_unsettled_or_missing_response_refusal_is_zero_write() {
+    for phase in ["reserved", "dispatched", "paid_without_response"] {
+        let world = World::new().await;
+        let inputs = current_compiler_use(&world.store, 1).await;
+        let bound = current_bound_request(phase, 1, &RUNS, "software fixture", &inputs);
+        let read = read_bound(&bound);
+        let request = &read.request;
+        let reservation = BudgetCallReservation {
+            billing_scope: SCOPE.into(),
+            call_id: request.request_id.clone(),
+            dispatch_group_id: request.episode_id.clone(),
+            stage: BudgetStage::Reflection,
+            actual_input_digest: request.cache_key_digest.clone(),
+            request_artifact: Some(
+                BudgetArtifact::from_serializable(read.schema_version.clone(), &bound).unwrap(),
+            ),
+            max_cost_micros: 20,
+            lease_token: fingerprint(&("host", SCOPE, &bound)).unwrap(),
+            lease_until: NOW + 60,
+            now: NOW,
+        };
+        let sources = request
+            .source_closure
+            .iter()
+            .map(|source| source.id.clone())
+            .collect::<Vec<_>>();
+        let call = world
+            .store
+            .reserve_budget_call_with_sources(&host(), &reservation, &sources)
+            .await
+            .unwrap();
+        let fence = BudgetCallFence {
+            billing_scope: SCOPE.into(),
+            call_id: request.request_id.clone(),
+            actual_input_digest: call.actual_input_digest.clone(),
+            lease_token: call.lease_token.clone(),
+            lease_epoch: call.lease_epoch,
+            now: NOW,
+        };
+        if phase != "reserved" {
+            let dispatched = world
+                .store
+                .begin_budget_dispatch(&host(), &fence)
+                .await
+                .unwrap();
+            assert!(dispatched.new_dispatch);
+            if phase == "paid_without_response" {
+                let completion = world
+                    .transport
+                    .execute(request, dispatched.call.dispatch_id.as_ref().unwrap())
+                    .await
+                    .unwrap();
+                world
+                    .store
+                    .finalize_budget_call(
+                        &host(),
+                        &fence,
+                        &UsageCharge {
+                            amount_micros: completion.actual_cost_micros,
+                            currency: completion.currency,
+                            pricing_version: completion.pricing_version,
+                            provider_request_id: completion.provider_request_id,
+                            usage_record_id: completion.usage_record_id,
+                            output_digest: hash(completion.output.as_bytes()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+        LifecycleStore::begin_revoke(
+            &admin(),
+            &world.store,
+            TypedObjectRef {
+                kind: "run".into(),
+                id: RUNS[1].into(),
+            },
+            "q03 fixture",
+            30,
+        )
+        .await
+        .unwrap();
+        let original = world.call(&bound).await;
+        assert!(original.response_artifact.is_none());
+        // A reservation opens no execution; only its dispatch opens one.
+        assert_eq!(original.execution_closed, phase == "reserved", "{phase}");
+        let before = ag121_fixed_lossless_snapshot(&world.path);
+        let error = world.replay_current(&bound).await.unwrap_err();
+        assert_conflict(&error, BINDING_MISMATCH);
+        assert_eq!(
+            ag121_fixed_lossless_snapshot(&world.path),
+            before,
+            "{phase}"
+        );
+        assert_eq!(world.call(&bound).await, original);
+        assert_eq!(
+            world.provider_calls(),
+            usize::from(phase == "paid_without_response")
+        );
+    }
+}

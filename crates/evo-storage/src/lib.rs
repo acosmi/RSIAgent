@@ -4,6 +4,7 @@ pub mod budget;
 pub mod dependency_read;
 pub mod lifecycle;
 pub mod replay;
+pub mod revocation;
 pub mod typed_budget;
 pub use sqlx;
 
@@ -23,7 +24,10 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{OwnedRwLockWriteGuard, RwLock},
+};
 
 pub const MVP_MAX_RUNS: u64 = 1_000;
 /// Storage-side mirrors of the E16.5 MVP capacity bounds enforced inside this
@@ -744,11 +748,30 @@ pub struct ObjectRowSnapshot {
 
 pub struct Session {
     tx: Transaction<'static, Sqlite>,
+    blob_write: Option<(PathBuf, OwnedRwLockWriteGuard<()>)>,
 }
 
 /// Schema of the tombstone the revocation cleanup leaves in place of an artifact
 /// whose source was revoked (plan §11.5, E08).
 const REDACTED_SCHEMA: &str = "rsia.redacted.v1";
+
+/// The largest content blob any writer or verifier accepts.
+const MAX_BLOB_BYTES: usize = 64 * 1024 * 1024;
+
+/// The bounded dependency closure of `?1` (a JSON array of `[kind, id]` roots) in
+/// namespace `?2`, walking at most `?3` nodes. LIMIT inside the recursive CTE
+/// bounds the walk itself; CROSS JOIN keeps its queue outside the dependency
+/// lookup (the existing measured algorithm).
+const CLOSURE_FROM_ROOTS: &str = "WITH RECURSIVE closure(kind, id) AS (
+       SELECT json_extract(r.value, '$[0]'), json_extract(r.value, '$[1]')
+         FROM json_each(?1) AS r
+       UNION
+       SELECT d.dst_kind, d.dst_id
+         FROM closure AS c
+         CROSS JOIN dependencies AS d
+           ON d.namespace = ?2 AND d.src_kind = c.kind AND d.src_id = c.id
+       LIMIT ?3
+     )";
 
 /// A `run` or `artifact` node of an upstream closure ([`Session::upstream_closure`])
 /// with what a revocation gate needs to judge it.
@@ -1105,7 +1128,7 @@ impl Drop for PrivateStagedBlob {
 }
 
 fn validate_blob_bound(bytes: &[u8], max_bytes: usize) -> Result<()> {
-    if max_bytes == 0 || max_bytes > 64 * 1024 * 1024 {
+    if max_bytes == 0 || max_bytes > MAX_BLOB_BYTES {
         return Err(Error::Invalid(
             "blob write bound must be 1..=67108864 bytes".into(),
         ));
@@ -1353,6 +1376,56 @@ async fn blob_file_identity(path: &Path) -> Result<BlobFileIdentity> {
     .map_err(internal)?
 }
 
+/// A blob already at `path`, hashed and identified so its later publication can
+/// verify it was not replaced; `None` when nothing is there.
+async fn preverified_blob_identity(
+    path: &Path,
+    digest: &str,
+    max_bytes: usize,
+) -> Result<Option<BlobFileIdentity>> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => {
+            verify_blob_file(path, digest, max_bytes).await?;
+            Ok(Some(blob_file_identity(path).await?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(internal(error)),
+    }
+}
+
+/// The first FS write of a registered publication, after every revocation,
+/// producer, source and watermark read of its writer transaction: a private
+/// synced temp, re-hashed, then a no-replace rename or the preverified target.
+async fn write_registered_blob(
+    root: &Path,
+    namespace: &str,
+    digest: &str,
+    bytes: &[u8],
+    max_bytes: usize,
+    existing: Option<&BlobFileIdentity>,
+) -> Result<()> {
+    let namespace_hash = hash(namespace.as_bytes());
+    let staging_dir = root.join(".blob-staging").join(&namespace_hash);
+    tokio::fs::create_dir_all(&staging_dir)
+        .await
+        .map_err(internal)?;
+    let mut staged =
+        PrivateStagedBlob::new(staging_dir.join(format!("{}.tmp", uuid::Uuid::new_v4())));
+    write_synced_temp(staged.path(), bytes).await?;
+    verify_blob_file(staged.path(), digest, max_bytes).await?;
+    let final_dir = root.join("blobs").join(namespace_hash);
+    tokio::fs::create_dir_all(&final_dir)
+        .await
+        .map_err(internal)?;
+    let published =
+        publish_or_verify_blob(staged.path(), &final_dir.join(digest), existing).await?;
+    staged.disarm();
+    if published {
+        sync_directory(&final_dir).await?;
+    }
+    Ok(())
+}
+
 async fn publish_or_verify_blob(
     temp: &Path,
     final_path: &Path,
@@ -1513,6 +1586,7 @@ async fn verify_registered_source_refs(
     } else {
         "digest"
     };
+    let mut parsed = Vec::with_capacity(refs.len());
     for source in refs {
         let source = source
             .as_object()
@@ -1544,9 +1618,22 @@ async fn verify_registered_source_refs(
                 "registered source_ref digest is invalid".into(),
             ));
         }
-        if session.get::<Value>(ctx, "tombstone", id).await?.is_some() {
-            return Err(Error::Forbidden);
-        }
+        parsed.push((kind, id, expected_digest));
+    }
+    // The walk starts at the refs themselves, so it also judges each ref's own
+    // tombstone and redaction before its content is compared.
+    let roots: Vec<_> = parsed
+        .iter()
+        .map(|(kind, id, _)| (kind.to_string(), id.to_string()))
+        .collect();
+    if session
+        .revocation_upstream(ctx, &roots, revocation::MAX_UPSTREAM_CLOSURE_NODES)
+        .await?
+        .is_some()
+    {
+        return Err(Error::Forbidden);
+    }
+    for (kind, id, expected_digest) in parsed {
         if kind == "blob" {
             if id != publishing_digest || expected_digest != publishing_digest {
                 return Err(Error::Conflict(
@@ -1599,7 +1686,11 @@ async fn load_dependency_record_snapshots(
     for row in rows {
         let kind: String = row.try_get("kind").map_err(internal)?;
         let id: String = row.try_get("id").map_err(internal)?;
-        if session.get::<Value>(ctx, "tombstone", &id).await?.is_some() {
+        if session
+            .revocation_dependency(ctx, &kind, &id)
+            .await?
+            .is_some()
+        {
             return Err(Error::Forbidden);
         }
         let record_fingerprint = if kind == "blob" {
@@ -1868,6 +1959,7 @@ async fn verify_export_source_refs(
     ctx: &Context,
     refs: &[Value],
 ) -> Result<()> {
+    let mut parsed = Vec::with_capacity(refs.len());
     for source in refs {
         let source = source
             .as_object()
@@ -1887,9 +1979,21 @@ async fn verify_export_source_refs(
             .get("digest")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Conflict("export source_ref lacks digest".into()))?;
-        if session.get::<Value>(ctx, "tombstone", id).await?.is_some() {
-            return Err(Error::Forbidden);
-        }
+        parsed.push((kind, id, digest));
+    }
+    // The walk starts at the refs themselves (see verify_registered_source_refs).
+    let roots: Vec<_> = parsed
+        .iter()
+        .map(|(kind, id, _)| (kind.to_string(), id.to_string()))
+        .collect();
+    if session
+        .revocation_upstream(ctx, &roots, revocation::MAX_UPSTREAM_CLOSURE_NODES)
+        .await?
+        .is_some()
+    {
+        return Err(Error::Forbidden);
+    }
+    for (kind, id, digest) in parsed {
         let stored: Value = session.need(ctx, kind, id).await?;
         if fingerprint(&stored)? != digest {
             return Err(Error::Conflict("export source changed".into()));
@@ -2031,8 +2135,10 @@ fn has_exact_fields(value: &Value, fields: &[&str]) -> bool {
 
 /// Private raw walk. `None` is a measured node-limit excess, never a SQL error.
 /// All node kinds count toward the bound; only run/artifact facts are returned.
-/// Run-body redaction is read only when the typed caller requests it.
-/// Session::upstream_closure keeps its historical decode, ordering and errors.
+/// Artifact redaction is always read; run-body redaction only for the typed E16
+/// snapshot (`revocation::status_in_tx` with `typed_e16`). The direct gates and
+/// Session::upstream_closure, which keeps its historical decode, ordering and
+/// errors, never read a run body.
 pub(crate) struct RawUpstreamNode {
     pub kind: String,
     pub id: String,
@@ -2053,19 +2159,8 @@ pub(crate) async fn upstream_rows_in_tx(
     }
     let seeds = serde_json::to_string(roots).map_err(internal)?;
     let fetch = i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1);
-    // LIMIT inside the recursive CTE bounds the walk itself. CROSS JOIN keeps
-    // its queue outside the dependency lookup (the existing measured algorithm).
-    let rows = sqlx::query(
-        "WITH RECURSIVE closure(kind, id) AS (
-           SELECT json_extract(r.value, '$[0]'), json_extract(r.value, '$[1]')
-             FROM json_each(?1) AS r
-           UNION
-           SELECT d.dst_kind, d.dst_id
-             FROM closure AS c
-             CROSS JOIN dependencies AS d
-               ON d.namespace = ?2 AND d.src_kind = c.kind AND d.src_id = c.id
-           LIMIT ?3
-         )
+    let rows = sqlx::query(&format!(
+        "{CLOSURE_FROM_ROOTS}
          SELECT c.kind AS kind, c.id AS id, t.body AS tombstone,
                 CASE WHEN c.kind = 'artifact' OR (?5 AND c.kind = 'run')
                      THEN COALESCE(json_extract(o.body, '$.schema_version') = ?4, 0)
@@ -2077,8 +2172,8 @@ pub(crate) async fn upstream_rows_in_tx(
             AND t.namespace = ?2 AND t.kind = 'tombstone' AND t.id = c.id
            LEFT JOIN objects AS o
              ON c.kind IN ('run', 'artifact')
-            AND o.namespace = ?2 AND o.kind = c.kind AND o.id = c.id",
-    )
+            AND o.namespace = ?2 AND o.kind = c.kind AND o.id = c.id"
+    ))
     .bind(seeds)
     .bind(namespace)
     .bind(fetch)
@@ -2142,6 +2237,22 @@ impl Store {
     pub async fn session(&self) -> Result<Session> {
         Ok(Session {
             tx: self.pool.begin().await.map_err(internal)?,
+            blob_write: None,
+        })
+    }
+
+    /// One request's publication boundary: blob lock, then a real SQLite write
+    /// intent. BEGIN IMMEDIATE obtains the writer fence without executing DML.
+    #[doc(hidden)]
+    pub async fn registered_blob_write_session(&self) -> Result<Session> {
+        let guard = self.blob_lock.clone().write_owned().await;
+        Ok(Session {
+            tx: self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(internal)?,
+            blob_write: Some((self.root.clone(), guard)),
         })
     }
     pub async fn close(&self) {
@@ -2178,14 +2289,8 @@ impl Store {
             .join(hash(ctx.namespace().as_bytes()));
         tokio::fs::create_dir_all(&dir).await.map_err(internal)?;
         let final_path = dir.join(&digest);
-        let existing_preverified = match tokio::fs::symlink_metadata(&final_path).await {
-            Ok(_) => {
-                verify_blob_file(&final_path, &digest, max_bytes).await?;
-                Some(blob_file_identity(&final_path).await?)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(internal(error)),
-        };
+        let existing_preverified =
+            preverified_blob_identity(&final_path, &digest, max_bytes).await?;
         let temp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
         let mut staged = PrivateStagedBlob::new(temp);
         write_synced_temp(staged.path(), bytes).await?;
@@ -2199,8 +2304,9 @@ impl Store {
         Ok(digest)
     }
     /// Publish bytes only while a strict E16 Prepared artifact still registers
-    /// their digest. The private file write and hash happen before the DB lock;
-    /// publication takes the same blob-lock -> SQLite-lock order as cleanup.
+    /// their digest. The bytes and existing target are hashed in the preflight;
+    /// publication takes the same blob-lock -> SQLite-write-lock order as cleanup
+    /// and judges everything before its first FS write.
     pub async fn publish_registered_blob(
         &self,
         ctx: &Context,
@@ -2265,16 +2371,12 @@ impl Store {
         let dependencies = self
             .prevalidate_registered_dependency_blobs(ctx, dependency_plan, Some(digest.as_str()))
             .await?;
-        let namespace_hash = hash(ctx.namespace().as_bytes());
-        let final_path = self.root.join("blobs").join(namespace_hash).join(&digest);
-        let existing_identity = match tokio::fs::symlink_metadata(&final_path).await {
-            Ok(_) => {
-                verify_blob_file(&final_path, &digest, max_bytes).await?;
-                Some(blob_file_identity(&final_path).await?)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(internal(error)),
-        };
+        let final_path = self
+            .root
+            .join("blobs")
+            .join(hash(ctx.namespace().as_bytes()))
+            .join(&digest);
+        let existing_identity = preverified_blob_identity(&final_path, &digest, max_bytes).await?;
         Ok(RegisteredBlobPublishPlan {
             namespace: ctx.namespace().into(),
             artifact_id: artifact_id.into(),
@@ -2304,108 +2406,63 @@ impl Store {
                 "registered blob bytes changed after preflight".into(),
             ));
         }
-        let artifact_id = plan.artifact_id;
-        let expected_schema = plan.expected_schema;
-        let payload_digest_field = plan.payload_digest_field;
-        let digest = plan.digest;
-        let max_bytes = plan.max_bytes;
-        let existing_preverified = plan.existing_identity;
-        let dependencies = plan.dependencies;
-        let namespace_hash = hash(ctx.namespace().as_bytes());
-        let staging_dir = self.root.join(".blob-staging").join(&namespace_hash);
-        tokio::fs::create_dir_all(&staging_dir)
-            .await
-            .map_err(internal)?;
-        let temp_path = staging_dir.join(format!("{}.tmp", uuid::Uuid::new_v4()));
-        let mut staged = PrivateStagedBlob::new(temp_path);
-        write_synced_temp(staged.path(), bytes).await?;
-
-        verify_blob_file(staged.path(), &digest, max_bytes).await?;
-        let final_dir = self.root.join("blobs").join(namespace_hash);
-        tokio::fs::create_dir_all(&final_dir)
-            .await
-            .map_err(internal)?;
-        let final_path = final_dir.join(&digest);
-
-        let _guard = self.blob_lock.write().await;
-        self.verify_prevalidated_dependency_identities(ctx, &dependencies)
+        let mut session = self.registered_blob_write_session().await?;
+        self.verify_prevalidated_dependency_identities(ctx, &plan.dependencies)
             .await?;
-        let mut session = self.session().await?;
-        let fenced = sqlx::query(
-            "UPDATE objects SET revision=revision
-             WHERE namespace=? AND kind='artifact' AND id=?",
-        )
-        .bind(ctx.namespace())
-        .bind(&artifact_id)
-        .execute(&mut *session.tx)
-        .await
-        .map_err(internal)?;
-        if fenced.rows_affected() != 1 {
-            return Err(Error::NotFound);
-        }
         if session
-            .get::<Value>(ctx, "tombstone", &artifact_id)
+            .revocation_dependency(ctx, "artifact", &plan.artifact_id)
             .await?
             .is_some()
         {
             return Err(Error::Forbidden);
         }
-        let artifact: Value = session.need(ctx, "artifact", &artifact_id).await?;
-        let state_field = if matches!(
-            expected_schema.as_str(),
-            "rsia.e16.seed_install.v1" | "rsia.e16.seed_install.v2" | "rsia.e16.import_source.v1"
-        ) {
-            "status"
-        } else {
-            "state"
-        };
-        if artifact.get("schema_version").and_then(Value::as_str) != Some(expected_schema.as_str())
-            || artifact.get("id").and_then(Value::as_str) != Some(artifact_id.as_str())
-            || artifact.get("namespace").and_then(Value::as_str) != Some(ctx.namespace())
-            || artifact.get("owner_actor").and_then(Value::as_str) != Some(ctx.actor())
-            || artifact
-                .get("payload")
-                .and_then(|payload| payload.get(state_field))
-                .and_then(Value::as_str)
-                != Some("prepared")
-            || artifact
-                .get("payload")
-                .and_then(|payload| payload.get(&payload_digest_field))
-                .and_then(Value::as_str)
-                != Some(digest.as_str())
-        {
-            return Err(Error::Conflict(
-                "registered blob producer is missing, revoked, changed, or no longer Prepared"
-                    .into(),
-            ));
+        verify_dependency_snapshot_in_session(&mut session, ctx, &plan.dependencies).await?;
+        let final_path = self
+            .root
+            .join("blobs")
+            .join(hash(ctx.namespace().as_bytes()))
+            .join(&plan.digest);
+        match &plan.existing_identity {
+            Some(identity) if blob_file_identity(&final_path).await? != *identity => {
+                return Err(Error::Conflict(
+                    "registered blob identity changed after preflight".into(),
+                ));
+            }
+            None if tokio::fs::try_exists(&final_path).await.map_err(internal)? => {
+                return Err(Error::Conflict(
+                    "blob target appeared after preflight; retry publication".into(),
+                ));
+            }
+            _ => {}
         }
-        let expected_watermark = artifact
-            .get("revoke_watermark")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| Error::Conflict("registered blob producer lacks watermark".into()))?;
-        let current_watermark = session
-            .watermark(ctx)
-            .await?
-            .and_then(|(seq, _)| u64::try_from(seq).ok())
-            .ok_or_else(|| Error::Conflict("current revoke watermark is unavailable".into()))?;
-        if expected_watermark != current_watermark {
-            return Err(Error::Conflict(
-                "registered blob producer watermark is stale".into(),
-            ));
-        }
-        verify_registered_source_refs(&mut session, ctx, &expected_schema, &artifact, &digest)
+        let artifact = session
+            .registered_blob_producer(
+                ctx,
+                &plan.artifact_id,
+                &plan.expected_schema,
+                &plan.payload_digest_field,
+                &plan.digest,
+            )
             .await?;
-        verify_dependency_snapshot_in_session(&mut session, ctx, &dependencies).await?;
-        let published =
-            publish_or_verify_blob(staged.path(), &final_path, existing_preverified.as_ref())
-                .await?;
-        staged.disarm();
+        verify_registered_source_refs(
+            &mut session,
+            ctx,
+            &plan.expected_schema,
+            &artifact,
+            &plan.digest,
+        )
+        .await?;
+        write_registered_blob(
+            &self.root,
+            ctx.namespace(),
+            &plan.digest,
+            bytes,
+            plan.max_bytes,
+            plan.existing_identity.as_ref(),
+        )
+        .await?;
         session.commit().await?;
-        drop(_guard);
-        if published {
-            sync_directory(&final_dir).await?;
-        }
-        Ok(digest)
+        Ok(plan.digest)
     }
 
     pub fn local_export_directory(&self, ctx: &Context, export_id: &str) -> Result<PathBuf> {
@@ -2487,7 +2544,7 @@ impl Store {
                 .join("blobs")
                 .join(hash(ctx.namespace().as_bytes()))
                 .join(&record.id);
-            verify_blob_file(&path, &record.id, 64 * 1024 * 1024).await?;
+            verify_blob_file(&path, &record.id, MAX_BLOB_BYTES).await?;
             blob_identities.push((record.id.clone(), blob_file_identity(&path).await?));
         }
         Ok(LocalExportDependencySnapshot {
@@ -2535,78 +2592,11 @@ impl Store {
         let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
         let receipt =
             local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
-        let namespace_hash = hash(ctx.namespace().as_bytes());
-        let staging_root = self.root.join(".export-staging");
-        ensure_unlinked_directory(&staging_root).await?;
-        let staging_parent = staging_root.join(&namespace_hash);
-        ensure_unlinked_directory(&staging_parent).await?;
-        let staging_path = staging_parent.join(uuid::Uuid::new_v4().to_string());
-        let mut staging = PrivateStagedDirectory::new(staging_path.clone());
-        tokio::fs::create_dir(&staging_path)
-            .await
-            .map_err(internal)?;
-        write_local_export_staging(staging.path(), files).await?;
-        if verify_local_export_directory(staging.path(), files).await?
-            != (tree_digest.clone(), delivered_bytes)
-        {
-            return Err(Error::Conflict("staged local export tree changed".into()));
-        }
-        let staging_identity = local_export_identity(staging.path()).await?;
-
-        let final_path = self.local_export_directory(ctx, export_id)?;
-        let final_parent = final_path.parent().ok_or(Error::Internal)?;
-        let export_root = self.root.join("exports");
-        ensure_unlinked_directory(&export_root).await?;
-        ensure_unlinked_directory(final_parent).await?;
-        let preverified_final = if tokio::fs::try_exists(&final_path).await.map_err(internal)? {
-            if verify_local_export_directory(&final_path, files).await?
-                != (tree_digest.clone(), delivered_bytes)
-            {
-                return Err(Error::Conflict("existing local export differs".into()));
-            }
-            Some(local_export_identity(&final_path).await?)
-        } else {
-            None
-        };
-
-        let _guard = self.blob_lock.write().await;
-        if local_export_identity(staging.path()).await? != staging_identity {
-            return Err(Error::Conflict(
-                "staged local export identity changed".into(),
-            ));
-        }
-        match &preverified_final {
-            Some(identity) => {
-                if local_export_identity(&final_path).await? != *identity {
-                    return Err(Error::Conflict(
-                        "existing local export identity changed".into(),
-                    ));
-                }
-            }
-            None => {
-                if tokio::fs::try_exists(&final_path).await.map_err(internal)? {
-                    return Err(Error::Conflict(
-                        "local export target appeared after preflight".into(),
-                    ));
-                }
-            }
-        }
+        let mut session = self.registered_blob_write_session().await?;
         self.verify_prevalidated_dependency_identities(ctx, dependencies)
             .await?;
-        let mut session = self.session().await?;
-        let fenced = sqlx::query(
-            "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
-        )
-        .bind(ctx.namespace())
-        .bind(export_id)
-        .execute(&mut *session.tx)
-        .await
-        .map_err(internal)?;
-        if fenced.rows_affected() != 1 {
-            return Err(Error::NotFound);
-        }
         if session
-            .get::<Value>(ctx, "tombstone", export_id)
+            .revocation_dependency(ctx, "artifact", export_id)
             .await?
             .is_some()
         {
@@ -2657,6 +2647,62 @@ impl Store {
             completed_attempt["payload"]["completion_receipt_digest"].clone();
         if expected_completed != *completed_attempt {
             return Err(Error::Conflict("completed export content differs".into()));
+        }
+
+        let namespace_hash = hash(ctx.namespace().as_bytes());
+        let staging_root = self.root.join(".export-staging");
+        ensure_unlinked_directory(&staging_root).await?;
+        let staging_parent = staging_root.join(&namespace_hash);
+        ensure_unlinked_directory(&staging_parent).await?;
+        let staging_path = staging_parent.join(uuid::Uuid::new_v4().to_string());
+        let mut staging = PrivateStagedDirectory::new(staging_path.clone());
+        tokio::fs::create_dir(&staging_path)
+            .await
+            .map_err(internal)?;
+        write_local_export_staging(staging.path(), files).await?;
+        if verify_local_export_directory(staging.path(), files).await?
+            != (tree_digest.clone(), delivered_bytes)
+        {
+            return Err(Error::Conflict("staged local export tree changed".into()));
+        }
+        let staging_identity = local_export_identity(staging.path()).await?;
+
+        let final_path = self.local_export_directory(ctx, export_id)?;
+        let final_parent = final_path.parent().ok_or(Error::Internal)?;
+        let export_root = self.root.join("exports");
+        ensure_unlinked_directory(&export_root).await?;
+        ensure_unlinked_directory(final_parent).await?;
+        let preverified_final = if tokio::fs::try_exists(&final_path).await.map_err(internal)? {
+            if verify_local_export_directory(&final_path, files).await?
+                != (tree_digest.clone(), delivered_bytes)
+            {
+                return Err(Error::Conflict("existing local export differs".into()));
+            }
+            Some(local_export_identity(&final_path).await?)
+        } else {
+            None
+        };
+
+        if local_export_identity(staging.path()).await? != staging_identity {
+            return Err(Error::Conflict(
+                "staged local export identity changed".into(),
+            ));
+        }
+        match &preverified_final {
+            Some(identity) => {
+                if local_export_identity(&final_path).await? != *identity {
+                    return Err(Error::Conflict(
+                        "existing local export identity changed".into(),
+                    ));
+                }
+            }
+            None => {
+                if tokio::fs::try_exists(&final_path).await.map_err(internal)? {
+                    return Err(Error::Conflict(
+                        "local export target appeared after preflight".into(),
+                    ));
+                }
+            }
         }
 
         if preverified_final.is_none() {
@@ -2733,19 +2779,8 @@ impl Store {
         self.verify_prevalidated_dependency_identities(ctx, &dependencies)
             .await?;
         let mut session = self.session().await?;
-        let fenced = sqlx::query(
-            "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
-        )
-        .bind(ctx.namespace())
-        .bind(export_id)
-        .execute(&mut *session.tx)
-        .await
-        .map_err(internal)?;
-        if fenced.rows_affected() != 1 {
-            return Err(Error::NotFound);
-        }
         if session
-            .get::<Value>(ctx, "tombstone", export_id)
+            .revocation_dependency(ctx, "artifact", export_id)
             .await?
             .is_some()
         {
@@ -3090,6 +3125,146 @@ impl Store {
     }
 }
 impl Session {
+    /// Re-read every physical dependency blob under this request's blob lock,
+    /// before registering any Prepared envelope. All intermediate kinds count.
+    #[doc(hidden)]
+    pub async fn verify_dependency_blob_bytes(
+        &mut self,
+        ctx: &Context,
+        roots: &[(String, String)],
+    ) -> Result<()> {
+        let root = self
+            .blob_write
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Conflict("dependency bytes require the request publication session".into())
+            })?
+            .0
+            .clone();
+        let limit = revocation::MAX_UPSTREAM_CLOSURE_NODES;
+        let rows = sqlx::query(&format!(
+            "{CLOSURE_FROM_ROOTS} SELECT kind, id FROM closure"
+        ))
+        .bind(serde_json::to_string(roots).map_err(internal)?)
+        .bind(ctx.namespace())
+        .bind(i64::try_from(limit + 1).map_err(internal)?)
+        .fetch_all(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        if rows.len() > limit {
+            return Err(Error::Conflict(format!(
+                "dependency blob closure exceeds {limit} nodes"
+            )));
+        }
+        let dir = root.join("blobs").join(hash(ctx.namespace().as_bytes()));
+        for row in rows {
+            if row.try_get::<String, _>("kind").map_err(internal)? == "blob" {
+                let digest: String = row.try_get("id").map_err(internal)?;
+                verify_blob_file(&dir.join(&digest), &digest, MAX_BLOB_BYTES).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Publish inside the request coordinator, without another connection or
+    /// commit. The caller judged the producer and its complete source closure in
+    /// this transaction before its first DML, and re-read its dependency bytes.
+    #[doc(hidden)]
+    pub async fn publish_registered_blob(
+        &mut self,
+        ctx: &Context,
+        artifact_id: &str,
+        expected_schema: &str,
+        payload_digest_field: &str,
+        bytes: &[u8],
+        max_bytes: usize,
+    ) -> Result<String> {
+        ctx.require(&[evo_core::Role::Host, evo_core::Role::Admin])?;
+        identifier(artifact_id)?;
+        validate_registered_blob_field(expected_schema, payload_digest_field)?;
+        validate_blob_bound(bytes, max_bytes)?;
+        let root = self
+            .blob_write
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Conflict("registered blob requires the request publication session".into())
+            })?
+            .0
+            .clone();
+        let digest = hash(bytes);
+        self.registered_blob_producer(
+            ctx,
+            artifact_id,
+            expected_schema,
+            payload_digest_field,
+            &digest,
+        )
+        .await?;
+        let final_path = root
+            .join("blobs")
+            .join(hash(ctx.namespace().as_bytes()))
+            .join(&digest);
+        let existing = preverified_blob_identity(&final_path, &digest, max_bytes).await?;
+        write_registered_blob(
+            &root,
+            ctx.namespace(),
+            &digest,
+            bytes,
+            max_bytes,
+            existing.as_ref(),
+        )
+        .await?;
+        Ok(digest)
+    }
+
+    /// The strict Prepared producer that still registers `digest` at the current
+    /// revoke watermark.
+    async fn registered_blob_producer(
+        &mut self,
+        ctx: &Context,
+        artifact_id: &str,
+        expected_schema: &str,
+        payload_digest_field: &str,
+        digest: &str,
+    ) -> Result<Value> {
+        let artifact: Value = self.need(ctx, "artifact", artifact_id).await?;
+        let state_field = if matches!(
+            expected_schema,
+            "rsia.e16.seed_install.v1" | "rsia.e16.seed_install.v2" | "rsia.e16.import_source.v1"
+        ) {
+            "status"
+        } else {
+            "state"
+        };
+        if artifact.get("schema_version").and_then(Value::as_str) != Some(expected_schema)
+            || artifact.get("id").and_then(Value::as_str) != Some(artifact_id)
+            || artifact.get("namespace").and_then(Value::as_str) != Some(ctx.namespace())
+            || artifact.get("owner_actor").and_then(Value::as_str) != Some(ctx.actor())
+            || artifact["payload"][state_field].as_str() != Some("prepared")
+            || artifact["payload"][payload_digest_field].as_str() != Some(digest)
+        {
+            return Err(Error::Conflict(
+                "registered blob producer is missing, revoked, changed, or no longer Prepared"
+                    .into(),
+            ));
+        }
+        let expected_watermark = artifact
+            .get("revoke_watermark")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| Error::Conflict("registered blob producer lacks watermark".into()))?;
+        let current_watermark = self
+            .watermark(ctx)
+            .await?
+            .and_then(|(seq, _)| u64::try_from(seq).ok())
+            .ok_or_else(|| Error::Conflict("current revoke watermark is unavailable".into()))?;
+        if expected_watermark != current_watermark {
+            return Err(Error::Conflict(
+                "registered blob producer watermark is stale".into(),
+            ));
+        }
+        Ok(artifact)
+    }
+
     /// Measure the whole instance against the E16.5 MVP capacity bounds inside
     /// this transaction. Every counter spans all namespaces (F24): the MVP load
     /// contract is per deployment, so a cap cannot be split by deriving from
@@ -4655,10 +4830,14 @@ mod tests {
                 .put(&ctx, "tombstone", "missing", ctx.actor(), &json!({}))
                 .await
                 .unwrap();
-            assert!(matches!(
-                load_dependency_record_snapshots(&mut session, &ctx, kind).await,
-                Err(Error::Forbidden)
-            ));
+            // A tombstone revokes only a run or an artifact of its id; an
+            // unreadable one fails those closed and leaves other kinds as they were.
+            let result = load_dependency_record_snapshots(&mut session, &ctx, kind).await;
+            match kind {
+                "run" | "artifact" => assert!(matches!(result, Err(Error::Forbidden)), "{kind}"),
+                "blob" => assert_eq!(result.unwrap()[0].fingerprint, None),
+                _ => assert!(matches!(result, Err(Error::NotFound)), "{kind}"),
+            }
             session.delete(&ctx, "tombstone", "missing").await.unwrap();
         }
     }
@@ -4977,7 +5156,6 @@ mod tests {
             .unwrap();
         session.commit().await.unwrap();
 
-        let guard = store.blob_lock.write().await;
         let task_store = store.clone();
         let task_admin = admin.clone();
         let task = tokio::spawn(async move {
@@ -4996,8 +5174,10 @@ mod tests {
             .root
             .join(".blob-staging")
             .join(hash(admin.namespace().as_bytes()));
+        // The private temp is the first FS write, made inside the request's blob
+        // lock and writer transaction. Cancel the request right after it.
         let mut observed = false;
-        for _ in 0..200 {
+        for _ in 0..5000 {
             if let Ok(mut entries) = tokio::fs::read_dir(&staging).await
                 && entries.next_entry().await.unwrap().is_some()
             {
@@ -5009,7 +5189,6 @@ mod tests {
         assert!(observed, "registered write never reached private staging");
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        drop(guard);
         let mut entries = tokio::fs::read_dir(&staging).await.unwrap();
         assert!(entries.next_entry().await.unwrap().is_none());
         assert!(matches!(
@@ -8637,4 +8816,74 @@ mod owned_config_workspace {
         }
     }
     // END RSIA AG174B INDEPENDENT H2
+}
+
+#[cfg(test)]
+mod q03_publication_tests {
+    use super::*;
+    use crate::lifecycle::{LifecycleStore, TypedObjectRef};
+    use evo_core::Role;
+
+    #[tokio::test]
+    async fn q03_valid_now_and_revocation_share_the_write_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("q03.sqlite3")).await.unwrap();
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let mut setup = store.session().await.unwrap();
+        setup.put(&admin, "run", "source", admin.actor(), &json!({
+            "schema_version":"rsia.optimization.source.v1",
+            "record":{"id":"source","body":b"source".to_vec(),"parent_family":"family","task_origin":"trusted_run","execution_attestation":"trusted_host","purpose":"development"},
+            "trace":{"run_id":"source","parent_family":"family","source_digest":hash(b"source"),"purpose":"development","outcome":"success","diagnosis":null,"excerpt":"source","seed":1},
+            "excerpt_start":0,"excerpt_end":6,
+        })).await.unwrap();
+        setup.commit().await.unwrap();
+        let mut session = store.registered_blob_write_session().await.unwrap();
+        let other_store = store.clone();
+        let other_admin = admin.clone();
+        let revoking = tokio::spawn(async move {
+            LifecycleStore::begin_revoke(
+                &other_admin,
+                &other_store,
+                TypedObjectRef {
+                    kind: "run".into(),
+                    id: "source".into(),
+                },
+                "q03 fixture",
+                10,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!revoking.is_finished());
+        let valid_now = evo_core::now().unwrap();
+        assert!(valid_now >= 0);
+        let roots = [("run".to_string(), "source".to_string())];
+        assert!(
+            session
+                .revocation_sources_live(&admin, &roots)
+                .await
+                .unwrap()
+        );
+        session
+            .put(
+                &admin,
+                "artifact",
+                "derived",
+                admin.actor(),
+                &json!({"created_at":valid_now}),
+            )
+            .await
+            .unwrap();
+        session
+            .put_edge(&admin, "artifact", "derived", "run", "source")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        revoking.await.unwrap().unwrap();
+        let mut next = store.registered_blob_write_session().await.unwrap();
+        assert!(!next.revocation_sources_live(&admin, &roots).await.unwrap());
+        let derived: Value = next.need(&admin, "artifact", "derived").await.unwrap();
+        assert_eq!(derived["created_at"], valid_now);
+        next.commit().await.unwrap();
+    }
 }

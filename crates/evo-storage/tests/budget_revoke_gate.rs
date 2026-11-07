@@ -92,7 +92,12 @@ async fn put_run(store: &Store, id: &str) {
         store,
         "run",
         id,
-        &json!({"id": id, "schema_version": "rsia.optimization.source.v1", "body": "run-body"}),
+        &json!({
+            "schema_version":"rsia.optimization.source.v1",
+            "record":{"id":id,"body":id.as_bytes().to_vec(),"parent_family":format!("family-{id}"),"task_origin":"trusted_run","execution_attestation":"trusted_host","purpose":"development"},
+            "trace":{"run_id":id,"parent_family":format!("family-{id}"),"source_digest":hash(id.as_bytes()),"purpose":"development","outcome":"success","diagnosis":null,"excerpt":id,"seed":1},
+            "excerpt_start":0,"excerpt_end":id.len(),
+        }),
     )
     .await;
 }
@@ -465,34 +470,77 @@ async fn an_existing_call_is_returned_again_after_the_revoke() {
     ));
 }
 
-/// A revocation tombstone is keyed by the id of its source alone and records which
-/// kind it was written for. A run source is not refused by the tombstone of an
-/// artifact that happens to carry its id (AG-032, AG-036).
+/// Historical name retained: a real run and a strict E16 import source sharing
+/// an id are conflicting revocation identities, not a healthy kind-isolation
+/// control. The namespace refuses new reserve/dispatch without refunding a hold,
+/// both before and after Admin records the artifact's tombstone.
 #[tokio::test]
 async fn a_tombstone_of_an_artifact_with_the_same_id_does_not_refuse_the_run_source() {
-    let (_dir, _path, store) = database().await;
-    // Both exist only because the test writes them around the production creators,
-    // which refuse the pair (AG-036).
+    let (_dir, path, store) = database().await;
     put_run(&store, "shared-id").await;
-    put_import_source(&store, "shared-id").await;
     authorize(&store).await;
-    revoke(&store, "artifact", "shared-id").await;
-    let mut session = store.session().await.unwrap();
-    let tombstone: RevokeTombstone = session
-        .need(&admin(), "tombstone", "shared-id")
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
-    assert_eq!(tombstone.source_kind, "artifact");
-
     let call = reserve(&store, "call-1", &["shared-id"]).await;
     assert_eq!(call.state, BudgetCallState::Reserved);
-    let decision = store
-        .begin_budget_dispatch(&host(), &fence(&call, 11))
-        .await
-        .unwrap();
-    assert!(decision.new_dispatch);
-    assert_eq!(decision.call.state, BudgetCallState::Dispatched);
+    assert_eq!(micros(&store).await, (20, 0));
+
+    // Synthetic stored conflict: production creators refuse this second identity.
+    put_import_source(&store, "shared-id").await;
+    for with_tombstone in [false, true] {
+        if with_tombstone {
+            revoke(&store, "artifact", "shared-id").await;
+            let mut session = store.session().await.unwrap();
+            let tombstone: RevokeTombstone = session
+                .need(&admin(), "tombstone", "shared-id")
+                .await
+                .unwrap();
+            session.commit().await.unwrap();
+            assert_eq!(tombstone.source_kind, "artifact");
+        }
+        let before = fingerprint(&path).await;
+        assert!(matches!(
+            store
+                .reserve_budget_call_with_sources(
+                    &host(),
+                    &reservation("call-2", &["shared-id"]),
+                    &owned(&["shared-id"]),
+                )
+                .await,
+            Err(Error::Forbidden)
+        ));
+        assert!(matches!(
+            store
+                .begin_budget_dispatch(&host(), &fence(&call, 11))
+                .await,
+            Err(Error::Cancelled)
+        ));
+        let mut session = store.session().await.unwrap();
+        assert_eq!(
+            session
+                .reserve_budget_call_with_sources_typed(
+                    &host(),
+                    &reservation("call-2", &["shared-id"]),
+                    &owned(&["shared-id"]),
+                )
+                .await
+                .unwrap(),
+            Err(evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked)
+        );
+        assert_eq!(
+            session
+                .begin_budget_dispatch_typed(&host(), &fence(&call, 11))
+                .await
+                .unwrap(),
+            Err(evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked)
+        );
+        session.commit().await.unwrap();
+        assert_nothing_written(
+            &before,
+            &fingerprint(&path).await,
+            "stored source identity conflict",
+        );
+        assert_eq!(call_of(&store, "call-1").await, call);
+        assert_eq!(micros(&store).await, (20, 0));
+    }
 }
 
 /// A tombstone that cannot be read as the revocation `begin_revoke` writes cannot
@@ -502,6 +550,9 @@ async fn a_tombstone_of_an_artifact_with_the_same_id_does_not_refuse_the_run_sou
 async fn a_tombstone_that_cannot_be_read_fails_closed() {
     let (_dir, path, store) = database().await;
     authorize(&store).await;
+    for id in ["bad-shape", "bad-kind", "late-shape", "late-kind"] {
+        put_run(&store, id).await;
+    }
     // The object table only requires valid JSON whose `$.id` is the id.
     raw_put(
         &store,

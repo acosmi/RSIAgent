@@ -2577,6 +2577,7 @@ impl RegisteredDevelopmentRunner {
             .resolve_pre_dispatch_result(
                 &call,
                 &reserve_fence,
+                &control.source_ids,
                 task.input.execute_target(),
                 "target_execution_failed",
             )
@@ -2585,7 +2586,13 @@ impl RegisteredDevelopmentRunner {
         let call = match call.state {
             BudgetCallState::Reserved | BudgetCallState::Dispatched => {
                 let dispatch_now = self
-                    .resolve_pre_dispatch_result(&call, &reserve_fence, self.now(), "clock_failed")
+                    .resolve_pre_dispatch_result(
+                        &call,
+                        &reserve_fence,
+                        &control.source_ids,
+                        self.now(),
+                        "clock_failed",
+                    )
                     .await?;
                 let fence = BudgetCallFence {
                     now: dispatch_now,
@@ -2656,6 +2663,7 @@ impl RegisteredDevelopmentRunner {
         &self,
         original_call: &BudgetCallRecord,
         fence: &BudgetCallFence,
+        source_ids: &[String],
         result: Result<T>,
         code: &str,
     ) -> Result<T> {
@@ -2664,13 +2672,25 @@ impl RegisteredDevelopmentRunner {
             Err(Error::ClockRegressed) => Err(Error::ClockRegressed),
             Err(error) => {
                 if original_call.state == BudgetCallState::Reserved {
-                    self.store
+                    let mut session = self.store.session().await?;
+                    let roots = source_ids
+                        .iter()
+                        .map(|id| ("run".to_string(), id.clone()))
+                        .collect::<Vec<_>>();
+                    if !session
+                        .revocation_sources_live(&self.executor, &roots)
+                        .await?
+                    {
+                        return Err(error);
+                    }
+                    session
                         .release_undispatched_budget_call(
                             &self.executor,
                             fence,
                             &format!("development_pre_dispatch_v1.{code}"),
                         )
                         .await?;
+                    session.commit().await?;
                 }
                 Err(error)
             }
@@ -2686,29 +2706,25 @@ impl RegisteredDevelopmentRunner {
         reserved_inputs: &crate::compiler::LoadedAuthenticatedBundleRecord,
     ) -> Result<BudgetDispatchDecision> {
         let mut session = self.store.session().await?;
-        // A proven source revocation keeps the existing typed budget refusal and
-        // its exact owned Reserved release reason. Success in this branch is
-        // never committed or allowed to dispatch; it would mean the persisted
-        // call no longer represents these original sources.
-        for source_id in source_ids {
-            if session
-                .get::<serde_json::Value>(&self.executor, "tombstone", source_id)
-                .await?
-                .is_some()
-            {
-                let result = self
-                    .begin_execution_in_session(&mut session, original_call, fence)
-                    .await?;
-                return match result {
-                    Err(error) => {
-                        session.commit().await?;
-                        Err(error)
-                    }
-                    Ok(_) => Err(Error::Conflict(
-                        "revoked development sources differ from the budget call".into(),
-                    )),
-                };
-            }
+        let roots: Vec<_> = source_ids
+            .iter()
+            .map(|id| ("run".to_string(), id.clone()))
+            .collect();
+        if !session
+            .revocation_sources_live(&self.executor, &roots)
+            .await?
+        {
+            // Keep the original typed priority, but never commit a source
+            // refusal or its compensation from this transaction.
+            let result = self
+                .begin_execution_in_session(&mut session, original_call, fence)
+                .await?;
+            return match result {
+                Err(error) => Err(error),
+                Ok(_) => Err(Error::Conflict(
+                    "revoked development sources differ from the budget call".into(),
+                )),
+            };
         }
         let gate = async {
             if reserved_inputs.bundle.digest != request.candidate_bundle_digest
@@ -2796,7 +2812,9 @@ impl RegisteredDevelopmentRunner {
     }
 
     /// The shared budget boundary distinguishes typed, proven pre-dispatch
-    /// refusals from outer errors. Its caller owns the single transaction commit.
+    /// refusals from outer errors. Its caller owns the single transaction commit;
+    /// `begin_bound_execution` judged the source closure first in this transaction
+    /// and never commits a release made over a revoked one.
     async fn begin_execution_in_session(
         &self,
         session: &mut Session,
@@ -2809,7 +2827,9 @@ impl RegisteredDevelopmentRunner {
         {
             Ok(decision) => Ok(Ok(decision)),
             Err(refusal) => {
-                if original_call.state == BudgetCallState::Reserved {
+                if original_call.state == BudgetCallState::Reserved
+                    && refusal != evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked
+                {
                     session
                         .release_undispatched_budget_call(
                             &self.executor,
@@ -3105,6 +3125,37 @@ mod pre_dispatch_tests {
                 )
                 .await
                 .unwrap();
+            let host = Context::new("n", "host", Role::Host).unwrap();
+            crate::evidence::store_trace_authority(
+                &store,
+                &host,
+                &crate::evidence::StoredTraceAuthority {
+                    schema_version: "rsia.optimization.source.v1".into(),
+                    record: crate::evidence::StoredRunRecord {
+                        id: "source".into(),
+                        body: b"source".to_vec(),
+                        parent_family: "family".into(),
+                        task_origin: evo_core::evidence::TaskOrigin::TrustedRun,
+                        execution_attestation:
+                            evo_core::evidence::ExecutionAttestation::TrustedHost,
+                        purpose: Purpose::Development,
+                    },
+                    trace: evo_core::optimization::OptimizationTrace {
+                        run_id: "source".into(),
+                        parent_family: "family".into(),
+                        source_digest: hash(b"source"),
+                        purpose: Purpose::Development,
+                        outcome: evo_core::optimization::TraceOutcome::Success,
+                        diagnosis: None,
+                        excerpt: "source".into(),
+                        seed: 1,
+                    },
+                    excerpt_start: 0,
+                    excerpt_end: 6,
+                },
+            )
+            .await
+            .unwrap();
             let call = store
                 .reserve_budget_call_with_sources(
                     &executor,
@@ -3179,6 +3230,7 @@ mod pre_dispatch_tests {
             .resolve_pre_dispatch_result::<String>(
                 &fixture.call,
                 &fixture.fence,
+                &["source".to_string()],
                 Err(Error::Internal),
                 "target_execution_failed",
             )
@@ -3205,6 +3257,7 @@ mod pre_dispatch_tests {
             .resolve_pre_dispatch_result::<i64>(
                 &fixture.call,
                 &fixture.fence,
+                &["source".to_string()],
                 Err(Error::Invalid("clock went negative".into())),
                 "clock_failed",
             )
@@ -3274,6 +3327,7 @@ mod pre_dispatch_tests {
                         .resolve_pre_dispatch_result::<String>(
                             &original,
                             &fixture.fence,
+                            &["source".to_string()],
                             Err(Error::Internal),
                             code,
                         )
@@ -3311,6 +3365,7 @@ mod pre_dispatch_tests {
                 .resolve_pre_dispatch_result::<String>(
                     &fixture.call,
                     &fixture.fence,
+                    &["source".to_string()],
                     Err(Error::Internal),
                     "target_execution_failed",
                 )
@@ -3333,7 +3388,8 @@ mod pre_dispatch_tests {
         let dispatched = fixture.persisted().await;
         assert!(
             matches!(fixture.runner.resolve_pre_dispatch_result::<String>(
-            &fixture.call, &fixture.fence, Err(Error::Internal), "target_execution_failed",
+            &fixture.call, &fixture.fence,
+                &["source".to_string()], Err(Error::Internal), "target_execution_failed",
         ).await, Err(Error::Conflict(message)) if message == "only_undispatched_reservation_can_be_released")
         );
         assert_eq!(fixture.persisted().await, dispatched);
@@ -3356,6 +3412,7 @@ mod pre_dispatch_tests {
                 .resolve_pre_dispatch_result::<String>(
                     &fixture.call,
                     &fixture.fence,
+                    &["source".to_string()],
                     Err(Error::Internal),
                     "target_execution_failed",
                 )
@@ -3392,6 +3449,56 @@ mod pre_dispatch_tests {
         ));
         assert_eq!(fixture.persisted().await, fixture.call);
         assert_eq!(fixture.reserved().await, 1);
+    }
+    #[tokio::test]
+    async fn q03_proven_revocation_preserves_reserved_compensation_and_healthy_failure_releases() {
+        for revoked in [false, true] {
+            let fixture = CleanupFixture::new().await;
+            if revoked {
+                let admin = Context::new("n", "admin", Role::Admin).unwrap();
+                evo_storage::lifecycle::LifecycleStore::begin_revoke(
+                    &admin,
+                    &fixture.runner.store,
+                    evo_storage::lifecycle::TypedObjectRef {
+                        kind: "run".into(),
+                        id: "source".into(),
+                    },
+                    "q03 fixture",
+                    11,
+                )
+                .await
+                .unwrap();
+            }
+            let original = fixture.persisted().await;
+            assert!(matches!(
+                fixture
+                    .runner
+                    .resolve_pre_dispatch_result::<()>(
+                        &fixture.call,
+                        &fixture.fence,
+                        &["source".to_string()],
+                        Err(Error::Internal),
+                        "target_execution_failed"
+                    )
+                    .await,
+                Err(Error::Internal)
+            ));
+            if revoked {
+                assert_eq!(fixture.persisted().await, original);
+                assert_eq!(fixture.reserved().await, 1);
+                assert!(matches!(
+                    fixture
+                        .runner
+                        .begin_execution(&fixture.call, &fixture.fence)
+                        .await,
+                    Err(Error::Cancelled)
+                ));
+                assert_eq!(fixture.persisted().await, original);
+            } else {
+                assert_eq!(fixture.persisted().await.state, BudgetCallState::Released);
+                assert_eq!(fixture.reserved().await, 0);
+            }
+        }
     }
 }
 

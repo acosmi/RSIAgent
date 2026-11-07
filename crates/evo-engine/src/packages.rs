@@ -1498,7 +1498,7 @@ impl PersistentPackageStore {
             request.compiler_version.as_str(),
             &request.candidate_material,
         ))?;
-        let mut session = store.session().await?;
+        let mut session = store.registered_blob_write_session().await?;
         let watermark = current_watermark(&mut session, ctx).await?;
         verify_sources(&mut session, ctx, &sources).await?;
         let mut quarantine = None;
@@ -1528,6 +1528,17 @@ impl PersistentPackageStore {
         // Judge resolved manifest content and request sources together, including
         // their joint closure bound, before either an existing lookup or any write.
         verify_sources(&mut session, ctx, &all_sources).await?;
+        if judge_dependency(ctx, &mut session, "artifact", &id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Forbidden);
+        }
+        let roots: Vec<_> = all_sources
+            .iter()
+            .map(|source| (source.kind.clone(), source.id.clone()))
+            .collect();
+        session.verify_dependency_blob_bytes(ctx, &roots).await?;
         if let Some(existing) = session
             .get::<E16Envelope<StagedAssetPayload>>(ctx, "artifact", &id)
             .await?
@@ -1598,8 +1609,7 @@ impl PersistentPackageStore {
                 .audit(ctx, "e16.staged_asset.prepare", &envelope.id)
                 .await?;
         }
-        session.commit().await?;
-        let blob_digest = store
+        let blob_digest = session
             .publish_registered_blob(
                 ctx,
                 &id,
@@ -1612,7 +1622,6 @@ impl PersistentPackageStore {
         if blob_digest != projection_digest {
             return Err(Error::Internal);
         }
-        let mut session = store.session().await?;
         let mut current: E16Envelope<StagedAssetPayload> =
             session.need(ctx, "artifact", &id).await?;
         if current.schema_version != E16_STAGED_ASSET_SCHEMA
@@ -1627,7 +1636,6 @@ impl PersistentPackageStore {
                 "staged asset changed before blob finalization".into(),
             ));
         }
-        verify_sources(&mut session, ctx, &current.source_refs).await?;
         current.payload.state = if quarantine.is_some() {
             StagedAssetState::Quarantined
         } else {

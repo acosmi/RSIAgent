@@ -37,9 +37,9 @@
 use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_storage::Store;
 use evo_storage::budget::{
-    BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallReservation, BudgetCallState,
-    BudgetExecutionProvenance, BudgetPreDispatchRefusal, BudgetStage, ModelCallSettlementEvidence,
-    RootBudgetAuthorization, UsageCharge,
+    BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallRef, BudgetCallReservation,
+    BudgetCallState, BudgetExecutionProvenance, BudgetPreDispatchRefusal, BudgetStage,
+    ModelCallSettlementEvidence, RootBudgetAuthorization, UsageCharge,
 };
 use evo_storage::lifecycle::{CleanupState, CleanupStatus, LifecycleStore, TypedObjectRef};
 use serde_json::{Value, json};
@@ -267,6 +267,51 @@ async fn reserve_bare(store: &Store, call_id: &str, request: BudgetArtifact) -> 
         .reserve_budget_call(&host(), &reservation(call_id, request))
         .await
         .unwrap()
+}
+
+/// Reserves `call_id` with `request` and no closure, then stores its reference over
+/// `sources` (the object and one edge to each run) as a reservation registered it
+/// before the revocation gate: a reservation no longer registers a closure over a
+/// revoked run, so this is how a late call over `run-a` reaches the ledger.
+async fn reserve_late(
+    store: &Store,
+    path: &Path,
+    call_id: &str,
+    request: BudgetArtifact,
+    sources: &[&str],
+) -> BudgetCallRecord {
+    let call = reserve_bare(store, call_id, request).await;
+    let reference = BudgetCallRef {
+        id: ref_id(call_id),
+        schema_version: "rsia.budget_call_ref.v1".into(),
+        namespace: NS.into(),
+        billing_scope: SCOPE.into(),
+        call_id: call_id.into(),
+        source_ids: owned(sources),
+    };
+    let mut connection = writable(path).await;
+    sqlx::query("INSERT INTO objects(namespace,kind,id,owner,body) VALUES(?,'artifact',?,?,?)")
+        .bind(NS)
+        .bind(&reference.id)
+        .bind(host().actor())
+        .bind(serde_json::to_string(&reference).unwrap())
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    for source in sources {
+        sqlx::query(
+            "INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id)
+             VALUES(?,'artifact',?,'run',?)",
+        )
+        .bind(NS)
+        .bind(&reference.id)
+        .bind(*source)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    }
+    connection.close().await.unwrap();
+    call
 }
 
 fn fence(call: &BudgetCallRecord, now: i64) -> BudgetCallFence {
@@ -799,11 +844,9 @@ async fn c_a_late_formal_call_unrelated_to_the_revoked_run_is_left_by_the_rechec
     );
 }
 
-/// C, related. After the budget scan passed, a formal call is reserved without a
-/// closure and then reserved again, as recovery reserves an existing call, with its
-/// closure `run-a`: a reservation of an existing call is returned as before and
-/// registers the closure (a new call over a revoked run is refused at once, so this
-/// is how a late call over `run-a` reaches the ledger). The recheck redacts its
+/// C, related. After the budget scan passed, a formal call over `run-a` reaches the
+/// ledger late (`reserve_late`: a new call over a revoked run, and a closure
+/// registered for an existing call over it, are refused at once). The recheck redacts its
 /// request by the registered closure, keeps its reference and accounting, and the
 /// cleanup completes. Baseline: `Failed` (`FORMAL_UNKNOWN`), the request kept.
 #[tokio::test]
@@ -824,9 +867,9 @@ async fn c_a_late_formal_call_over_the_revoked_run_is_redacted_by_the_recheck() 
             .await,
         Err(Error::Forbidden)
     ));
-    reserve_bare(&store, "call-f-late", formal_request("call-f-late")).await;
-    reserve(
+    reserve_late(
         &store,
+        &path,
         "call-f-late",
         formal_request("call-f-late"),
         &[RUN_A],
@@ -1362,9 +1405,10 @@ async fn ag181_registered_ref_precedes_conflicting_and_unreadable_request() {
         for (call_id, source, request, _) in &calls {
             // A call over a revoked run reaches the ledger late as in test C.
             if late && *source == RUN_A {
-                reserve_bare(&store, call_id, request.clone()).await;
+                reserve_late(&store, &path, call_id, request.clone(), &[*source]).await;
+            } else {
+                reserve(&store, call_id, request.clone(), &[*source]).await;
             }
-            reserve(&store, call_id, request.clone(), &[*source]).await;
             before.insert(
                 *call_id,
                 (
@@ -1557,10 +1601,11 @@ async fn assert_tampered_ref_isolated_then_repaired(
         ("call-5-b", over_b),
     ] {
         // A call over a revoked run reaches the ledger late as in test C.
-        if late && sources.contains(&RUN_A) {
-            reserve_bare(&store, call_id, formal_request(call_id)).await;
-        }
-        calls.push(reserve(&store, call_id, formal_request(call_id), sources).await);
+        calls.push(if late && sources.contains(&RUN_A) {
+            reserve_late(&store, &path, call_id, formal_request(call_id), sources).await
+        } else {
+            reserve(&store, call_id, formal_request(call_id), sources).await
+        });
     }
     if !late {
         dispatch_and_settle(&store, &calls[0]).await;

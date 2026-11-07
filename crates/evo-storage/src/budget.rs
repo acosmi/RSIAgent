@@ -3,7 +3,7 @@
 //! Monetary values are integer micros in the root's authorized currency/pricing
 //! version. No floating-point conversion occurs here.
 
-use super::lifecycle::{BudgetRequestSources, RevokeTombstone, budget_request_source_ids};
+use super::lifecycle::{BudgetRequestSources, budget_request_source_ids};
 use super::{
     MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal, mvp_capacity_exceeded,
 };
@@ -1350,11 +1350,17 @@ impl Store {
                 !typed_budget::call_sources_live_in_tx(&mut tx, &call).await?,
             ),
             E16CallMode::Legacy => match legacy_call_sources(&mut tx, &call).await? {
-                LegacyCallSources::Named(source_ids) => (
-                    any_run_source_revoked(&mut tx, &call.namespace, &source_ids).await?,
-                    false,
-                    false,
-                ),
+                LegacyCallSources::Named(source_ids) => {
+                    let roots: Vec<_> = source_ids.iter().map(|id| ("run", id.as_str())).collect();
+                    let status =
+                        crate::revocation::status_in_tx(&mut tx, &call.namespace, &roots, false)
+                            .await?;
+                    (
+                        status == crate::revocation::RevocationStatus::Blocked,
+                        status == crate::revocation::RevocationStatus::Unverifiable,
+                        false,
+                    )
+                }
                 LegacyCallSources::Unverifiable => (false, true, false),
             },
         };
@@ -2755,18 +2761,26 @@ async fn reserve_budget_call_with_sources_in_tx_typed(
         if !same_reservation(ctx, &existing, request) {
             return Ok(Err(BudgetPreDispatchRefusal::CallIdReused));
         }
-        if !source_ids.is_empty()
-            && let Err(refusal) =
+        if !source_ids.is_empty() {
+            // A historical call whose ref is intact stays a read. Repairing a
+            // lost ref is a new content-dependent write and passes the gate first.
+            if registered_source_ids(tx, &existing).await?.is_none()
+                && source_closure_blocked(tx, ctx.namespace(), &source_ids).await?
+            {
+                return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
+            }
+            if let Err(refusal) =
                 ensure_budget_call_ref_typed(tx, ctx, &existing, &source_ids).await?
-        {
-            return Ok(Err(refusal));
+            {
+                return Ok(Err(refusal));
+            }
         }
         return Ok(Ok(existing));
     }
     // The revocation tombstone is committed before its cleanup runs, so it is
     // read here, in the transaction that would write the reservation and its
     // request body: nothing below has run when a source is refused.
-    if any_run_source_revoked(tx, ctx.namespace(), &source_ids).await? {
+    if source_closure_blocked(tx, ctx.namespace(), &source_ids).await? {
         return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
     }
     let row = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
@@ -3249,7 +3263,7 @@ async fn begin_budget_dispatch_in_tx_typed(
             registered_source_ids(tx, &call).await?.unwrap_or_default()
         }
     };
-    if any_run_source_revoked(tx, &call.namespace, &source_ids).await? {
+    if source_closure_blocked(tx, &call.namespace, &source_ids).await? {
         return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
     }
     let active: i64 = sqlx::query_scalar(
@@ -3844,46 +3858,21 @@ async fn ensure_budget_call_ref_typed(
     Ok(Ok(reference))
 }
 
-/// Whether any of `source_ids` was revoked, in `namespace`, as a `run`.
-///
-/// `begin_revoke` writes the tombstone and the watermark in one transaction
-/// before the cleanup starts, so a source is revoked from the moment it commits.
-/// A tombstone is keyed by the id of its source alone and records the kind it was
-/// written for (`source_kind`, `run` or `artifact`). The sources of a budget call
-/// are runs (`ensure_budget_call_ref` writes `run` edges), so a tombstone decides
-/// one only when it was written for a run: a revoked artifact that shares the id
-/// is another object and does not refuse it. A tombstone that cannot be read as
-/// one `begin_revoke` writes (it does not decode, or its source kind is neither
-/// `run` nor `artifact`) cannot be matched to anything and fails closed, the
-/// same rule the other tombstone gates follow (`ensure_dependencies_live`).
-async fn any_run_source_revoked(
+/// Whether new use of the legacy run roots is refused: a revoked or unreadable
+/// node anywhere in their complete upstream closure, or a closure that cannot be
+/// completed (an isolated namespace, an overflowing walk). The same raw rule as
+/// publication and E16 snapshots. A missing or unqualified run is not a
+/// revocation: it keeps the reservation's existing refusal order.
+async fn source_closure_blocked(
     tx: &mut Transaction<'_, Sqlite>,
     namespace: &str,
     source_ids: &[String],
 ) -> Result<bool> {
-    for source_id in source_ids {
-        let body: Option<String> = sqlx::query_scalar(
-            "SELECT body FROM objects WHERE namespace=? AND kind='tombstone' AND id=?",
-        )
-        .bind(namespace)
-        .bind(source_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(internal)?;
-        let Some(body) = body else {
-            continue;
-        };
-        // `artifact`: the tombstone belongs to the other object that shares this id.
-        // `run`, a kind `begin_revoke` does not write, or a body that does not
-        // decode: revoked.
-        let source_kind = serde_json::from_str::<RevokeTombstone>(&body)
-            .ok()
-            .map(|tombstone| tombstone.source_kind);
-        if source_kind.as_deref() != Some("artifact") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let roots: Vec<(&str, &str)> = source_ids.iter().map(|id| ("run", id.as_str())).collect();
+    Ok(
+        crate::revocation::status_in_tx(tx, namespace, &roots, false).await?
+            != crate::revocation::RevocationStatus::Live,
+    )
 }
 
 /// What the budget call reference of a legacy call registers as its source
@@ -3980,7 +3969,7 @@ async fn registered_source_ids(
 /// The sources a legacy call is judged by, at its dispatch and at its model
 /// settlement.
 enum LegacyCallSources {
-    /// Checked against the revocation tombstones (`any_run_source_revoked`).
+    /// Judged with their complete closure (`source_closure_blocked`).
     Named(Vec<String>),
     /// The reference is missing and the request cannot be read for a closure:
     /// whether the call is free of a revoked source cannot be told.
