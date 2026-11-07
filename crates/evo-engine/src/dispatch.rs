@@ -73,11 +73,12 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
 }
 
 pub use evo_storage::{
-    ManagementBackupResultV2, ManagementCancelArrival, ManagementDiagnostic, ManagementJob, ManagementJobState,
-    ManagementJobV2, ManagementOptimizationCallProducer, ManagementOptimizationCallRef,
-    ManagementOptimizationProgressV2, ManagementOptimizationResultV2,
-    ManagementOptimizationStageRef, ManagementPartialResultV2, ManagementPendingTerminalState,
-    ManagementResult, ManagementResultV2, ManagementTraceExportResultV2, VersionedManagementJob,
+    ManagementBackupResultV2, ManagementCancelArrival, ManagementDiagnostic, ManagementJob,
+    ManagementJobState, ManagementJobV2, ManagementOptimizationCallProducer,
+    ManagementOptimizationCallRef, ManagementOptimizationProgressV2,
+    ManagementOptimizationResultV2, ManagementOptimizationStageRef, ManagementPartialResultV2,
+    ManagementPendingTerminalState, ManagementResult, ManagementResultV2,
+    ManagementTraceExportResultV2, VersionedManagementJob,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
