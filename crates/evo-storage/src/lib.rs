@@ -5116,6 +5116,8 @@ mod tests {
         true
     }
 
+    // Card name kept: the gate now lives at the startup entries (StartupGate::evaluate /
+    // DataDirectoryLock::acquire); this test asserts the shared check_local_permissions(Database) gate.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[tokio::test]
     async fn store_open_checks_permissions_before_cleanup_and_migrations() {
