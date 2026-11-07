@@ -202,7 +202,10 @@ async fn generate_legacy_failed_backup_with_real_host_writes_and_cleanup() {
         !destination.exists(),
         "refuse to overwrite a legacy artifact"
     );
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let path = temporary
         .path()
         .canonicalize()

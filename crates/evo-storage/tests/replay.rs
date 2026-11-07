@@ -264,7 +264,10 @@ async fn put_trusted_development_source(store: &Store, ctx: &Context, id: &str, 
 }
 
 async fn setup() -> (tempfile::TempDir, Store, Context) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()

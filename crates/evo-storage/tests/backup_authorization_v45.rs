@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 async fn fixture() -> (tempfile::TempDir, Store, Context) {
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let root = directory.path().canonicalize().unwrap();
     let database = root.join("rsia.sqlite3");
     std::fs::OpenOptions::new()
@@ -169,7 +172,10 @@ async fn authorized_backup_keeps_v2_manifest_and_full_snapshot() {
         0
     );
     store.close().await;
-    let child_root = tempfile::tempdir().unwrap();
+    let child_root = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     assert!(
         std::process::Command::new(std::env::current_exe().unwrap())
             .args([

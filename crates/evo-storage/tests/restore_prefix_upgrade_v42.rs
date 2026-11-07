@@ -948,7 +948,10 @@ async fn a_0005_backup_replays_a_revocation_made_after_the_binary_upgrade() {
 
 #[tokio::test]
 async fn a_current_backup_applies_nothing_and_writes_no_migration_record() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let root = directory.path().canonicalize().unwrap();
     let live = root.join("rsia.sqlite3");
     {

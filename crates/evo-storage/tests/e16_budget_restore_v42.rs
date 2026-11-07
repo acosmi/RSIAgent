@@ -79,7 +79,12 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .tempdir()
+            .unwrap();
         let root = dir.path().canonicalize().unwrap();
         let live = root.join("rsia.sqlite3");
         {
