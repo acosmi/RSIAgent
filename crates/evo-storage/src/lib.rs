@@ -5235,46 +5235,26 @@ mod tests {
             "source_refs":[],"revoke_watermark":1,"payload":{"state":"prepared","content_blob_digest":digest}
         })).await.unwrap();
         session.commit().await.unwrap();
-        let guard = store.blob_lock.write().await;
-        let task_store = store.clone();
-        let task_admin = admin.clone();
-        let task_bytes = bytes.clone();
-        let task = tokio::spawn(async move {
-            task_store
+        // AG-119 moved the private temp write after the writer fence, so the
+        // temp is renamed in place: the published inode is the staged member.
+        assert_eq!(
+            store
                 .publish_registered_blob(
-                    &task_admin,
+                    &admin,
                     "private-producer",
                     "rsia.e16.staged_asset.v1",
                     "content_blob_digest",
-                    &task_bytes,
+                    &bytes,
                     1024,
                 )
                 .await
-        });
+                .unwrap(),
+            digest
+        );
         let staging = directory.path().join(".blob-staging").join(hash(b"n"));
-        let mut observed = None;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if let Ok(entries) = std::fs::read_dir(&staging) {
-                for entry in entries {
-                    let path = entry.unwrap().path();
-                    if std::fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
-                        observed = Some(path);
-                    }
-                }
-            }
-            if observed.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        let staged = observed.expect("actual complete staging bytes before publication");
         ag157_mode(&staging, 0o700, true);
         ag157_mode(staging.parent().unwrap(), 0o700, true);
-        ag157_mode(&staged, 0o600, false);
-        assert_eq!(hash(&std::fs::read(&staged).unwrap()), digest);
-        drop(guard);
-        assert_eq!(task.await.unwrap().unwrap(), digest);
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
         let published = directory
             .path()
             .join("blobs")
@@ -5284,7 +5264,6 @@ mod tests {
         ag157_mode(published.parent().unwrap(), 0o700, true);
         ag157_mode(published.parent().unwrap().parent().unwrap(), 0o700, true);
         assert_eq!(store.read_blob(&admin, &digest, 1024).await.unwrap(), bytes);
-        assert!(!staged.exists());
         store.close().await;
         println!("AG157_REAL_OBSERVATION={NAME}");
     }
