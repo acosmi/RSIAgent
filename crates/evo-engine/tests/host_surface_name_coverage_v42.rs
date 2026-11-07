@@ -56,7 +56,17 @@ fn request() -> PrepareRunRequest {
 
 async fn database() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("name-coverage.sqlite3"))
+    let root = dir.path().canonicalize().unwrap();
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join("name-coverage.sqlite3"))
+            .unwrap();
+    }
+    let store = Store::open(&root.join("name-coverage.sqlite3"))
         .await
         .unwrap();
     (dir, store)
@@ -1674,9 +1684,14 @@ async fn r9_healthy_chain(
     assert_eq!(serde_json::to_string(&record).unwrap(), expected);
     assert_eq!(record.source.original_utf8, source.original_utf8);
     store.close().await;
-    let store = Store::open(&dir.path().join("name-coverage.sqlite3"))
-        .await
-        .unwrap();
+    let store = Store::open(
+        &dir.path()
+            .canonicalize()
+            .unwrap()
+            .join("name-coverage.sqlite3"),
+    )
+    .await
+    .unwrap();
     let mut session = store.session().await.unwrap();
     let loaded: HostSurfaceRecordV2 = session.need(&admin, "artifact", SURFACE_ID).await.unwrap();
     let listed: Vec<HostSurfaceRecordV2> = session.list(&admin, "artifact").await.unwrap();
@@ -1729,8 +1744,20 @@ async fn r9_restore_chain(
     resource_fault: Option<&str>,
 ) {
     let private = tempfile::tempdir().unwrap();
-    let backup = private.path().join("actual-rust-backup");
-    store.backup(&backup).await.unwrap();
+    let backup = dir
+        .canonicalize()
+        .unwrap()
+        .join("backups/actual-rust-backup");
+    let admin = context(Role::Admin);
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("actual-rust-backup").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     store.close().await;
     let anchor = dir.join("name-coverage.sqlite3");
     let before = capture_raw_database_family(&anchor);
@@ -2475,8 +2502,20 @@ async fn r10_restore_text_content(
     faults: Vec<Value>,
 ) {
     let private = tempfile::tempdir().unwrap();
-    let backup = private.path().join("text-content-backup");
-    store.backup(&backup).await.unwrap();
+    let backup = dir
+        .canonicalize()
+        .unwrap()
+        .join("backups/text-content-backup");
+    let admin = context(Role::Admin);
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("text-content-backup").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     store.close().await;
     let anchor = dir.join("name-coverage.sqlite3");
     let before = capture_raw_database_family(&anchor);
@@ -2574,9 +2613,14 @@ async fn r10_text_matrix() {
     }
     assert_eq!(records.len(), 30); // 29 successors and their actual predecessor.
     store.close().await;
-    let store = Store::open(&dir.path().join("name-coverage.sqlite3"))
-        .await
-        .unwrap();
+    let store = Store::open(
+        &dir.path()
+            .canonicalize()
+            .unwrap()
+            .join("name-coverage.sqlite3"),
+    )
+    .await
+    .unwrap();
     let mut session = store.session().await.unwrap();
     let listed: Vec<HostSurfaceRecordV2> = session.list(&admin, "artifact").await.unwrap();
     assert_eq!(listed.len(), records.len());
@@ -2847,9 +2891,14 @@ async fn r11_number_admission_matrix() {
     }
     assert_eq!(records.len(), 2);
     store.close().await;
-    let store = Store::open(&dir.path().join("name-coverage.sqlite3"))
-        .await
-        .unwrap();
+    let store = Store::open(
+        &dir.path()
+            .canonicalize()
+            .unwrap()
+            .join("name-coverage.sqlite3"),
+    )
+    .await
+    .unwrap();
     let mut session = store.session().await.unwrap();
     let listed: Vec<HostSurfaceRecordV2> = session.list(&admin, "artifact").await.unwrap();
     assert_eq!(listed.len(), 2);
@@ -2927,8 +2976,20 @@ async fn r11_number_admission_matrix() {
     let equivalent = equivalent.unwrap();
     assert_eq!(variants.len(), 2);
     let private = tempfile::tempdir().unwrap();
-    let backup = private.path().join("number-admission-backup");
-    store.backup(&backup).await.unwrap();
+    let backup = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("backups/number-admission-backup");
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("number-admission-backup").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     store.close().await;
     let anchor = dir.path().join("name-coverage.sqlite3");
     let before = capture_raw_database_family(&anchor);

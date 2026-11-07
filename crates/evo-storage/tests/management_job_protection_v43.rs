@@ -33,7 +33,16 @@ fn job(key: &str, state: ManagementJobState, at: i64) -> ManagementJob {
 #[tokio::test]
 async fn legacy_and_current_jobs_keep_restore_and_cleanup_protection() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("rsia.sqlite3");
+    let path = dir.path().canonicalize().unwrap().join("rsia.sqlite3");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+    }
     let store = Store::open(&path).await.unwrap();
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let host = Context::new("n", "host", Role::Host).unwrap();
@@ -101,8 +110,16 @@ async fn legacy_and_current_jobs_keep_restore_and_cleanup_protection() {
         assert_eq!(v["schema_version"], "rsia.redacted.v1");
     }
     s.commit().await.unwrap();
-    let backup = dir.path().join("backup");
-    store.backup(&backup).await.unwrap();
+    let backup = path.parent().unwrap().join("backups/backup");
+    store
+        .backup(
+            &admin,
+            evo_storage::lifecycle::BackupName::parse("backup").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     store.close().await;
     let manifest: Value =
         serde_json::from_slice(&std::fs::read(backup.join("backup-manifest.json")).unwrap())
