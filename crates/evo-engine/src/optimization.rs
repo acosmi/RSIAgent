@@ -1279,7 +1279,8 @@ async fn verify_fact_compiler_use(
     Ok(())
 }
 // Raw observations remain accounting/audit records. A bound continuation
-// reloads its original request and typed execution closure before reuse.
+// reloads the original request its observation is bound to, and a cached
+// candidate terminal reloads its gate-verified development observation.
 async fn verify_current_development_cache_in_session(
     session: &mut Session,
     ctx: &Context,
@@ -1310,17 +1311,9 @@ async fn verify_current_development_cache_in_session(
         {
             return Err(Error::Conflict("development recovery input differs".into()));
         }
-        // The recovery observation predates the ordinary DevelopmentObserved
-        // stage. Supply only its real receipt addresses to the same E03 reader;
-        // the carrier is neither sealed nor written and grants no authority.
-        let mut carrier = fact.clone();
-        carrier
-            .dependencies
-            .extend(crate::development::typed_receipt_closure(&report)?);
-        crate::development::verify_observed_report_in_session(
-            ctx, session, &carrier, &request, &report,
-        )
-        .await?;
+        // The report itself is verified by the shared E03 gate once the step
+        // observes it, fresh or reused: a forged or legacy report keeps that
+        // gate's rejection instead of failing here as a step error.
     } else if fact.kind == StageFactKind::StepCompleted {
         let prepared_id = canonical_stage_artifact_id(&StageFact {
             kind: StageFactKind::StepPrepared,

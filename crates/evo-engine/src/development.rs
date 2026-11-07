@@ -1529,22 +1529,14 @@ pub async fn read_execution_receipt_in_session(
     identifier(task_id)?;
     let legacy_receipt_id = legacy_execution_receipt_id(&request.request_id, task_id, side)?;
     let current_receipt_id = execution_receipt_id(&request.request_id, task_id, side)?;
-    let (id, schema) = match version {
-        DevelopmentExecutionReceiptVersion::V1 => {
-            (&legacy_receipt_id, DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA)
-        }
-        DevelopmentExecutionReceiptVersion::V2 => {
-            (&current_receipt_id, DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2)
-        }
+    // The requested ID fixes the wire: each version derives its own ID domain.
+    let id = match version {
+        DevelopmentExecutionReceiptVersion::V1 => &legacy_receipt_id,
+        DevelopmentExecutionReceiptVersion::V2 => &current_receipt_id,
     };
     let receipt = get_execution_receipt(session, ctx, id)
         .await?
         .ok_or(Error::NotFound)?;
-    if receipt.schema_version != schema {
-        return Err(Error::Conflict(
-            "development execution receipt identity mismatch".into(),
-        ));
-    }
     let control = need_control(session, ctx, &receipt.control_id).await?;
     validate_control_request_binding(&control, request)?;
     let task = registered_task(&control, request, task_id)?;
@@ -3200,12 +3192,8 @@ impl DevRunner for RegisteredDevelopmentRunner {
                                 "call_id_reused_with_different_content".into(),
                             ));
                         }
-                        if matches!(
-                            ReadRegisteredExecutionSettlement::from_call(&call)?,
-                            ReadRegisteredExecutionSettlement::Legacy(_)
-                        ) {
-                            return Err(source_legacy());
-                        }
+                        ReadRegisteredExecutionSettlement::from_call(&call)?;
+                        return Err(source_legacy());
                     }
                 }
             }

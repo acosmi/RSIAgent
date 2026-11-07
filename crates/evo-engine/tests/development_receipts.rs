@@ -2860,6 +2860,475 @@ async fn generic_model_response_never_becomes_current_execution_evidence() {
     fixture.store.close().await;
 }
 
+// AG-183 V104 (§5.1.1 item 7): object rows the old producer natively wrote, captured
+// byte for byte from the registered runner of this file's own Fixture at commit
+// 7b285b9c603b567648dd0df579c2c9100e3f1c99 (pure-function V1 producer, capture
+// backup sha256 e6377d577867f891ca5eaf330e508d7c3abcdf097be45625455aa6dac867f31d).
+// Order: per task (a, b) the parent receipt, its output, the candidate receipt, its
+// output and the grader receipt, then the run receipt. Never regenerated here.
+/// The request those rows were produced for, as that commit's API serialized it.
+const NATIVE_7B285B9_PURE_REQUEST: &str = r#"{"attempt":1,"candidate_bundle_digest":"c69a7d061fe68a35d66b88b8566476bbafae26eb783507b022197fc1966398e9","environment_digest":"ba5285161ba6eed0085fb13784ce5c92f70ebc268b94fd66aa1d68a32884204d","episode_id":"episode-1","grader_digest":"649c2cd5a8aebd7c31c6378e9294b5a991bb86dd7c8dd9cedcdae722d1d5b92a","idempotency_key":"dev-request-1-idem","manifest":{"digest":"1d9be8cd6389d8f9204e2fc66bcc17518524c85a39ab3c2acdbe200a1ca03774","id":"dev-manifest","tasks":[{"id":"task-a","input_digest":"4b1cd29e86ac99565f4c19e46a6803fdd3a189ea82eba26f9263153a7ce1e5bd","parent_family":"family-a"},{"id":"task-b","input_digest":"a577fd498cd0f7aa4af7f772f9e03f7904453337cb21b3d7945f73ddc444a1e4","parent_family":"family-b"}]},"namespace":"n","parent_bundle_digest":"a251f2c86e5b625537281fa11f41cfc88802d13d8be50d8af71bc63c045ea3cd","purpose":"development","request_id":"dev-request-1","revoke_watermark":1,"rules_digest":"6c621d1a05138a7888d37d9269a9da8e2e11e4aced2f6cfd24b05ab1b9e61bb0","step":1,"tools_digest":"f9d35d43770d39092a663e665e82ae1d84a9e0da3d0d10c407acada6a40cd281"}"#;
+/// 11 object rows: (namespace, kind, id, owner, revision, body).
+const NATIVE_7B285B9_PURE_ROWS: [(&str, &str, &str, &str, i64, &str); 11] = [
+    (
+        "n",
+        "artifact",
+        "e03dev-c8e9a537a2362a3a97ad9c2235b356faad249d9d50618a0c9bc8233053f2e3bb",
+        "dev-executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-c8e9a537a2362a3a97ad9c2235b356faad249d9d50618a0c9bc8233053f2e3bb","record_kind":"development_execution_receipt_v1","payload":{"schema_version":"rsia.development_execution_receipt.v1","receipt_id":"devexec-db8b3e9eb82dd767bb56838e8a2639cb5de980e130dd3fcfee67571a5f9f2609","control_id":"dev-control","namespace":"n","episode_id":"episode-1","step":1,"attempt":1,"request_id":"dev-request-1","task_id":"task-a","side":"parent","input_digest":"4b1cd29e86ac99565f4c19e46a6803fdd3a189ea82eba26f9263153a7ce1e5bd","bundle_digest":"a251f2c86e5b625537281fa11f41cfc88802d13d8be50d8af71bc63c045ea3cd","environment_digest":"ba5285161ba6eed0085fb13784ce5c92f70ebc268b94fd66aa1d68a32884204d","request_digest":"e293395460d59855c7213159326c7d13fccab2e310f0d95950080e57a5699959","budget_call_id":"devcall-db8b3e9eb82dd767bb56838e8a2639cb5de980e130dd3fcfee67571a5f9f2609","dispatch_id":"bc483077-6c20-480f-950c-83454b11839b","usage_record_id":"devusage-db8b3e9eb82dd767bb56838e8a2639cb5de980e130dd3fcfee67571a5f9f2609","output_digest":"775020695f409fbe0aea28e542460777bb8224e85d7b9b05773384969960de62","output_artifact_id":"devout-db8b3e9eb82dd767bb56838e8a2639cb5de980e130dd3fcfee67571a5f9f2609","cost_state":{"state":"known","micros":0,"currency":"USD","pricing_version":"pricing-v1"},"execution_provenance":"registered_pure_function","revoke_watermark":1,"source_ids":["run-a","run-b"],"executor_actor":"dev-executor","executor_role":"worker","issued_at_unix_seconds":100}}"#,
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-e30568d8fecc7c066a4fbb30dd9740b7599faa5b0150990bd600f26a0e46057a",
+        "dev-executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-e30568d8fecc7c066a4fbb30dd9740b7599faa5b0150990bd600f26a0e46057a","record_kind":"development_execution_output_v1","payload":{"schema_version":"rsia.development_execution_output.v1","id":"devout-db8b3e9eb82dd767bb56838e8a2639cb5de980e130dd3fcfee67571a5f9f2609","control_id":"dev-control","request_id":"dev-request-1","task_id":"task-a","side":"parent","output_utf8":"{\"answer\":{\"clamped\":-1}}","output_digest":"775020695f409fbe0aea28e542460777bb8224e85d7b9b05773384969960de62"}}"#,
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f5bcdcda41a4816c359afb84946af4c70ae2c688b4ad6d4f6a696d2fc935268b",
+        "dev-executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-f5bcdcda41a4816c359afb84946af4c70ae2c688b4ad6d4f6a696d2fc935268b","record_kind":"development_execution_receipt_v1","payload":{"schema_version":"rsia.development_execution_receipt.v1","receipt_id":"devexec-28ae6ad03ae7fd71360d20e50c59837b4baea8dd937820168850d4bba4bc3581","control_id":"dev-control","namespace":"n","episode_id":"episode-1","step":1,"attempt":1,"request_id":"dev-request-1","task_id":"task-a","side":"candidate","input_digest":"4b1cd29e86ac99565f4c19e46a6803fdd3a189ea82eba26f9263153a7ce1e5bd","bundle_digest":"c69a7d061fe68a35d66b88b8566476bbafae26eb783507b022197fc1966398e9","environment_digest":"ba5285161ba6eed0085fb13784ce5c92f70ebc268b94fd66aa1d68a32884204d","request_digest":"2279e899c83f6f4b8c1b5e8a54b6aad820ccd674b01ec991eca824fb1aa783cc","budget_call_id":"devcall-28ae6ad03ae7fd71360d20e50c59837b4baea8dd937820168850d4bba4bc3581","dispatch_id":"6b15fd15-eb9a-40b6-b85b-b625ce783f2f","usage_record_id":"devusage-28ae6ad03ae7fd71360d20e50c59837b4baea8dd937820168850d4bba4bc3581","output_digest":"775020695f409fbe0aea28e542460777bb8224e85d7b9b05773384969960de62","output_artifact_id":"devout-28ae6ad03ae7fd71360d20e50c59837b4baea8dd937820168850d4bba4bc3581","cost_state":{"state":"known","micros":0,"currency":"USD","pricing_version":"pricing-v1"},"execution_provenance":"registered_pure_function","revoke_watermark":1,"source_ids":["run-a","run-b"],"executor_actor":"dev-executor","executor_role":"worker","issued_at_unix_seconds":100}}"#,
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-18d86ed5f4c6dfeac46c5eb500f019e4af2215cbdec445669c8ba0dcd001c020",
+        "dev-executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-18d86ed5f4c6dfeac46c5eb500f019e4af2215cbdec445669c8ba0dcd001c020","record_kind":"development_execution_output_v1","payload":{"schema_version":"rsia.development_execution_output.v1","id":"devout-28ae6ad03ae7fd71360d20e50c59837b4baea8dd937820168850d4bba4bc3581","control_id":"dev-control","request_id":"dev-request-1","task_id":"task-a","side":"candidate","output_utf8":"{\"answer\":{\"clamped\":-1}}","output_digest":"775020695f409fbe0aea28e542460777bb8224e85d7b9b05773384969960de62"}}"#,
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-264a971fb3c5db68914c923845f8625abb4848d06d6e5342fff278e08e5e9ea4",
+        "dev-grader",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-264a971fb3c5db68914c923845f8625abb4848d06d6e5342fff278e08e5e9ea4","record_kind":"development_grader_receipt_v1","payload":{"schema_version":"rsia.development_grader_receipt.v1","receipt_id":"devgrade-b42dd4e5d5f4578b43644e68923332561c01c9b026b1e43702bdbb0d48b76da9","control_id":"dev-control","namespace":"n","episode_id":"episode-1","step":1,"attempt":1,"request_id":"dev-request-1","task_id":"task-a","parent_execution_receipt_id":"devexec-db8b3e9eb82dd767bb56838e8a2639cb5de980e130dd3fcfee67571a5f9f2609","candidate_execution_receipt_id":"devexec-28ae6ad03ae7fd71360d20e50c59837b4baea8dd937820168850d4bba4bc3581","parent_output_digest":"775020695f409fbe0aea28e542460777bb8224e85d7b9b05773384969960de62","candidate_output_digest":"775020695f409fbe0aea28e542460777bb8224e85d7b9b05773384969960de62","oracle_digest":"07a5ee4619f9a38d3b463a9137cfb467f0f49c469af6f37d90f4e732b6d24f5a","grader_digest":"649c2cd5a8aebd7c31c6378e9294b5a991bb86dd7c8dd9cedcdae722d1d5b92a","grader_version":"exact-json-v1","parent_score_micros":1000000,"candidate_score_micros":1000000,"parent_passed":true,"candidate_passed":true,"scored_output_pair_digest":"61c9a943498b687b9d2c0b66095e9203f56121b7a620dd3bf12694292289d044","scoring_budget_call_id":null,"revoke_watermark":1,"source_ids":["run-a","run-b"],"grader_actor":"dev-grader","issued_at_unix_seconds":100}}"#,
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-0b45169812221a319377f95ca1b1fc42746e040da50e3efd798f7f8146bbd507",
+        "dev-executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-0b45169812221a319377f95ca1b1fc42746e040da50e3efd798f7f8146bbd507","record_kind":"development_execution_receipt_v1","payload":{"schema_version":"rsia.development_execution_receipt.v1","receipt_id":"devexec-8133972033c6782b39ec7ffc4ea550b9e299e4559049d5e28e70167693a98c83","control_id":"dev-control","namespace":"n","episode_id":"episode-1","step":1,"attempt":1,"request_id":"dev-request-1","task_id":"task-b","side":"parent","input_digest":"a577fd498cd0f7aa4af7f772f9e03f7904453337cb21b3d7945f73ddc444a1e4","bundle_digest":"a251f2c86e5b625537281fa11f41cfc88802d13d8be50d8af71bc63c045ea3cd","environment_digest":"ba5285161ba6eed0085fb13784ce5c92f70ebc268b94fd66aa1d68a32884204d","request_digest":"865721ad3f6d88d7db1ac9efcfba2223f4ab8316b84d03e1b0f3d8f33922c39b","budget_call_id":"devcall-8133972033c6782b39ec7ffc4ea550b9e299e4559049d5e28e70167693a98c83","dispatch_id":"b7ae85b4-9e6d-4c42-a3ab-fa035477e06d","usage_record_id":"devusage-8133972033c6782b39ec7ffc4ea550b9e299e4559049d5e28e70167693a98c83","output_digest":"f2aaaf435a06e6ffdb92925f30ae14673a3ed5e4f7c793c44b4197afb36222aa","output_artifact_id":"devout-8133972033c6782b39ec7ffc4ea550b9e299e4559049d5e28e70167693a98c83","cost_state":{"state":"known","micros":0,"currency":"USD","pricing_version":"pricing-v1"},"execution_provenance":"registered_pure_function","revoke_watermark":1,"source_ids":["run-a","run-b"],"executor_actor":"dev-executor","executor_role":"worker","issued_at_unix_seconds":100}}"#,
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-cae37c0e7c69fe02b22a0a89a3bbbf821db208790f5e0b474ab8e30e3a491dea",
+        "dev-executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-cae37c0e7c69fe02b22a0a89a3bbbf821db208790f5e0b474ab8e30e3a491dea","record_kind":"development_execution_output_v1","payload":{"schema_version":"rsia.development_execution_output.v1","id":"devout-8133972033c6782b39ec7ffc4ea550b9e299e4559049d5e28e70167693a98c83","control_id":"dev-control","request_id":"dev-request-1","task_id":"task-b","side":"parent","output_utf8":"{\"answer\":{\"clamped\":3}}","output_digest":"f2aaaf435a06e6ffdb92925f30ae14673a3ed5e4f7c793c44b4197afb36222aa"}}"#,
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f14a8a6fb981e2d1cbd1c7f9a76f51b554fc6053f0814ec7de500e583cc82cdb",
+        "dev-executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-f14a8a6fb981e2d1cbd1c7f9a76f51b554fc6053f0814ec7de500e583cc82cdb","record_kind":"development_execution_receipt_v1","payload":{"schema_version":"rsia.development_execution_receipt.v1","receipt_id":"devexec-1c6ebf2cc794f4b14a650ed0728f4ba548c765f32d019e389e79a2731556b88a","control_id":"dev-control","namespace":"n","episode_id":"episode-1","step":1,"attempt":1,"request_id":"dev-request-1","task_id":"task-b","side":"candidate","input_digest":"a577fd498cd0f7aa4af7f772f9e03f7904453337cb21b3d7945f73ddc444a1e4","bundle_digest":"c69a7d061fe68a35d66b88b8566476bbafae26eb783507b022197fc1966398e9","environment_digest":"ba5285161ba6eed0085fb13784ce5c92f70ebc268b94fd66aa1d68a32884204d","request_digest":"b516de1d6b5cb03529afb5ec499c0f0c3c235acef838b93b51cc0d531df86708","budget_call_id":"devcall-1c6ebf2cc794f4b14a650ed0728f4ba548c765f32d019e389e79a2731556b88a","dispatch_id":"bdc1c3cb-b160-4f29-af23-24142c344ce5","usage_record_id":"devusage-1c6ebf2cc794f4b14a650ed0728f4ba548c765f32d019e389e79a2731556b88a","output_digest":"f2aaaf435a06e6ffdb92925f30ae14673a3ed5e4f7c793c44b4197afb36222aa","output_artifact_id":"devout-1c6ebf2cc794f4b14a650ed0728f4ba548c765f32d019e389e79a2731556b88a","cost_state":{"state":"known","micros":0,"currency":"USD","pricing_version":"pricing-v1"},"execution_provenance":"registered_pure_function","revoke_watermark":1,"source_ids":["run-a","run-b"],"executor_actor":"dev-executor","executor_role":"worker","issued_at_unix_seconds":100}}"#,
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-92b6e07b532f41fff34bebe10865b660a8e065d2b0c9398f669fcb58ca7e9913",
+        "dev-executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-92b6e07b532f41fff34bebe10865b660a8e065d2b0c9398f669fcb58ca7e9913","record_kind":"development_execution_output_v1","payload":{"schema_version":"rsia.development_execution_output.v1","id":"devout-1c6ebf2cc794f4b14a650ed0728f4ba548c765f32d019e389e79a2731556b88a","control_id":"dev-control","request_id":"dev-request-1","task_id":"task-b","side":"candidate","output_utf8":"{\"answer\":{\"clamped\":3}}","output_digest":"f2aaaf435a06e6ffdb92925f30ae14673a3ed5e4f7c793c44b4197afb36222aa"}}"#,
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-a13b1ef2c8e8d2f7345f69e694a3f3324149436ff317af0ee92ffe352a468a34",
+        "dev-grader",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-a13b1ef2c8e8d2f7345f69e694a3f3324149436ff317af0ee92ffe352a468a34","record_kind":"development_grader_receipt_v1","payload":{"schema_version":"rsia.development_grader_receipt.v1","receipt_id":"devgrade-ee8d625372f72d630d8aa5c7557b6a10913fe8eca8929e58e91b0219a390d1f1","control_id":"dev-control","namespace":"n","episode_id":"episode-1","step":1,"attempt":1,"request_id":"dev-request-1","task_id":"task-b","parent_execution_receipt_id":"devexec-8133972033c6782b39ec7ffc4ea550b9e299e4559049d5e28e70167693a98c83","candidate_execution_receipt_id":"devexec-1c6ebf2cc794f4b14a650ed0728f4ba548c765f32d019e389e79a2731556b88a","parent_output_digest":"f2aaaf435a06e6ffdb92925f30ae14673a3ed5e4f7c793c44b4197afb36222aa","candidate_output_digest":"f2aaaf435a06e6ffdb92925f30ae14673a3ed5e4f7c793c44b4197afb36222aa","oracle_digest":"07a5ee4619f9a38d3b463a9137cfb467f0f49c469af6f37d90f4e732b6d24f5a","grader_digest":"649c2cd5a8aebd7c31c6378e9294b5a991bb86dd7c8dd9cedcdae722d1d5b92a","grader_version":"exact-json-v1","parent_score_micros":1000000,"candidate_score_micros":1000000,"parent_passed":true,"candidate_passed":true,"scored_output_pair_digest":"01f02f96fffecfb0500b75c47dacbf3bac245bd7442ee31512a04699385a878c","scoring_budget_call_id":null,"revoke_watermark":1,"source_ids":["run-a","run-b"],"grader_actor":"dev-grader","issued_at_unix_seconds":100}}"#,
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-2261bc39676d29e5d143a3fd9fc56c8f4c690c6d6567de40170f78dbbf3d205e",
+        "dev-executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-2261bc39676d29e5d143a3fd9fc56c8f4c690c6d6567de40170f78dbbf3d205e","record_kind":"development_run_receipt_v1","payload":{"schema_version":"rsia.development_run_receipt.v1","id":"devrun-8df78fb2c1aab041e1bce0100ae96187c626445b2cdb051dad0f891d712f9344","control_id":"dev-control","namespace":"n","request_id":"dev-request-1","episode_id":"episode-1","step":1,"attempt":1,"execution_receipt_ids":["devexec-db8b3e9eb82dd767bb56838e8a2639cb5de980e130dd3fcfee67571a5f9f2609","devexec-28ae6ad03ae7fd71360d20e50c59837b4baea8dd937820168850d4bba4bc3581","devexec-8133972033c6782b39ec7ffc4ea550b9e299e4559049d5e28e70167693a98c83","devexec-1c6ebf2cc794f4b14a650ed0728f4ba548c765f32d019e389e79a2731556b88a"],"grader_receipt_ids":["devgrade-b42dd4e5d5f4578b43644e68923332561c01c9b026b1e43702bdbb0d48b76da9","devgrade-ee8d625372f72d630d8aa5c7557b6a10913fe8eca8929e58e91b0219a390d1f1"],"budget_call_ids":["devcall-db8b3e9eb82dd767bb56838e8a2639cb5de980e130dd3fcfee67571a5f9f2609","devcall-28ae6ad03ae7fd71360d20e50c59837b4baea8dd937820168850d4bba4bc3581","devcall-8133972033c6782b39ec7ffc4ea550b9e299e4559049d5e28e70167693a98c83","devcall-1c6ebf2cc794f4b14a650ed0728f4ba548c765f32d019e389e79a2731556b88a"],"usage_record_ids":["devusage-db8b3e9eb82dd767bb56838e8a2639cb5de980e130dd3fcfee67571a5f9f2609","devusage-28ae6ad03ae7fd71360d20e50c59837b4baea8dd937820168850d4bba4bc3581","devusage-8133972033c6782b39ec7ffc4ea550b9e299e4559049d5e28e70167693a98c83","devusage-1c6ebf2cc794f4b14a650ed0728f4ba548c765f32d019e389e79a2731556b88a"],"executor_actor":"dev-executor","issued_at_unix_seconds":100}}"#,
+    ),
+];
+/// Every dependency edge these rows own: (namespace, src_kind, src_id, dst_kind, dst_id).
+const NATIVE_7B285B9_PURE_EDGES: [(&str, &str, &str, &str, &str); 46] = [
+    (
+        "n",
+        "artifact",
+        "e03dev-0b45169812221a319377f95ca1b1fc42746e040da50e3efd798f7f8146bbd507",
+        "artifact",
+        "budget-ref-5e4effce2d3c100e9839373908829b3b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-0b45169812221a319377f95ca1b1fc42746e040da50e3efd798f7f8146bbd507",
+        "artifact",
+        "e03dev-cae37c0e7c69fe02b22a0a89a3bbbf821db208790f5e0b474ab8e30e3a491dea",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-0b45169812221a319377f95ca1b1fc42746e040da50e3efd798f7f8146bbd507",
+        "artifact",
+        "e03dev-fa1131c7be6e139e0c27f0e9db40e1318c58b9b9d8c4bb81a27533cca04684ae",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-0b45169812221a319377f95ca1b1fc42746e040da50e3efd798f7f8146bbd507",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-0b45169812221a319377f95ca1b1fc42746e040da50e3efd798f7f8146bbd507",
+        "run",
+        "run-b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-18d86ed5f4c6dfeac46c5eb500f019e4af2215cbdec445669c8ba0dcd001c020",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-18d86ed5f4c6dfeac46c5eb500f019e4af2215cbdec445669c8ba0dcd001c020",
+        "run",
+        "run-b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-2261bc39676d29e5d143a3fd9fc56c8f4c690c6d6567de40170f78dbbf3d205e",
+        "artifact",
+        "e03dev-0b45169812221a319377f95ca1b1fc42746e040da50e3efd798f7f8146bbd507",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-2261bc39676d29e5d143a3fd9fc56c8f4c690c6d6567de40170f78dbbf3d205e",
+        "artifact",
+        "e03dev-264a971fb3c5db68914c923845f8625abb4848d06d6e5342fff278e08e5e9ea4",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-2261bc39676d29e5d143a3fd9fc56c8f4c690c6d6567de40170f78dbbf3d205e",
+        "artifact",
+        "e03dev-a13b1ef2c8e8d2f7345f69e694a3f3324149436ff317af0ee92ffe352a468a34",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-2261bc39676d29e5d143a3fd9fc56c8f4c690c6d6567de40170f78dbbf3d205e",
+        "artifact",
+        "e03dev-c8e9a537a2362a3a97ad9c2235b356faad249d9d50618a0c9bc8233053f2e3bb",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-2261bc39676d29e5d143a3fd9fc56c8f4c690c6d6567de40170f78dbbf3d205e",
+        "artifact",
+        "e03dev-f14a8a6fb981e2d1cbd1c7f9a76f51b554fc6053f0814ec7de500e583cc82cdb",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-2261bc39676d29e5d143a3fd9fc56c8f4c690c6d6567de40170f78dbbf3d205e",
+        "artifact",
+        "e03dev-f5bcdcda41a4816c359afb84946af4c70ae2c688b4ad6d4f6a696d2fc935268b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-2261bc39676d29e5d143a3fd9fc56c8f4c690c6d6567de40170f78dbbf3d205e",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-2261bc39676d29e5d143a3fd9fc56c8f4c690c6d6567de40170f78dbbf3d205e",
+        "run",
+        "run-b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-264a971fb3c5db68914c923845f8625abb4848d06d6e5342fff278e08e5e9ea4",
+        "artifact",
+        "e03dev-c8e9a537a2362a3a97ad9c2235b356faad249d9d50618a0c9bc8233053f2e3bb",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-264a971fb3c5db68914c923845f8625abb4848d06d6e5342fff278e08e5e9ea4",
+        "artifact",
+        "e03dev-f5bcdcda41a4816c359afb84946af4c70ae2c688b4ad6d4f6a696d2fc935268b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-264a971fb3c5db68914c923845f8625abb4848d06d6e5342fff278e08e5e9ea4",
+        "artifact",
+        "e03dev-fa1131c7be6e139e0c27f0e9db40e1318c58b9b9d8c4bb81a27533cca04684ae",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-264a971fb3c5db68914c923845f8625abb4848d06d6e5342fff278e08e5e9ea4",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-264a971fb3c5db68914c923845f8625abb4848d06d6e5342fff278e08e5e9ea4",
+        "run",
+        "run-b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-92b6e07b532f41fff34bebe10865b660a8e065d2b0c9398f669fcb58ca7e9913",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-92b6e07b532f41fff34bebe10865b660a8e065d2b0c9398f669fcb58ca7e9913",
+        "run",
+        "run-b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-a13b1ef2c8e8d2f7345f69e694a3f3324149436ff317af0ee92ffe352a468a34",
+        "artifact",
+        "e03dev-0b45169812221a319377f95ca1b1fc42746e040da50e3efd798f7f8146bbd507",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-a13b1ef2c8e8d2f7345f69e694a3f3324149436ff317af0ee92ffe352a468a34",
+        "artifact",
+        "e03dev-f14a8a6fb981e2d1cbd1c7f9a76f51b554fc6053f0814ec7de500e583cc82cdb",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-a13b1ef2c8e8d2f7345f69e694a3f3324149436ff317af0ee92ffe352a468a34",
+        "artifact",
+        "e03dev-fa1131c7be6e139e0c27f0e9db40e1318c58b9b9d8c4bb81a27533cca04684ae",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-a13b1ef2c8e8d2f7345f69e694a3f3324149436ff317af0ee92ffe352a468a34",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-a13b1ef2c8e8d2f7345f69e694a3f3324149436ff317af0ee92ffe352a468a34",
+        "run",
+        "run-b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-c8e9a537a2362a3a97ad9c2235b356faad249d9d50618a0c9bc8233053f2e3bb",
+        "artifact",
+        "budget-ref-28f396d691131f0d8c5831a5d701a2e5",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-c8e9a537a2362a3a97ad9c2235b356faad249d9d50618a0c9bc8233053f2e3bb",
+        "artifact",
+        "e03dev-e30568d8fecc7c066a4fbb30dd9740b7599faa5b0150990bd600f26a0e46057a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-c8e9a537a2362a3a97ad9c2235b356faad249d9d50618a0c9bc8233053f2e3bb",
+        "artifact",
+        "e03dev-fa1131c7be6e139e0c27f0e9db40e1318c58b9b9d8c4bb81a27533cca04684ae",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-c8e9a537a2362a3a97ad9c2235b356faad249d9d50618a0c9bc8233053f2e3bb",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-c8e9a537a2362a3a97ad9c2235b356faad249d9d50618a0c9bc8233053f2e3bb",
+        "run",
+        "run-b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-cae37c0e7c69fe02b22a0a89a3bbbf821db208790f5e0b474ab8e30e3a491dea",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-cae37c0e7c69fe02b22a0a89a3bbbf821db208790f5e0b474ab8e30e3a491dea",
+        "run",
+        "run-b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-e30568d8fecc7c066a4fbb30dd9740b7599faa5b0150990bd600f26a0e46057a",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-e30568d8fecc7c066a4fbb30dd9740b7599faa5b0150990bd600f26a0e46057a",
+        "run",
+        "run-b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f14a8a6fb981e2d1cbd1c7f9a76f51b554fc6053f0814ec7de500e583cc82cdb",
+        "artifact",
+        "budget-ref-c933de659f5baf9bba2bee6762bc5cca",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f14a8a6fb981e2d1cbd1c7f9a76f51b554fc6053f0814ec7de500e583cc82cdb",
+        "artifact",
+        "e03dev-92b6e07b532f41fff34bebe10865b660a8e065d2b0c9398f669fcb58ca7e9913",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f14a8a6fb981e2d1cbd1c7f9a76f51b554fc6053f0814ec7de500e583cc82cdb",
+        "artifact",
+        "e03dev-fa1131c7be6e139e0c27f0e9db40e1318c58b9b9d8c4bb81a27533cca04684ae",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f14a8a6fb981e2d1cbd1c7f9a76f51b554fc6053f0814ec7de500e583cc82cdb",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f14a8a6fb981e2d1cbd1c7f9a76f51b554fc6053f0814ec7de500e583cc82cdb",
+        "run",
+        "run-b",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f5bcdcda41a4816c359afb84946af4c70ae2c688b4ad6d4f6a696d2fc935268b",
+        "artifact",
+        "budget-ref-d3ca2274400db0b5abd234e4e800c3ef",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f5bcdcda41a4816c359afb84946af4c70ae2c688b4ad6d4f6a696d2fc935268b",
+        "artifact",
+        "e03dev-18d86ed5f4c6dfeac46c5eb500f019e4af2215cbdec445669c8ba0dcd001c020",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f5bcdcda41a4816c359afb84946af4c70ae2c688b4ad6d4f6a696d2fc935268b",
+        "artifact",
+        "e03dev-fa1131c7be6e139e0c27f0e9db40e1318c58b9b9d8c4bb81a27533cca04684ae",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f5bcdcda41a4816c359afb84946af4c70ae2c688b4ad6d4f6a696d2fc935268b",
+        "run",
+        "run-a",
+    ),
+    (
+        "n",
+        "artifact",
+        "e03dev-f5bcdcda41a4816c359afb84946af4c70ae2c688b4ad6d4f6a696d2fc935268b",
+        "run",
+        "run-b",
+    ),
+];
+
+/// Inserts native rows and the edges they own exactly as stored, bypassing every
+/// current writer.
+async fn insert_native(
+    path: &std::path::Path,
+    rows: &[(&str, &str, &str, &str, i64, &str)],
+    edges: &[(&str, &str, &str, &str, &str)],
+) {
+    let pool = evo_storage::sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    for (namespace, kind, id, owner, revision, body) in rows {
+        evo_storage::sqlx::query(
+            "INSERT INTO objects(namespace,kind,id,owner,body,revision) VALUES(?,?,?,?,?,?)",
+        )
+        .bind(namespace)
+        .bind(kind)
+        .bind(id)
+        .bind(owner)
+        .bind(body)
+        .bind(revision)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    for (namespace, src_kind, src_id, dst_kind, dst_id) in edges {
+        evo_storage::sqlx::query(
+            "INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,?,?,?,?)",
+        )
+        .bind(namespace)
+        .bind(src_kind)
+        .bind(src_id)
+        .bind(dst_kind)
+        .bind(dst_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    pool.close().await;
+}
+
+fn native_payload(body: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(body).unwrap()["payload"].clone()
+}
+
 #[tokio::test]
 async fn legacy_receipts_and_stage_cache_never_gain_current_authority() {
     let fixture = Fixture::new().await;
@@ -2870,9 +3339,13 @@ async fn legacy_receipts_and_stage_cache_never_gain_current_authority() {
         .await
         .unwrap();
     let current_id = report.results[0].parent_execution_id.clone();
-    let current = load_execution_receipt(&fixture.store, &fixture.admin, &current_id)
-        .await
-        .unwrap();
+    assert_eq!(
+        load_execution_receipt(&fixture.store, &fixture.admin, &current_id)
+            .await
+            .unwrap()
+            .schema_version,
+        DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2
+    );
     let current_storage = storage_id(EXECUTION_RECEIPT_KIND, &current_id).unwrap();
     let mut session = fixture.store.session().await.unwrap();
     let original: serde_json::Value = session
@@ -2880,28 +3353,18 @@ async fn legacy_receipts_and_stage_cache_never_gain_current_authority() {
         .await
         .unwrap();
     session.commit().await.unwrap();
-    // Deliberately derived historical wire, not a native old-producer constant
-    // or V104 evidence. It can never add authority even alongside real current facts.
-    let mut legacy = current.clone();
-    legacy.schema_version = DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA.into();
-    legacy.receipt_id =
-        legacy_execution_receipt_id(&request.request_id, "task-a", DevelopmentSide::Parent)
-            .unwrap();
-    let legacy_storage = storage_id(EXECUTION_RECEIPT_KIND, &legacy.receipt_id).unwrap();
-    let legacy_envelope = serde_json::json!({"schema_version":"rsia.typed_artifact_envelope.v1","id":legacy_storage,"record_kind":EXECUTION_RECEIPT_KIND,"payload":legacy});
-    let mut session = fixture.store.session().await.unwrap();
-    session
-        .put(
-            &fixture.admin,
-            "artifact",
-            &legacy_storage,
-            "admin",
-            &legacy_envelope,
-        )
-        .await
-        .unwrap();
-    session.commit().await.unwrap();
+    // The native 7b285b9 V1 receipt of this exact request and side, byte for
+    // byte. It can never add authority even alongside real current facts.
     let path = fixture._dir.path().join("development.sqlite3");
+    insert_native(&path, &NATIVE_7B285B9_PURE_ROWS[..1], &[]).await;
+    let legacy: evo_engine::development::DevelopmentExecutionReceiptV1 =
+        serde_json::from_value(native_payload(NATIVE_7B285B9_PURE_ROWS[0].5)).unwrap();
+    assert_eq!(legacy.schema_version, DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA);
+    assert_eq!(
+        legacy.receipt_id,
+        legacy_execution_receipt_id(&request.request_id, "task-a", DevelopmentSide::Parent)
+            .unwrap()
+    );
     let before = clock_failure_sqlite_snapshot(&path);
     let mut session = fixture.store.session().await.unwrap();
     let historical = read_execution_receipt_in_session(
@@ -3093,5 +3556,178 @@ async fn legacy_receipts_and_stage_cache_never_gain_current_authority() {
     assert_eq!(financial_replay, accounted);
     assert_eq!(financial_replay.response_artifact.as_ref(), Some(&artifact));
     assert_eq!(clock_failure_sqlite_snapshot(&path), before);
+    fixture.store.close().await;
+
+    // The whole native 7b285b9 run of this Fixture's request: statically readable
+    // as Legacy, with its current successor ID derivable from the same input and
+    // version; never rerun or upgraded under its request ID, while a new request
+    // ID runs current; and cleaned by revocation like any execution evidence.
+    let fixture = Fixture::new().await;
+    let request = fixture.request();
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        serde_json::from_str::<serde_json::Value>(NATIVE_7B285B9_PURE_REQUEST).unwrap()
+    );
+    let path = fixture._dir.path().join("development.sqlite3");
+    insert_native(&path, &NATIVE_7B285B9_PURE_ROWS, &NATIVE_7B285B9_PURE_EDGES).await;
+    let run = native_payload(NATIVE_7B285B9_PURE_ROWS[10].5);
+    assert_eq!(
+        serde_json::to_value(
+            evo_engine::development::load_run_receipt(
+                &fixture.store,
+                &fixture.admin,
+                run["id"].as_str().unwrap()
+            )
+            .await
+            .unwrap()
+        )
+        .unwrap(),
+        run
+    );
+    let sides = [
+        ("task-a", DevelopmentSide::Parent, 0),
+        ("task-a", DevelopmentSide::Candidate, 2),
+        ("task-b", DevelopmentSide::Parent, 5),
+        ("task-b", DevelopmentSide::Candidate, 7),
+    ];
+    for (task, side, row) in sides {
+        let receipt = native_payload(NATIVE_7B285B9_PURE_ROWS[row].5);
+        let output = native_payload(NATIVE_7B285B9_PURE_ROWS[row + 1].5);
+        let id = receipt["receipt_id"].as_str().unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                load_execution_receipt(&fixture.store, &fixture.admin, id)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            serde_json::to_value(
+                load_execution_output(
+                    &fixture.store,
+                    &fixture.admin,
+                    receipt["output_artifact_id"].as_str().unwrap()
+                )
+                .await
+                .unwrap()
+            )
+            .unwrap(),
+            output
+        );
+        let mut session = fixture.store.session().await.unwrap();
+        let read = read_execution_receipt_in_session(
+            &mut session,
+            &fixture.admin,
+            &request,
+            task,
+            side,
+            DevelopmentExecutionReceiptVersion::V1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.state, evo_storage::PersistentContractState::Legacy);
+        assert_eq!(read.legacy_receipt_id, id);
+        assert_eq!(
+            read.current_receipt_id,
+            execution_receipt_id(&request.request_id, task, side).unwrap()
+        );
+        assert_ne!(read.current_receipt_id, read.legacy_receipt_id);
+        assert!(matches!(
+            read_execution_receipt_in_session(
+                &mut session,
+                &fixture.admin,
+                &request,
+                task,
+                side,
+                DevelopmentExecutionReceiptVersion::V2,
+            )
+            .await,
+            Err(Error::NotFound)
+        ));
+        session.commit().await.unwrap();
+    }
+    for (task, row) in [("task-a", 4), ("task-b", 9)] {
+        assert_eq!(
+            serde_json::to_value(
+                load_grader_receipt(
+                    &fixture.store,
+                    &fixture.admin,
+                    &grader_receipt_id(&request.request_id, task).unwrap()
+                )
+                .await
+                .unwrap()
+            )
+            .unwrap(),
+            native_payload(NATIVE_7B285B9_PURE_ROWS[row].5)
+        );
+    }
+    let before = clock_failure_sqlite_snapshot(&path);
+    assert!(
+        matches!(fixture.runner().run(request.clone()).await, Err(Error::Conflict(message)) if message == "development execution source_legacy; new request_id required")
+    );
+    assert_eq!(clock_failure_sqlite_snapshot(&path), before);
+    let mut successor = request.clone();
+    successor.request_id = "ag183-native-successor".into();
+    let current = fixture.runner().run(successor.clone()).await.unwrap();
+    for (task, side, _) in sides {
+        let id = execution_receipt_id(&successor.request_id, task, side).unwrap();
+        assert!(
+            current
+                .results
+                .iter()
+                .any(|result| result.parent_execution_id == id
+                    || result.candidate_execution_id == id)
+        );
+        assert_eq!(
+            load_execution_receipt(&fixture.store, &fixture.admin, &id)
+                .await
+                .unwrap()
+                .schema_version,
+            DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2
+        );
+    }
+    let mut status = LifecycleCoordinator::revoke_source(
+        &fixture.admin,
+        &fixture.store,
+        "run-a",
+        "privacy",
+        200,
+    )
+    .await
+    .unwrap();
+    for now in 201..400 {
+        if status.state == CleanupState::Complete {
+            break;
+        }
+        status = LifecycleCoordinator::continue_cleanup(
+            &fixture.admin,
+            &fixture.store,
+            &status.job_id,
+            8,
+            now,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(status.state, CleanupState::Complete);
+    // The outputs are redacted; the receipts, grader receipts and run receipt are
+    // the preserved accounting history, still exactly the native bytes.
+    let mut session = fixture.store.session().await.unwrap();
+    for (index, (_, kind, id, _, _, body)) in NATIVE_7B285B9_PURE_ROWS.iter().enumerate() {
+        let stored = session
+            .object_row(&fixture.admin, kind, id)
+            .await
+            .unwrap()
+            .unwrap();
+        if [1, 3, 6, 8].contains(&index) {
+            let value: serde_json::Value = serde_json::from_str(&stored.body).unwrap();
+            assert_eq!(value["schema_version"], "rsia.redacted.v1", "{id}");
+        } else {
+            assert_eq!(stored.body, *body, "{id}");
+        }
+    }
+    session.commit().await.unwrap();
     fixture.store.close().await;
 }

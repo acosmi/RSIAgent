@@ -2,26 +2,33 @@
 //! Admin-registered K=3, `PracticeAttemptSetV1`, and the guarantee that an
 //! attempt is never a development cycle or an independent sample. Real SQLite
 //! store, the registered pure-function runner, no model, no provider, zero
-//! monetary cost. The contrast path needs runners whose scores differ between
-//! attempts; the deterministic registered runner cannot produce that, so
-//! `ContrastRunner` writes honest E03 receipts with chosen outputs.
+//! monetary cost. A contrast needs scores that differ between attempts; the
+//! deterministic registered runners cannot produce that. `ContrastRunner`
+//! chooses its outputs instead, and since AG-183 the issuer recomputes the
+//! frozen target and refuses every chosen output that is not the real one, so
+//! the contrast policy itself is exercised on its own (`select_contrast`).
 
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
 use async_trait::async_trait;
+use evo_core::contract::{CompileParts, HostCapabilities, Profile, SkillSnapshot};
 use evo_core::curriculum::{CurriculumControlProfileV1, LearnerStateV2};
 use evo_core::evaluation::DataUse;
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::strategy::PracticePlan;
-use evo_core::{Context, Error, Role, fingerprint, hash};
+use evo_core::{Context, Error, Role, Strategy, fingerprint, hash};
 use evo_engine::curriculum::{
     CurriculumSourceArtifactV1, CurriculumSourceKindV1, DevelopmentCycleReceiptV1,
     PersistentCurriculumCoordinator, curriculum_state_storage_id,
 };
 use evo_engine::curriculum_profiles::{
     RegisteredPureFunctionProfileV1, registered_profile_source_bodies,
+};
+use evo_engine::development::projection::{
+    ConfigProjectionControlV1, ConfigProjectionDevelopmentRunner, ConfigProjectionTaskV1,
+    register_config_projection_control,
 };
 use evo_engine::development::{
     DEVELOPMENT_RUN_RECEIPT_SCHEMA, DevelopmentControlV1, DevelopmentCostState,
@@ -43,8 +50,9 @@ use evo_engine::optimization::{
 };
 use evo_engine::practice::{
     PRACTICE_ATTEMPT_SET_SCHEMA, PRACTICE_REGISTRATION_BINDING_SCHEMA,
-    PRACTICE_REGISTRATION_SCHEMA, PracticeAttemptSetV1, PracticeOutcomeV1, PracticeRegistrationV1,
-    PracticeRunRequest, load_practice_attempt_set, load_practice_registration,
+    PRACTICE_REGISTRATION_SCHEMA, PRACTICE_REQUEST_CLOSURE_SCHEMA, PracticeAttemptSetV1,
+    PracticeAttemptV1, PracticeOutcomeV1, PracticeRegistrationV1, PracticeRunRequest,
+    PracticeTaskResultV1, load_practice_attempt_set, load_practice_registration,
     load_practice_registration_binding, practice_attempt_request, practice_attempt_request_id,
     practice_attempt_set_storage_id, practice_registration_binding_storage_id,
     practice_registration_storage_id, register_practice, run_practice_set, select_contrast,
@@ -628,6 +636,8 @@ struct ContrastRunner {
     grader: Context,
     correct: fn(u32, &str) -> bool,
     calls: AtomicUsize,
+    /// The exact errors the issuer answered the runner with.
+    refusals: Mutex<Vec<String>>,
 }
 
 impl ContrastRunner {
@@ -638,7 +648,12 @@ impl ContrastRunner {
             grader: fixture.grader.clone(),
             correct,
             calls: AtomicUsize::new(0),
+            refusals: Mutex::new(Vec::new()),
         }
+    }
+
+    fn refusals(&self) -> Vec<String> {
+        self.refusals.lock().unwrap().clone()
     }
 
     async fn issue_side(
@@ -756,6 +771,19 @@ impl ContrastRunner {
 impl DevRunner for ContrastRunner {
     async fn run(&self, request: DevelopmentRunRequest) -> evo_core::Result<DevelopmentRunReport> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let result = self.run_chosen(request).await;
+        if let Err(error) = &result {
+            self.refusals.lock().unwrap().push(error.to_string());
+        }
+        result
+    }
+}
+
+impl ContrastRunner {
+    async fn run_chosen(
+        &self,
+        request: DevelopmentRunRequest,
+    ) -> evo_core::Result<DevelopmentRunReport> {
         let control = load_development_control(&self.store, &self.executor, CONTROL_ID).await?;
         let mut results = Vec::new();
         let mut execution_ids = Vec::new();
@@ -1427,114 +1455,405 @@ async fn a_worker_may_run_a_registered_set_and_a_new_set_never_reuses_an_old_att
 // 4. The contrast path (fixture runners with differing scores)
 // ---------------------------------------------------------------------------
 
+/// The contrast policy's input, written out: per attempt, the adopted scores of
+/// task-a and task-b. No receipt stands behind it; it only feeds `select_contrast`.
+fn policy_attempts(set_id: &str, scores: &[[u32; 2]]) -> Vec<PracticeAttemptV1> {
+    scores
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let attempt = u32::try_from(index + 1).unwrap();
+            let request_id = practice_attempt_request_id(set_id, attempt).unwrap();
+            PracticeAttemptV1 {
+                attempt,
+                execution_receipt_id: run_receipt_id(&request_id).unwrap(),
+                request_id,
+                tasks: [("task-a", "family-a"), ("task-b", "family-b")]
+                    .iter()
+                    .zip(row)
+                    .map(|((task, family), score)| PracticeTaskResultV1 {
+                        task_id: (*task).into(),
+                        parent_family: (*family).into(),
+                        passed: *score == 1_000_000,
+                        score_micros: *score,
+                        output_digest: d(&format!("policy-output-{score}")),
+                    })
+                    .collect(),
+                cost_state: known_zero(),
+                cache_hit: false,
+            }
+        })
+        .collect()
+}
+
+/// A runner that chose a wrong output for attempt 1 stops the set at that very
+/// side: the issuer recomputed the frozen target and refused before any receipt.
+/// The call it had reserved, dispatched and settled stays settled at its zero
+/// charge; nothing about it is refunded or rewritten.
+async fn assert_chosen_output_refused(
+    fixture: &Fixture,
+    runner: &ContrastRunner,
+    set: &PracticeAttemptSetV1,
+    request: &PracticeRunRequest,
+    refused_task: &str,
+) {
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runner.refusals(),
+        vec!["state conflict: registered execution output differs from frozen target".to_string()]
+    );
+    assert_eq!(
+        set.outcome,
+        PracticeOutcomeV1::Incomplete {
+            reason: "attempt_error:1:conflict".into()
+        }
+    );
+    assert!(set.attempts.is_empty());
+    let development = practice_attempt_request(&fixture.control, request, 1).unwrap();
+    let call_id = execution_budget_call_id(
+        &development.request_id,
+        refused_task,
+        DevelopmentSide::Parent,
+    )
+    .unwrap();
+    let call = fixture
+        .store
+        .budget_call(&fixture.admin, SCOPE, &call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, evo_storage::budget::BudgetCallState::Finalized);
+    assert_eq!(call.actual_cost_micros, Some(0));
+    assert!(matches!(
+        load_execution_receipt(
+            &fixture.store,
+            &fixture.admin,
+            &evo_engine::development::execution_receipt_id(
+                &development.request_id,
+                refused_task,
+                DevelopmentSide::Parent,
+            )
+            .unwrap(),
+        )
+        .await,
+        Err(Error::NotFound)
+    ));
+}
+
 #[tokio::test]
 async fn k3_with_a_better_second_attempt_names_the_contrast_and_keeps_every_attempt() {
+    // N: the runner chose a wrong output for attempt 1 (only attempt 2 right).
     let fixture = Fixture::new().await;
     let plan = plan_k3("authorization-contrast");
     register_k3(&fixture, &plan).await;
     let runner = ContrastRunner::new(&fixture, |attempt, _task| attempt == 2);
-    let set = run_practice_set(
-        &fixture.admin,
-        &fixture.store,
-        &runner,
-        practice_request("set-contrast", plan),
-    )
-    .await
-    .unwrap();
-    assert_eq!(runner.calls.load(Ordering::SeqCst), 3);
-    // Higher score is better; the worse attempt is the earliest of the worst.
+    let request = practice_request("set-contrast", plan);
+    let set = run_practice_set(&fixture.admin, &fixture.store, &runner, request.clone())
+        .await
+        .unwrap();
+    assert_chosen_output_refused(&fixture, &runner, &set, &request, "task-a").await;
+    let stored = load_practice_attempt_set(&fixture.store, &fixture.admin, "set-contrast")
+        .await
+        .unwrap();
+    assert_eq!(fingerprint(&stored).unwrap(), fingerprint(&set).unwrap());
+
+    // P: higher score is better; the worse attempt is the earliest of the worst.
+    let attempts = policy_attempts("set-contrast", &[[0, 0], [1_000_000, 0], [0, 0]]);
     assert_eq!(
-        set.outcome,
+        select_contrast(&attempts),
         PracticeOutcomeV1::Contrast {
             better_attempt: 2,
             worse_attempt: 1,
             task_id: "task-a".into(),
         }
     );
-    assert_eq!(set.attempts.len(), 3);
     assert_eq!(
-        set.attempts
+        attempts
             .iter()
-            .map(|attempt| attempt.tasks[0].score_micros)
+            .map(|attempt| (attempt.tasks[0].score_micros, attempt.tasks[0].passed))
             .collect::<Vec<_>>(),
-        vec![0, 1_000_000, 0]
+        vec![(0, false), (1_000_000, true), (0, false)]
     );
-    assert_eq!(
-        set.attempts
-            .iter()
-            .map(|attempt| attempt.tasks[0].passed)
-            .collect::<Vec<_>>(),
-        vec![false, true, false]
-    );
-    // The outputs differ, so the digests do: the evidence is the receipts'.
-    assert_ne!(
-        set.attempts[0].tasks[0].output_digest,
-        set.attempts[1].tasks[0].output_digest
-    );
-    assert_eq!(
-        set.attempts[0].tasks[0].output_digest,
-        set.attempts[2].tasks[0].output_digest
-    );
-    // Even with a contrast the set is no independent sample.
-    assert_eq!(set.independent_clusters, 2);
-    assert!(!set.counts_as_independent_samples);
-    let stored = load_practice_attempt_set(&fixture.store, &fixture.admin, "set-contrast")
+
+    // Real K=3 of a config projection control: every attempt runs the frozen
+    // Bundle projection under its persisted request closure, nothing chosen.
+    // A deterministic target cannot make attempts differ, so the real outcome
+    // is NoContrast; the set still keeps every attempt and is no sample.
+    let content = SkillSnapshot {
+        content: "config_precedence.v1: highest_layer_first".into(),
+        ..SkillSnapshot::empty()
+    };
+    let profile = Profile {
+        id: "practice-config-profile".into(),
+        evolution_enabled: true,
+        parent_digest: d("experimental-parent"),
+        baseline_digest: d("experimental-baseline"),
+    };
+    let bundle = trusted_compiler_inputs::bundle_current(
+        &fixture.store,
+        &fixture.executor,
+        CompileParts {
+            profile: &profile,
+            parent: &content,
+            baseline: &SkillSnapshot::empty(),
+            parent_strategy: &Strategy::default(),
+            baseline_strategy: &Strategy::default(),
+            skill_patch: &Default::default(),
+            improver_patch: &Default::default(),
+            caps: &HostCapabilities {
+                available: Default::default(),
+                granted: Default::default(),
+            },
+            revoked: &Default::default(),
+        },
+        &fixture.control.environment_digest,
+        1,
+    )
+    .await
+    .unwrap();
+    trusted_compiler_inputs::persist_bundle_current(
+        &fixture.store,
+        &fixture.executor,
+        &bundle,
+        &fixture.control.environment_digest,
+        1,
+    )
+    .await
+    .unwrap();
+    let config = ConfigProjectionControlV1::registered(
+        "practice-config-control",
+        NAMESPACE,
+        SCOPE,
+        "dev-root",
+        "dev-executor",
+        "dev-grader",
+        "optimizer",
+        "practice-config-manifest",
+        vec![
+            ConfigProjectionTaskV1::registered(
+                "family-a",
+                serde_json::json!({"template":"F","layer_count":2,"key_type":"B","placement":"E","seed":1}),
+            )
+            .unwrap(),
+        ],
+        fixture.control.environment_digest.clone(),
+        d("rules"),
+        d("tools"),
+        vec!["run-a".into(), "run-b".into()],
+        1,
+    )
+    .unwrap();
+    register_config_projection_control(&fixture.admin, &fixture.store, config.clone())
         .await
         .unwrap();
-    assert_eq!(stored.outcome, set.outcome);
-    stored.validate().unwrap();
+    let config_runner = ConfigProjectionDevelopmentRunner::with_clock(
+        fixture.store.clone(),
+        fixture.executor.clone(),
+        fixture.grader.clone(),
+        config.id.clone(),
+        600,
+        Arc::new(|| 100),
+    )
+    .unwrap();
+    let task_id = config.tasks[0].task_id.clone();
+    let plan =
+        PracticePlan::new("cluster-1", vec![task_id.clone()], 3, Some(d("config-k3"))).unwrap();
+    register_k3(&fixture, &plan).await;
+    let config_request = PracticeRunRequest {
+        set_id: "set-config".into(),
+        control_id: config.id.clone(),
+        plan,
+        episode_id: "practice-episode-set-config".into(),
+        step: 1,
+        bundle_digest: bundle.digest.clone(),
+        revoke_watermark: 1,
+        created_at: 10,
+    };
+    let set = run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &config_runner,
+        config_request.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(set.outcome, PracticeOutcomeV1::NoContrast);
+    assert_eq!(set.attempts.len(), 3);
+    assert_eq!(set.independent_clusters, 1);
+    assert!(!set.counts_as_independent_samples);
+    for attempt in &set.attempts {
+        assert!(!attempt.cache_hit);
+        assert_eq!(attempt.cost_state, known_zero());
+        assert_eq!(attempt.tasks.len(), 1);
+        assert_eq!(attempt.tasks[0].task_id, task_id);
+        assert_eq!(attempt.tasks[0].score_micros, 1_000_000);
+        assert!(attempt.tasks[0].passed);
+        assert_eq!(attempt.tasks[0], set.attempts[0].tasks[0]);
+    }
+    set.validate().unwrap();
+    let stored = load_practice_attempt_set(&fixture.store, &fixture.admin, "set-config")
+        .await
+        .unwrap();
+    assert_eq!(fingerprint(&stored).unwrap(), fingerprint(&set).unwrap());
+    // The same request again re-verifies every attempt through its closure and
+    // pays nothing.
+    let calls = fixture.group_calls("practice-episode-set-config").await;
+    assert_eq!(calls.len(), 6);
+    let again = run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &config_runner,
+        config_request,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fingerprint(&again).unwrap(), fingerprint(&set).unwrap());
+    assert_eq!(
+        fixture.group_calls("practice-episode-set-config").await,
+        calls
+    );
+    let mut session = fixture.store.session().await.unwrap();
+    let artifacts = session
+        .list::<serde_json::Value>(&fixture.admin, "artifact")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(
+        count_schema(&artifacts, PRACTICE_REQUEST_CLOSURE_SCHEMA),
+        3 + 3,
+        "one closure per attempt of each set, the refused set included"
+    );
+    assert!(artifacts.iter().all(|value| {
+        value["schema_version"] != OPTIMIZATION_STAGE_FACT_SCHEMA
+            || value["episode_id"] != "practice-episode-set-config"
+    }));
+    // The config runner's Prepared gate is unchanged for any other request: an
+    // attempt of a set that was never authorized has neither ticket.
+    let unauthorized = practice_attempt_request_id("set-never-authorized", 1).unwrap();
+    let mut development = DevelopmentRunRequest {
+        request_id: unauthorized.clone(),
+        namespace: NAMESPACE.into(),
+        purpose: Purpose::Development,
+        episode_id: "practice-episode-set-config".into(),
+        step: 1,
+        attempt: 1,
+        manifest: config.manifest().unwrap(),
+        parent_bundle_digest: bundle.digest.clone(),
+        candidate_bundle_digest: bundle.digest.clone(),
+        environment_digest: config.environment_digest.clone(),
+        grader_digest: config.grader_digest.clone(),
+        rules_digest: config.rules_digest.clone(),
+        tools_digest: config.tools_digest.clone(),
+        revoke_watermark: 1,
+        idempotency_key: format!("{unauthorized}-idem"),
+    };
+    assert!(matches!(
+        config_runner.run(development.clone()).await,
+        Err(Error::NotFound)
+    ));
+    // A request that differs from what its closure froze is no attempt of it.
+    development.request_id = set.attempts[0].request_id.clone();
+    development.idempotency_key = "another-idempotency-key".into();
+    assert!(matches!(
+        config_runner.run(development).await,
+        Err(Error::Conflict(message)) if message == "practice request differs from its request closure"
+    ));
+    assert_eq!(
+        fixture.group_calls("practice-episode-set-config").await,
+        calls
+    );
 }
 
 #[tokio::test]
 async fn the_contrast_names_the_first_task_whose_attempts_differ() {
+    // N: task-a is right everywhere, task-b only in attempt 3. Attempt 1 issues
+    // its legal task-a receipts and grade, then is refused at task-b's parent.
     let fixture = Fixture::new().await;
     let plan = plan_k3("authorization-contrast-b");
     register_k3(&fixture, &plan).await;
-    // task-a agrees everywhere; only attempt 3 gets task-b right.
     let runner = ContrastRunner::new(&fixture, |attempt, task| task == "task-a" || attempt == 3);
-    let set = run_practice_set(
-        &fixture.admin,
-        &fixture.store,
-        &runner,
-        practice_request("set-contrast-b", plan),
-    )
-    .await
-    .unwrap();
+    let request = practice_request("set-contrast-b", plan);
+    let set = run_practice_set(&fixture.admin, &fixture.store, &runner, request.clone())
+        .await
+        .unwrap();
+    assert_chosen_output_refused(&fixture, &runner, &set, &request, "task-b").await;
+    let development = practice_attempt_request(&fixture.control, &request, 1).unwrap();
+    for side in [DevelopmentSide::Parent, DevelopmentSide::Candidate] {
+        let receipt = load_execution_receipt(
+            &fixture.store,
+            &fixture.admin,
+            &evo_engine::development::execution_receipt_id(&development.request_id, "task-a", side)
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            receipt.schema_version,
+            evo_engine::development::DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2
+        );
+    }
+    assert!(
+        evo_engine::development::load_grader_receipt(
+            &fixture.store,
+            &fixture.admin,
+            &evo_engine::development::grader_receipt_id(&development.request_id, "task-a").unwrap(),
+        )
+        .await
+        .is_ok()
+    );
+
+    // P: the first task, in control order, whose attempts differ is named.
+    let attempts = policy_attempts(
+        "set-contrast-b",
+        &[[1_000_000, 0], [1_000_000, 0], [1_000_000, 1_000_000]],
+    );
     assert_eq!(
-        set.outcome,
+        select_contrast(&attempts),
         PracticeOutcomeV1::Contrast {
             better_attempt: 3,
             worse_attempt: 1,
             task_id: "task-b".into(),
         }
     );
-    assert_eq!(select_contrast(&set.attempts), set.outcome);
 }
 
 #[tokio::test]
 async fn identical_attempts_from_a_fixture_runner_are_no_contrast_and_k_is_never_raised() {
+    // N: a runner that answers every task wrongly is refused at its first side.
     let fixture = Fixture::new().await;
     let plan = plan_k3("authorization-no-contrast");
     register_k3(&fixture, &plan).await;
     let runner = ContrastRunner::new(&fixture, |_attempt, _task| false);
+    let request = practice_request("set-no-contrast", plan);
+    let set = run_practice_set(&fixture.admin, &fixture.store, &runner, request.clone())
+        .await
+        .unwrap();
+    assert_chosen_output_refused(&fixture, &runner, &set, &request, "task-a").await;
+
+    // P: attempts that all failed identically are no valid difference.
+    let attempts = policy_attempts("set-no-contrast", &[[0, 0], [0, 0], [0, 0]]);
+    assert_eq!(select_contrast(&attempts), PracticeOutcomeV1::NoContrast);
+
+    // I: identical real attempts run K=3 exactly, with no fourth try.
+    let plan = plan_k3("authorization-no-contrast-real");
+    register_k3(&fixture, &plan).await;
+    let runner = fixture.counting();
     let set = run_practice_set(
         &fixture.admin,
         &fixture.store,
         &runner,
-        practice_request("set-no-contrast", plan),
+        practice_request("set-no-contrast-real", plan),
     )
     .await
     .unwrap();
-    // Every attempt failed identically: no valid difference, and no fourth try.
     assert_eq!(set.outcome, PracticeOutcomeV1::NoContrast);
     assert_eq!(set.attempts.len(), 3);
-    assert_eq!(runner.calls.load(Ordering::SeqCst), 3);
-    assert!(set.attempts.iter().all(|attempt| {
-        attempt
-            .tasks
+    assert_eq!(runner.calls(), 3);
+    assert!(
+        set.attempts
             .iter()
-            .all(|task| !task.passed && task.score_micros == 0)
-    }));
+            .all(|attempt| attempt.tasks == set.attempts[0].tasks)
+    );
 }
 
 // ---------------------------------------------------------------------------

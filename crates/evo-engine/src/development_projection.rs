@@ -535,11 +535,15 @@ fn projection_content_digest(projection: &RunProjection) -> Result<String> {
     fingerprint(&(&projection.instructions, &projection.tools))
 }
 
+// A Prepared fact authorizes an optimization request. Only when it is absent may
+// a practice attempt's persisted request closure authorize the same execution;
+// without either the ticket is missing exactly as before.
 async fn require_request_fact(
     s: &mut Session,
     ctx: &Context,
+    c: &ConfigControl,
     request: &DevelopmentRunRequest,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let expected = StageFact {
         schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
         artifact_id: String::new(),
@@ -556,7 +560,17 @@ async fn require_request_fact(
         payload: serde_json::to_value(request).map_err(|_| Error::Internal)?,
     }
     .seal()?;
-    let actual: StageFact = s.need(ctx, "artifact", &expected.artifact_id).await?;
+    let Some(actual) = s
+        .get::<StageFact>(ctx, "artifact", &expected.artifact_id)
+        .await?
+    else {
+        return Box::pin(crate::practice::verify_request_closure_in_session(
+            s, ctx, &c.record, request,
+        ))
+        .await?
+        .map(|closure| (closure, true))
+        .ok_or(Error::NotFound);
+    };
     actual.validate()?;
     if actual.payload != expected.payload
         || actual.input_digest != expected.input_digest
@@ -584,13 +598,14 @@ async fn require_request_fact(
             ));
         }
     }
-    Ok(actual.artifact_id)
+    Ok((actual.artifact_id, false))
 }
 
 struct ConfigBundles {
     parent: LoadedAuthenticatedBundleRecord,
     candidate: LoadedAuthenticatedBundleRecord,
     request_fact_id: String,
+    practice_closure: bool,
 }
 
 async fn load_bundles(
@@ -601,7 +616,7 @@ async fn load_bundles(
 ) -> Result<ConfigBundles> {
     c.bind(request)?;
     require_live_sources(s, ctx, &c.record.source_ids, request.revoke_watermark).await?;
-    let request_fact_id = require_request_fact(s, ctx, request).await?;
+    let (request_fact_id, practice_closure) = require_request_fact(s, ctx, c, request).await?;
     let mut records = Vec::with_capacity(2);
     for digest in [
         &request.parent_bundle_digest,
@@ -641,6 +656,7 @@ async fn load_bundles(
         parent,
         candidate,
         request_fact_id,
+        practice_closure,
     })
 }
 
@@ -873,18 +889,12 @@ pub async fn read_config_projection_execution_receipt_in_session(
     let legacy_receipt_id = legacy_execution_receipt_id(&request.request_id, task_id, side)?;
     let current_receipt_id =
         config_projection_execution_receipt_id(&request.request_id, task_id, side)?;
-    let (id, schema) = match version {
-        DevelopmentExecutionReceiptVersion::V1 => {
-            (&legacy_receipt_id, CONFIG_PROJECTION_EXECUTION_SCHEMA)
-        }
-        DevelopmentExecutionReceiptVersion::V2 => {
-            (&current_receipt_id, CONFIG_PROJECTION_EXECUTION_SCHEMA_V2)
-        }
+    // The requested ID fixes the wire: each version derives its own ID domain.
+    let id = match version {
+        DevelopmentExecutionReceiptVersion::V1 => &legacy_receipt_id,
+        DevelopmentExecutionReceiptVersion::V2 => &current_receipt_id,
     };
     let receipt = need_config_execution(session, ctx, id).await?;
-    if receipt.schema_version != schema {
-        return Err(projection_mismatch());
-    }
     let c = need_config_control(session, ctx, &receipt.execution.control_id).await?;
     let state = match version {
         DevelopmentExecutionReceiptVersion::V1 => {
@@ -1174,12 +1184,8 @@ async fn reject_legacy_request_in_session(
                         "call_id_reused_with_different_content".into(),
                     ));
                 }
-                if matches!(
-                    ReadRegisteredExecutionSettlement::from_call(&call)?,
-                    ReadRegisteredExecutionSettlement::Legacy(_)
-                ) {
-                    return Err(source_legacy());
-                }
+                ReadRegisteredExecutionSettlement::from_call(&call)?;
+                return Err(source_legacy());
             }
         }
     }
@@ -1888,7 +1894,7 @@ impl crate::monitoring::ConsolidationDevRunner for ConfigProjectionDevelopmentRu
     }
 }
 
-pub(super) async fn is_config_control(s: &mut Session, ctx: &Context, id: &str) -> Result<bool> {
+pub(crate) async fn is_config_control(s: &mut Session, ctx: &Context, id: &str) -> Result<bool> {
     let raw: serde_json::Value = need_record(s, ctx, CONTROL_KIND, id).await?;
     Ok(raw["schema_version"] == CONFIG_PROJECTION_CONTROL_SCHEMA)
 }
@@ -1997,7 +2003,15 @@ pub(super) async fn verify_observed_report_in_session(
 )> {
     let c = need_config_control(s, ctx, &run.control_id).await?;
     let bundles = load_bundles(s, ctx, &c, request).await?;
-    if bundles.request_fact_id != crate::optimization::development_request_fact_id(observed)? {
+    // A Prepared fact pairs with its own observation, exactly as before. A request
+    // closure pairs only with the practice transport, which is never sealed or
+    // stored, so a closure-authorized run never becomes a stage observation.
+    let paired = if bundles.practice_closure {
+        observed.artifact_id.is_empty()
+    } else {
+        bundles.request_fact_id == crate::optimization::development_request_fact_id(observed)?
+    };
+    if !paired {
         return Err(projection_mismatch());
     }
     for edge in typed_receipt_closure(report)? {
