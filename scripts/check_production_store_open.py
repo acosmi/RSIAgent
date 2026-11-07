@@ -73,15 +73,32 @@ def block_end(code: str, start: int) -> int:
     raise ValueError("unbalanced source block")
 
 
+def cfg_test_item_end(code: str, start: int) -> int:
+    """Exclusive end of the item a `#[cfg(test)]` attribute guards.
+
+    A level-0 "," before any level-0 "{" or ";" is a struct field or field
+    initializer: stop at that comma so the enclosing braces survive. Level-0
+    ";" keeps the statement/item stop and level-0 "{" the whole-block stop.
+    A level-0 closer (a final field without a trailing comma) stops just
+    before it, again preserving the enclosing braces.
+    """
+    depth = 0
+    for i in range(start, len(code)):
+        char = code[i]
+        if depth == 0 and char == "{": return block_end(code, i)
+        if char in "([{": depth += 1
+        elif char in ")]}":
+            if depth == 0: return i
+            depth -= 1
+        elif depth == 0 and char in ",;": return i + 1
+    raise ValueError("unsupported cfg(test) item")
+
+
 def production_code(text: str) -> str:
     code = lexical_code(text)
     pattern = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]")
     while match := pattern.search(code):
-        body = code.find("{", match.end())
-        semi = code.find(";", match.end())
-        if semi >= 0 and (body < 0 or semi < body): end = semi + 1
-        elif body >= 0: end = block_end(code, body)
-        else: raise ValueError("unsupported cfg(test) item")
+        end = cfg_test_item_end(code, match.end())
         code = code[:match.start()] + blank(code[match.start():end]) + code[end:]
     return code
 

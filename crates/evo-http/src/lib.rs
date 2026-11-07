@@ -370,6 +370,9 @@ async fn management(
     body: Bytes,
 ) -> std::result::Result<Json<Value>, HttpError> {
     let caller = state.auth.authenticate(&headers)?;
+    if operation == "backup.create" {
+        caller.require(&[Role::Admin])?;
+    }
     let body = parse_unique_value(&body, "invalid_management_payload")?;
     reject_body_identity(&body)?;
     let result = state

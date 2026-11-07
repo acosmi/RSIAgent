@@ -36,7 +36,6 @@ use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 
 pub enum LocalPermissionTarget<'a> {
     Database(&'a std::path::Path),
-    BackupPublication(&'a std::path::Path),
     IndependentAnchor(&'a std::path::Path),
 }
 
@@ -97,10 +96,6 @@ fn permission_private_rule(owner: u32, mode: u32, euid: u32) -> bool {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn permission_ancestor_rule(owner: u32, mode: u32, euid: u32) -> bool {
     (owner == 0 || owner == euid) && (mode & 0o022 == 0 || (owner == 0 && mode & 0o1000 != 0))
-}
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn permission_publish_parent_rule(owner: u32, mode: u32, euid: u32) -> bool {
-    (owner == 0 || owner == euid) && mode & 0o022 == 0
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -305,25 +300,6 @@ pub fn check_local_permissions(
                 }
                 Ok(())
             }
-            LocalPermissionTarget::BackupPublication(destination) => {
-                // The caller retains its original existing-target Conflict
-                // and platform priority before invoking this metadata check.
-                let parent = destination
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(std::path::Path::new("."));
-                permission_unlinked_components(parent)?;
-                let real = std::fs::canonicalize(parent)?;
-                let info = std::fs::metadata(&real)?;
-                if !info.is_dir() || !permission_publish_parent_rule(info.uid(), info.mode(), euid)
-                {
-                    return Err(LocalPermissionError::Insecure);
-                }
-                if let Some(ancestor) = real.parent() {
-                    permission_real_ancestors(ancestor, euid)?;
-                }
-                Ok(())
-            }
             LocalPermissionTarget::IndependentAnchor(anchor) => {
                 permission_unlinked_components(anchor)?;
                 let info = std::fs::symlink_metadata(anchor)?;
@@ -350,22 +326,16 @@ pub fn check_local_permissions(
     }
 }
 
-// Test-only observation facts. Ordinary builds contain neither slots
-// nor the two producer call sites. No callback, registry, or input override.
+// Test-only observation fact. Ordinary builds contain neither the slot
+// nor its producer call site. No callback, registry, or input override.
 #[cfg(test)]
 std::thread_local! {
     static AG157_EXPORT_STAGING_FACT: std::cell::RefCell<
         Option<(std::path::PathBuf, std::fs::Metadata)>
     > = const { std::cell::RefCell::new(None) };
-    static AG157_BACKUP_VACUUM_FACT: std::cell::RefCell<
-        Option<(std::path::PathBuf, std::io::Result<std::fs::Metadata>)>
-    > = const { std::cell::RefCell::new(None) };
 }
 // Export call site: clone the existing real FD metadata after write/fsync,
 // before its normal 0400 transition; keep the latest member's path/metadata.
-// Backup call site: after the new 0600 File is closed, record the actual lstat
-// result immediately before the original VACUUM. Recording an IO result does
-// not branch, retry, or change the business Result; the test takes and checks it.
 // Each test clears its own slot before the operation, then only takes the fact.
 
 pub const MVP_MAX_RUNS: u64 = 1_000;
@@ -537,6 +507,17 @@ pub enum ManagementResultV2 {
     Partial(ManagementPartialResultV2),
     Optimization(ManagementOptimizationResultV2),
     Trace(ManagementTraceExportResultV2),
+    Backup(ManagementBackupResultV2),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementBackupResultV2 {
+    BackupCreated {
+        relative_name: lifecycle::BackupName,
+        manifest_sha256: String,
+        durability: lifecycle::BackupDurability,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,6 +636,18 @@ pub struct ManagementJobV2 {
         deserialize_with = "management_optimization_present"
     )]
     pub optimization: Option<ManagementOptimizationProgressV2>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "management_backup_present"
+    )]
+    pub backup: Option<Box<lifecycle::BackupProgressV2>>,
+}
+
+fn management_backup_present<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Box<lifecycle::BackupProgressV2>>, D::Error> {
+    lifecycle::BackupProgressV2::deserialize(deserializer).map(|v| Some(Box::new(v)))
 }
 
 fn management_optimization_present<'de, D: serde::Deserializer<'de>>(
@@ -745,6 +738,7 @@ impl VersionedManagementJob {
                     cancel_arrival: after.then_some(ManagementCancelArrival::AfterSideEffect),
                     pending_terminal_state: None,
                     optimization: None,
+                    backup: None,
                 }
             }
         })
@@ -927,6 +921,14 @@ fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
                 || (job.pending_terminal_state.is_some()
                     && job.state != ManagementJobState::Draining)
                 || (job.optimization.is_some() && job.operation != "optimization.step")
+                || (job.backup.is_some() && job.operation != "backup.create")
+                || (job.backup.is_some() && job.optimization.is_some())
+                || job
+                    .backup
+                    .as_ref()
+                    .is_some_and(|progress| !progress.valid_wire())
+                || (matches!(job.result, Some(ManagementResultV2::Backup(_)))
+                    && job.operation != "backup.create")
             {
                 return Err(invalid_shape());
             }
@@ -2627,6 +2629,7 @@ impl Store {
     }
     pub async fn close(&self) {
         self.pool.close().await;
+        let _backup_exit = self.blob_lock.write().await;
     }
     pub async fn integrity(&self) -> Result<String> {
         sqlx::query_scalar("PRAGMA integrity_check")
@@ -2634,8 +2637,15 @@ impl Store {
             .await
             .map_err(internal)
     }
-    pub async fn backup(&self, destination: &Path) -> Result<()> {
-        crate::lifecycle::backup_consistent(self, destination).await
+    /// Authorize one backup under this Store's fixed `backups` directory.
+    /// No filesystem or clock is observed before the Admin gate.
+    pub fn backup(
+        &self,
+        ctx: &Context,
+        name: lifecycle::BackupName,
+    ) -> Result<lifecycle::BackupPreparation> {
+        ctx.require(&[Role::Admin])?;
+        Ok(lifecycle::BackupPreparation::new(self.clone(), name))
     }
     /// Caller must register the returned digest and owner through a trusted host operation.
     pub async fn put_blob(&self, ctx: &Context, bytes: &[u8]) -> Result<String> {
@@ -4984,8 +4994,23 @@ mod tests {
     use super::*;
     use evo_core::Role;
     async fn db() -> (tempfile::TempDir, Store) {
-        let d = tempfile::tempdir().unwrap();
-        let s = Store::open(&d.path().join("db.sqlite3")).await.unwrap();
+        let d = tempfile::Builder::new()
+            .permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .tempdir()
+            .unwrap();
+        let root = d.path().canonicalize().unwrap();
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(root.join("db.sqlite3"))
+                .unwrap();
+        }
+        let s = Store::open(&root.join("db.sqlite3")).await.unwrap();
         (d, s)
     }
 
@@ -5457,367 +5482,6 @@ mod tests {
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[tokio::test]
-    async fn consistent_backup_database_manifest_and_blob_members_are_0600() {
-        use crate::budget::{
-            BudgetArtifact, BudgetCallFence, BudgetCallReservation, BudgetExecutionProvenance,
-            BudgetStage, ModelCallSettlementEvidence, RootBudgetAuthorization, UsageCharge,
-        };
-        const NAME: &str = "consistent_backup_database_manifest_and_blob_members_are_0600";
-        if ag157_loose_umask_child(NAME) {
-            return;
-        }
-        let directory = ag157_private_tempdir();
-        let database = directory.path().join("source.sqlite3");
-        let store = Store::open(&database).await.unwrap();
-        let admin = Context::new("n", "admin", Role::Admin).unwrap();
-        let host = Context::new("n", "host", Role::Host).unwrap();
-        let mut session = store.session().await.unwrap();
-        session
-            .put(
-                &admin,
-                "run",
-                "run-1",
-                admin.actor(),
-                &json!({
-                    "schema_version": "rsia.optimization.source.v1",
-                    "record": {
-                        "id": "run-1", "body": b"source".to_vec(),
-                        "parent_family": "ag157-backup-fixture",
-                        "task_origin": "trusted_run", "execution_attestation": "trusted_host",
-                        "purpose": "development"
-                    },
-                    "trace": {
-                        "run_id": "run-1", "parent_family": "ag157-backup-fixture",
-                        "source_digest": hash(b"source"), "purpose": "development",
-                        "outcome": "success", "diagnosis": null, "excerpt": "source", "seed": 1
-                    },
-                    "excerpt_start": 0, "excerpt_end": 6
-                }),
-            )
-            .await
-            .unwrap();
-        session
-            .put(
-                &admin,
-                "artifact",
-                "data",
-                admin.actor(),
-                &json!({"id":"data","payload":"full backup data"}),
-            )
-            .await
-            .unwrap();
-        session.audit(&admin, "ag157-backup", "data").await.unwrap();
-        session
-            .bump_watermark(&admin, &hash(b"ag157-backup-watermark"))
-            .await
-            .unwrap();
-        session.commit().await.unwrap();
-        let blob = store
-            .put_blob(&admin, b"complete backup blob")
-            .await
-            .unwrap();
-        let call_id = "call-1";
-        let marker = "ag157-five-micros";
-        store
-            .authorize_root_budget(
-                &admin,
-                &RootBudgetAuthorization {
-                    root_budget_id: "root-1".into(),
-                    billing_scope: "scope-1".into(),
-                    allowed_namespaces: vec!["n".into()],
-                    currency: "USD".into(),
-                    pricing_version: "pricing-v1".into(),
-                    payment_subject: "payer".into(),
-                    authorization_receipt_digest: hash(b"authorization"),
-                    per_call_cap_micros: 100,
-                    total_limit_micros: 1_000,
-                    created_at: 1,
-                },
-            )
-            .await
-            .unwrap();
-        let request = BudgetCallReservation {
-            billing_scope: "scope-1".into(),
-            call_id: call_id.into(),
-            dispatch_group_id: "group-1".into(),
-            stage: BudgetStage::Reflection,
-            actual_input_digest: hash(format!("input-{call_id}").as_bytes()),
-            request_artifact: Some(
-                BudgetArtifact::from_serializable(
-                    "rsia.model_request.artifact.v1",
-                    &json!({
-                        "request_id":call_id,
-                        "source_closure":[{"id":"run-1","digest":hash(b"source")}],
-                        "input":[{"content":marker}],
-                    }),
-                )
-                .unwrap(),
-            ),
-            max_cost_micros: 20,
-            lease_token: format!("lease-{call_id}"),
-            lease_until: 100,
-            now: 1,
-        };
-        let call = store.reserve_budget_call(&host, &request).await.unwrap();
-        let fence = BudgetCallFence {
-            billing_scope: call.billing_scope.clone(),
-            call_id: call.call_id.clone(),
-            actual_input_digest: call.actual_input_digest.clone(),
-            lease_token: call.lease_token.clone(),
-            lease_epoch: call.lease_epoch,
-            now: 2,
-        };
-        let dispatched = store
-            .begin_budget_dispatch(&host, &fence)
-            .await
-            .unwrap()
-            .call;
-        let response = BudgetArtifact::from_serializable(
-            "test.response.v1",
-            &json!({"status":"completed","output":marker}),
-        )
-        .unwrap();
-        store
-            .settle_model_budget_call(
-                &host,
-                &fence,
-                &UsageCharge {
-                    amount_micros: 5,
-                    currency: "USD".into(),
-                    pricing_version: "pricing-v1".into(),
-                    provider_request_id: "provider-1".into(),
-                    usage_record_id: "usage-1".into(),
-                    output_digest: hash(marker.as_bytes()),
-                },
-                &ModelCallSettlementEvidence {
-                    provenance: BudgetExecutionProvenance::Fixture,
-                    actual_model_digest: Some(hash(b"model")),
-                    transport_artifact: BudgetArtifact::from_serializable(
-                        "test.transport.v1",
-                        &json!({"raw":marker}),
-                    )
-                    .unwrap(),
-                    usable_response: Some(response.clone()),
-                    blocked_response: BudgetArtifact::from_serializable(
-                        "test.response.v1",
-                        &json!({"status":"blocked"}),
-                    )
-                    .unwrap(),
-                    forced_block_reason: None,
-                },
-            )
-            .await
-            .unwrap();
-        store
-            .close_budget_call_execution(
-                &host,
-                "scope-1",
-                "call-1",
-                dispatched.dispatch_id.as_deref().unwrap(),
-                "complete",
-                3,
-            )
-            .await
-            .unwrap();
-
-        let expected_call = store
-            .budget_call(&host, "scope-1", "call-1")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(expected_call.actual_cost_micros, Some(5));
-        assert!(expected_call.execution_closed);
-        let expected_root = store.root_budget(&admin, "scope-1").await.unwrap().unwrap();
-        assert_eq!(expected_root.spent_micros, 5);
-        assert_eq!(expected_root.reserved_micros, 0);
-        let expected_migrations: Vec<(i64,String)> = sqlx::query_as(
-            "SELECT version, lower(hex(checksum)) FROM _sqlx_migrations WHERE success=1 ORDER BY version")
-            .fetch_all(&store.pool).await.unwrap();
-        let expected_audit = store.verify_audit(&admin).await.unwrap();
-        assert!(expected_audit >= 1);
-        AG157_BACKUP_VACUUM_FACT.with(|fact| {
-            fact.borrow_mut().take();
-        });
-        let backup = directory.path().join("backup");
-        store.backup(&backup).await.unwrap();
-        let (empty_path, empty_info) = AG157_BACKUP_VACUUM_FACT
-            .with(|fact| fact.borrow_mut().take())
-            .unwrap();
-        assert!(empty_path.ends_with("rsia.sqlite3"));
-        let empty_info = empty_info.unwrap();
-        assert!(empty_info.is_file());
-        assert_eq!(empty_info.len(), 0);
-        assert_eq!(empty_info.mode() & 0o777, 0o600);
-        assert_eq!(empty_info.uid(), rustix::process::geteuid().as_raw());
-        assert_eq!(empty_info.nlink(), 1);
-        let published = ag157_mode(&backup.join("rsia.sqlite3"), 0o600, false);
-        assert_eq!(
-            (empty_info.dev(), empty_info.ino()),
-            (published.dev(), published.ino())
-        );
-        assert!(!empty_path.exists());
-        for entry in ag157_snapshot(&backup) {
-            assert_eq!(
-                entry.mode & 0o777,
-                if entry.kind == "dir" { 0o700 } else { 0o600 }
-            );
-            assert_eq!(entry.uid, rustix::process::geteuid().as_raw());
-        }
-        let manifest_bytes = std::fs::read(backup.join("backup-manifest.json")).unwrap();
-        let manifest: lifecycle::BackupManifest = serde_json::from_slice(&manifest_bytes).unwrap();
-        assert!(manifest.complete);
-        assert_eq!(manifest.schema_version, lifecycle::BACKUP_SCHEMA);
-        assert_eq!(manifest.migrations.len(), expected_migrations.len());
-        for entry in std::iter::once(&manifest.database).chain(manifest.blobs.iter()) {
-            let bytes = std::fs::read(backup.join(&entry.path)).unwrap();
-            assert_eq!(hash(&bytes), entry.sha256);
-            assert_eq!(bytes.len() as u64, entry.bytes);
-        }
-        assert!(manifest.blobs.iter().any(|entry| entry.sha256 == blob));
-        let backup_snapshot = ag157_snapshot(&backup);
-        assert!(
-            matches!(store.backup(&backup).await,Err(Error::Conflict(reason)) if reason == "backup destination already exists")
-        );
-        assert_eq!(ag157_snapshot(&backup), backup_snapshot);
-        store.close().await;
-        let anchor_directory = ag157_private_tempdir();
-        let anchor = anchor_directory.path().join("current-anchor.sqlite3");
-        ag157_private_file(&anchor, &std::fs::read(&database).unwrap());
-        let delta = directory.path().join("delta.json");
-        let namespaces: Vec<_> = manifest.watermarks.iter().map(|watermark| json!({
-            "namespace":watermark.namespace,"base_seq":watermark.seq,"base_digest":watermark.digest,
-            "events":[],"latest_seq":watermark.seq,"latest_digest":watermark.digest
-        })).collect();
-        ag157_private_file(
-            &delta,
-            &serde_json::to_vec(&json!({"schema_version":"rsia.revoke_delta.v1",
-            "base_manifest_sha256":hash(&manifest_bytes),"namespaces":namespaces}))
-            .unwrap(),
-        );
-        let destination = directory.path().join("restored");
-        let python_identity = std::process::Command::new("python3").args(["-B", "-c",
-            "import json,sqlite3; c=sqlite3.connect(':memory:'); print(json.dumps({'version':sqlite3.sqlite_version,'source_id':c.execute('select sqlite_source_id()').fetchone()[0]})); c.close()"])
-            .output().unwrap();
-        assert!(
-            python_identity.status.success(),
-            "{}",
-            String::from_utf8_lossy(&python_identity.stderr)
-        );
-        let python_sqlite: Value = serde_json::from_slice(&python_identity.stdout).unwrap();
-        assert!(!python_sqlite["version"].as_str().unwrap().is_empty());
-        assert!(python_sqlite["source_id"].as_str().unwrap().len() >= 40);
-        println!("AG157_PYTHON_SQLITE_ACTUAL={python_sqlite}");
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/restore_backup.py");
-        let output = std::process::Command::new("python3")
-            .arg("-B")
-            .arg(script)
-            .arg("--backup")
-            .arg(backup.canonicalize().unwrap())
-            .arg("--dest")
-            .arg(&destination)
-            .arg("--revoke-delta")
-            .arg(&delta)
-            .arg("--trusted-revocations-db")
-            .arg(anchor.canonicalize().unwrap())
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "restore {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let receipt: Value =
-            serde_json::from_slice(&std::fs::read(destination.join("restore.json")).unwrap())
-                .unwrap();
-        assert_eq!(receipt["receipt_scope"], "local_only_not_for_export");
-        let restored = Store::open(&destination.join("rsia.sqlite3"))
-            .await
-            .unwrap();
-        assert_eq!(restored.integrity().await.unwrap(), "ok");
-        assert_eq!(restored.verify_audit(&admin).await.unwrap(), expected_audit);
-        assert_eq!(
-            restored
-                .budget_call(&host, "scope-1", "call-1")
-                .await
-                .unwrap()
-                .unwrap(),
-            expected_call
-        );
-        assert_eq!(
-            restored
-                .root_budget(&admin, "scope-1")
-                .await
-                .unwrap()
-                .unwrap(),
-            expected_root
-        );
-        let actual_migrations: Vec<(i64,String)> = sqlx::query_as(
-            "SELECT version, lower(hex(checksum)) FROM _sqlx_migrations WHERE success=1 ORDER BY version")
-            .fetch_all(&restored.pool).await.unwrap();
-        assert_eq!(actual_migrations, expected_migrations);
-        for watermark in &manifest.watermarks {
-            let actual: (i64, String) =
-                sqlx::query_as("SELECT seq,digest FROM revoke_watermark WHERE namespace=?")
-                    .bind(&watermark.namespace)
-                    .fetch_one(&restored.pool)
-                    .await
-                    .unwrap();
-            assert_eq!(actual, (watermark.seq, watermark.digest.clone()));
-        }
-        let mut session = restored.session().await.unwrap();
-        let value: Value = session.need(&admin, "artifact", "data").await.unwrap();
-        assert_eq!(value, json!({"id":"data","payload":"full backup data"}));
-        session.commit().await.unwrap();
-        assert_eq!(
-            restored.read_blob(&admin, &blob, 1024).await.unwrap(),
-            b"complete backup blob"
-        );
-        restored.close().await;
-        println!("AG157_REAL_OBSERVATION={NAME}");
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[tokio::test]
-    async fn insecure_backup_parent_refuses_before_temp_creation() {
-        let (directory, store) = db().await;
-        let admin = Context::new("n", "admin", Role::Admin).unwrap();
-        let mut session = store.session().await.unwrap();
-        session.audit(&admin, "test", "x").await.unwrap();
-        session
-            .bump_watermark(&admin, &hash(b"ag157-backup-watermark"))
-            .await
-            .unwrap();
-        session.commit().await.unwrap();
-        let good = directory.path().join("healthy-backup");
-        store.backup(&good).await.unwrap();
-        let bad_parent = directory.path().join("bad-publish-parent");
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&bad_parent)
-            .unwrap();
-        std::fs::set_permissions(&bad_parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        let held = store.pool.acquire().await.unwrap();
-        let before = ag157_snapshot(directory.path());
-        let error = tokio::time::timeout(
-            Duration::from_secs(2),
-            store.backup(&bad_parent.join("must-not-exist")),
-        )
-        .await
-        .expect("permission refusal before the held single pool connection")
-        .unwrap_err();
-        assert!(
-            matches!(&error,Error::Invalid(reason) if reason == "data_directory_insecure"),
-            "{error}"
-        );
-        assert_eq!(ag157_snapshot(directory.path()), before);
-        assert_eq!(std::fs::read_dir(&bad_parent).unwrap().count(), 0);
-        drop(held);
-        store.close().await;
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn effective_uid_owner_rule_private_metadata_cases() {
         for mode in [0o400, 0o600, 0o700] {
@@ -5845,8 +5509,6 @@ mod tests {
         assert!(!permission_ancestor_rule(1002, 0o700, 1001));
         assert!(permission_ancestor_rule(0, 0o755, 1001));
         assert!(permission_ancestor_rule(1001, 0o755, 1001));
-        assert!(!permission_publish_parent_rule(0, 0o1777, 1001));
-        assert!(permission_publish_parent_rule(0, 0o755, 1001));
     }
 
     // Graph construction stays outside the progress handler's measured region.
@@ -6509,8 +6171,12 @@ mod tests {
             .unwrap();
         t.commit().await.unwrap();
         assert_eq!(s.verify_audit(&c).await.unwrap(), 1);
-        let backup = d.path().join("backup");
-        s.backup(&backup).await.unwrap();
+        let backup = d.path().join("backups/backup");
+        s.backup(&c, lifecycle::BackupName::parse("backup").unwrap())
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
         let restored = Store::open(&backup.join("rsia.sqlite3")).await.unwrap();
         assert_eq!(restored.verify_audit(&c).await.unwrap(), 1);
         assert_eq!(restored.integrity().await.unwrap(), "ok");

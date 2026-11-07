@@ -7,11 +7,755 @@ use serde_json::json;
 use sqlx::{ConnectOptions, Connection, Row, sqlite::SqliteConnectOptions};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::sync::OwnedRwLockWriteGuard;
 
 pub const REVOKE_TOMBSTONE_SCHEMA: &str = "rsia.revoke_tombstone.v1";
 pub const MAX_CLEANUP_EDGE_PAGE: usize = 1_000;
 pub const BACKUP_SCHEMA: &str = "rsia.backup.v2";
+
+/// A single validated component beneath this Store's fixed backup root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct BackupName(String);
+
+impl BackupName {
+    pub fn parse(value: &str) -> Result<Self> {
+        if value.is_empty()
+            || value.len() > 64
+            || !value.as_bytes()[0].is_ascii_alphanumeric()
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        {
+            return Err(Error::Invalid("invalid backup relative name".into()));
+        }
+        Ok(Self(value.into()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for BackupName {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Self::parse(&String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupPhase {
+    Preparing,
+    Prepared,
+    Published,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupDurability {
+    Verified,
+    Unverified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackupPhysicalIdentity {
+    device: u64,
+    inode: u64,
+    uid: u32,
+    mode: u32,
+}
+
+/// Private physical provenance; public status projects only phase and result references.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupProgressV2 {
+    pub phase: BackupPhase,
+    pub durability: BackupDurability,
+    snapshot_generation: u64,
+    snapshot_lease_token: Option<String>,
+    source: BackupPhysicalIdentity,
+    database: BackupPhysicalIdentity,
+    parent: BackupPhysicalIdentity,
+    temporary: BackupPhysicalIdentity,
+    temporary_name: String,
+    manifest_utf8: Option<String>,
+    manifest_sha256: Option<String>,
+}
+
+impl BackupProgressV2 {
+    pub fn manifest_sha256(&self) -> Option<&str> {
+        self.manifest_sha256.as_deref()
+    }
+
+    pub fn published(&self, durability: BackupDurability) -> Box<Self> {
+        let mut progress = self.clone();
+        progress.phase = BackupPhase::Published;
+        progress.durability = durability;
+        Box::new(progress)
+    }
+
+    pub(crate) fn valid_wire(&self) -> bool {
+        let owned_name = self.temporary_name.starts_with('.')
+            && !self.temporary_name.contains('/')
+            && !self.temporary_name.contains('\\');
+        owned_name
+            && self.snapshot_generation > 0
+            && self.snapshot_lease_token.is_some()
+            && match self.phase {
+                BackupPhase::Preparing => {
+                    self.manifest_utf8.is_none()
+                        && self.manifest_sha256.is_none()
+                        && self.durability == BackupDurability::Unverified
+                }
+                BackupPhase::Prepared | BackupPhase::Published => {
+                    self.manifest_utf8
+                        .as_ref()
+                        .zip(self.manifest_sha256.as_ref())
+                        .is_some_and(|(raw, digest)| evo_core::hash(raw.as_bytes()) == *digest)
+                        && (self.phase != BackupPhase::Prepared
+                            || self.durability == BackupDurability::Unverified)
+                }
+            }
+    }
+}
+
+/// An authorized operation with no filesystem effects yet.
+pub struct BackupPreparation {
+    store: Store,
+    name: BackupName,
+}
+
+/// Owns the temporary directory and the existing blob exclusion lock.
+pub struct PreparingBackup {
+    store: Store,
+    name: BackupName,
+    root: PathBuf,
+    parent: PathBuf,
+    temp: PathBuf,
+    progress: BackupProgressV2,
+    guard: Option<OwnedRwLockWriteGuard<()>>,
+    #[cfg(test)]
+    pause_before_copy: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(test)]
+    fail_parent_sync: bool,
+}
+
+/// A complete snapshot whose preparation lock is retained until its receipt commits.
+pub struct PreparedBackup {
+    owned: PreparingBackup,
+}
+
+/// Publication does not borrow the source pool; the caller retains its new Session.
+pub struct BackupPublicationTask {
+    owned: PreparingBackup,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackupPublication {
+    pub relative_name: BackupName,
+    pub manifest_sha256: String,
+    pub durability: BackupDurability,
+    directory: PathBuf,
+}
+
+impl BackupPublication {
+    /// Physical output for trusted local callers; never included in public status.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
+
+impl BackupPreparation {
+    pub(crate) fn new(store: Store, name: BackupName) -> Self {
+        Self { store, name }
+    }
+
+    /// Direct Store backups create no management job, input, or audit row.
+    pub async fn complete(self) -> Result<BackupPublication> {
+        let store = self.store.clone();
+        let prepared = self
+            .begin(0, None)
+            .await?
+            .prepare(
+                Instant::now() + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await?;
+        let session = match store.session().await {
+            Ok(session) => session,
+            Err(error) => {
+                prepared.discard().await?;
+                return Err(error);
+            }
+        };
+        let result = prepared.release().publish().await;
+        match (result, session.commit().await) {
+            (Ok(mut publication), Err(_)) => {
+                publication.durability = BackupDurability::Unverified;
+                Ok(publication)
+            }
+            (result, _) => result,
+        }
+    }
+
+    pub async fn begin(
+        self,
+        generation: u64,
+        lease_token: Option<String>,
+    ) -> Result<PreparingBackup> {
+        let guard = self.store.blob_lock.clone().write_owned().await;
+        // A successful pool borrow precedes even the first filesystem operation.
+        let connection = self.store.pool.acquire().await.map_err(internal)?;
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return Err(Error::Invalid("backup unsupported platform".into()));
+        }
+        let root = backup_source_root(&self.store)?;
+        let source = backup_identity(&root, true)?;
+        let database_path = self
+            .store
+            .pool
+            .connect_options()
+            .get_filename()
+            .to_path_buf();
+        let database = backup_identity(&database_path, false)?;
+        let parent = root.join("backups");
+        match std::fs::symlink_metadata(&parent) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_backup_dir(&parent)?;
+                sync_directory(root.clone()).await?;
+            }
+            Err(error) => return Err(internal(error)),
+        }
+        let parent_identity = backup_identity(&parent, true)?;
+        check_backup_ancestors(&parent)?;
+        let destination = parent.join(self.name.as_str());
+        if std::fs::symlink_metadata(&destination).is_ok() {
+            return Err(Error::Conflict("backup destination already exists".into()));
+        }
+        evo_core::now()?;
+        let temporary_name = format!(".{}.tmp-{}", self.name.as_str(), uuid::Uuid::new_v4());
+        let temp = parent.join(&temporary_name);
+        create_backup_dir(&temp)?;
+        let temporary = match backup_identity(&temp, true) {
+            Ok(identity) => identity,
+            Err(error) => {
+                std::fs::remove_dir_all(&temp).map_err(internal)?;
+                return Err(error);
+            }
+        };
+        drop(connection);
+        Ok(PreparingBackup {
+            store: self.store,
+            name: self.name,
+            root,
+            parent,
+            temp,
+            progress: BackupProgressV2 {
+                phase: BackupPhase::Preparing,
+                durability: BackupDurability::Unverified,
+                snapshot_generation: generation,
+                snapshot_lease_token: lease_token,
+                source,
+                database,
+                parent: parent_identity,
+                temporary,
+                temporary_name,
+                manifest_utf8: None,
+                manifest_sha256: None,
+            },
+            guard: Some(guard),
+            #[cfg(test)]
+            pause_before_copy: None,
+            #[cfg(test)]
+            fail_parent_sync: false,
+        })
+    }
+
+    /// Read-only recovery. Snapshot claims belong to the old Running image,
+    /// which necessarily predates the later Prepared receipt.
+    pub async fn verify(
+        &self,
+        progress: &BackupProgressV2,
+        ctx: &Context,
+        job: &super::ManagementJobV2,
+        private_input_utf8: &str,
+    ) -> Result<Option<BackupPublication>> {
+        let root = backup_source_root(&self.store)?;
+        let parent = root.join("backups");
+        if backup_identity(&root, true)? != progress.source
+            || backup_identity(self.store.pool.connect_options().get_filename(), false)?
+                != progress.database
+            || backup_identity(&parent, true)? != progress.parent
+        {
+            return Err(Error::Conflict("backup source identity differs".into()));
+        }
+        check_backup_ancestors(&parent)?;
+        let destination = parent.join(self.name.as_str());
+        if !destination.try_exists().map_err(internal)? {
+            return Ok(None);
+        }
+        if backup_identity(&destination, true)? != progress.temporary {
+            return Err(Error::Conflict(
+                "backup publication ownership differs".into(),
+            ));
+        }
+        let digest = progress
+            .manifest_sha256
+            .as_ref()
+            .ok_or_else(|| Error::Conflict("backup manifest digest missing".into()))?;
+        let proof = async {
+            let raw = progress
+                .manifest_utf8
+                .as_ref()
+                .ok_or_else(|| Error::Conflict("backup manifest proof missing".into()))?;
+            backup_identity(&destination.join("backup-manifest.json"), false)?;
+            let actual = tokio::fs::read(destination.join("backup-manifest.json"))
+                .await
+                .map_err(internal)?;
+            if actual != raw.as_bytes() || evo_core::hash(&actual) != *digest {
+                return Err(Error::Conflict("backup manifest proof differs".into()));
+            }
+            let manifest: BackupManifest =
+                serde_json::from_value(parse_strict_json(raw)?).map_err(internal)?;
+            verify_backup_members(&destination, &manifest).await?;
+            let options = SqliteConnectOptions::new()
+                .filename(destination.join("rsia.sqlite3"))
+                .read_only(true)
+                .disable_statement_logging();
+            let mut connection = sqlx::SqliteConnection::connect_with(&options)
+                .await
+                .map_err(internal)?;
+            let result = async {
+                sqlx::query("BEGIN")
+                    .execute(&mut connection)
+                    .await
+                    .map_err(internal)?;
+                let saved = sqlx::query(
+                    "SELECT owner,body FROM objects
+                     WHERE namespace=? AND kind='job' AND id=?",
+                )
+                .bind(ctx.namespace())
+                .bind(&job.id)
+                .fetch_one(&mut connection)
+                .await
+                .map_err(internal)?;
+                let saved_job = super::decode_management_job(
+                    saved.try_get::<&str, _>("body").map_err(internal)?,
+                )?;
+                let super::VersionedManagementJob::V2(saved_job) = saved_job else {
+                    return Err(Error::Conflict(
+                        "backup snapshot job version differs".into(),
+                    ));
+                };
+                if saved.try_get::<String, _>("owner").map_err(internal)? != ctx.actor()
+                    || saved_job.id != job.id
+                    || saved_job.operation != "backup.create"
+                    || saved_job.owner_actor != job.owner_actor
+                    || saved_job.owner_role != job.owner_role
+                    || saved_job.request_key != job.request_key
+                    || saved_job.payload_digest != job.payload_digest
+                    || saved_job.private_input_ref != job.private_input_ref
+                    || saved_job.state != super::ManagementJobState::Running
+                    || saved_job.generation != progress.snapshot_generation
+                    || saved_job.lease_token != progress.snapshot_lease_token
+                    || saved_job.backup.as_ref().is_none_or(|saved| {
+                        saved.phase != BackupPhase::Preparing
+                            || saved.temporary != progress.temporary
+                            || saved.source != progress.source
+                            || saved.parent != progress.parent
+                            || saved.database != progress.database
+                    })
+                {
+                    return Err(Error::Conflict("backup snapshot claim differs".into()));
+                }
+                let saved_input: String = sqlx::query_scalar(
+                    "SELECT body FROM objects
+                     WHERE namespace=? AND kind='artifact' AND id=? AND owner=?",
+                )
+                .bind(ctx.namespace())
+                .bind(&job.private_input_ref)
+                .bind(ctx.actor())
+                .fetch_one(&mut connection)
+                .await
+                .map_err(internal)?;
+                if saved_input != private_input_utf8 {
+                    return Err(Error::Conflict("backup snapshot input differs".into()));
+                }
+                if fingerprint(&load_backup_migrations(&mut connection).await?)?
+                    != fingerprint(&manifest.migrations)?
+                    || fingerprint(&load_backup_watermarks(&mut connection).await?)?
+                        != fingerprint(&manifest.watermarks)?
+                {
+                    return Err(Error::Conflict("backup snapshot metadata differs".into()));
+                }
+                Ok(())
+            }
+            .await;
+            let closed = connection.close().await.map_err(internal);
+            result?;
+            closed
+        }
+        .await;
+        Ok(Some(BackupPublication {
+            relative_name: self.name.clone(),
+            manifest_sha256: digest.clone(),
+            directory: destination,
+            durability: if proof.is_ok() && progress.phase == BackupPhase::Published {
+                progress.durability
+            } else {
+                BackupDurability::Unverified
+            },
+        }))
+    }
+}
+
+impl PreparingBackup {
+    pub fn progress(&self) -> Box<BackupProgressV2> {
+        Box::new(self.progress.clone())
+    }
+
+    pub async fn discard(self) -> Result<()> {
+        if backup_identity(&self.temp, true)? != self.progress.temporary {
+            return Err(Error::Conflict("backup temporary ownership differs".into()));
+        }
+        tokio::fs::remove_dir_all(&self.temp)
+            .await
+            .map_err(internal)
+    }
+
+    pub async fn prepare(
+        mut self,
+        deadline: Instant,
+        stopped: Arc<AtomicBool>,
+    ) -> Result<PreparedBackup> {
+        let result = self.snapshot(deadline, stopped).await;
+        match result {
+            Ok(()) => Ok(PreparedBackup { owned: self }),
+            Err(error) => {
+                self.discard().await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn snapshot(&mut self, deadline: Instant, stopped: Arc<AtomicBool>) -> Result<()> {
+        let mut connection = self.store.pool.acquire().await.map_err(internal)?;
+        if backup_identity(&self.root, true)? != self.progress.source
+            || backup_identity(&self.parent, true)? != self.progress.parent
+            || backup_identity(&self.temp, true)? != self.progress.temporary
+            || backup_identity(self.store.pool.connect_options().get_filename(), false)?
+                != self.progress.database
+        {
+            return Err(Error::Conflict(
+                "backup preparation identity differs".into(),
+            ));
+        }
+        let database_path = self.temp.join("rsia.sqlite3");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        options.open(&database_path).map_err(internal)?;
+        {
+            let mut handle = connection.lock_handle().await.map_err(internal)?;
+            handle.set_progress_handler(1_000, move || {
+                Instant::now() < deadline && !stopped.load(Ordering::Acquire)
+            });
+        }
+        let vacuum = sqlx::query("VACUUM INTO ?")
+            .bind(database_path.to_string_lossy().as_ref())
+            .execute(&mut *connection)
+            .await;
+        // Await the actual SQLite result and clear the handler on every result.
+        connection
+            .lock_handle()
+            .await
+            .map_err(internal)?
+            .remove_progress_handler();
+        vacuum.map_err(internal)?;
+        let migrations = load_backup_migrations(&mut connection).await?;
+        let watermarks = load_backup_watermarks(&mut connection).await?;
+        drop(connection);
+        #[cfg(test)]
+        if let Some((reached, resume)) = &self.pause_before_copy {
+            reached.notify_one();
+            resume.notified().await;
+        }
+        sync_file(&database_path).await?;
+        let database = file_entry(&database_path, "rsia.sqlite3").await?;
+        let mut blobs = copy_backup_blobs(&self.store, &self.temp).await?;
+        blobs.sort_by(|left, right| left.path.cmp(&right.path));
+        let manifest = BackupManifest {
+            schema_version: BACKUP_SCHEMA.into(),
+            complete: true,
+            database,
+            blobs,
+            migrations,
+            watermarks,
+            created_at: evo_core::now()?,
+        };
+        let raw = serde_json::to_string_pretty(&manifest).map_err(internal)?;
+        write_backup_member(&self.temp.join("backup-manifest.json"), raw.as_bytes()).await?;
+        sync_directory(self.temp.clone()).await?;
+        self.progress.phase = BackupPhase::Prepared;
+        self.progress.manifest_sha256 = Some(evo_core::hash(raw.as_bytes()));
+        self.progress.manifest_utf8 = Some(raw);
+        Ok(())
+    }
+}
+
+impl PreparedBackup {
+    pub fn progress(&self) -> Box<BackupProgressV2> {
+        self.owned.progress()
+    }
+    pub async fn discard(self) -> Result<()> {
+        self.owned.discard().await
+    }
+    pub fn release(mut self) -> BackupPublicationTask {
+        self.owned.guard.take();
+        BackupPublicationTask { owned: self.owned }
+    }
+}
+
+impl BackupPublicationTask {
+    pub fn progress(&self) -> Box<BackupProgressV2> {
+        self.owned.progress()
+    }
+    pub async fn discard(self) -> Result<()> {
+        self.owned.discard().await
+    }
+
+    /// The caller keeps its publication Session alive across this entire future.
+    pub async fn publish(self) -> Result<BackupPublication> {
+        let owned = self.owned;
+        let destination = owned.parent.join(owned.name.as_str());
+        let checked = async {
+            if backup_source_root(&owned.store)? != owned.root {
+                return Err(Error::Conflict("backup source identity differs".into()));
+            }
+            check_backup_ancestors(&owned.parent)?;
+            if backup_identity(&owned.root, true)? != owned.progress.source
+                || backup_identity(owned.store.pool.connect_options().get_filename(), false)?
+                    != owned.progress.database
+                || backup_identity(&owned.parent, true)? != owned.progress.parent
+                || backup_identity(&owned.temp, true)? != owned.progress.temporary
+            {
+                return Err(Error::Conflict(
+                    "backup publication identity differs".into(),
+                ));
+            }
+            backup_identity(&owned.temp.join("backup-manifest.json"), false)?;
+            let raw = tokio::fs::read(owned.temp.join("backup-manifest.json"))
+                .await
+                .map_err(internal)?;
+            if owned.progress.manifest_utf8.as_deref().map(str::as_bytes) != Some(raw.as_slice())
+                || owned.progress.manifest_sha256.as_deref() != Some(evo_core::hash(&raw).as_str())
+            {
+                return Err(Error::Conflict("backup prepared manifest differs".into()));
+            }
+            publish_backup_directory(&owned.temp, &destination)
+        }
+        .await;
+        if let Err(error) = checked {
+            owned.discard().await?;
+            return Err(error);
+        }
+        #[cfg(test)]
+        let synced = if owned.fail_parent_sync {
+            Err(Error::Internal)
+        } else {
+            sync_directory(owned.parent.clone()).await
+        };
+        #[cfg(not(test))]
+        let synced = sync_directory(owned.parent.clone()).await;
+        let durability = if synced.is_ok() {
+            BackupDurability::Verified
+        } else {
+            BackupDurability::Unverified
+        };
+        Ok(BackupPublication {
+            relative_name: owned.name.clone(),
+            manifest_sha256: owned
+                .progress
+                .manifest_sha256
+                .clone()
+                .ok_or(Error::Internal)?,
+            durability,
+            directory: destination,
+        })
+    }
+}
+
+fn backup_source_root(store: &Store) -> Result<PathBuf> {
+    let supplied = if store.root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        &store.root
+    };
+    let absolute = if supplied.is_absolute() {
+        supplied.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(internal)?.join(supplied)
+    };
+    // Inspect the original spelling before canonicalization can erase an
+    // alias, including one followed by `..`.
+    let mut prefix = PathBuf::new();
+    for component in absolute.components() {
+        prefix.push(component.as_os_str());
+        if std::fs::symlink_metadata(&prefix)
+            .map_err(internal)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(Error::Conflict("data_directory_insecure".into()));
+        }
+    }
+    let root = absolute.canonicalize().map_err(internal)?;
+    check_backup_ancestors(&root)?;
+    Ok(root)
+}
+
+fn backup_identity(path: &Path, directory: bool) -> Result<BackupPhysicalIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).map_err(internal)?;
+        if meta.file_type().is_symlink()
+            || (directory && !meta.is_dir())
+            || (!directory && (!meta.is_file() || meta.nlink() != 1))
+            || meta.uid() != rustix::process::geteuid().as_raw()
+            || meta.mode() & 0o077 != 0
+        {
+            return Err(Error::Conflict("data_directory_insecure".into()));
+        }
+        Ok(BackupPhysicalIdentity {
+            device: meta.dev(),
+            inode: meta.ino(),
+            uid: meta.uid(),
+            mode: meta.mode() & 0o7777,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, directory);
+        Err(Error::Invalid("backup unsupported platform".into()))
+    }
+}
+
+fn check_backup_ancestors(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        for ancestor in path.ancestors() {
+            let meta = std::fs::symlink_metadata(ancestor).map_err(internal)?;
+            let uid = meta.uid();
+            if !meta.is_dir()
+                || meta.file_type().is_symlink()
+                || (uid != 0 && uid != rustix::process::geteuid().as_raw())
+                || (meta.mode() & 0o022 != 0 && !(uid == 0 && meta.mode() & 0o1000 != 0))
+            {
+                return Err(Error::Conflict("data_directory_insecure".into()));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(Error::Invalid("backup unsupported platform".into()))
+    }
+}
+
+fn create_backup_dir(path: &Path) -> Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).map_err(internal)
+}
+
+async fn write_backup_member(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).await.map_err(internal)?;
+    file.write_all(bytes).await.map_err(internal)?;
+    file.sync_all().await.map_err(internal)
+}
+
+async fn verify_backup_members(root: &Path, manifest: &BackupManifest) -> Result<()> {
+    if manifest.schema_version != BACKUP_SCHEMA
+        || !manifest.complete
+        || manifest.database.path != "rsia.sqlite3"
+    {
+        return Err(Error::Conflict("backup manifest invalid".into()));
+    }
+    let mut expected = std::collections::BTreeSet::from(["backup-manifest.json".to_owned()]);
+    for member in std::iter::once(&manifest.database).chain(&manifest.blobs) {
+        let path = Path::new(&member.path);
+        if path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            || !expected.insert(member.path.clone())
+        {
+            return Err(Error::Conflict("backup member path invalid".into()));
+        }
+        let full = root.join(path);
+        check_backup_ancestors(full.parent().ok_or(Error::Internal)?)?;
+        backup_identity(&full, false)?;
+        let actual = file_entry(&full, &member.path).await?;
+        if actual.sha256 != member.sha256 || actual.bytes != member.bytes {
+            return Err(Error::Conflict("backup member proof differs".into()));
+        }
+    }
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        backup_identity(&directory, true)?;
+        let mut entries = tokio::fs::read_dir(&directory).await.map_err(internal)?;
+        while let Some(entry) = entries.next_entry().await.map_err(internal)? {
+            let kind = entry.file_type().await.map_err(internal)?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            } else if kind.is_file() {
+                let relative = entry
+                    .path()
+                    .strip_prefix(root)
+                    .map_err(internal)?
+                    .to_string_lossy()
+                    .into_owned();
+                if !expected.remove(&relative) {
+                    return Err(Error::Conflict("backup has unexpected member".into()));
+                }
+            } else {
+                return Err(Error::Conflict("backup has linked member".into()));
+            }
+        }
+    }
+    if !expected.is_empty() {
+        return Err(Error::Conflict("backup member missing".into()));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1039,59 +1783,6 @@ fn registered_execution_source_ids(request: &serde_json::Value) -> Option<Vec<St
         .collect()
 }
 
-pub(crate) async fn backup_consistent(store: &Store, destination: &Path) -> Result<()> {
-    if !cfg!(any(
-        target_os = "linux",
-        target_os = "android",
-        target_vendor = "apple"
-    )) {
-        return Err(Error::Invalid(
-            "atomic no-overwrite backup publication unsupported platform".into(),
-        ));
-    }
-    if destination.exists() {
-        return Err(Error::Conflict("backup destination already exists".into()));
-    }
-    super::check_local_permissions(super::LocalPermissionTarget::BackupPublication(destination))
-        .map_err(|error| match error {
-            super::LocalPermissionError::Io(error) => internal(error),
-            other => Error::Invalid(other.to_string()),
-        })?;
-    evo_core::now()?;
-    let parent = super::local_data_directory(destination);
-    let name = destination
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| Error::Invalid("backup destination needs a UTF-8 name".into()))?;
-    let temp = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
-    let mut directory = tokio::fs::DirBuilder::new();
-    #[cfg(unix)]
-    directory.mode(0o700);
-    directory.create(&temp).await.map_err(internal)?;
-    let result = backup_into_temp(store, &temp).await;
-    if let Err(error) = result {
-        let _ = tokio::fs::remove_dir_all(&temp).await;
-        return Err(error);
-    }
-    if destination.exists() {
-        let _ = tokio::fs::remove_dir_all(&temp).await;
-        return Err(Error::Conflict(
-            "backup destination appeared during backup".into(),
-        ));
-    }
-    let source = temp.clone();
-    let target = destination.to_path_buf();
-    let published = tokio::task::spawn_blocking(move || publish_backup_directory(&source, &target))
-        .await
-        .map_err(internal)?;
-    if let Err(error) = published {
-        let _ = tokio::fs::remove_dir_all(&temp).await;
-        return Err(error);
-    }
-    sync_directory(parent.to_path_buf()).await?;
-    Ok(())
-}
-
 fn publish_backup_directory(source: &Path, destination: &Path) -> Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
     {
@@ -1113,51 +1804,6 @@ fn publish_backup_directory(source: &Path, destination: &Path) -> Result<()> {
             "atomic no-overwrite backup publication unsupported platform".into(),
         ))
     }
-}
-
-async fn backup_into_temp(store: &Store, temp: &Path) -> Result<()> {
-    let _blob_guard = store.blob_lock.write().await;
-    let mut connection = store.pool.acquire().await.map_err(internal)?;
-    let database_path = temp.join("rsia.sqlite3");
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    drop(options.open(&database_path).map_err(internal)?);
-    #[cfg(test)]
-    super::AG157_BACKUP_VACUUM_FACT.with(|fact| {
-        *fact.borrow_mut() = Some((
-            database_path.clone(),
-            std::fs::symlink_metadata(&database_path),
-        ));
-    });
-    sqlx::query("VACUUM INTO ?")
-        .bind(database_path.to_string_lossy().as_ref())
-        .execute(&mut *connection)
-        .await
-        .map_err(internal)?;
-    sync_file(&database_path).await?;
-    let database = file_entry(&database_path, "rsia.sqlite3").await?;
-    let migrations = load_backup_migrations(&mut connection).await?;
-    let watermarks = load_backup_watermarks(&mut connection).await?;
-    let mut blobs = copy_backup_blobs(store, temp).await?;
-    blobs.sort_by(|left, right| left.path.cmp(&right.path));
-    let manifest = BackupManifest {
-        schema_version: BACKUP_SCHEMA.into(),
-        complete: true,
-        database,
-        blobs,
-        migrations,
-        watermarks,
-        created_at: evo_core::now()?,
-    };
-    let manifest_path = temp.join("backup-manifest.json");
-    let bytes = serde_json::to_vec_pretty(&manifest).map_err(internal)?;
-    super::write_synced_temp(&manifest_path, &bytes).await?;
-    sync_directory(temp.to_path_buf()).await
 }
 
 async fn load_backup_migrations(
@@ -1240,15 +1886,7 @@ async fn copy_backup_blobs(store: &Store, temp: &Path) -> Result<Vec<BackupFileE
     if !source.exists() {
         return Ok(Vec::new());
     }
-    if !tokio::fs::symlink_metadata(&source)
-        .await
-        .map_err(internal)?
-        .is_dir()
-    {
-        return Err(Error::Conflict(
-            "linked blob root cannot be backed up".into(),
-        ));
-    }
+    backup_identity(&source, true)?;
     let target_root = temp.join("blobs");
     let mut entries = Vec::new();
     let mut namespaces = tokio::fs::read_dir(&source).await.map_err(internal)?;
@@ -1263,6 +1901,7 @@ async fn copy_backup_blobs(store: &Store, temp: &Path) -> Result<Vec<BackupFileE
             .to_str()
             .ok_or_else(|| Error::Invalid("blob namespace path is not UTF-8".into()))?;
         let target_namespace = target_root.join(&namespace_name);
+        backup_identity(&namespace.path(), true)?;
         let mut files = tokio::fs::read_dir(namespace.path())
             .await
             .map_err(internal)?;
@@ -1288,22 +1927,28 @@ async fn copy_backup_blobs(store: &Store, temp: &Path) -> Result<Vec<BackupFileE
             if evo_core::hash(&bytes) != file_text {
                 return Err(Error::Conflict("blob filename digest mismatch".into()));
             }
-            let mut directories = tokio::fs::DirBuilder::new();
-            directories.recursive(true);
-            #[cfg(unix)]
-            directories.mode(0o700);
-            directories
-                .create(&target_namespace)
-                .await
-                .map_err(internal)?;
+            if !target_root.exists() {
+                create_backup_dir(&target_root)?;
+            }
+            if !target_namespace.exists() {
+                create_backup_dir(&target_namespace)?;
+            }
             let destination = target_namespace.join(&file_name);
-            super::write_synced_temp(&destination, &bytes).await?;
+            backup_identity(&file.path(), false)?;
+            write_backup_member(&destination, &bytes).await?;
             entries.push(BackupFileEntry {
                 path: relative,
                 sha256: evo_core::hash(&bytes),
                 bytes: u64::try_from(bytes.len()).map_err(|_| Error::Internal)?,
             });
         }
+    }
+    if target_root.exists() {
+        let mut directories = tokio::fs::read_dir(&target_root).await.map_err(internal)?;
+        while let Some(directory) = directories.next_entry().await.map_err(internal)? {
+            sync_directory(directory.path()).await?;
+        }
+        sync_directory(target_root).await?;
     }
     Ok(entries)
 }
@@ -4579,6 +5224,127 @@ impl<'de> serde::de::Visitor<'de> for StrictJsonVisitor {
             values.insert(key, value.0);
         }
         Ok(StrictJson(serde_json::Value::Object(values)))
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod backup_lifecycle_tests {
+    use super::*;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    async fn fixture() -> (tempfile::TempDir, Store, Context) {
+        let directory = tempfile::Builder::new()
+            .permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .tempdir()
+            .unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let path = root.join("rsia.sqlite3");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let store = Store::open(&path).await.unwrap();
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let mut session = store.session().await.unwrap();
+        session
+            .bump_watermark(&admin, &evo_core::hash(b"watermark"))
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        (directory, store, admin)
+    }
+
+    #[tokio::test]
+    async fn backup_preparation_releases_pool_after_snapshot_for_lease_progress() {
+        let (directory, store, admin) = fixture().await;
+        let mut preparing = store
+            .backup(&admin, BackupName::parse("pool").unwrap())
+            .unwrap()
+            .begin(0, None)
+            .await
+            .unwrap();
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        preparing.pause_before_copy = Some((reached.clone(), resume.clone()));
+        let worker = tokio::spawn(async move {
+            preparing
+                .prepare(
+                    Instant::now() + Duration::from_secs(30),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .await
+        });
+        reached.notified().await;
+        let mut session = tokio::time::timeout(Duration::from_secs(2), store.session())
+            .await
+            .unwrap()
+            .unwrap();
+        session
+            .audit(&admin, "lease_progress_after_snapshot", "pool")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        let closing_store = store.clone();
+        let closed = tokio::spawn(async move { closing_store.close().await });
+        while !store.pool.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !closed.is_finished(),
+            "close must await the actual copy/cleanup lock"
+        );
+        resume.notify_one();
+        let prepared = worker.await.unwrap().unwrap();
+        assert!(
+            !closed.is_finished(),
+            "Prepared still owns its unrecorded temporary directory"
+        );
+        prepared.discard().await.unwrap();
+        closed.await.unwrap();
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("backups"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert!(store.session().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn backup_parent_fsync_failure_reports_real_publication_reference() {
+        let (_directory, store, admin) = fixture().await;
+        let mut prepared = store
+            .backup(&admin, BackupName::parse("unverified").unwrap())
+            .unwrap()
+            .begin(0, None)
+            .await
+            .unwrap()
+            .prepare(
+                Instant::now() + Duration::from_secs(30),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            .unwrap();
+        prepared.owned.fail_parent_sync = true;
+        let progress = prepared.progress();
+        let session = store.session().await.unwrap();
+        let publication = prepared.release().publish().await.unwrap();
+        assert_eq!(publication.durability, BackupDurability::Unverified);
+        assert_eq!(
+            Some(publication.manifest_sha256.as_str()),
+            progress.manifest_sha256()
+        );
+        assert!(publication.directory().join("rsia.sqlite3").is_file());
+        let raw = std::fs::read(publication.directory().join("backup-manifest.json")).unwrap();
+        assert_eq!(evo_core::hash(&raw), publication.manifest_sha256);
+        session.commit().await.unwrap();
+        store.close().await;
+        assert!(publication.directory().exists());
     }
 }
 
