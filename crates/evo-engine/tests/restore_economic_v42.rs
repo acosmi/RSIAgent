@@ -946,7 +946,12 @@ impl Scenario {
     /// pool and report an experiment selects from, the root budget and one finalized
     /// call. No economic record and no backup yet.
     async fn begin() -> Self {
-        let guard = tempfile::tempdir().unwrap();
+        let guard = tempfile::Builder::new()
+            .permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .tempdir()
+            .unwrap();
         // the script refuses symlinks in any supplied path (`/var` on macOS)
         let root = guard.path().canonicalize().unwrap();
         let live = root.join("rsia.sqlite3");
@@ -1844,7 +1849,10 @@ async fn actual_parent_and_current_reports_remain_revoked_after_real_backup_rest
     );
     assert_eq!(metadata["scope"]["external_provider_calls"], 0);
     assert_eq!(metadata["scope"]["real_paid_effect_claimed"], false);
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     // The existing restore CLI rejects symlinked path components on macOS.
     let root = directory.path().canonicalize().unwrap();
     let live = root.join("history-copy.sqlite3");

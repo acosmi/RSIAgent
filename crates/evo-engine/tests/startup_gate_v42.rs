@@ -105,7 +105,7 @@ impl Fixture {
     /// reservation and an exposure-ledger artifact. `run-2` is revoked after the
     /// backup, so the restore replays one revocation into `D`.
     async fn new() -> Self {
-        let guard = tempfile::tempdir().unwrap();
+        let guard = private_tempdir();
         let root = guard.path().canonicalize().unwrap();
         let live = root.join("rsia.sqlite3");
         {

@@ -130,7 +130,10 @@ struct Fixture {
 }
 
 async fn fixture(outcome: TraceOutcome, empty_excerpt: bool) -> Fixture {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     // The real restore script rejects symlinks in its path, including /var on macOS.
     let root = directory.path().canonicalize().unwrap();
     let database = root.join("native-cleanup.sqlite3");

@@ -66,7 +66,10 @@ async fn issue_controlled_source(fixture: &Fixture, id: &str, body: Vec<u8>) {
         .unwrap();
 }
 async fn setup() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let root = dir.path().canonicalize().unwrap();
     {
         use std::os::unix::fs::OpenOptionsExt;

@@ -25,7 +25,10 @@ fn d(label: &str) -> String {
 }
 
 async fn state(auth: AuthRegistry) -> (tempfile::TempDir, HttpState) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()

@@ -1034,7 +1034,12 @@ impl Scenario {
     /// A live database with namespace `n` at revoke watermark 1, the source run
     /// every dependent below hangs from, and `facts`. No backup yet.
     async fn begin(facts: &[Fact]) -> Self {
-        let guard = tempfile::tempdir().unwrap();
+        let guard = tempfile::Builder::new()
+            .permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .tempdir()
+            .unwrap();
         // the script refuses symlinks in any supplied path (`/var` on macOS)
         let root = guard.path().canonicalize().unwrap();
         let live = root.join("rsia.sqlite3");

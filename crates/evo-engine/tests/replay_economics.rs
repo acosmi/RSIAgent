@@ -1152,7 +1152,10 @@ async fn actual_m33_history_copy() -> (
     assert_eq!(metadata["scope"]["external_provider_calls"], 0);
     assert_eq!(metadata["scope"]["real_paid_effect_claimed"], false);
     assert_eq!(metadata["scope"]["current_v3_authority_claimed"], false);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let path = dir
         .path()
         .canonicalize()

@@ -32,7 +32,10 @@ fn job(key: &str, state: ManagementJobState, at: i64) -> ManagementJob {
 
 #[tokio::test]
 async fn legacy_and_current_jobs_keep_restore_and_cleanup_protection() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let path = dir.path().canonicalize().unwrap().join("rsia.sqlite3");
     {
         use std::os::unix::fs::OpenOptionsExt;

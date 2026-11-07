@@ -31,7 +31,10 @@ fn ctx(actor: &str, role: Role) -> Context {
 }
 
 async fn database() -> (tempfile::TempDir, Store) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     {
         use std::os::unix::fs::OpenOptionsExt;
         std::fs::OpenOptions::new()
