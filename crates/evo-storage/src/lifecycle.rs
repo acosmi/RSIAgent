@@ -5255,6 +5255,9 @@ mod backup_lifecycle_tests {
             .bump_watermark(&admin, &evo_core::hash(b"watermark"))
             .await
             .unwrap();
+        // A backup covers namespaces that hold objects, audit or root budgets;
+        // a bare watermark names none.
+        session.audit(&admin, "fixture", "backup").await.unwrap();
         session.commit().await.unwrap();
         (directory, store, admin)
     }

@@ -90,9 +90,11 @@ impl Fixture {
             .await
             .unwrap();
         for (index, call_id) in ["settled", "uncertain"].into_iter().enumerate() {
-            let input =
-                BudgetArtifact::from_serializable("test.backup.input.v1", &json!({"call":call_id}))
-                    .unwrap();
+            let input = BudgetArtifact::from_serializable(
+                "rsia.model_request.artifact.v1",
+                &json!({"request_id":call_id,"source_closure":[],"input":[{"content":call_id}]}),
+            )
+            .unwrap();
             let call = store
                 .reserve_budget_call(
                     &host,
@@ -155,8 +157,12 @@ impl Fixture {
                             provenance: BudgetExecutionProvenance::Fixture,
                             actual_model_digest: Some(hash(b"fixture-model")),
                             transport_artifact: output.clone(),
-                            usable_response: Some(output.clone()),
-                            blocked_response: output,
+                            usable_response: Some(output),
+                            blocked_response: BudgetArtifact::from_serializable(
+                                "test.backup.output.v1",
+                                &json!({"status":"blocked"}),
+                            )
+                            .unwrap(),
                             forced_block_reason: None,
                         },
                     )

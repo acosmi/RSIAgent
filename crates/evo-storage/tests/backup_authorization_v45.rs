@@ -97,6 +97,11 @@ async fn authorized_backup_keeps_v2_manifest_and_full_snapshot() {
             .bump_watermark(&admin, &hash(b"bare-watermark"))
             .await
             .unwrap();
+        // A backup covers namespaces that hold objects, audit or root budgets.
+        session
+            .audit(&admin, "fixture.created", "bare")
+            .await
+            .unwrap();
         session.commit().await.unwrap();
         let publication = store
             .backup(&admin, BackupName::parse("bare").unwrap())
@@ -337,6 +342,17 @@ async fn backup_atomic_publish_does_not_replace_existing_destination() {
 #[tokio::test]
 async fn backup_prepublication_failure_removes_only_owned_temporary_directory() {
     let (directory, store, admin) = fixture().await;
+    // SQLite consults the progress handler once a statement passes 1000 VM steps;
+    // enough audit rows make the VACUUM copy reach it, so the expired deadline
+    // really interrupts the snapshot.
+    let mut session = store.session().await.unwrap();
+    for index in 0..3000 {
+        session
+            .audit(&admin, "fixture.bulk", &index.to_string())
+            .await
+            .unwrap();
+    }
+    session.commit().await.unwrap();
     let preparing = store
         .backup(&admin, BackupName::parse("interrupted").unwrap())
         .unwrap()
