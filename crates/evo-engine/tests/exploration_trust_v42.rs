@@ -25,12 +25,13 @@
 //!   written before the label existed.
 //!
 //! The registered runner executes parent and candidate with the same pure function,
-//! so on its own it produces `KeepIncumbent`, never a candidate. The verified path is
-//! covered with `ContrastRunner`, which writes honest E03 evidence with chosen
-//! outputs, as `practice_v42` does: the budget rows, settlements, execution receipts
-//! and grader receipts through the public issuing functions, and the run receipt as
-//! a typed envelope (the registered runner's own issuer is private). Real SQLite
-//! store, no provider, zero monetary cost.
+//! so on its own it produces `KeepIncumbent`, never a candidate. `ContrastRunner`
+//! goes through the public issuing functions with chosen outputs; since AG-183 the
+//! issuer recomputes the frozen target, so every chosen output that is not the
+//! target's is refused at its side before any receipt, and the coordinator closes
+//! that paid dispatch uncertain. The verified content path runs the config
+//! projection runner over real frozen Bundles. Real SQLite store, no provider, zero
+//! monetary cost.
 //!
 //! Not covered (and not claimed): a trusted node from a runner that consumes the
 //! candidate's projection (none exists), the `Trusted` nodes and `TrustedExecution`
@@ -741,9 +742,15 @@ struct ContrastRunner {
     executor: Context,
     grader: Context,
     candidate_correct: fn(&str) -> bool,
+    /// The exact errors the issuer answered the runner with.
+    refusals: std::sync::Mutex<Vec<String>>,
 }
 
 impl ContrastRunner {
+    fn refusals(&self) -> Vec<String> {
+        self.refusals.lock().unwrap().clone()
+    }
+
     async fn issue_side(
         &self,
         control: &DevelopmentControlV1,
@@ -858,6 +865,16 @@ impl ContrastRunner {
 #[async_trait]
 impl DevRunner for ContrastRunner {
     async fn run(&self, request: DevelopmentRunRequest) -> Result<DevelopmentRunReport> {
+        let result = self.run_chosen(request).await;
+        if let Err(error) = &result {
+            self.refusals.lock().unwrap().push(error.to_string());
+        }
+        result
+    }
+}
+
+impl ContrastRunner {
+    async fn run_chosen(&self, request: DevelopmentRunRequest) -> Result<DevelopmentRunReport> {
         let control = load_development_control(&self.store, &self.executor, CONTROL_ID).await?;
         let mut results = Vec::new();
         let mut execution_ids = Vec::new();
@@ -1386,6 +1403,7 @@ impl Env {
             executor: Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
             grader: Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
             candidate_correct,
+            refusals: Default::default(),
         }
     }
 
@@ -1430,9 +1448,10 @@ impl Env {
     }
 }
 
-/// Only the model edit is scripted. Config outputs and scores come from actual
-/// frozen Bundle/FD execution through the separate registered runner.
-struct ConfigEditingModel;
+/// Only the model edit is scripted: it replaces the Skill content with its text.
+/// Config outputs and scores come from actual frozen Bundle/FD execution through
+/// the separate registered runner.
+struct ConfigEditingModel(&'static str);
 
 #[async_trait]
 impl ModelPort for ConfigEditingModel {
@@ -1469,7 +1488,7 @@ impl ModelPort for ConfigEditingModel {
                     suggestion.edit.end = parent.content.len();
                     suggestion.edit.expected_text_digest = hash(parent.content.as_bytes());
                     suggestion.edit.operation = TextEditOperation::Replace {
-                        text: CONFIG_HIGH.into(),
+                        text: self.0.into(),
                     };
                 }
             }
@@ -1480,7 +1499,14 @@ impl ModelPort for ConfigEditingModel {
     }
 }
 
-async fn config_content_env(id: &str) -> (Env, ConfigProjectionDevelopmentRunner) {
+/// A world whose root Skill content is `root`, under a config projection control
+/// with one task per `placements` entry (E: every layer sets the key, M: only the
+/// defaults do).
+async fn config_content_env(
+    id: &str,
+    root: &str,
+    placements: &[&str],
+) -> (Env, ConfigProjectionDevelopmentRunner) {
     let mut env = Env::new(true).await;
     let control = ConfigProjectionControlV1::registered(
         "config-projection-control",
@@ -1491,13 +1517,16 @@ async fn config_content_env(id: &str) -> (Env, ConfigProjectionDevelopmentRunner
         "dev-grader",
         "optimizer",
         "config-projection-manifest",
-        vec![
-            ConfigProjectionTaskV1::registered(
-                "config-family",
-                json!({"template":"F","layer_count":2,"key_type":"B","placement":"E","seed":1}),
-            )
-            .unwrap(),
-        ],
+        placements
+            .iter()
+            .map(|placement| {
+                ConfigProjectionTaskV1::registered(
+                    "config-family",
+                    json!({"template":"F","layer_count":2,"key_type":"B","placement":placement,"seed":1}),
+                )
+                .unwrap()
+            })
+            .collect(),
         d("environment"),
         d("rules"),
         d("tools"),
@@ -1510,7 +1539,7 @@ async fn config_content_env(id: &str) -> (Env, ConfigProjectionDevelopmentRunner
         .unwrap();
     env.fixture.manifest = control.manifest().unwrap();
     let skill = SkillSnapshot {
-        content: CONFIG_LOW.into(),
+        content: root.into(),
         ..parent_skill()
     };
     let bundle = trusted_compiler_inputs::bundle_current(
@@ -1576,7 +1605,7 @@ async fn config_content_env(id: &str) -> (Env, ConfigProjectionDevelopmentRunner
 #[tokio::test]
 async fn projection_consumed_node_is_current_content_and_can_deepen_and_finalize() {
     let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
-    let (env, runner) = config_content_env("world-current-projection").await;
+    let (env, runner) = config_content_env("world-current-projection", CONFIG_LOW, &["E"]).await;
     let mut request = env.fixture.request(
         &env.root,
         "world-current-projection",
@@ -1588,7 +1617,7 @@ async fn projection_consumed_node_is_current_content_and_can_deepen_and_finalize
     let result = env
         .coordinator
         .run_next(
-            Some(&ConfigEditingModel),
+            Some(&ConfigEditingModel(CONFIG_HIGH)),
             Some(&runner),
             Some(&env.journal),
             request,
@@ -1636,7 +1665,7 @@ async fn projection_consumed_node_is_current_content_and_can_deepen_and_finalize
     // honest historical software premise, then execute and verify the Recover
     // itself with the current config projection runner (not an identity receipt).
     let id = "world-current-recover";
-    let (env, runner) = config_content_env(id).await;
+    let (env, runner) = config_content_env(id, CONFIG_LOW, &["E"]).await;
     let mut request = env.fixture.request(&env.root, id, 1, "recover-failure");
     request.development_request.grader_digest =
         evo_engine::development::projection::config_projection_grader_digest().unwrap();
@@ -1678,7 +1707,7 @@ async fn projection_consumed_node_is_current_content_and_can_deepen_and_finalize
     let recovered = env
         .coordinator
         .run_next(
-            Some(&ConfigEditingModel),
+            Some(&ConfigEditingModel(CONFIG_HIGH)),
             Some(&runner),
             Some(&env.journal),
             request,
@@ -1746,12 +1775,13 @@ async fn legacy_trusted_nodes_stay_readable_but_cannot_drive_current_selection()
             1,
             "historical-trusted",
             &env.root,
-            &env.contrast_runner(|_| true),
+            &env.registered_runner(),
         )
         .await;
     let node_id = result.node_id.as_ref().unwrap();
-    // Exact pre-Q29 software-history shape: retain old identity receipts and
-    // restore the old Trusted label. It has no new content edge or execution.
+    // Pre-Q29 software-history shape: the honest identity receipts of the
+    // registered runner stay as they are, and the old Trusted label is restored
+    // over them. No current content edge or execution is added.
     rewrite_node(&env.store, node_id, |node| {
         node["node"]["status"] = json!({"status":"valid","quality_micros":1_000_000});
         node["node"]["best_valid_ancestor_micros"] = json!(1_000_000);
@@ -1791,7 +1821,7 @@ async fn legacy_trusted_nodes_stay_readable_but_cannot_drive_current_selection()
         before_dispatch
     );
     // A separate real current-content chain remains healthy in the same scope.
-    let (healthy, runner) = config_content_env("world-current-control").await;
+    let (healthy, runner) = config_content_env("world-current-control", CONFIG_LOW, &["E"]).await;
     let mut request =
         healthy
             .fixture
@@ -1801,7 +1831,7 @@ async fn legacy_trusted_nodes_stay_readable_but_cannot_drive_current_selection()
     let actual = healthy
         .coordinator
         .run_next(
-            Some(&ConfigEditingModel),
+            Some(&ConfigEditingModel(CONFIG_HIGH)),
             Some(&runner),
             Some(&healthy.journal),
             request,
@@ -1910,6 +1940,42 @@ fn assert_terminal_failure(seen: &Seen, label: &str, reason: &str) {
     );
     assert_eq!(seen.fact_evidence, json!(label));
     assert_eq!(seen.fact_reason, json!(reason));
+}
+
+/// AG-183: what a runner that chose an output the frozen target does not produce
+/// gets. The issuer recomputes the registered target and refuses at that side,
+/// before any receipt; the coordinator keeps no error text and closes the paid
+/// dispatch uncertain, naming no candidate.
+const CHOSEN_OUTPUT_REFUSAL: &str =
+    "state conflict: registered execution output differs from frozen target";
+const UNCERTAIN_REASON: &str = "development_execution_outcome_unknown";
+
+fn assert_chosen_output_refused(seen: &Seen) {
+    assert_eq!(seen.outcome, UNCERTAIN_REASON);
+    assert_eq!(seen.status, json!({"status": "usage_uncertain"}));
+    assert_eq!(seen.node_evidence, json!("not_observed"));
+    assert_eq!(seen.fact_state, json!("uncertain"));
+    assert_eq!(seen.fact_evidence, json!("not_observed"));
+    assert_eq!(seen.fact_reason, json!(UNCERTAIN_REASON));
+    assert!(!seen.names_candidate);
+}
+
+/// One real dispatch of a config world through `run_next` with `model`.
+async fn config_step(
+    env: &Env,
+    world: &str,
+    step: u32,
+    tag: &str,
+    model: &dyn ModelPort,
+    runner: &dyn DevRunner,
+) -> CoordinatorStepResult {
+    let mut request = env.fixture.request(&env.root, world, step, tag);
+    request.development_request.grader_digest =
+        evo_engine::development::projection::config_projection_grader_digest().unwrap();
+    env.coordinator
+        .run_next(Some(model), Some(runner), Some(&env.journal), request)
+        .await
+        .unwrap()
 }
 
 fn dispatched_seqs(action: &BatchActionV1) -> Vec<u32> {
@@ -2197,12 +2263,15 @@ async fn the_registered_runner_executes_both_sides_alike_so_it_never_yields_a_ca
     );
 }
 
-/// AG-187 (§6.7.4 Q-29, V121.a): the receipts are real and E03's observation gate
-/// verifies them, but the registered runner contract declares `identity_only`: the
-/// comparison proves the receipt chain, not the content of the candidate. The node is
-/// the terminal content refusal of a paid step, the paid rows stay as they were, and
-/// nothing deepens or proposes it. (It replaces the test that took this comparison
-/// for a trusted valid node.)
+/// AG-187 (§6.7.4 Q-29, V121.a) and AG-183: the comparison this test was built on,
+/// a pure-function candidate that answers better than its parent, has no honest
+/// evidence any more. Both sides run the same registered function on the same
+/// frozen input, so the issuer refuses a chosen output that is not the target's
+/// (N). An honest identity-only chain still verifies and is still no Skill content:
+/// it equals its parent and keeps the incumbent
+/// (`the_registered_runner_executes_both_sides_alike_*`). The refused step was paid
+/// for once, its dispatch is closed uncertain and drives nothing, and a reconnect
+/// returns it without reaching a port.
 #[tokio::test]
 async fn identity_only_candidate_is_refused_as_skill_content() {
     // The rows the step settled and the root they were paid from.
@@ -2223,46 +2292,40 @@ async fn identity_only_candidate_is_refused_as_skill_content() {
 
     let env = Env::new(true).await;
     env.register("world-identity").await;
-    // The candidate answers every task correctly, the parent none: a strict
-    // improvement, backed by receipts the gate reloads.
+    // The candidate claims every task, the parent none: chosen outputs.
     let runner = Spy::new(env.contrast_runner(|_| true));
     let first = env
         .run("world-identity", 1, "identity-1", &env.root, &runner)
         .await;
     assert_eq!(runner.calls(), 1, "the step ran and was paid for once");
+    assert_eq!(runner.inner.refusals(), vec![CHOSEN_OUTPUT_REFUSAL]);
     let first_seen = seen(&env, &first).await;
-    assert_terminal_failure(&first_seen, "evidence_rejected", REJECTED_REASON);
+    assert_chosen_output_refused(&first_seen);
+    // Nothing was observed, so there is no verdict to read.
     assert!(
-        first_seen.names_candidate,
-        "the node still names the candidate it dispatched"
+        stage_facts(&env.store, "world-identity", 1)
+            .await
+            .iter()
+            .all(|fact| fact.kind != StageFactKind::DevelopmentObserved)
     );
-
-    // E03's generic gate verifies the very facts the coordinator judged: the refusal
-    // is about what the evidence can support, not about the receipts.
-    let view = gate_verdict(&env.store, "world-identity", 1).await.unwrap();
-    assert_eq!(view.outcomes.len(), 2);
-    for outcome in &view.outcomes {
-        assert_eq!(outcome.parent_score_micros, 0);
-        assert_eq!(outcome.candidate_score_micros, 1_000_000);
-    }
     let usage = env
         .coordinator
         .verified_mechanism_usage("world-identity")
         .await
         .unwrap();
     assert_eq!(usage.len(), 1);
-    assert_eq!(usage[0].dispatch_state(), MechanismUsageState::Observed);
-    assert_eq!(usage[0].evidence(), ExplorationEvidenceV1::EvidenceRejected);
+    assert_eq!(usage[0].dispatch_state(), MechanismUsageState::Uncertain);
+    assert_eq!(usage[0].evidence(), ExplorationEvidenceV1::NotObserved);
 
-    // The step was paid for: one settled row per side of each task.
+    // The parent side of the first task was reserved, dispatched and settled
+    // before the refusal; that accounted call stays as it was.
     let paid_rows = paid(&env.store).await;
-    assert_eq!(paid_rows.0.len(), 4);
-    assert!(
-        paid_rows
-            .0
-            .iter()
-            .all(|row| row.state == evo_storage::budget::BudgetCallState::Finalized)
+    assert_eq!(paid_rows.0.len(), 1);
+    assert_eq!(
+        paid_rows.0[0].state,
+        evo_storage::budget::BudgetCallState::Finalized
     );
+    assert_eq!(paid_rows.0[0].actual_cost_micros, Some(0));
 
     // Nothing deepens the node: the only legal action is the other root.
     let next = env.coordinator.decide_next("world-identity").await.unwrap();
@@ -2277,25 +2340,25 @@ async fn identity_only_candidate_is_refused_as_skill_content() {
         Err(Error::Conflict(message)) => {
             assert_eq!(message, "selected node is not a valid observed candidate");
         }
-        other => panic!("an identity-only candidate is no final candidate, got {other:?}"),
+        other => panic!("a refused step is no final candidate, got {other:?}"),
     }
 
-    // A reconnect returns the stored refusal without reaching a port, and nothing
+    // A reconnect returns the stored terminal without reaching a port, and nothing
     // after the refusal touched the paid rows or the root.
     let again = env
         .reconnect(&env.coordinator, "world-identity", 1, "identity-1")
         .await;
     assert_eq!(again.node_id, first.node_id);
-    assert_eq!(again.outcome, REJECTED_REASON);
+    assert_eq!(again.outcome, UNCERTAIN_REASON);
     assert_eq!(runner.calls(), 1);
     assert_eq!(paid(&env.store).await, paid_rows);
     assert_eq!(seen(&env, &first).await, first_seen);
 }
 
-/// AG-187 (V121.a): the request of a refused identity-only candidate, sent again
-/// with every port at hand, from this coordinator and from a new one over the same
-/// store, returns the stored refusal: no new dispatch, no runner or model call, no
-/// budget row.
+/// AG-187 (V121.a) and AG-183: the request of a refused step, sent again with
+/// every port at hand, from this coordinator and from a new one over the same
+/// store, returns the stored terminal: no new dispatch, no runner or model call,
+/// no budget row. What an honest identity-only chain reads as is unchanged.
 #[tokio::test]
 async fn replayed_identity_candidate_stays_refused_without_new_spend() {
     async fn paid(store: &Store) -> Vec<evo_storage::budget::BudgetCallRecord> {
@@ -2314,10 +2377,20 @@ async fn replayed_identity_candidate_stays_refused_without_new_spend() {
     let first = env
         .run("world-replay", 1, "replay-1", &env.root, &runner)
         .await;
-    assert_eq!(first.outcome, REJECTED_REASON);
-    // What the gate read: the registered runner contract declares `identity_only`.
+    assert_eq!(first.outcome, UNCERTAIN_REASON);
+    assert_eq!(runner.inner.refusals(), vec![CHOSEN_OUTPUT_REFUSAL]);
+    // What the gate reads of an honest chain of the same control: `identity_only`.
+    env.register("world-replay-honest").await;
+    env.run(
+        "world-replay-honest",
+        1,
+        "replay-honest-1",
+        &env.root,
+        &env.registered_runner(),
+    )
+    .await;
     assert_eq!(
-        gate_verdict(&env.store, "world-replay", 1)
+        gate_verdict(&env.store, "world-replay-honest", 1)
             .await
             .unwrap()
             .candidate_consumption,
@@ -2341,7 +2414,7 @@ async fn replayed_identity_candidate_stays_refused_without_new_spend() {
             .unwrap();
         assert_eq!(again.node_id, first.node_id);
         assert_eq!(again.dispatch_id, first.dispatch_id);
-        assert_eq!(again.outcome, REJECTED_REASON);
+        assert_eq!(again.outcome, UNCERTAIN_REASON);
     }
     assert_eq!(runner.calls(), 1, "the runner is not reached again");
     assert_eq!(
@@ -2358,39 +2431,63 @@ async fn replayed_identity_candidate_stays_refused_without_new_spend() {
 
 #[tokio::test]
 async fn the_node_quality_is_the_mean_of_the_scores_the_gate_recomputed() {
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
+    // N: a candidate chosen right on task-a only is refused at its parent side.
     let env = Env::new(true).await;
     env.register("world-partial").await;
-    // The candidate answers task-a only: 1000000 and 0, so the mean is 500000.
     let runner = env.contrast_runner(|task| task == "task-a");
     let step = env
         .run("world-partial", 1, "partial-1", &env.root, &runner)
         .await;
-    // AG-187: the comparison is identity-only, so it supports no Skill content and
-    // gives the node no quality: the node is the content refusal.
-    assert_terminal_failure(
-        &seen(&env, &step).await,
-        "evidence_rejected",
-        REJECTED_REASON,
+    assert_chosen_output_refused(&seen(&env, &step).await);
+    assert_eq!(runner.refusals(), vec![CHOSEN_OUTPUT_REFUSAL]);
+
+    // A real two-task content chain: the parent reads the lowest layer first and
+    // so misses the overriding layer (E) but not a key only the defaults set (M);
+    // the candidate reads the highest layer first. The node's quality is the mean
+    // of the candidate scores the gate recomputed from the frozen executions.
+    let (env, runner) = config_content_env("world-mean", CONFIG_LOW, &["E", "M"]).await;
+    let step = config_step(
+        &env,
+        "world-mean",
+        1,
+        "mean-1",
+        &ConfigEditingModel(CONFIG_HIGH),
+        &runner,
+    )
+    .await;
+    assert_eq!(step.outcome, "candidate_observed");
+    let view = gate_verdict(&env.store, "world-mean", 1).await.unwrap();
+    assert_eq!(view.outcomes.len(), 2);
+    let mean = |scores: Vec<u32>| {
+        scores.iter().map(|score| u64::from(*score)).sum::<u64>() / scores.len() as u64
+    };
+    assert_eq!(
+        mean(
+            view.outcomes
+                .iter()
+                .map(|outcome| outcome.parent_score_micros)
+                .collect()
+        ),
+        500_000
     );
-    // The gate still verifies it and recomputes the same mean.
-    let view = gate_verdict(&env.store, "world-partial", 1).await.unwrap();
-    let total: u64 = view
-        .outcomes
-        .iter()
-        .map(|outcome| u64::from(outcome.candidate_score_micros))
-        .sum();
-    assert_eq!(total / view.outcomes.len() as u64, 500_000);
-    // It is no final candidate.
-    match env
-        .coordinator
-        .final_candidate_request("world-partial", step.node_id.as_deref().unwrap())
+    let quality = mean(
+        view.outcomes
+            .iter()
+            .map(|outcome| outcome.candidate_score_micros)
+            .collect(),
+    );
+    let node = payload(&env.store, NODE, step.node_id.as_deref().unwrap()).await;
+    assert_eq!(node["evidence"], "trusted");
+    assert_eq!(
+        node["node"]["status"],
+        json!({"status":"valid","quality_micros":quality})
+    );
+    // It can be proposed.
+    env.coordinator
+        .final_candidate_request("world-mean", step.node_id.as_deref().unwrap())
         .await
-    {
-        Err(Error::Conflict(message)) => {
-            assert_eq!(message, "selected node is not a valid observed candidate");
-        }
-        other => panic!("an identity-only candidate is no final candidate, got {other:?}"),
-    }
+        .unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -2441,7 +2538,7 @@ async fn a_report_whose_scores_differ_from_its_receipts_is_rejected_whatever_it_
         vec![2]
     );
 
-    // The candidate's score is overstated over honest receipts in which it lost.
+    // N: a runner that chose the outputs is refused before it can overstate them.
     env.register("world-overstated").await;
     let overstated = Spy::forging(env.contrast_runner(|_| false), |report| {
         for result in &mut report.results {
@@ -2458,24 +2555,9 @@ async fn a_report_whose_scores_differ_from_its_receipts_is_rejected_whatever_it_
             &overstated,
         )
         .await;
-    assert_terminal_failure(
-        &seen(&env, &step).await,
-        "evidence_rejected",
-        REJECTED_REASON,
-    );
-    assert!(matches!(
-        gate_verdict(&env.store, "world-overstated", 1).await,
-        Err(Error::Conflict(_))
-    ));
-    assert!(matches!(
-        env.coordinator
-            .final_candidate_request("world-overstated", step.node_id.as_deref().unwrap())
-            .await,
-        Err(Error::Conflict(_))
-    ));
-
-    // A forged Fixture claim over honest receipts is a fixture, not a refusal: the
-    // report says what it is, and what it says is never trusted.
+    assert_chosen_output_refused(&seen(&env, &step).await);
+    assert_eq!(overstated.inner.refusals(), vec![CHOSEN_OUTPUT_REFUSAL]);
+    // Likewise one that would relabel its chosen outputs as a fixture.
     env.register("world-relabelled").await;
     let relabelled = Spy::forging(env.contrast_runner(|_| true), |report| {
         report.provenance = DevelopmentExecutionProvenance::Fixture;
@@ -2489,6 +2571,58 @@ async fn a_report_whose_scores_differ_from_its_receipts_is_rejected_whatever_it_
             &relabelled,
         )
         .await;
+    assert_chosen_output_refused(&seen(&env, &step).await);
+
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
+    // The candidate's score is overstated over real executions in which it did no
+    // better: its new content still reads the lowest layer first.
+    let (env, runner) = config_content_env("world-overstated-real", CONFIG_LOW, &["E"]).await;
+    let overstated = Spy::forging(runner, |report| {
+        for result in &mut report.results {
+            result.candidate_score_micros = 1_000_000;
+            result.candidate_passed = true;
+        }
+    });
+    let step = config_step(
+        &env,
+        "world-overstated-real",
+        1,
+        "overstated-real-1",
+        &ConfigEditingModel("config_precedence.v1: lowest_layer_first\nunrelated note"),
+        &overstated,
+    )
+    .await;
+    assert_terminal_failure(
+        &seen(&env, &step).await,
+        "evidence_rejected",
+        REJECTED_REASON,
+    );
+    assert!(matches!(
+        gate_verdict(&env.store, "world-overstated-real", 1).await,
+        Err(Error::Conflict(_))
+    ));
+    assert!(matches!(
+        env.coordinator
+            .final_candidate_request("world-overstated-real", step.node_id.as_deref().unwrap())
+            .await,
+        Err(Error::Conflict(_))
+    ));
+
+    // A forged Fixture claim over a real improvement is a fixture, not a refusal:
+    // the report says what it is, and what it says is never trusted.
+    let (env, runner) = config_content_env("world-relabelled-real", CONFIG_LOW, &["E"]).await;
+    let relabelled = Spy::forging(runner, |report| {
+        report.provenance = DevelopmentExecutionProvenance::Fixture;
+    });
+    let step = config_step(
+        &env,
+        "world-relabelled-real",
+        1,
+        "relabelled-real-1",
+        &ConfigEditingModel(CONFIG_HIGH),
+        &relabelled,
+    )
+    .await;
     assert_terminal_failure(&seen(&env, &step).await, "fixture_declared", FIXTURE_REASON);
 }
 
@@ -2551,23 +2685,85 @@ async fn step_with_or_without_a_crash(
 
 #[tokio::test]
 async fn a_recovered_step_carries_the_same_evidence_label_as_an_uninterrupted_one() {
-    let env = Env::new(true).await;
+    let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
+    // An honest content improvement: the same Trusted valid node after the crash,
+    // over evidence the gate verifies, and the runner is not paid again.
+    let mut honest = Vec::new();
+    for (world, crash) in [
+        ("world-honest-straight", false),
+        ("world-honest-recovered", true),
+    ] {
+        let (env, runner) = config_content_env(world, CONFIG_LOW, &["E"]).await;
+        let runner = Spy::new(runner);
+        let step = if crash {
+            let mut request = env.fixture.request(&env.root, world, 1, "recovery-1");
+            request.development_request.grader_digest =
+                evo_engine::development::projection::config_projection_grader_digest().unwrap();
+            let (journal, entered) =
+                HangingJournal::new(&env.store, StageFactKind::DevelopmentObserved);
+            tokio::select! {
+                biased;
+                result = env.coordinator.run_next(
+                    Some(&ConfigEditingModel(CONFIG_HIGH)),
+                    Some(&runner),
+                    Some(&journal),
+                    request,
+                ) => panic!("the hanging journal must not answer: {result:?}"),
+                () = entered.notified() => {}
+            }
+            assert_eq!(runner.calls(), 1);
+            let replay = Spy::new(
+                ConfigProjectionDevelopmentRunner::with_clock(
+                    env.store.clone(),
+                    Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
+                    Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
+                    "config-projection-control",
+                    600,
+                    Arc::new(|| 100),
+                )
+                .unwrap(),
+            );
+            let finished = config_step(
+                &env,
+                world,
+                1,
+                "recovery-1",
+                &ConfigEditingModel(CONFIG_HIGH),
+                &replay,
+            )
+            .await;
+            assert_eq!(replay.calls(), 0, "the recovery journal replays the report");
+            finished
+        } else {
+            config_step(
+                &env,
+                world,
+                1,
+                "recovery-1",
+                &ConfigEditingModel(CONFIG_HIGH),
+                &runner,
+            )
+            .await
+        };
+        let step_seen = seen(&env, &step).await;
+        assert_eq!(step_seen.outcome, "candidate_observed");
+        assert_eq!(
+            step_seen.status,
+            json!({"status":"valid","quality_micros":1_000_000})
+        );
+        assert_eq!(step_seen.node_evidence, json!("trusted"));
+        assert_eq!(step_seen.fact_state, json!("observed"));
+        assert!(step_seen.names_candidate);
+        gate_verdict(&env.store, world, 1).await.unwrap();
+        honest.push(step_seen);
+    }
+    assert_eq!(honest[0], honest[1]);
 
-    // An honest identity-only candidate: the same content refusal (AG-187) after
-    // the crash, over evidence the gate verifies.
-    let honest = || Spy::new(env.contrast_runner(|_| true));
-    let straight =
-        step_with_or_without_a_crash(&env, "world-honest-straight", &honest(), &honest(), false)
-            .await;
-    let recovered =
-        step_with_or_without_a_crash(&env, "world-honest-recovered", &honest(), &honest(), true)
-            .await;
-    let straight_seen = seen(&env, &straight).await;
-    assert_terminal_failure(&straight_seen, "evidence_rejected", REJECTED_REASON);
-    assert_eq!(seen(&env, &recovered).await, straight_seen);
-    gate_verdict(&env.store, "world-honest-recovered", 1)
-        .await
-        .unwrap();
+    let env = Env::new(true).await;
+    // N: a runner that chose the outputs is refused at its first side.
+    let chosen = Spy::new(env.contrast_runner(|_| true));
+    let step = step_with_or_without_a_crash(&env, "world-chosen", &chosen, &chosen, false).await;
+    assert_chosen_output_refused(&seen(&env, &step).await);
 
     // A forged report: refused the first time, refused the same way when replayed.
     fn forge(report: &mut DevelopmentRunReport) {
@@ -2750,14 +2946,14 @@ async fn records_without_an_evidence_label_read_as_not_observed_and_are_no_final
 #[tokio::test]
 async fn a_final_candidate_needs_a_valid_node_and_trusted_evidence() {
     let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
-    let (env, runner) = config_content_env("world-guard").await;
+    let (env, runner) = config_content_env("world-guard", CONFIG_LOW, &["E"]).await;
     let mut request = env.fixture.request(&env.root, "world-guard", 1, "guard-1");
     request.development_request.grader_digest =
         evo_engine::development::projection::config_projection_grader_digest().unwrap();
     let first = env
         .coordinator
         .run_next(
-            Some(&ConfigEditingModel),
+            Some(&ConfigEditingModel(CONFIG_HIGH)),
             Some(&runner),
             Some(&env.journal),
             request,
@@ -3099,11 +3295,11 @@ async fn legacy_v1_control_stays_readable_and_grants_no_skill_content() {
         other => panic!("the v1 control was registered again: {other:?}"),
     }
 
-    // A step against it: the receipts bind the v1 contract and the gate verifies
-    // them, but the contract declares no candidate consumption, so the candidate is
-    // refused as Skill content.
+    // A step against it: the honest receipts bind the v1 contract and the gate
+    // verifies them, but the contract declares no candidate consumption, and the
+    // two sides of one pure function are equal, so it keeps the incumbent.
     env.register("world-legacy-runner").await;
-    let runner = Spy::new(env.contrast_runner(|_| true));
+    let runner = Spy::new(env.registered_runner());
     let step = env
         .run(
             "world-legacy-runner",
@@ -3114,14 +3310,24 @@ async fn legacy_v1_control_stays_readable_and_grants_no_skill_content() {
         )
         .await;
     assert_eq!(runner.calls(), 1);
-    assert_terminal_failure(
-        &seen(&env, &step).await,
-        "evidence_rejected",
-        REJECTED_REASON,
-    );
+    assert_eq!(step.outcome, KEEP_INCUMBENT_REASON);
     let view = gate_verdict(&env.store, "world-legacy-runner", 1)
         .await
         .unwrap();
     assert_eq!(view.outcomes.len(), 2);
     assert_eq!(view.candidate_consumption, None);
+    // N: chosen outputs under the v1 contract are refused by the same issuer.
+    env.register("world-legacy-chosen").await;
+    let chosen = Spy::new(env.contrast_runner(|_| true));
+    let step = env
+        .run(
+            "world-legacy-chosen",
+            1,
+            "legacy-chosen-1",
+            &env.root,
+            &chosen,
+        )
+        .await;
+    assert_chosen_output_refused(&seen(&env, &step).await);
+    assert_eq!(chosen.inner.refusals(), vec![CHOSEN_OUTPUT_REFUSAL]);
 }

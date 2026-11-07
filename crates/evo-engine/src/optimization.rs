@@ -1278,6 +1278,102 @@ async fn verify_fact_compiler_use(
     }
     Ok(())
 }
+// Raw observations remain accounting/audit records. A bound continuation
+// reloads the original request its observation is bound to, and a cached
+// candidate terminal reloads its gate-verified development observation.
+async fn verify_current_development_cache_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    fact: &StageFact,
+) -> Result<()> {
+    if fact.kind == StageFactKind::DispatchObserved
+        && fact.stage == OptimizationJournalStage::Development
+    {
+        let report: DevelopmentRunReport =
+            serde_json::from_value(fact.payload.clone()).map_err(|_| Error::Internal)?;
+        // Honest fixture data retains its original downstream classification;
+        // it does not become typed execution evidence by entering a cache.
+        if report.provenance == DevelopmentExecutionProvenance::Fixture {
+            return Ok(());
+        }
+        let prepared_id = canonical_stage_artifact_id(&StageFact {
+            kind: StageFactKind::DispatchPrepared,
+            ..fact.clone()
+        })?;
+        let prepared = load_stage_fact(session, ctx, &prepared_id).await?;
+        prepared.validate()?;
+        let request: DevelopmentRunRequest =
+            serde_json::from_value(prepared.payload.clone()).map_err(|_| Error::Internal)?;
+        validate_development_binding(&request, &report)?;
+        if prepared.input_digest != fact.input_digest
+            || fact.input_digest != fingerprint(&request)?
+            || request.request_id != fact.request_id
+        {
+            return Err(Error::Conflict("development recovery input differs".into()));
+        }
+        // The report itself is verified by the shared E03 gate once the step
+        // observes it, fresh or reused: a forged or legacy report keeps that
+        // gate's rejection instead of failing here as a step error.
+    } else if fact.kind == StageFactKind::StepCompleted {
+        let prepared_id = canonical_stage_artifact_id(&StageFact {
+            kind: StageFactKind::StepPrepared,
+            ..fact.clone()
+        })?;
+        let Some(prepared) = read_stage_fact(session, ctx, &prepared_id).await? else {
+            // A rejected grant can be terminal before a step was prepared.
+            return if fact.payload["status"] == "candidate" {
+                Err(Error::NotFound)
+            } else {
+                Ok(())
+            };
+        };
+        prepared.validate()?;
+        if prepared.input_digest != fact.input_digest {
+            return Err(Error::Conflict("terminal input differs".into()));
+        }
+        let context: ModelRequestContext =
+            serde_json::from_value(prepared.payload["context"].clone())
+                .map_err(|_| Error::Internal)?;
+        let request: DevelopmentRunRequest =
+            serde_json::from_value(prepared.payload["development"].clone())
+                .map_err(|_| Error::Internal)?;
+        if context.namespace != fact.namespace
+            || context.episode_id != fact.episode_id
+            || context.step != fact.step
+            || context.attempt != fact.attempt
+            || context.request_id != fact.request_id
+        {
+            return Err(Error::Conflict("terminal input differs".into()));
+        }
+        let (request_id, observed_id) = development_stage_fact_ids(&context, &request)?;
+        let Some(observed) = read_stage_fact(session, ctx, &observed_id).await? else {
+            return if fact.payload["status"] == "candidate" {
+                Err(Error::Conflict(
+                    "current step cache lacks its development observation".into(),
+                ))
+            } else {
+                Ok(())
+            };
+        };
+        let report: DevelopmentRunReport =
+            serde_json::from_value(observed.payload.clone()).map_err(|_| Error::Internal)?;
+        if report.provenance != DevelopmentExecutionProvenance::Fixture {
+            if !fact
+                .dependencies
+                .iter()
+                .any(|d| d.kind == "artifact" && d.id == observed_id)
+            {
+                return Err(Error::Conflict(
+                    "current step cache omits its development observation".into(),
+                ));
+            }
+            verified_development_observation_in_session(ctx, session, &request_id, &observed_id)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Read a persisted bound fact inside the consumer's existing transaction.
 /// The caller owns commit and may atomically create a proposal from this value.
 pub(crate) async fn read_bound_stage_fact_in_session(
@@ -1313,6 +1409,7 @@ pub(crate) async fn read_bound_stage_fact_in_session(
             )
             .await?;
         }
+        Box::pin(verify_current_development_cache_in_session(s, ctx, fact)).await?;
     }
     Ok(fact)
 }

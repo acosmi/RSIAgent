@@ -13,13 +13,13 @@ use evo_engine::development::projection::{
     ConfigProjectionExecutionIssueRequest, ConfigProjectionExecutionRequestV1,
     ConfigProjectionTaskV1, config_projection_runner_contract,
     issue_config_projection_execution_receipt, load_config_projection_execution_receipt,
-    register_config_projection_control,
+    read_config_projection_execution_receipt_in_session, register_config_projection_control,
 };
 use evo_engine::development::{
-    CandidateConsumption, DevelopmentSide, EXECUTION_OUTPUT_KIND, EXECUTION_RECEIPT_KIND,
-    ExecutionReceiptIssueRequest, execution_budget_call_id, execution_output_id,
-    execution_receipt_id, issue_execution_receipt, load_execution_output, registered_runner_digest,
-    storage_id, typed_receipt_closure,
+    CandidateConsumption, DevelopmentExecutionReceiptVersion, DevelopmentSide,
+    EXECUTION_OUTPUT_KIND, EXECUTION_RECEIPT_KIND, ExecutionReceiptIssueRequest,
+    execution_budget_call_id, execution_output_id, execution_receipt_id, issue_execution_receipt,
+    load_execution_output, registered_runner_digest, storage_id, typed_receipt_closure,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::lifecycle::LifecycleCoordinator;
@@ -703,7 +703,7 @@ async fn active_zero_truncated_and_missing_projection_evidence_are_invalid() {
     let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(LOW, HIGH, false).await;
     let request = f.request("bad-projection");
-    let (_, p, o) = f.execute(&request).await;
+    let (report, p, o) = f.execute(&request).await;
     f.verify(&p, &o).await.unwrap();
     let task = &f.control.tasks[0].task_id;
     let call_id =
@@ -743,9 +743,8 @@ async fn active_zero_truncated_and_missing_projection_evidence_are_invalid() {
         projection_refusal(verify_development_observation(&f.store, &f.executor, &p, &o).await);
     }
     f.replace_budget_request(&call_id, &original);
-    let receipt_id =
-        execution_receipt_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap();
-    let stored = storage_id(EXECUTION_RECEIPT_KIND, &receipt_id).unwrap();
+    let receipt_id = &report.results[0].candidate_execution_id;
+    let stored = storage_id(EXECUTION_RECEIPT_KIND, receipt_id).unwrap();
     let original = f.raw("artifact", &stored).await;
     let mut missing = original.clone();
     missing["payload"]
@@ -764,18 +763,61 @@ async fn active_zero_truncated_and_missing_projection_evidence_are_invalid() {
 
 #[tokio::test]
 async fn forged_output_or_projection_does_not_verify_even_with_recomputed_outer_digests() {
+    use evo_storage::budget::{
+        BudgetArtifact, BudgetCallFence, BudgetCallReservation, BudgetExecutionProvenance,
+        BudgetStage, ModelCallSettlementEvidence, REGISTERED_EXECUTION_SETTLEMENT_SCHEMA,
+        REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2, ReadRegisteredExecutionSettlement,
+        RegisteredExecutionProvenance, RegisteredExecutionSettlement,
+        RegisteredExecutionSettlementV2, UsageCharge,
+    };
+
     let _workspace = CONFIG_WORKSPACE_TEST_GATE.lock().await;
     let f = Fixture::new(LOW, HIGH, false).await;
     let request = f.request("forged");
-    let (_, p, o) = f.execute(&request).await;
+    let (report, p, o) = f.execute(&request).await;
     f.verify(&p, &o).await.unwrap();
     let task = &f.control.tasks[0].task_id;
-    let rid = execution_receipt_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap();
+    let rid = &report.results[0].candidate_execution_id;
     let oid = execution_output_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap();
-    let rstore = storage_id(EXECUTION_RECEIPT_KIND, &rid).unwrap();
+    let rstore = storage_id(EXECUTION_RECEIPT_KIND, rid).unwrap();
     let ostore = storage_id(EXECUTION_OUTPUT_KIND, &oid).unwrap();
     let original_receipt = f.raw("artifact", &rstore).await;
     let original_output = f.raw("artifact", &ostore).await;
+    let mut wrong_identity = original_receipt.clone();
+    wrong_identity["payload"]["execution"]["receipt_id"] =
+        json!(execution_receipt_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap());
+    f.put("artifact", &rstore, &wrong_identity).await;
+    assert!(matches!(
+        load_config_projection_execution_receipt(&f.store, &f.admin, rid).await,
+        Err(Error::Forbidden)
+    ));
+    let mut s = f.store.session().await.unwrap();
+    assert!(matches!(
+        read_config_projection_execution_receipt_in_session(
+            &mut s,
+            &f.admin,
+            &request,
+            task,
+            DevelopmentSide::Candidate,
+            DevelopmentExecutionReceiptVersion::V2,
+        )
+        .await,
+        Err(Error::Forbidden)
+    ));
+    assert!(matches!(
+        read_config_projection_execution_receipt_in_session(
+            &mut s,
+            &f.admin,
+            &request,
+            task,
+            DevelopmentSide::Candidate,
+            DevelopmentExecutionReceiptVersion::V1,
+        )
+        .await,
+        Err(Error::NotFound)
+    ));
+    s.commit().await.unwrap();
+    f.put("artifact", &rstore, &original_receipt).await;
     let mut output = original_output.clone();
     let mut answer: Value =
         serde_json::from_str(output["payload"]["output_utf8"].as_str().unwrap()).unwrap();
@@ -798,7 +840,8 @@ async fn forged_output_or_projection_does_not_verify_even_with_recomputed_outer_
     f.put("artifact", &rstore, &claimed_projection).await;
     projection_refusal(f.verify(&p, &o).await);
     f.put("artifact", &rstore, &original_receipt).await;
-    let mut forged = f.frozen(&request, DevelopmentSide::Candidate).await;
+    let original_frozen = f.frozen(&request, DevelopmentSide::Candidate).await;
+    let mut forged = original_frozen.clone();
     forged.projection.instructions = vec![LOW.into()];
     f.replace_budget_request(
         &execution_budget_call_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap(),
@@ -827,6 +870,274 @@ async fn forged_output_or_projection_does_not_verify_even_with_recomputed_outer_
         .await,
         Err(Error::Forbidden)
     ));
+    f.replace_budget_request(
+        &execution_budget_call_id(&request.request_id, task, DevelopmentSide::Candidate).unwrap(),
+        &serde_json::to_value(&original_frozen).unwrap(),
+    );
+    f.verify(&p, &o).await.unwrap();
+
+    // Reuse the real frozen projection/output from the healthy public runner.
+    // Only this new request's identity and real financial writer vary.
+    let healthy_output = original_output["payload"]["output_utf8"].as_str().unwrap();
+    for (index, (writer, provenance)) in [
+        (ctx("another-real-worker", Role::Worker), None),
+        (ctx(f.executor.actor(), Role::Host), None),
+        (
+            f.admin.clone(),
+            Some(BudgetExecutionProvenance::ExternalProvider),
+        ),
+        (
+            ctx("model-financial-host", Role::Host),
+            Some(BudgetExecutionProvenance::Fixture),
+        ),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let next = f.request(&format!("settler-{index}"));
+        let prepared = f.journal(f.facts(&next, None), &next).await;
+        let mut frozen = original_frozen.clone();
+        frozen.request = next.clone();
+        frozen.request_fact_id = prepared;
+        let request_digest = fingerprint(&frozen).unwrap();
+        let call_id =
+            execution_budget_call_id(&next.request_id, task, DevelopmentSide::Candidate).unwrap();
+        let call = f
+            .store
+            .reserve_budget_call_with_sources(
+                &f.executor,
+                &BudgetCallReservation {
+                    billing_scope: SCOPE.into(),
+                    call_id: call_id.clone(),
+                    dispatch_group_id: next.episode_id.clone(),
+                    stage: BudgetStage::DevelopmentExecution,
+                    actual_input_digest: request_digest.clone(),
+                    request_artifact: Some(
+                        BudgetArtifact::from_serializable(
+                            "rsia.development_config_request.v1",
+                            &frozen,
+                        )
+                        .unwrap(),
+                    ),
+                    max_cost_micros: 1,
+                    lease_token: format!(
+                        "lease-{}",
+                        &fingerprint(&(&call_id, "config-projection-execution")).unwrap()[..32]
+                    ),
+                    lease_until: 700,
+                    now: 100,
+                },
+                &f.control.source_ids,
+            )
+            .await
+            .unwrap();
+        // A reserve registers no reference for an empty closure; the runner adds
+        // the same legal empty one in its reserve Session, and so does this one.
+        let reference = format!(
+            "budget-ref-{}",
+            &fingerprint(&("rsia.budget_call_ref.v1", NS, SCOPE, &call_id)).unwrap()[..32]
+        );
+        f.put(
+            "artifact",
+            &reference,
+            &json!({
+                "id": reference,
+                "schema_version": "rsia.budget_call_ref.v1",
+                "namespace": NS,
+                "billing_scope": SCOPE,
+                "call_id": call_id,
+                "source_ids": [],
+            }),
+        )
+        .await;
+        let fence = BudgetCallFence {
+            billing_scope: SCOPE.into(),
+            call_id: call_id.clone(),
+            actual_input_digest: request_digest.clone(),
+            lease_token: call.lease_token,
+            lease_epoch: call.lease_epoch,
+            now: 100,
+        };
+        let dispatch = f
+            .store
+            .begin_budget_dispatch(&f.executor, &fence)
+            .await
+            .unwrap();
+        let dispatch_id = dispatch.call.dispatch_id.unwrap();
+        let output_digest = hash(healthy_output.as_bytes());
+        let submission = RegisteredExecutionSettlement {
+            schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA.into(),
+            provenance: RegisteredExecutionProvenance::RegisteredPureFunction,
+            call_id: call_id.clone(),
+            dispatch_id: dispatch_id.clone(),
+            request_digest,
+            output_digest: output_digest.clone(),
+            target_id: "config_precedence.v1".into(),
+            target_digest: f.control.target_digest.clone(),
+            runner_digest: f.control.runner_digest.clone(),
+        };
+        let charge = UsageCharge {
+            amount_micros: 0,
+            currency: "USD".into(),
+            pricing_version: "local-zero-v1".into(),
+            provider_request_id: format!("registered-config-projection:{dispatch_id}"),
+            usage_record_id: format!("config-settler-usage-{index}"),
+            output_digest,
+        };
+        let accounted = if let Some(provenance) = provenance {
+            let forged = BudgetArtifact::from_serializable(
+                REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2,
+                &RegisteredExecutionSettlementV2 {
+                    schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2.into(),
+                    settler_actor: f.executor.actor().into(),
+                    settler_role: Role::Worker,
+                    settlement: submission.clone(),
+                },
+            )
+            .unwrap();
+            let model = f
+                .store
+                .settle_model_budget_call(
+                    writer,
+                    &fence,
+                    &charge,
+                    &ModelCallSettlementEvidence {
+                        provenance: *provenance,
+                        actual_model_digest: Some(d("config-model-financial-fixture")),
+                        transport_artifact: BudgetArtifact::from_serializable(
+                            "test.transport.v1",
+                            &json!({"provider_request_id":charge.provider_request_id}),
+                        )
+                        .unwrap(),
+                        usable_response: Some(forged.clone()),
+                        blocked_response: BudgetArtifact::from_serializable(
+                            "test.response.v1",
+                            &json!({"state":"blocked"}),
+                        )
+                        .unwrap(),
+                        forced_block_reason: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(model.response_usable);
+            assert_eq!(model.call.execution_provenance, Some(*provenance));
+            let closed = f
+                .store
+                .close_budget_call_execution(
+                    writer,
+                    SCOPE,
+                    &call_id,
+                    &dispatch_id,
+                    "config_model_financial_close",
+                    100,
+                )
+                .await
+                .unwrap();
+            assert_eq!(closed.response_artifact.as_ref(), Some(&forged));
+            closed
+        } else {
+            let settled = f
+                .store
+                .settle_registered_execution_call(writer, &fence, &charge, &submission)
+                .await
+                .unwrap();
+            let ReadRegisteredExecutionSettlement::Current(fact) =
+                ReadRegisteredExecutionSettlement::from_call(&settled).unwrap()
+            else {
+                panic!("registered writer must persist its actual settler");
+            };
+            assert_eq!(fact.settler_actor, writer.actor());
+            assert_eq!(fact.settler_role, writer.role());
+            settled
+        };
+        assert_eq!(accounted.state, BudgetCallState::Finalized);
+        assert_eq!(accounted.actual_cost_micros, Some(0));
+        assert!(accounted.execution_closed);
+        let issued = issue_config_projection_execution_receipt(
+            &f.executor,
+            &f.store,
+            ConfigProjectionExecutionIssueRequest {
+                control_id: f.control.id.clone(),
+                request: next.clone(),
+                task_id: task.clone(),
+                side: DevelopmentSide::Candidate,
+                lease_seconds: 600,
+                issued_at_unix_seconds: 100,
+            },
+        )
+        .await;
+        if provenance.is_none() && writer.actor() == f.executor.actor() {
+            let receipt = issued.unwrap();
+            assert_eq!(receipt.execution.executor_actor, writer.actor());
+            assert_eq!(receipt.execution.executor_role, Role::Host);
+            let mut s = f.store.session().await.unwrap();
+            let read = read_config_projection_execution_receipt_in_session(
+                &mut s,
+                &f.grader,
+                &next,
+                task,
+                DevelopmentSide::Candidate,
+                DevelopmentExecutionReceiptVersion::V2,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                read.state,
+                evo_storage::PersistentContractState::CurrentVerified
+            );
+            assert_eq!(read.receipt.execution.executor_role, Role::Host);
+            s.commit().await.unwrap();
+        } else {
+            let expected = match provenance {
+                None => "registered execution settler differs from registered executor",
+                Some(BudgetExecutionProvenance::Fixture) => {
+                    "execution receipt lacks a matching closed development budget call"
+                }
+                Some(_) => "registered execution settlement is invalid",
+            };
+            assert!(matches!(issued, Err(Error::Conflict(ref message)) if message == expected));
+            let mut s = f.store.session().await.unwrap();
+            assert!(matches!(
+                read_config_projection_execution_receipt_in_session(
+                    &mut s,
+                    &f.admin,
+                    &next,
+                    task,
+                    DevelopmentSide::Candidate,
+                    DevelopmentExecutionReceiptVersion::V2,
+                )
+                .await,
+                Err(Error::NotFound)
+            ));
+            assert!(
+                s.get::<Value>(
+                    &f.admin,
+                    "artifact",
+                    &storage_id(
+                        EXECUTION_OUTPUT_KIND,
+                        &execution_output_id(&next.request_id, task, DevelopmentSide::Candidate)
+                            .unwrap(),
+                    )
+                    .unwrap()
+                )
+                .await
+                .unwrap()
+                .is_none()
+            );
+            s.commit().await.unwrap();
+        }
+        assert_eq!(
+            f.store
+                .budget_call(&f.admin, SCOPE, &call_id)
+                .await
+                .unwrap()
+                .unwrap(),
+            accounted
+        );
+        let root = f.store.root_budget(&f.admin, SCOPE).await.unwrap().unwrap();
+        assert_eq!((root.spent_micros, root.reserved_micros), (0, 0));
+    }
 }
 
 #[tokio::test]
@@ -868,9 +1179,13 @@ async fn development_replay_and_recovery_leave_active_and_production_projection_
     let request = f.request("isolation");
     let prepared = f.journal(f.facts(&request, None), &request).await;
     let task = &f.control.tasks[0].task_id;
-    for side in [DevelopmentSide::Parent, DevelopmentSide::Candidate] {
+    for (side, role) in [
+        (DevelopmentSide::Parent, Role::Host),
+        (DevelopmentSide::Candidate, Role::Worker),
+    ] {
+        let issuer = ctx(f.executor.actor(), role);
         let receipt = issue_config_projection_execution_receipt(
-            &f.executor,
+            &issuer,
             &f.store,
             ConfigProjectionExecutionIssueRequest {
                 control_id: f.control.id.clone(),
@@ -883,6 +1198,76 @@ async fn development_replay_and_recovery_leave_active_and_production_projection_
         )
         .await
         .unwrap();
+        assert_eq!(
+            receipt.schema_version,
+            "rsia.development_config_execution.v2"
+        );
+        assert_eq!(
+            receipt.execution.schema_version,
+            "rsia.development_execution_receipt.v2"
+        );
+        assert_eq!(receipt.execution.executor_role, role);
+        let loaded = load_config_projection_execution_receipt(
+            &f.store,
+            &f.admin,
+            &receipt.execution.receipt_id,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded).unwrap(),
+            serde_json::to_value(&receipt).unwrap()
+        );
+        let mut s = f.store.session().await.unwrap();
+        let read = read_config_projection_execution_receipt_in_session(
+            &mut s,
+            &f.grader,
+            &request,
+            task,
+            side,
+            DevelopmentExecutionReceiptVersion::V2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read.state,
+            evo_storage::PersistentContractState::CurrentVerified
+        );
+        assert_eq!(read.current_receipt_id, receipt.execution.receipt_id);
+        assert_ne!(read.legacy_receipt_id, read.current_receipt_id);
+        assert_ne!(
+            read.current_receipt_id,
+            execution_receipt_id(&request.request_id, task, side).unwrap()
+        );
+        assert_eq!(
+            read.receipt.request_projection_digest,
+            receipt.request_projection_digest
+        );
+        assert!(matches!(
+            read_config_projection_execution_receipt_in_session(
+                &mut s,
+                &f.grader,
+                &request,
+                task,
+                side,
+                DevelopmentExecutionReceiptVersion::V1,
+            )
+            .await,
+            Err(Error::NotFound)
+        ));
+        let call = s
+            .budget_call(&f.admin, SCOPE, &receipt.execution.budget_call_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let evo_storage::budget::ReadRegisteredExecutionSettlement::Current(fact) =
+            evo_storage::budget::ReadRegisteredExecutionSettlement::from_call(&call).unwrap()
+        else {
+            panic!("config current receipt requires its actual settler");
+        };
+        assert_eq!(fact.settler_actor, f.executor.actor());
+        assert_eq!(fact.settler_role, role);
+        s.commit().await.unwrap();
         assert_eq!(
             receipt.execution.cost_state,
             evo_engine::development::DevelopmentCostState::Known {
@@ -939,6 +1324,245 @@ async fn development_replay_and_recovery_leave_active_and_production_projection_
     );
 }
 
+// AG-183 V104 (§5.1.1 item 7): object rows the old producer natively wrote, captured
+// byte for byte from this file's own `Fixture::new(LOW, HIGH, true)` and
+// `request("ag183-native-c1")` at commit 7b285b9c603b567648dd0df579c2c9100e3f1c99
+// (config projection C1 producer, capture backup sha256
+// 9d5b9bb2a53f3d7711e2c92658eb8927c0e6e9f8da34abe39b598e6068c49c0c). Order: the
+// parent C1 receipt, its output, the candidate C1 receipt, its output, the grader
+// receipt and the run receipt. Never regenerated here.
+/// The request those rows were produced for, as that commit's API serialized it.
+const NATIVE_7B285B9_CONFIG_REQUEST: &str = r#"{"attempt":1,"candidate_bundle_digest":"83b4e374363c74009bc7cab63043a9d4e10ae53cdd9cbc45619255289338e4e0","environment_digest":"d098e909e1133a910e4ef0bfd21786ac4cfc31e09361e4a77607fdea48127fdf","episode_id":"episode-ag183-native-c1","grader_digest":"cb79e9bfd33f3f607ba36ff287b744a3a1bbc282fddaf533f6862545ddcc3699","idempotency_key":"config-key-ag183-native-c1","manifest":{"digest":"9e036b4abcc30a2f6475197a4f3acccc404f5e659e218cbd6b565f70d672c464","id":"config-manifest","tasks":[{"id":"F-L2-B-E-s1","input_digest":"4c82c0277875570058290bd4a32f634baf425c7667de7bc4f0b28a21249572ba","parent_family":"config-family"}]},"namespace":"config-development","parent_bundle_digest":"dbfae603d6ce2133482663e476973505b62dbfb81c4db738c678c4df0432742f","purpose":"development","request_id":"request-ag183-native-c1","revoke_watermark":1,"rules_digest":"6c621d1a05138a7888d37d9269a9da8e2e11e4aced2f6cfd24b05ab1b9e61bb0","step":1,"tools_digest":"f9d35d43770d39092a663e665e82ae1d84a9e0da3d0d10c407acada6a40cd281"}"#;
+/// The Prepared fact id that commit journaled for that request.
+const NATIVE_7B285B9_CONFIG_PREPARED: &str =
+    "optstage-42d5a928591920798088c7b4e80328ad23f76ba6b2c7e867a30d0613777be6eb";
+/// 6 object rows: (namespace, kind, id, owner, revision, body).
+const NATIVE_7B285B9_CONFIG_ROWS: [(&str, &str, &str, &str, i64, &str); 6] = [
+    (
+        "config-development",
+        "artifact",
+        "e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670",
+        "executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670","record_kind":"development_execution_receipt_v1","payload":{"schema_version":"rsia.development_config_execution.v1","execution":{"schema_version":"rsia.development_execution_receipt.v1","receipt_id":"devexec-63f84473812bb5419ea4a9351469316549ec2cb6fea78448dd61e9ec515097ae","control_id":"config-control","namespace":"config-development","episode_id":"episode-ag183-native-c1","step":1,"attempt":1,"request_id":"request-ag183-native-c1","task_id":"F-L2-B-E-s1","side":"parent","input_digest":"4c82c0277875570058290bd4a32f634baf425c7667de7bc4f0b28a21249572ba","bundle_digest":"dbfae603d6ce2133482663e476973505b62dbfb81c4db738c678c4df0432742f","environment_digest":"d098e909e1133a910e4ef0bfd21786ac4cfc31e09361e4a77607fdea48127fdf","request_digest":"0378e1b57765d7ca48e1c60f1dc8d5df090aa898b23025dd124db09219b2b6d4","budget_call_id":"devcall-63f84473812bb5419ea4a9351469316549ec2cb6fea78448dd61e9ec515097ae","dispatch_id":"5078ab4c-43c3-4d25-8f7a-46f8501e0345","usage_record_id":"devusage-63f84473812bb5419ea4a9351469316549ec2cb6fea78448dd61e9ec515097ae","output_digest":"0f3936f505571cb5c7feea4c2731fc773a129ff8d9027d8ca1ac7e32e57fb250","output_artifact_id":"devout-63f84473812bb5419ea4a9351469316549ec2cb6fea78448dd61e9ec515097ae","cost_state":{"state":"known","micros":0,"currency":"USD","pricing_version":"local-zero-v1"},"execution_provenance":"registered_pure_function","revoke_watermark":1,"source_ids":["source-config"],"executor_actor":"executor","executor_role":"worker","issued_at_unix_seconds":100},"request_projection_digest":"db6fb07a6b336a6a9dde875c8f50e6ad13d77323f81395f52811fd5f6251df29"}}"#,
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-acddb67a2095147890f1844e00430e64c960fae713a4fe995872797db81f73e3",
+        "executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-acddb67a2095147890f1844e00430e64c960fae713a4fe995872797db81f73e3","record_kind":"development_execution_output_v1","payload":{"schema_version":"rsia.development_execution_output.v1","id":"devout-63f84473812bb5419ea4a9351469316549ec2cb6fea78448dd61e9ec515097ae","control_id":"config-control","request_id":"request-ag183-native-c1","task_id":"F-L2-B-E-s1","side":"parent","output_utf8":"{\"key\":\"/enabled\",\"present\":true,\"value\":true,\"source_layer\":\"defaults\",\"source_path\":\"defaults/base.json\",\"json_pointer\":\"/enabled\"}","output_digest":"0f3936f505571cb5c7feea4c2731fc773a129ff8d9027d8ca1ac7e32e57fb250"}}"#,
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837",
+        "executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837","record_kind":"development_execution_receipt_v1","payload":{"schema_version":"rsia.development_config_execution.v1","execution":{"schema_version":"rsia.development_execution_receipt.v1","receipt_id":"devexec-e204f2d85b0fcd74a317a68310fdf3de920e38045e90646565363f0a495f77ca","control_id":"config-control","namespace":"config-development","episode_id":"episode-ag183-native-c1","step":1,"attempt":1,"request_id":"request-ag183-native-c1","task_id":"F-L2-B-E-s1","side":"candidate","input_digest":"4c82c0277875570058290bd4a32f634baf425c7667de7bc4f0b28a21249572ba","bundle_digest":"83b4e374363c74009bc7cab63043a9d4e10ae53cdd9cbc45619255289338e4e0","environment_digest":"d098e909e1133a910e4ef0bfd21786ac4cfc31e09361e4a77607fdea48127fdf","request_digest":"918efa34728714b5e468c31ee8a0cc72fbe566f1a6b9bbbf5f7b8b5b2a9fc981","budget_call_id":"devcall-e204f2d85b0fcd74a317a68310fdf3de920e38045e90646565363f0a495f77ca","dispatch_id":"e234ce7f-485c-480b-a43a-f947cfcd9535","usage_record_id":"devusage-e204f2d85b0fcd74a317a68310fdf3de920e38045e90646565363f0a495f77ca","output_digest":"123a05a75ce2756b4b049cd04d73000f1739d7b1bf9b28bb51cede33e3eeccff","output_artifact_id":"devout-e204f2d85b0fcd74a317a68310fdf3de920e38045e90646565363f0a495f77ca","cost_state":{"state":"known","micros":0,"currency":"USD","pricing_version":"local-zero-v1"},"execution_provenance":"registered_pure_function","revoke_watermark":1,"source_ids":["source-config"],"executor_actor":"executor","executor_role":"worker","issued_at_unix_seconds":100},"request_projection_digest":"ef2188cc1ed21fc8b0e00de2e8592d44ba91bacde9a76adb6abb563f915dddbe"}}"#,
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-e4ca623394eb9759903fc20bab5874d0d23190164f3a9a85f93e6f2c1359b685",
+        "executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-e4ca623394eb9759903fc20bab5874d0d23190164f3a9a85f93e6f2c1359b685","record_kind":"development_execution_output_v1","payload":{"schema_version":"rsia.development_execution_output.v1","id":"devout-e204f2d85b0fcd74a317a68310fdf3de920e38045e90646565363f0a495f77ca","control_id":"config-control","request_id":"request-ag183-native-c1","task_id":"F-L2-B-E-s1","side":"candidate","output_utf8":"{\"key\":\"/enabled\",\"present\":true,\"value\":false,\"source_layer\":\"override\",\"source_path\":\"override/config.json\",\"json_pointer\":\"/enabled\"}","output_digest":"123a05a75ce2756b4b049cd04d73000f1739d7b1bf9b28bb51cede33e3eeccff"}}"#,
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-05ef0a1ba5c293ad3826fe7f4e01a0ec9ba93180a3c78d3be68cb88fbc95925f",
+        "grader",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-05ef0a1ba5c293ad3826fe7f4e01a0ec9ba93180a3c78d3be68cb88fbc95925f","record_kind":"development_grader_receipt_v1","payload":{"schema_version":"rsia.development_grader_receipt.v1","receipt_id":"devgrade-7effaeadf8e858815f63bf9fd96ef28b79761b6b1cf41503d66eaab4cd84cc20","control_id":"config-control","namespace":"config-development","episode_id":"episode-ag183-native-c1","step":1,"attempt":1,"request_id":"request-ag183-native-c1","task_id":"F-L2-B-E-s1","parent_execution_receipt_id":"devexec-63f84473812bb5419ea4a9351469316549ec2cb6fea78448dd61e9ec515097ae","candidate_execution_receipt_id":"devexec-e204f2d85b0fcd74a317a68310fdf3de920e38045e90646565363f0a495f77ca","parent_output_digest":"0f3936f505571cb5c7feea4c2731fc773a129ff8d9027d8ca1ac7e32e57fb250","candidate_output_digest":"123a05a75ce2756b4b049cd04d73000f1739d7b1bf9b28bb51cede33e3eeccff","oracle_digest":"7aa6d8a4f7a8ed9a8ee334c874bc60ed77f5e9079060b7fd6b0407c378116598","grader_digest":"cb79e9bfd33f3f607ba36ff287b744a3a1bbc282fddaf533f6862545ddcc3699","grader_version":"config_precedence_exact_six_fields.v1","parent_score_micros":0,"candidate_score_micros":1000000,"parent_passed":false,"candidate_passed":true,"scored_output_pair_digest":"40dbb4bc6ed36581d58bce75f8ed49cfbfd8c61697dd0991b784cee345a92f49","scoring_budget_call_id":null,"revoke_watermark":1,"source_ids":["source-config"],"grader_actor":"grader","issued_at_unix_seconds":100}}"#,
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-df8391e6dff5158533459a5dc6657709dd2472c00991ee8fbc1491a90c43ef12",
+        "executor",
+        1,
+        r#"{"schema_version":"rsia.typed_artifact_envelope.v1","id":"e03dev-df8391e6dff5158533459a5dc6657709dd2472c00991ee8fbc1491a90c43ef12","record_kind":"development_run_receipt_v1","payload":{"schema_version":"rsia.development_run_receipt.v1","id":"devrun-c6722a3d9564787022fd20ab92bb27176b617433863885c46739ad7787d51da5","control_id":"config-control","namespace":"config-development","request_id":"request-ag183-native-c1","episode_id":"episode-ag183-native-c1","step":1,"attempt":1,"execution_receipt_ids":["devexec-63f84473812bb5419ea4a9351469316549ec2cb6fea78448dd61e9ec515097ae","devexec-e204f2d85b0fcd74a317a68310fdf3de920e38045e90646565363f0a495f77ca"],"grader_receipt_ids":["devgrade-7effaeadf8e858815f63bf9fd96ef28b79761b6b1cf41503d66eaab4cd84cc20"],"budget_call_ids":["devcall-63f84473812bb5419ea4a9351469316549ec2cb6fea78448dd61e9ec515097ae","devcall-e204f2d85b0fcd74a317a68310fdf3de920e38045e90646565363f0a495f77ca"],"usage_record_ids":["devusage-63f84473812bb5419ea4a9351469316549ec2cb6fea78448dd61e9ec515097ae","devusage-e204f2d85b0fcd74a317a68310fdf3de920e38045e90646565363f0a495f77ca"],"executor_actor":"executor","issued_at_unix_seconds":100}}"#,
+    ),
+];
+/// Every dependency edge these rows own: (namespace, src_kind, src_id, dst_kind, dst_id).
+const NATIVE_7B285B9_CONFIG_EDGES: [(&str, &str, &str, &str, &str); 24] = [
+    (
+        "config-development",
+        "artifact",
+        "e03dev-05ef0a1ba5c293ad3826fe7f4e01a0ec9ba93180a3c78d3be68cb88fbc95925f",
+        "artifact",
+        "e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-05ef0a1ba5c293ad3826fe7f4e01a0ec9ba93180a3c78d3be68cb88fbc95925f",
+        "artifact",
+        "e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-05ef0a1ba5c293ad3826fe7f4e01a0ec9ba93180a3c78d3be68cb88fbc95925f",
+        "artifact",
+        "e03dev-c652de30d08eec530234356e0314259cbb32acd3faaa6ef452af35473bb0afe7",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-05ef0a1ba5c293ad3826fe7f4e01a0ec9ba93180a3c78d3be68cb88fbc95925f",
+        "run",
+        "source-config",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837",
+        "artifact",
+        "budget-ref-9915d7842195d532682741b3e35e155b",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837",
+        "artifact",
+        "e03dev-c652de30d08eec530234356e0314259cbb32acd3faaa6ef452af35473bb0afe7",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837",
+        "artifact",
+        "e03dev-e4ca623394eb9759903fc20bab5874d0d23190164f3a9a85f93e6f2c1359b685",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837",
+        "artifact",
+        "formal-bundle-83b4e374363c74009bc7cab63043a9d4e10ae53cdd9cbc45619255289338e4e0",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837",
+        "artifact",
+        "formal-bundle-dbfae603d6ce2133482663e476973505b62dbfb81c4db738c678c4df0432742f",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837",
+        "artifact",
+        "optstage-42d5a928591920798088c7b4e80328ad23f76ba6b2c7e867a30d0613777be6eb",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837",
+        "run",
+        "source-config",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670",
+        "artifact",
+        "budget-ref-8950b06e7c6ee9b31de5ec7f0e0192e9",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670",
+        "artifact",
+        "e03dev-acddb67a2095147890f1844e00430e64c960fae713a4fe995872797db81f73e3",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670",
+        "artifact",
+        "e03dev-c652de30d08eec530234356e0314259cbb32acd3faaa6ef452af35473bb0afe7",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670",
+        "artifact",
+        "formal-bundle-83b4e374363c74009bc7cab63043a9d4e10ae53cdd9cbc45619255289338e4e0",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670",
+        "artifact",
+        "formal-bundle-dbfae603d6ce2133482663e476973505b62dbfb81c4db738c678c4df0432742f",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670",
+        "artifact",
+        "optstage-42d5a928591920798088c7b4e80328ad23f76ba6b2c7e867a30d0613777be6eb",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670",
+        "run",
+        "source-config",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-acddb67a2095147890f1844e00430e64c960fae713a4fe995872797db81f73e3",
+        "run",
+        "source-config",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-df8391e6dff5158533459a5dc6657709dd2472c00991ee8fbc1491a90c43ef12",
+        "artifact",
+        "e03dev-05ef0a1ba5c293ad3826fe7f4e01a0ec9ba93180a3c78d3be68cb88fbc95925f",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-df8391e6dff5158533459a5dc6657709dd2472c00991ee8fbc1491a90c43ef12",
+        "artifact",
+        "e03dev-8c02eb1873845b79d3eb515d33031b779c9add2d713c74c73c61d6d367f00837",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-df8391e6dff5158533459a5dc6657709dd2472c00991ee8fbc1491a90c43ef12",
+        "artifact",
+        "e03dev-958000aeec030451ff83b726e0557cda4217ced74abb61a4ce90222be0fa5670",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-df8391e6dff5158533459a5dc6657709dd2472c00991ee8fbc1491a90c43ef12",
+        "run",
+        "source-config",
+    ),
+    (
+        "config-development",
+        "artifact",
+        "e03dev-e4ca623394eb9759903fc20bab5874d0d23190164f3a9a85f93e6f2c1359b685",
+        "run",
+        "source-config",
+    ),
+];
+
+fn native_payload(body: &str) -> Value {
+    serde_json::from_str::<Value>(body).unwrap()["payload"].clone()
+}
+
 #[tokio::test]
 async fn source_revocation_redacts_real_projection_execution_and_cannot_upgrade_legacy_on_recovery()
 {
@@ -975,8 +1599,28 @@ async fn source_revocation_redacts_real_projection_execution_and_cannot_upgrade_
 
     let f = Fixture::new(LOW, HIGH, true).await;
     let request = f.request("revoked");
-    let (_, p, o) = f.execute(&request).await;
+    let (report, p, o) = f.execute(&request).await;
     f.verify(&p, &o).await.unwrap();
+    let mut s = f.store.session().await.unwrap();
+    let read = read_config_projection_execution_receipt_in_session(
+        &mut s,
+        &f.grader,
+        &request,
+        &f.control.tasks[0].task_id,
+        DevelopmentSide::Candidate,
+        DevelopmentExecutionReceiptVersion::V2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read.state,
+        evo_storage::PersistentContractState::CurrentVerified
+    );
+    assert_eq!(
+        read.current_receipt_id,
+        report.results[0].candidate_execution_id
+    );
+    s.commit().await.unwrap();
     let before = f.calls(&request).await;
     let mut cleanup = LifecycleCoordinator::revoke_source(
         &f.admin,
@@ -1002,6 +1646,36 @@ async fn source_revocation_redacts_real_projection_execution_and_cannot_upgrade_
         Err(Error::Forbidden)
     ));
     assert!(f.verify(&p, &o).await.is_err());
+    // The receipt is preserved accounting history, as every execution receipt is
+    // under revocation; only the output it names is redacted (below).
+    assert_eq!(
+        serde_json::to_value(
+            load_config_projection_execution_receipt(
+                &f.store,
+                &f.admin,
+                &report.results[0].candidate_execution_id,
+            )
+            .await
+            .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&read.receipt).unwrap()
+    );
+    // A Current read reloads the live source closure first, as the runner does.
+    let mut s = f.store.session().await.unwrap();
+    assert!(matches!(
+        read_config_projection_execution_receipt_in_session(
+            &mut s,
+            &f.grader,
+            &request,
+            &f.control.tasks[0].task_id,
+            DevelopmentSide::Candidate,
+            DevelopmentExecutionReceiptVersion::V2,
+        )
+        .await,
+        Err(Error::Forbidden)
+    ));
+    s.commit().await.unwrap();
     let output = storage_id(
         EXECUTION_OUTPUT_KIND,
         &execution_output_id(
@@ -1023,6 +1697,205 @@ async fn source_revocation_redacts_real_projection_execution_and_cannot_upgrade_
         assert_eq!(a.actual_cost_micros, b.actual_cost_micros);
         assert_eq!(a.state, BudgetCallState::Finalized);
     }
+
+    // The native 7b285b9 C1 run of the same input: statically readable as Legacy
+    // with a derivable current successor ID, never upgraded or rerun under its
+    // request ID (recovery included), while a new request ID runs current; and
+    // cleaned by revocation like any execution evidence.
+    let f = Fixture::new(LOW, HIGH, true).await;
+    let request = f.request("ag183-native-c1");
+    assert_eq!(
+        serde_json::to_value(&request).unwrap(),
+        serde_json::from_str::<Value>(NATIVE_7B285B9_CONFIG_REQUEST).unwrap()
+    );
+    let pool = evo_storage::sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        f.directory.path().join("config.sqlite3").display()
+    ))
+    .await
+    .unwrap();
+    for (namespace, kind, id, owner, revision, body) in NATIVE_7B285B9_CONFIG_ROWS {
+        evo_storage::sqlx::query(
+            "INSERT INTO objects(namespace,kind,id,owner,body,revision) VALUES(?,?,?,?,?,?)",
+        )
+        .bind(namespace)
+        .bind(kind)
+        .bind(id)
+        .bind(owner)
+        .bind(body)
+        .bind(revision)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    for (namespace, src_kind, src_id, dst_kind, dst_id) in NATIVE_7B285B9_CONFIG_EDGES {
+        evo_storage::sqlx::query(
+            "INSERT INTO dependencies(namespace,src_kind,src_id,dst_kind,dst_id) VALUES(?,?,?,?,?)",
+        )
+        .bind(namespace)
+        .bind(src_kind)
+        .bind(src_id)
+        .bind(dst_kind)
+        .bind(dst_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    pool.close().await;
+    // Recovery of the same request reaches the same Prepared fact the old run had.
+    let prepared = f.journal(f.facts(&request, None), &request).await;
+    assert_eq!(prepared, NATIVE_7B285B9_CONFIG_PREPARED);
+    let task = &f.control.tasks[0].task_id;
+    for (side, row) in [
+        (DevelopmentSide::Parent, 0),
+        (DevelopmentSide::Candidate, 2),
+    ] {
+        let receipt = native_payload(NATIVE_7B285B9_CONFIG_ROWS[row].5);
+        let id = receipt["execution"]["receipt_id"].as_str().unwrap();
+        assert_eq!(
+            receipt["schema_version"],
+            "rsia.development_config_execution.v1"
+        );
+        assert_eq!(
+            serde_json::to_value(
+                load_config_projection_execution_receipt(&f.store, &f.admin, id)
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            serde_json::to_value(
+                load_execution_output(
+                    &f.store,
+                    &f.admin,
+                    receipt["execution"]["output_artifact_id"].as_str().unwrap()
+                )
+                .await
+                .unwrap()
+            )
+            .unwrap(),
+            native_payload(NATIVE_7B285B9_CONFIG_ROWS[row + 1].5)
+        );
+        let mut s = f.store.session().await.unwrap();
+        let read = read_config_projection_execution_receipt_in_session(
+            &mut s,
+            &f.grader,
+            &request,
+            task,
+            side,
+            DevelopmentExecutionReceiptVersion::V1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.state, evo_storage::PersistentContractState::Legacy);
+        assert_eq!(read.legacy_receipt_id, id);
+        assert_ne!(read.current_receipt_id, read.legacy_receipt_id);
+        assert!(matches!(
+            read_config_projection_execution_receipt_in_session(
+                &mut s,
+                &f.grader,
+                &request,
+                task,
+                side,
+                DevelopmentExecutionReceiptVersion::V2,
+            )
+            .await,
+            Err(Error::NotFound)
+        ));
+        s.commit().await.unwrap();
+    }
+    assert_eq!(
+        serde_json::to_value(
+            evo_engine::development::load_grader_receipt(
+                &f.store,
+                &f.admin,
+                &evo_engine::development::grader_receipt_id(&request.request_id, task).unwrap()
+            )
+            .await
+            .unwrap()
+        )
+        .unwrap(),
+        native_payload(NATIVE_7B285B9_CONFIG_ROWS[4].5)
+    );
+    let run = native_payload(NATIVE_7B285B9_CONFIG_ROWS[5].5);
+    assert_eq!(
+        serde_json::to_value(
+            evo_engine::development::load_run_receipt(
+                &f.store,
+                &f.admin,
+                run["id"].as_str().unwrap()
+            )
+            .await
+            .unwrap()
+        )
+        .unwrap(),
+        run
+    );
+    assert!(
+        matches!(f.runner().run(request.clone()).await, Err(Error::Conflict(ref message)) if message == "development execution source_legacy; new request_id required")
+    );
+    assert!(f.calls(&request).await.is_empty());
+    let successor = f.request("ag183-native-c1-successor");
+    let (current, _, _) = f.execute(&successor).await;
+    let mut s = f.store.session().await.unwrap();
+    for side in [DevelopmentSide::Parent, DevelopmentSide::Candidate] {
+        let read = read_config_projection_execution_receipt_in_session(
+            &mut s,
+            &f.grader,
+            &successor,
+            task,
+            side,
+            DevelopmentExecutionReceiptVersion::V2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read.state,
+            evo_storage::PersistentContractState::CurrentVerified
+        );
+        assert!(
+            [
+                &current.results[0].parent_execution_id,
+                &current.results[0].candidate_execution_id
+            ]
+            .contains(&&read.current_receipt_id)
+        );
+    }
+    s.commit().await.unwrap();
+    let mut cleanup = LifecycleCoordinator::revoke_source(
+        &f.admin,
+        &f.store,
+        "source-config",
+        "fixture source revoked",
+        200,
+    )
+    .await
+    .unwrap();
+    for now in 201..500 {
+        if matches!(cleanup.state, CleanupState::Complete | CleanupState::Failed) {
+            break;
+        }
+        cleanup =
+            LifecycleCoordinator::continue_cleanup(&f.admin, &f.store, &cleanup.job_id, 16, now)
+                .await
+                .unwrap();
+    }
+    assert_eq!(cleanup.state, CleanupState::Complete);
+    // The outputs are redacted; the C1 receipts, grader receipt and run receipt are
+    // the preserved accounting history, still exactly the native bytes.
+    let mut s = f.store.session().await.unwrap();
+    for (index, (_, kind, id, _, _, body)) in NATIVE_7B285B9_CONFIG_ROWS.iter().enumerate() {
+        let stored = s.object_row(&f.admin, kind, id).await.unwrap().unwrap();
+        if [1, 3].contains(&index) {
+            let value: Value = serde_json::from_str(&stored.body).unwrap();
+            assert_eq!(value["schema_version"], "rsia.redacted.v1", "{id}");
+        } else {
+            assert_eq!(stored.body, *body, "{id}");
+        }
+    }
+    s.commit().await.unwrap();
 }
 
 #[tokio::test]
@@ -1119,9 +1992,11 @@ async fn legacy_clamp_contracts_and_receipt_wire_keep_identity_only_semantics() 
     .unwrap();
     let bytes = serde_json::to_vec(&receipt).unwrap();
     let value = serde_json::to_value(&receipt).unwrap();
+    // AG-183 issues every new registered receipt on the current wire; the
+    // identity-only semantics below are unchanged.
     assert_eq!(
         value["schema_version"],
-        "rsia.development_execution_receipt.v1"
+        "rsia.development_execution_receipt.v2"
     );
     assert!(value.get("request_projection_digest").is_none());
     let restored: evo_engine::development::DevelopmentExecutionReceiptV1 =

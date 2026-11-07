@@ -400,6 +400,8 @@ impl BudgetExecutionProvenance {
 /// carries a `source_ids` closure so source revocation can find the row.
 pub const REGISTERED_EXECUTION_REQUEST_SCHEMA: &str = "rsia.registered_execution_request.v1";
 pub const REGISTERED_EXECUTION_SETTLEMENT_SCHEMA: &str = "rsia.registered_execution_settlement.v1";
+pub const REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2: &str =
+    "rsia.registered_execution_settlement.v2";
 
 /// Provenance of an in-process registered execution. It is recorded in the
 /// row's typed settlement artifact because `execution_provenance` is pinned
@@ -411,8 +413,8 @@ pub enum RegisteredExecutionProvenance {
     RegisteredPureFunction,
 }
 
-/// Typed settlement of one registered execution, persisted as the budget
-/// row's response artifact by `settle_registered_execution_call`.
+/// The unchanged v1 submission payload and legacy accounting/audit view.
+/// New settlements wrap this data with the actual writer's identity in v2.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegisteredExecutionSettlement {
@@ -464,17 +466,75 @@ impl RegisteredExecutionSettlement {
         let settlement: Self = serde_json::from_str(&artifact.body)
             .map_err(|_| Error::Conflict("registered execution settlement is invalid".into()))?;
         settlement.validate()?;
-        if settlement.call_id != call.call_id
-            || call.dispatch_id.as_deref() != Some(settlement.dispatch_id.as_str())
-            || call.actual_input_digest != settlement.request_digest
-            || call.output_digest.as_deref() != Some(settlement.output_digest.as_str())
+        settlement.validate_call_binding(call)?;
+        Ok(settlement)
+    }
+
+    fn validate_call_binding(&self, call: &BudgetCallRecord) -> Result<()> {
+        if self.call_id != call.call_id
+            || call.dispatch_id.as_deref() != Some(self.dispatch_id.as_str())
+            || call.actual_input_digest != self.request_digest
+            || call.output_digest.as_deref() != Some(self.output_digest.as_str())
             || call.execution_provenance == Some(BudgetExecutionProvenance::Fixture)
         {
             return Err(Error::Conflict(
                 "registered execution settlement differs from its budget row".into(),
             ));
         }
-        Ok(settlement)
+        Ok(())
+    }
+}
+
+/// Actual facts written by the successful registered-settlement transaction.
+/// This read DTO never grants authority to a caller-supplied v2 body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegisteredExecutionSettlementV2 {
+    pub schema_version: String,
+    pub settler_actor: String,
+    pub settler_role: Role,
+    pub settlement: RegisteredExecutionSettlement,
+}
+
+/// Static version table. A valid v1 remains readable, but carries no settler
+/// witness and cannot be promoted to a current execution fact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadRegisteredExecutionSettlement {
+    Legacy(RegisteredExecutionSettlement),
+    Current(RegisteredExecutionSettlementV2),
+}
+
+impl ReadRegisteredExecutionSettlement {
+    pub fn from_call(call: &BudgetCallRecord) -> Result<Self> {
+        let artifact = call.response_artifact.as_ref().ok_or_else(|| {
+            Error::Conflict("budget call carries no registered execution settlement".into())
+        })?;
+        match artifact.schema_version.as_str() {
+            REGISTERED_EXECUTION_SETTLEMENT_SCHEMA => {
+                RegisteredExecutionSettlement::from_call(call).map(Self::Legacy)
+            }
+            REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2 => {
+                let value: RegisteredExecutionSettlementV2 = serde_json::from_str(&artifact.body)
+                    .map_err(|_| {
+                    Error::Conflict("registered execution settlement is invalid".into())
+                })?;
+                if value.schema_version != REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2
+                    || call.execution_provenance.is_some()
+                    || identifier(&value.settler_actor).is_err()
+                    || !matches!(value.settler_role, Role::Worker | Role::Host)
+                {
+                    return Err(Error::Conflict(
+                        "registered execution settlement is invalid".into(),
+                    ));
+                }
+                value.settlement.validate()?;
+                value.settlement.validate_call_binding(call)?;
+                Ok(Self::Current(value))
+            }
+            _ => Err(Error::Conflict(
+                "budget call response artifact is not a registered execution settlement".into(),
+            )),
+        }
     }
 }
 
@@ -1106,7 +1166,7 @@ impl Store {
         ctx.require(&[Role::Worker, Role::Host])?;
         validate_fence(fence)?;
         validate_charge(charge)?;
-        let artifact = settlement.artifact()?;
+        settlement.validate()?;
         if charge.amount_micros != 0 {
             return Err(Error::Invalid(
                 "registered pure-function execution has no monetary cost".into(),
@@ -1146,7 +1206,19 @@ impl Store {
             ));
         }
         if let Some(existing) = &call.response_artifact {
-            if *existing != artifact || !call.execution_closed {
+            let same_submission = match ReadRegisteredExecutionSettlement::from_call(&call)? {
+                ReadRegisteredExecutionSettlement::Legacy(_) => {
+                    *existing
+                        == BudgetArtifact::from_serializable(
+                            REGISTERED_EXECUTION_SETTLEMENT_SCHEMA,
+                            settlement,
+                        )?
+                }
+                ReadRegisteredExecutionSettlement::Current(previous) => {
+                    previous.settlement == *settlement
+                }
+            };
+            if !same_submission || !call.execution_closed {
                 return Err(Error::Conflict(
                     "registered settlement reused with different content".into(),
                 ));
@@ -1185,6 +1257,15 @@ impl Store {
         } else {
             None
         };
+        let artifact = BudgetArtifact::from_serializable(
+            REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2,
+            &RegisteredExecutionSettlementV2 {
+                schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2.into(),
+                settler_actor: ctx.actor().into(),
+                settler_role: ctx.role(),
+                settlement: settlement.clone(),
+            },
+        )?;
         let accounting_overflow = apply_charge(
             &mut tx,
             &call,

@@ -6,15 +6,17 @@
 
 use super::{
     CONTROL_KIND, DEVELOPMENT_EXECUTION_OUTPUT_SCHEMA, DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA,
-    DEVELOPMENT_GRADER_RECEIPT_SCHEMA, DEVELOPMENT_RUN_RECEIPT_SCHEMA, DevelopmentCostState,
-    DevelopmentEvidenceScope, DevelopmentExecutionOutputV1, DevelopmentExecutionReceiptV1,
-    DevelopmentGraderReceiptV1, DevelopmentRunReceiptV1, DevelopmentSide, EXECUTION_OUTPUT_KIND,
-    EXECUTION_RECEIPT_KIND, GRADER_RECEIPT_KIND, GraderReceiptIssueRequest, RUN_RECEIPT_KIND,
-    VerifiedDevelopmentTaskOutcome, budget_call_ref_id, cost_state_from_call, digest,
-    execution_budget_call_id, execution_output_id, execution_receipt_id, execution_usage_record_id,
-    get_record, grader_receipt_id, need_record, pair_source_changed, put_record,
-    require_live_sources, run_receipt_id, side_bundle_digest, storage_id, typed_receipt_closure,
-    valid_time, validate_output_artifact,
+    DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2, DEVELOPMENT_GRADER_RECEIPT_SCHEMA,
+    DEVELOPMENT_RUN_RECEIPT_SCHEMA, DevelopmentCostState, DevelopmentEvidenceScope,
+    DevelopmentExecutionOutputV1, DevelopmentExecutionReceiptV1,
+    DevelopmentExecutionReceiptVersion, DevelopmentGraderReceiptV1, DevelopmentRunReceiptV1,
+    DevelopmentSide, EXECUTION_OUTPUT_KIND, EXECUTION_RECEIPT_KIND, GRADER_RECEIPT_KIND,
+    GraderReceiptIssueRequest, RUN_RECEIPT_KIND, VerifiedDevelopmentTaskOutcome,
+    budget_call_ref_id, cost_state_from_call, digest, execution_budget_call_id,
+    execution_output_id, execution_usage_record_id, get_record, grader_receipt_id,
+    legacy_execution_receipt_id, need_record, pair_source_changed, put_record,
+    require_live_sources, run_receipt_id, side_bundle_digest, source_legacy, storage_id,
+    typed_receipt_closure, valid_time, validate_output_artifact,
 };
 use crate::compiler::{LoadedAuthenticatedBundleRecord, ReadBundle};
 use crate::evidence::load_stored_source;
@@ -39,16 +41,33 @@ use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier};
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallRef, BudgetCallReservation,
     BudgetCallState, BudgetExecutionProvenance, BudgetStage,
-    REGISTERED_EXECUTION_SETTLEMENT_SCHEMA, RegisteredExecutionProvenance,
-    RegisteredExecutionSettlement, RootBudgetRecord, UsageCharge,
+    REGISTERED_EXECUTION_SETTLEMENT_SCHEMA, ReadRegisteredExecutionSettlement,
+    RegisteredExecutionProvenance, RegisteredExecutionSettlement, RegisteredExecutionSettlementV2,
+    RootBudgetRecord, UsageCharge,
 };
-use evo_storage::{Session, Store};
+use evo_storage::{PersistentContractState, PersistentContractVersion, Session, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub const CONFIG_PROJECTION_CONTROL_SCHEMA: &str = "rsia.development_config_control.v1";
 pub const CONFIG_PROJECTION_EXECUTION_SCHEMA: &str = "rsia.development_config_execution.v1";
+pub(crate) const CONFIG_PROJECTION_EXECUTION_SCHEMA_V2: &str =
+    "rsia.development_config_execution.v2";
+const CONFIG_PROJECTION_EXECUTION_VERSIONS: &[PersistentContractVersion] = &[
+    PersistentContractVersion {
+        schema: CONFIG_PROJECTION_EXECUTION_SCHEMA,
+        introduced_change: "historical config execution without actual settler proof",
+        verifier_retained: false,
+        current: false,
+    },
+    PersistentContractVersion {
+        schema: CONFIG_PROJECTION_EXECUTION_SCHEMA_V2,
+        introduced_change: "config execution bound to the actual registered settler",
+        verifier_retained: true,
+        current: true,
+    },
+];
 pub const CONFIG_PROJECTION_REQUEST_SCHEMA: &str = "rsia.development_config_request.v1";
 pub const CONFIG_PROJECTION_RUNNER_SCHEMA: &str = "rsia.registered_development_runner.v3";
 pub const CONFIG_PROJECTION_TARGET: &str = "config_precedence.v1";
@@ -447,6 +466,33 @@ pub struct ConfigProjectionExecutionReceiptV1 {
     pub request_projection_digest: String,
 }
 
+/// A read-time classification and lineage, never caller execution authority.
+#[derive(Debug, Clone)]
+pub struct ConfigProjectionExecutionReceiptRead {
+    pub receipt: ConfigProjectionExecutionReceiptV1,
+    pub state: PersistentContractState,
+    pub legacy_receipt_id: String,
+    pub current_receipt_id: String,
+}
+
+fn config_projection_execution_receipt_id(
+    request_id: &str,
+    task_id: &str,
+    side: DevelopmentSide,
+) -> Result<String> {
+    identifier(request_id)?;
+    identifier(task_id)?;
+    Ok(format!(
+        "devexec-{}",
+        fingerprint(&(
+            CONFIG_PROJECTION_EXECUTION_SCHEMA_V2,
+            request_id,
+            task_id,
+            side
+        ))?
+    ))
+}
+
 /// Immutable budget request plus the existing Prepared fact form the execution ticket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -489,11 +535,15 @@ fn projection_content_digest(projection: &RunProjection) -> Result<String> {
     fingerprint(&(&projection.instructions, &projection.tools))
 }
 
+// A Prepared fact authorizes an optimization request. Only when it is absent may
+// a practice attempt's persisted request closure authorize the same execution;
+// without either the ticket is missing exactly as before.
 async fn require_request_fact(
     s: &mut Session,
     ctx: &Context,
+    c: &ConfigControl,
     request: &DevelopmentRunRequest,
-) -> Result<String> {
+) -> Result<(String, bool)> {
     let expected = StageFact {
         schema_version: OPTIMIZATION_STAGE_FACT_SCHEMA.into(),
         artifact_id: String::new(),
@@ -510,7 +560,17 @@ async fn require_request_fact(
         payload: serde_json::to_value(request).map_err(|_| Error::Internal)?,
     }
     .seal()?;
-    let actual: StageFact = s.need(ctx, "artifact", &expected.artifact_id).await?;
+    let Some(actual) = s
+        .get::<StageFact>(ctx, "artifact", &expected.artifact_id)
+        .await?
+    else {
+        return Box::pin(crate::practice::verify_request_closure_in_session(
+            s, ctx, &c.record, request,
+        ))
+        .await?
+        .map(|closure| (closure, true))
+        .ok_or(Error::NotFound);
+    };
     actual.validate()?;
     if actual.payload != expected.payload
         || actual.input_digest != expected.input_digest
@@ -538,13 +598,14 @@ async fn require_request_fact(
             ));
         }
     }
-    Ok(actual.artifact_id)
+    Ok((actual.artifact_id, false))
 }
 
 struct ConfigBundles {
     parent: LoadedAuthenticatedBundleRecord,
     candidate: LoadedAuthenticatedBundleRecord,
     request_fact_id: String,
+    practice_closure: bool,
 }
 
 async fn load_bundles(
@@ -555,7 +616,7 @@ async fn load_bundles(
 ) -> Result<ConfigBundles> {
     c.bind(request)?;
     require_live_sources(s, ctx, &c.record.source_ids, request.revoke_watermark).await?;
-    let request_fact_id = require_request_fact(s, ctx, request).await?;
+    let (request_fact_id, practice_closure) = require_request_fact(s, ctx, c, request).await?;
     let mut records = Vec::with_capacity(2);
     for digest in [
         &request.parent_bundle_digest,
@@ -595,6 +656,7 @@ async fn load_bundles(
         parent,
         candidate,
         request_fact_id,
+        practice_closure,
     })
 }
 
@@ -697,7 +759,7 @@ fn validate_call(
     call: &BudgetCallRecord,
     frozen: &ConfigProjectionExecutionRequestV1,
     output_digest: &str,
-) -> Result<()> {
+) -> Result<RegisteredExecutionSettlementV2> {
     let request_digest = fingerprint(frozen)?;
     if call.namespace != ctx.namespace()
         || call.billing_scope != c.record.billing_scope
@@ -719,7 +781,11 @@ fn validate_call(
             "execution receipt lacks a matching closed development budget call".into(),
         ));
     }
-    let settlement = RegisteredExecutionSettlement::from_call(call)?;
+    let fact = match ReadRegisteredExecutionSettlement::from_call(call)? {
+        ReadRegisteredExecutionSettlement::Current(fact) => fact,
+        ReadRegisteredExecutionSettlement::Legacy(_) => return Err(source_legacy()),
+    };
+    let settlement = &fact.settlement;
     if settlement.provenance != RegisteredExecutionProvenance::RegisteredPureFunction
         || settlement.target_id != CONFIG_PROJECTION_TARGET
         || settlement.target_digest != c.record.target_digest
@@ -745,7 +811,44 @@ fn validate_call(
     if fingerprint(&stored)? != request_digest {
         return Err(projection_mismatch());
     }
-    Ok(())
+    if fact.settler_actor != c.record.executor_actor {
+        return Err(Error::Conflict(
+            "registered execution settler differs from registered executor".into(),
+        ));
+    }
+    Ok(fact)
+}
+
+fn parse_config_execution_receipt(
+    payload: serde_json::Value,
+) -> Result<ConfigProjectionExecutionReceiptV1> {
+    // Missing projection evidence is a strict-wire refusal, never identity-only credit.
+    let receipt: ConfigProjectionExecutionReceiptV1 =
+        serde_json::from_value(payload).map_err(|_| Error::Forbidden)?;
+    let version = CONFIG_PROJECTION_EXECUTION_VERSIONS
+        .iter()
+        .find(|version| version.schema == receipt.schema_version)
+        .ok_or_else(|| Error::Invalid("unsupported config execution receipt schema".into()))?;
+    let base = &receipt.execution;
+    let (schema, expected_id) = if version.current {
+        (
+            DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2,
+            config_projection_execution_receipt_id(&base.request_id, &base.task_id, base.side)?,
+        )
+    } else {
+        (
+            DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA,
+            legacy_execution_receipt_id(&base.request_id, &base.task_id, base.side)?,
+        )
+    };
+    if base.schema_version != schema || base.receipt_id != expected_id {
+        return Err(Error::Forbidden);
+    }
+    digest(
+        &receipt.request_projection_digest,
+        "request_projection_digest",
+    )?;
+    Ok(receipt)
 }
 
 async fn need_config_execution(
@@ -754,19 +857,10 @@ async fn need_config_execution(
     id: &str,
 ) -> Result<ConfigProjectionExecutionReceiptV1> {
     let raw: serde_json::Value = need_record(s, ctx, EXECUTION_RECEIPT_KIND, id).await?;
-    // Missing projection evidence is a strict-wire refusal, never identity-only credit.
-    let receipt: ConfigProjectionExecutionReceiptV1 =
-        serde_json::from_value(raw).map_err(|_| Error::Forbidden)?;
-    if receipt.schema_version != CONFIG_PROJECTION_EXECUTION_SCHEMA
-        || receipt.execution.receipt_id != id
-        || receipt.execution.namespace != ctx.namespace()
-    {
+    let receipt = parse_config_execution_receipt(raw)?;
+    if receipt.execution.receipt_id != id || receipt.execution.namespace != ctx.namespace() {
         return Err(Error::Forbidden);
     }
-    digest(
-        &receipt.request_projection_digest,
-        "request_projection_digest",
-    )?;
     Ok(receipt)
 }
 
@@ -779,6 +873,68 @@ pub async fn load_config_projection_execution_receipt(
     let receipt = need_config_execution(&mut s, ctx, id).await?;
     s.commit().await?;
     Ok(receipt)
+}
+
+/// Reads one exact config wire and its lineage in the caller's transaction.
+pub async fn read_config_projection_execution_receipt_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    request: &DevelopmentRunRequest,
+    task_id: &str,
+    side: DevelopmentSide,
+    version: DevelopmentExecutionReceiptVersion,
+) -> Result<ConfigProjectionExecutionReceiptRead> {
+    validate_development_request(request)?;
+    identifier(task_id)?;
+    let legacy_receipt_id = legacy_execution_receipt_id(&request.request_id, task_id, side)?;
+    let current_receipt_id =
+        config_projection_execution_receipt_id(&request.request_id, task_id, side)?;
+    // The requested ID fixes the wire: each version derives its own ID domain.
+    let id = match version {
+        DevelopmentExecutionReceiptVersion::V1 => &legacy_receipt_id,
+        DevelopmentExecutionReceiptVersion::V2 => &current_receipt_id,
+    };
+    let receipt = need_config_execution(session, ctx, id).await?;
+    let c = need_config_control(session, ctx, &receipt.execution.control_id).await?;
+    let state = match version {
+        DevelopmentExecutionReceiptVersion::V1 => {
+            c.bind(request)?;
+            let (task, _) = c.task(task_id)?;
+            let base = &receipt.execution;
+            if base.episode_id != request.episode_id
+                || base.step != request.step
+                || base.attempt != request.attempt
+                || base.input_digest != task.input_digest
+                || base.bundle_digest != side_bundle_digest(request, side)
+                || base.environment_digest != request.environment_digest
+                || base.budget_call_id
+                    != execution_budget_call_id(&request.request_id, task_id, side)?
+                || base.output_artifact_id
+                    != execution_output_id(&request.request_id, task_id, side)?
+                || base.execution_provenance
+                    != DevelopmentExecutionProvenance::RegisteredPureFunction
+                || base.revoke_watermark != request.revoke_watermark
+                || base.source_ids != c.record.source_ids
+                || base.executor_actor != c.record.executor_actor
+                || !matches!(base.executor_role, Role::Worker | Role::Host)
+            {
+                return Err(projection_mismatch());
+            }
+            PersistentContractState::Legacy
+        }
+        DevelopmentExecutionReceiptVersion::V2 => {
+            let bundles = load_bundles(session, ctx, &c, request).await?;
+            let (task, case) = c.task(task_id)?;
+            verify_side(session, ctx, &c, request, &bundles, (task, case), side).await?;
+            PersistentContractState::CurrentVerified
+        }
+    };
+    Ok(ConfigProjectionExecutionReceiptRead {
+        receipt,
+        state,
+        legacy_receipt_id,
+        current_receipt_id,
+    })
 }
 
 struct ConfigSide {
@@ -797,14 +953,15 @@ async fn verify_side(
     side: DevelopmentSide,
 ) -> Result<ConfigSide> {
     let (task, case) = task_case;
-    let id = execution_receipt_id(&request.request_id, &task.task_id, side)?;
+    let id = config_projection_execution_receipt_id(&request.request_id, &task.task_id, side)?;
     let receipt = need_config_execution(s, ctx, &id).await?;
     let base = &receipt.execution;
     let frozen = freeze_request(c, request, bundles, task, case, side)?;
     if receipt.request_projection_digest != projection_content_digest(&frozen.projection)? {
         return Err(projection_mismatch());
     }
-    if base.schema_version != DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA
+    if receipt.schema_version != CONFIG_PROJECTION_EXECUTION_SCHEMA_V2
+        || base.schema_version != DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2
         || base.control_id != c.record.id
         || base.episode_id != request.episode_id
         || base.step != request.step
@@ -847,7 +1004,12 @@ async fn verify_side(
     if execute_frozen(case, &frozen)? != output.output_utf8 {
         return Err(output_mismatch());
     }
-    validate_call(ctx, c, &call, &frozen, &base.output_digest)?;
+    let fact = validate_call(ctx, c, &call, &frozen, &base.output_digest)?;
+    if base.executor_actor != fact.settler_actor || base.executor_role != fact.settler_role {
+        return Err(Error::Conflict(
+            "registered execution settler differs from registered executor".into(),
+        ));
+    }
     let value = serde_json::from_str(&output.output_utf8).map_err(|_| output_mismatch())?;
     let score = u32::from(grade_exact(&task.expected, &value)) * 1_000_000;
     Ok(ConfigSide {
@@ -979,6 +1141,75 @@ pub struct ConfigProjectionExecutionIssueRequest {
     pub issued_at_unix_seconds: i64,
 }
 
+async fn reject_legacy_request_in_session(
+    s: &mut Session,
+    ctx: &Context,
+    c: &ConfigControl,
+    request: &DevelopmentRunRequest,
+    bundles: &ConfigBundles,
+) -> Result<()> {
+    for (task, case) in c.record.tasks.iter().zip(&c.cases) {
+        for side in [DevelopmentSide::Parent, DevelopmentSide::Candidate] {
+            let legacy_id = legacy_execution_receipt_id(&request.request_id, &task.task_id, side)?;
+            if let Some(raw) =
+                get_record::<serde_json::Value>(s, ctx, EXECUTION_RECEIPT_KIND, &legacy_id).await?
+            {
+                let receipt = parse_config_execution_receipt(raw)?;
+                if receipt.execution.receipt_id != legacy_id
+                    || receipt.execution.namespace != ctx.namespace()
+                {
+                    return Err(Error::Forbidden);
+                }
+                if receipt.execution.control_id != c.record.id {
+                    return Err(Error::Conflict(
+                        "development request already executed under a different control".into(),
+                    ));
+                }
+                return Err(source_legacy());
+            }
+            let call_id = execution_budget_call_id(&request.request_id, &task.task_id, side)?;
+            if let Some(call) = s
+                .budget_call(ctx, &c.record.billing_scope, &call_id)
+                .await?
+                && call.response_artifact.as_ref().is_some_and(|artifact| {
+                    artifact.schema_version == REGISTERED_EXECUTION_SETTLEMENT_SCHEMA
+                })
+            {
+                let frozen = freeze_request(c, request, bundles, task, case, side)?;
+                if call.actual_input_digest != fingerprint(&frozen)?
+                    || call.dispatch_group_id != request.episode_id
+                    || call.stage != BudgetStage::DevelopmentExecution
+                {
+                    return Err(Error::Conflict(
+                        "call_id_reused_with_different_content".into(),
+                    ));
+                }
+                ReadRegisteredExecutionSettlement::from_call(&call)?;
+                return Err(source_legacy());
+            }
+        }
+    }
+    if let Some(run) = get_record::<DevelopmentRunReceiptV1>(
+        s,
+        ctx,
+        RUN_RECEIPT_KIND,
+        &run_receipt_id(&request.request_id)?,
+    )
+    .await?
+    {
+        for id in &run.execution_receipt_ids {
+            let receipt: serde_json::Value =
+                need_record(s, ctx, EXECUTION_RECEIPT_KIND, id).await?;
+            if receipt["schema_version"] == CONFIG_PROJECTION_EXECUTION_SCHEMA
+                || receipt["schema_version"] == DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA
+            {
+                return Err(source_legacy());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn issue_config_projection_execution_receipt(
     ctx: &Context,
     store: &Store,
@@ -1004,6 +1235,7 @@ pub async fn issue_config_projection_execution_receipt(
         return Err(Error::Budget);
     }
     let bundles = load_bundles(&mut s, ctx, &c, &issue.request).await?;
+    reject_legacy_request_in_session(&mut s, ctx, &c, &issue.request, &bundles).await?;
     s.commit().await?;
     let (task, case) = c.task(&issue.task_id)?;
     execute_side(
@@ -1037,7 +1269,8 @@ async fn execute_side(
     now: i64,
 ) -> Result<ConfigProjectionExecutionReceiptV1> {
     let frozen = freeze_request(c, request, bundles, task, case, side)?;
-    let receipt_id = execution_receipt_id(&request.request_id, &task.task_id, side)?;
+    let receipt_id =
+        config_projection_execution_receipt_id(&request.request_id, &task.task_id, side)?;
     let mut s = store.session().await?;
     if get_record::<serde_json::Value>(&mut s, ctx, EXECUTION_RECEIPT_KIND, &receipt_id)
         .await?
@@ -1113,7 +1346,7 @@ async fn execute_side(
         }
     };
     let output_digest = hash(output_utf8.as_bytes());
-    let call = if matches!(
+    if matches!(
         call.state,
         BudgetCallState::Reserved | BudgetCallState::Dispatched
     ) {
@@ -1184,10 +1417,16 @@ async fn execute_side(
         };
         store
             .settle_registered_execution_call(ctx, &fence, &charge, &settlement)
-            .await?
-    } else {
-        call
-    };
+            .await?;
+    }
+    let mut s = store.session().await?;
+    require_live_sources(&mut s, ctx, &c.record.source_ids, request.revoke_watermark).await?;
+    let call = s
+        .budget_call(ctx, &c.record.billing_scope, &call_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let fact = validate_call(ctx, c, &call, &frozen, &output_digest)?;
+    require_call_sources(&mut s, ctx, c, &call, false).await?;
     let output = DevelopmentExecutionOutputV1 {
         schema_version: DEVELOPMENT_EXECUTION_OUTPUT_SCHEMA.into(),
         id: execution_output_id(&request.request_id, &task.task_id, side)?,
@@ -1199,10 +1438,10 @@ async fn execute_side(
         output_digest: output_digest.clone(),
     };
     let receipt = ConfigProjectionExecutionReceiptV1 {
-        schema_version: CONFIG_PROJECTION_EXECUTION_SCHEMA.into(),
+        schema_version: CONFIG_PROJECTION_EXECUTION_SCHEMA_V2.into(),
         request_projection_digest: projection_content_digest(&frozen.projection)?,
         execution: DevelopmentExecutionReceiptV1 {
-            schema_version: DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA.into(),
+            schema_version: DEVELOPMENT_EXECUTION_RECEIPT_SCHEMA_V2.into(),
             receipt_id,
             control_id: c.record.id.clone(),
             namespace: request.namespace.clone(),
@@ -1225,15 +1464,11 @@ async fn execute_side(
             execution_provenance: DevelopmentExecutionProvenance::RegisteredPureFunction,
             revoke_watermark: request.revoke_watermark,
             source_ids: c.record.source_ids.clone(),
-            executor_actor: ctx.actor().into(),
-            executor_role: ctx.role(),
+            executor_actor: fact.settler_actor,
+            executor_role: fact.settler_role,
             issued_at_unix_seconds: now,
         },
     };
-    let mut s = store.session().await?;
-    require_live_sources(&mut s, ctx, &c.record.source_ids, request.revoke_watermark).await?;
-    validate_call(ctx, c, &call, &frozen, &receipt.execution.output_digest)?;
-    require_call_sources(&mut s, ctx, c, &call, false).await?;
     if let Some(existing) =
         get_record::<DevelopmentExecutionOutputV1>(&mut s, ctx, EXECUTION_OUTPUT_KIND, &output.id)
             .await?
@@ -1372,13 +1607,13 @@ pub async fn issue_config_projection_grader_receipt(
     valid_time(issue.issued_at_unix_seconds)?;
     if issue.scoring_budget_call_id.is_some()
         || issue.parent_execution_receipt_id
-            != execution_receipt_id(
+            != config_projection_execution_receipt_id(
                 &issue.request.request_id,
                 &issue.task_id,
                 DevelopmentSide::Parent,
             )?
         || issue.candidate_execution_receipt_id
-            != execution_receipt_id(
+            != config_projection_execution_receipt_id(
                 &issue.request.request_id,
                 &issue.task_id,
                 DevelopmentSide::Candidate,
@@ -1509,6 +1744,7 @@ impl DevRunner for ConfigProjectionDevelopmentRunner {
         let (c, root) = self.control().await?;
         let mut s = self.store.session().await?;
         let bundles = load_bundles(&mut s, &self.executor, &c, &request).await?;
+        reject_legacy_request_in_session(&mut s, &self.executor, &c, &request, &bundles).await?;
         s.commit().await?;
         let mut results = Vec::with_capacity(c.record.tasks.len());
         let mut executions = BTreeSet::new();
@@ -1658,7 +1894,7 @@ impl crate::monitoring::ConsolidationDevRunner for ConfigProjectionDevelopmentRu
     }
 }
 
-pub(super) async fn is_config_control(s: &mut Session, ctx: &Context, id: &str) -> Result<bool> {
+pub(crate) async fn is_config_control(s: &mut Session, ctx: &Context, id: &str) -> Result<bool> {
     let raw: serde_json::Value = need_record(s, ctx, CONTROL_KIND, id).await?;
     Ok(raw["schema_version"] == CONFIG_PROJECTION_CONTROL_SCHEMA)
 }
@@ -1681,17 +1917,11 @@ pub(super) fn validate_execution_envelope(
     kind: &str,
     payload: serde_json::Value,
 ) -> Result<()> {
-    let receipt: ConfigProjectionExecutionReceiptV1 =
-        serde_json::from_value(payload).map_err(|_| Error::Forbidden)?;
-    if receipt.schema_version != CONFIG_PROJECTION_EXECUTION_SCHEMA
-        || storage_id(kind, &receipt.execution.receipt_id)? != id
-    {
+    let receipt = parse_config_execution_receipt(payload)?;
+    if storage_id(kind, &receipt.execution.receipt_id)? != id {
         return Err(Error::Forbidden);
     }
-    digest(
-        &receipt.request_projection_digest,
-        "request_projection_digest",
-    )
+    Ok(())
 }
 
 fn bound_pair(
@@ -1773,7 +2003,15 @@ pub(super) async fn verify_observed_report_in_session(
 )> {
     let c = need_config_control(s, ctx, &run.control_id).await?;
     let bundles = load_bundles(s, ctx, &c, request).await?;
-    if bundles.request_fact_id != crate::optimization::development_request_fact_id(observed)? {
+    // A Prepared fact pairs with its own observation, exactly as before. A request
+    // closure pairs only with the practice transport, which is never sealed or
+    // stored, so a closure-authorized run never becomes a stage observation.
+    let paired = if bundles.practice_closure {
+        observed.artifact_id.is_empty()
+    } else {
+        bundles.request_fact_id == crate::optimization::development_request_fact_id(observed)?
+    };
+    if !paired {
         return Err(projection_mismatch());
     }
     for edge in typed_receipt_closure(report)? {

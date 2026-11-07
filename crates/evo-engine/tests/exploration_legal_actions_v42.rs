@@ -62,13 +62,9 @@ use evo_engine::development::projection::{
     register_config_projection_control,
 };
 use evo_engine::development::{
-    DEVELOPMENT_RUN_RECEIPT_SCHEMA, DevelopmentControlV1, DevelopmentEvidenceScope,
-    DevelopmentExecutionReceiptV1, DevelopmentRunReceiptV1, DevelopmentSide, DevelopmentTaskSpecV1,
-    EXECUTION_RECEIPT_KIND, ExecutionReceiptIssueRequest, GraderReceiptIssueRequest,
-    RUN_RECEIPT_KIND, RegisteredExecutionRequestV1, RegisteredTargetInputV1,
-    execution_budget_call_id, execution_request_digest, issue_execution_receipt,
-    issue_grader_receipt, load_development_control, register_development_control,
-    registered_runner_digest, run_receipt_id, storage_id,
+    DevelopmentControlV1, DevelopmentEvidenceScope, DevelopmentTaskSpecV1,
+    RegisteredDevelopmentRunner, RegisteredTargetInputV1, register_development_control,
+    registered_runner_digest,
 };
 use evo_engine::evidence::{
     StoredRunRecord, StoredTraceAuthority, store_source_selection, store_trace_authority,
@@ -88,12 +84,7 @@ use evo_engine::optimization::{
 use evo_engine::replay::{LiveWorldAuthority, run_replay};
 use evo_engine::streaming_evaluator::{FixedGraderMethod, FixedGraderSpec};
 use evo_storage::Store;
-use evo_storage::budget::{
-    BudgetArtifact, BudgetCallFence, BudgetCallReservation, BudgetStage,
-    REGISTERED_EXECUTION_REQUEST_SCHEMA, REGISTERED_EXECUTION_SETTLEMENT_SCHEMA,
-    RegisteredExecutionProvenance, RegisteredExecutionSettlement, RootBudgetAuthorization,
-    UsageCharge,
-};
+use evo_storage::budget::RootBudgetAuthorization;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -112,8 +103,6 @@ const RUNS: [&str; 2] = ["run-failure", "run-success"];
 const WORLD: &str = "exploration_world_v1";
 const NODE: &str = "exploration_node_v1";
 const DISPATCH: &str = "exploration_dispatch_v1";
-/// An answer the grader scores 0 for every registered task.
-const WRONG_ANSWER: &str = "{\"answer\":{\"clamped\":12345}}";
 /// The fixed code of a verified candidate refused as identity-only Skill content.
 const REJECTED_REASON: &str = "development_evidence_rejected";
 
@@ -623,262 +612,6 @@ impl ModelPort for NoChangeModel {
     }
 }
 
-/// A runner whose parent never answers a task correctly and whose candidate
-/// answers the tasks `candidate_correct` names correctly. It issues honest E03
-/// evidence (budget rows, settlements, execution and grader receipts through the
-/// public issuing functions, the run receipt as a typed envelope), so the gate
-/// verifies it exactly like a registered runner's; only the outputs, and so the
-/// scores, differ between the sides. The deterministic registered runner cannot do
-/// that (`practice_v42`'s `ContrastRunner` is the same device).
-struct ContrastRunner {
-    store: Store,
-    executor: Context,
-    grader: Context,
-    candidate_correct: fn(&str) -> bool,
-}
-
-impl ContrastRunner {
-    async fn issue_side(
-        &self,
-        control: &DevelopmentControlV1,
-        request: &DevelopmentRunRequest,
-        task: &DevelopmentTaskSpecV1,
-        side: DevelopmentSide,
-        output: &str,
-    ) -> Result<DevelopmentExecutionReceiptV1> {
-        let bundle_digest = match side {
-            DevelopmentSide::Parent => request.parent_bundle_digest.clone(),
-            DevelopmentSide::Candidate => request.candidate_bundle_digest.clone(),
-        };
-        let request_digest = execution_request_digest(control, request, task, side)?;
-        let call_id = execution_budget_call_id(&request.request_id, &task.task_id, side)?;
-        let stored = RegisteredExecutionRequestV1 {
-            schema_version: REGISTERED_EXECUTION_REQUEST_SCHEMA.into(),
-            control_id: control.id.clone(),
-            request_id: request.request_id.clone(),
-            episode_id: request.episode_id.clone(),
-            task_id: task.task_id.clone(),
-            side,
-            input: task.input,
-            input_digest: task.input_digest.clone(),
-            bundle_digest,
-            environment_digest: request.environment_digest.clone(),
-            request_digest: request_digest.clone(),
-            target_id: task.target_id.clone(),
-            target_digest: control.target_digest.clone(),
-            runner_digest: control.runner_digest.clone(),
-            source_ids: control.source_ids.clone(),
-        };
-        let call = self
-            .store
-            .reserve_budget_call_with_sources(
-                &self.executor,
-                &BudgetCallReservation {
-                    billing_scope: control.billing_scope.clone(),
-                    call_id: call_id.clone(),
-                    dispatch_group_id: request.episode_id.clone(),
-                    stage: BudgetStage::DevelopmentExecution,
-                    actual_input_digest: request_digest.clone(),
-                    request_artifact: Some(BudgetArtifact::from_serializable(
-                        REGISTERED_EXECUTION_REQUEST_SCHEMA,
-                        &stored,
-                    )?),
-                    max_cost_micros: 1,
-                    lease_token: format!("lease-{}", &fingerprint(&call_id)?[..32]),
-                    lease_until: 700,
-                    now: 100,
-                },
-                &control.source_ids,
-            )
-            .await?;
-        let fence = BudgetCallFence {
-            billing_scope: control.billing_scope.clone(),
-            call_id: call_id.clone(),
-            actual_input_digest: request_digest.clone(),
-            lease_token: call.lease_token.clone(),
-            lease_epoch: call.lease_epoch,
-            now: 101,
-        };
-        let dispatch_id = self
-            .store
-            .begin_budget_dispatch(&self.executor, &fence)
-            .await?
-            .call
-            .dispatch_id
-            .ok_or(Error::Internal)?;
-        let output_digest = hash(output.as_bytes());
-        self.store
-            .settle_registered_execution_call(
-                &self.executor,
-                &fence,
-                &UsageCharge {
-                    amount_micros: 0,
-                    currency: "USD".into(),
-                    pricing_version: "pricing-v1".into(),
-                    provider_request_id: format!("registered-pure-function:{dispatch_id}"),
-                    usage_record_id: format!("usage-{}", &fingerprint(&call_id)?[..32]),
-                    output_digest: output_digest.clone(),
-                },
-                &RegisteredExecutionSettlement {
-                    schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA.into(),
-                    provenance: RegisteredExecutionProvenance::RegisteredPureFunction,
-                    call_id: call_id.clone(),
-                    dispatch_id,
-                    request_digest,
-                    output_digest,
-                    target_id: task.target_id.clone(),
-                    target_digest: control.target_digest.clone(),
-                    runner_digest: control.runner_digest.clone(),
-                },
-            )
-            .await?;
-        issue_execution_receipt(
-            &self.executor,
-            &self.store,
-            ExecutionReceiptIssueRequest {
-                control_id: control.id.clone(),
-                request: request.clone(),
-                task_id: task.task_id.clone(),
-                side,
-                output_utf8: output.into(),
-                budget_call_id: call_id,
-                issued_at_unix_seconds: 100,
-            },
-        )
-        .await
-    }
-}
-
-#[async_trait]
-impl DevRunner for ContrastRunner {
-    async fn run(&self, request: DevelopmentRunRequest) -> Result<DevelopmentRunReport> {
-        let control = load_development_control(&self.store, &self.executor, CONTROL_ID).await?;
-        let mut results = Vec::new();
-        let mut execution_ids = Vec::new();
-        let mut grader_ids = Vec::new();
-        let mut call_ids = Vec::new();
-        let mut usage_ids = Vec::new();
-        for manifest_task in &request.manifest.tasks {
-            let task = control.task(&manifest_task.id)?;
-            let candidate_output = if (self.candidate_correct)(&task.task_id) {
-                format!("{{\"answer\":{}}}", task.expected_answer_json)
-            } else {
-                WRONG_ANSWER.to_string()
-            };
-            let parent = self
-                .issue_side(
-                    &control,
-                    &request,
-                    task,
-                    DevelopmentSide::Parent,
-                    WRONG_ANSWER,
-                )
-                .await?;
-            let candidate = self
-                .issue_side(
-                    &control,
-                    &request,
-                    task,
-                    DevelopmentSide::Candidate,
-                    &candidate_output,
-                )
-                .await?;
-            let grader = issue_grader_receipt(
-                &self.grader,
-                &self.store,
-                GraderReceiptIssueRequest {
-                    control_id: control.id.clone(),
-                    request: request.clone(),
-                    task_id: task.task_id.clone(),
-                    parent_execution_receipt_id: parent.receipt_id.clone(),
-                    candidate_execution_receipt_id: candidate.receipt_id.clone(),
-                    scoring_budget_call_id: None,
-                    issued_at_unix_seconds: 100,
-                },
-            )
-            .await?;
-            results.push(PairedTaskResult {
-                task_id: task.task_id.clone(),
-                parent_score_micros: grader.parent_score_micros,
-                candidate_score_micros: grader.candidate_score_micros,
-                parent_passed: grader.parent_passed,
-                candidate_passed: grader.candidate_passed,
-                parent_execution_id: parent.receipt_id.clone(),
-                candidate_execution_id: candidate.receipt_id.clone(),
-                grader_receipt_digest: fingerprint(&grader)?,
-            });
-            for receipt in [&parent, &candidate] {
-                execution_ids.push(receipt.receipt_id.clone());
-                call_ids.push(receipt.budget_call_id.clone());
-                usage_ids.push(receipt.usage_record_id.clone());
-            }
-            grader_ids.push(grader.receipt_id.clone());
-        }
-        let run_id = run_receipt_id(&request.request_id)?;
-        let run = DevelopmentRunReceiptV1 {
-            schema_version: DEVELOPMENT_RUN_RECEIPT_SCHEMA.into(),
-            id: run_id.clone(),
-            control_id: control.id.clone(),
-            namespace: control.namespace.clone(),
-            request_id: request.request_id.clone(),
-            episode_id: request.episode_id.clone(),
-            step: request.step,
-            attempt: request.attempt,
-            execution_receipt_ids: execution_ids.clone(),
-            grader_receipt_ids: grader_ids,
-            budget_call_ids: call_ids,
-            usage_record_ids: usage_ids.clone(),
-            executor_actor: self.executor.actor().into(),
-            issued_at_unix_seconds: 100,
-        };
-        let run_storage = storage_id(RUN_RECEIPT_KIND, &run_id)?;
-        let mut session = self.store.session().await?;
-        session
-            .put(
-                &self.executor,
-                "artifact",
-                &run_storage,
-                self.executor.actor(),
-                &json!({
-                    "schema_version": "rsia.typed_artifact_envelope.v1",
-                    "id": run_storage,
-                    "record_kind": RUN_RECEIPT_KIND,
-                    "payload": run,
-                }),
-            )
-            .await?;
-        for source in &control.source_ids {
-            session
-                .put_edge(&self.executor, "artifact", &run_storage, "run", source)
-                .await?;
-        }
-        for id in &execution_ids {
-            session
-                .put_edge(
-                    &self.executor,
-                    "artifact",
-                    &run_storage,
-                    "artifact",
-                    &storage_id(EXECUTION_RECEIPT_KIND, id)?,
-                )
-                .await?;
-        }
-        session.commit().await?;
-        Ok(DevelopmentRunReport {
-            request_id: request.request_id,
-            manifest_digest: request.manifest.digest,
-            parent_bundle_digest: request.parent_bundle_digest,
-            candidate_bundle_digest: request.candidate_bundle_digest,
-            environment_digest: request.environment_digest,
-            grader_digest: request.grader_digest,
-            results,
-            execution_receipt_id: run_id,
-            usage_record_ids: usage_ids,
-            provenance: DevelopmentExecutionProvenance::RegisteredPureFunction,
-        })
-    }
-}
-
 /// A journal that never finishes the commit of a fact of kind `hang_on`. Dropping
 /// the `run_next` future once it was entered simulates a crash at that point: the
 /// dispatch stays claimed and the step has no terminal fact. `StepPrepared` is the
@@ -1313,11 +1046,6 @@ fn world(id: &str, slots: &[u32], baseline_micros: u32) -> ExplorationWorldV1 {
     world
 }
 
-/// A candidate that answers every task: quality 1000000.
-fn answers_all(_: &str) -> bool {
-    true
-}
-
 /// Counts the runs of the runner it wraps: a recovered step must not reach it.
 struct CallCounting<R> {
     inner: R,
@@ -1411,14 +1139,19 @@ impl Env {
         self.coordinator.register_world(world).await.unwrap();
     }
 
-    /// A runner whose candidate answers the tasks `candidate_correct` names correctly.
-    fn runner(&self, candidate_correct: fn(&str) -> bool) -> ContrastRunner {
-        ContrastRunner {
-            store: self.store.clone(),
-            executor: Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
-            grader: Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
-            candidate_correct,
-        }
+    /// The registered runner: it executes both sides of the frozen pure-function
+    /// target. Only steps that propose no candidate hand it to `run_next`; a
+    /// content improvement runs on the config world's runner.
+    fn runner(&self) -> RegisteredDevelopmentRunner {
+        RegisteredDevelopmentRunner::with_clock(
+            self.store.clone(),
+            Context::new(NAMESPACE, "dev-executor", Role::Worker).unwrap(),
+            Context::new(NAMESPACE, "dev-grader", Role::Evaluator).unwrap(),
+            CONTROL_ID,
+            600,
+            Arc::new(|| 100),
+        )
+        .unwrap()
     }
 
     /// The decisions the world has completed: the number of its nodes.
@@ -2663,7 +2396,7 @@ async fn the_legal_action_conditions_of_recover_are_unchanged() {
         let id = format!("world-recover-{case}");
         env.register(world(&id, &[1], HALF)).await;
         let first = env
-            .step(&id, Child::HardFailure.model(), &env.runner(answers_all))
+            .step(&id, Child::HardFailure.model(), &env.runner())
             .await
             .unwrap();
         rewrite_node(&env.store, first.node_id.as_deref().unwrap(), |node| {
@@ -2684,7 +2417,7 @@ async fn the_legal_action_conditions_of_recover_are_unchanged() {
             env.coordinator
                 .run_next(
                     Some(Child::HardFailure.model()),
-                    Some(&env.runner(answers_all)),
+                    Some(&env.runner()),
                     Some(&env.journal),
                     env.fixture.request(&parent, &id, 2, &format!("{id}-2")),
                 )
