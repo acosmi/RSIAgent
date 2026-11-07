@@ -1118,8 +1118,10 @@ pub struct SkillGroupCandidate {
     pub candidate_digest: String,
 }
 
+/// The marker is built from the outcomes of one admitted job; the job entry
+/// alone admits its group count against `CapacityItem::SkillGroupPerJob`.
 pub fn validate_skill_groups(groups: &[SkillGroupCandidate]) -> Result<()> {
-    if groups.is_empty() || groups.len() > 2 {
+    if groups.is_empty() {
         return Err(Error::Invalid(
             "skill groups must contain one or two groups".into(),
         ));

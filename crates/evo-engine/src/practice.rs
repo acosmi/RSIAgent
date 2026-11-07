@@ -81,6 +81,7 @@ use std::collections::BTreeSet;
 
 pub const PRACTICE_REGISTRATION_SCHEMA: &str = "rsia.practice_registration.v1";
 pub const PRACTICE_ATTEMPT_SET_SCHEMA: &str = "rsia.practice_attempt_set.v1";
+pub const PRACTICE_ATTEMPT_SET_SCHEMA_V2: &str = "rsia.practice_attempt_set.v2";
 pub const PRACTICE_REGISTRATION_BINDING_SCHEMA: &str = "rsia.practice_registration_binding.v1";
 /// The only expanded K. K=1 is the default and needs no registration.
 pub const REGISTERED_PRACTICE_ATTEMPTS: u8 = 3;
@@ -126,6 +127,75 @@ pub fn practice_attempt_set_storage_id(set_id: &str) -> Result<String> {
         "practice-set-{}",
         fingerprint(&(PRACTICE_ATTEMPT_SET_SCHEMA, set_id))?
     ))
+}
+
+/// New prepared sets have a separate address; v1 history is never rewritten.
+pub fn practice_attempt_set_storage_id_v2(set_id: &str) -> Result<String> {
+    identifier(set_id)?;
+    Ok(format!(
+        "practice-set-{}",
+        fingerprint(&(PRACTICE_ATTEMPT_SET_SCHEMA_V2, set_id))?
+    ))
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PracticeSetStateV2 {
+    Prepared,
+    Running,
+    Draining,
+    Completed,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct PracticeAttemptBindingV2 {
+    attempt: u32,
+    request_id: String,
+    request_digest: String,
+    receipt_id: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PracticeAttemptSetV2 {
+    schema_version: String,
+    id: String,
+    set_id: String,
+    namespace: String,
+    control_id: String,
+    request_digest: String,
+    registration_id: Option<String>,
+    state: PracticeSetStateV2,
+    started: Option<PracticeAttemptBindingV2>,
+    attempts: Vec<PracticeAttemptV1>,
+    result: Option<PracticeAttemptSetV1>,
+}
+fn parse_set_v2(
+    ctx: &Context,
+    set_id: &str,
+    value: serde_json::Value,
+) -> Result<PracticeAttemptSetV2> {
+    let set: PracticeAttemptSetV2 = serde_json::from_value(value)
+        .map_err(|_| Error::Conflict("practice v2 set is not strict".into()))?;
+    if set.schema_version != PRACTICE_ATTEMPT_SET_SCHEMA_V2
+        || set.id != practice_attempt_set_storage_id_v2(set_id)?
+        || set.set_id != set_id
+        || set.namespace != ctx.namespace()
+    {
+        return Err(Error::Conflict("practice v2 identity differs".into()));
+    }
+    if let Some(result) = &set.result {
+        result.validate()?;
+        if result.id != set.id
+            || result.set_id != set.set_id
+            || result.namespace != set.namespace
+            || result.control_id != set.control_id
+            || result.request_digest != set.request_digest
+            || result.registration_id != set.registration_id
+        {
+            return Err(Error::Conflict("practice v2 result binding differs".into()));
+        }
+    }
+    Ok(set)
 }
 
 /// Storage id of the binding of a registration: one per registration, derived
@@ -535,7 +605,10 @@ impl PracticeAttemptSetV1 {
     /// Structural and semantic checks of a stored or freshly built set,
     /// including that the outcome is exactly what its attempts imply.
     pub fn validate(&self) -> Result<()> {
-        if self.schema_version != Self::SCHEMA {
+        if !matches!(
+            self.schema_version.as_str(),
+            PRACTICE_ATTEMPT_SET_SCHEMA | PRACTICE_ATTEMPT_SET_SCHEMA_V2
+        ) {
             return Err(Error::Invalid(
                 "unsupported practice attempt set schema".into(),
             ));
@@ -554,7 +627,13 @@ impl PracticeAttemptSetV1 {
         ] {
             identifier(value)?;
         }
-        if self.id != practice_attempt_set_storage_id(&self.set_id)? {
+        if self.id
+            != if self.schema_version == PRACTICE_ATTEMPT_SET_SCHEMA {
+                practice_attempt_set_storage_id(&self.set_id)?
+            } else {
+                practice_attempt_set_storage_id_v2(&self.set_id)?
+            }
+        {
             return Err(Error::Conflict(
                 "practice attempt set id is not derived from its set id".into(),
             ));
@@ -742,7 +821,7 @@ fn error_class(error: &Error) -> &'static str {
         Error::Invalid(_) => "invalid",
         Error::Forbidden => "forbidden",
         Error::NotFound => "not_found",
-        Error::Conflict(_) => "conflict",
+        Error::Conflict(_) | Error::Capacity(_) => "conflict",
         Error::Budget => "budget",
         Error::Cancelled => "cancelled",
         Error::ClockRegressed => "clock_regressed",
@@ -823,6 +902,12 @@ fn parse_set(ctx: &Context, id: &str, value: serde_json::Value) -> Result<Practi
         .get("schema_version")
         .and_then(|schema| schema.as_str())
     {
+        Some(PRACTICE_ATTEMPT_SET_SCHEMA_V2) => {
+            let set = parse_set_v2(ctx, id, value)?;
+            return set
+                .result
+                .ok_or_else(|| Error::Conflict("practice set is still draining".into()));
+        }
         Some(PRACTICE_ATTEMPT_SET_SCHEMA) => {}
         Some(REDACTED_SCHEMA) => {
             return Err(Error::Conflict(
@@ -915,13 +1000,33 @@ async fn load_existing_set(
     ctx: &Context,
     set_id: &str,
 ) -> Result<Option<PracticeAttemptSetV1>> {
-    let storage = practice_attempt_set_storage_id(set_id)?;
     let mut session = store.session().await?;
+    if let Some(value) = session
+        .get::<serde_json::Value>(
+            ctx,
+            ARTIFACT_KIND,
+            &practice_attempt_set_storage_id(set_id)?,
+        )
+        .await?
+    {
+        session.commit().await?;
+        return parse_set(ctx, set_id, value).map(Some);
+    }
     let value = session
-        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &storage)
+        .get::<serde_json::Value>(
+            ctx,
+            ARTIFACT_KIND,
+            &practice_attempt_set_storage_id_v2(set_id)?,
+        )
         .await?;
     session.commit().await?;
-    value.map(|value| parse_set(ctx, set_id, value)).transpose()
+    match value {
+        Some(value) if value["schema_version"] == REDACTED_SCHEMA => {
+            parse_set(ctx, set_id, value).map(Some)
+        }
+        Some(value) => Ok(parse_set_v2(ctx, set_id, value)?.result),
+        None => Ok(None),
+    }
 }
 
 fn parse_binding(
@@ -1053,19 +1158,6 @@ async fn ensure_registration_available(
         }
         _ => Ok(()),
     }
-}
-
-/// Claims the registration for `set_id` in its own transaction, before the first
-/// runner call. Of two concurrent different set ids exactly one claims it.
-async fn claim_registration(
-    ctx: &Context,
-    store: &Store,
-    registration_id: &str,
-    set_id: &str,
-) -> Result<()> {
-    let mut session = store.session().await?;
-    bind_registration(&mut session, ctx, registration_id, set_id).await?;
-    session.commit().await
 }
 
 /// A K=3 plan must cite a persisted registration that authorizes exactly it.
@@ -1220,29 +1312,111 @@ async fn run_attempts(
     control: &DevelopmentControlV1,
     request: &PracticeRunRequest,
     k: u32,
+    prepared: &mut PracticeAttemptSetV2,
 ) -> Result<(Vec<PracticeAttemptV1>, Option<String>)> {
-    let mut attempts = Vec::new();
-    for number in 1..=k {
+    let mut attempts = prepared.attempts.clone();
+    for number in (attempts.len() as u32 + 1)..=k {
         let development = practice_attempt_request(control, request, number)?;
+        let binding = PracticeAttemptBindingV2 {
+            attempt: number,
+            request_id: development.request_id.clone(),
+            request_digest: fingerprint(&development)?,
+            receipt_id: run_receipt_id(&development.request_id)?,
+        };
         let cache_hit = attempt_already_executed(store, ctx, &development.request_id).await?;
+        if let Some(started) = &prepared.started {
+            if started != &binding {
+                return Err(Error::Conflict("practice attempt request changed".into()));
+            }
+            if !cache_hit {
+                return Err(Error::Conflict(
+                    "practice attempt remains draining without a receipt".into(),
+                ));
+            }
+        } else {
+            let mut session = store.session().await?;
+            let mut current: PracticeAttemptSetV2 =
+                session.need(ctx, ARTIFACT_KIND, &prepared.id).await?;
+            if current.started.is_some()
+                || current.attempts.len() != attempts.len()
+                || current.request_digest != prepared.request_digest
+            {
+                return Err(Error::Conflict("practice attempt already claimed".into()));
+            }
+            current.started = Some(binding);
+            current.state = PracticeSetStateV2::Running;
+            require_live_sources(
+                &mut session,
+                ctx,
+                &control.source_ids,
+                request.revoke_watermark,
+            )
+            .await?;
+            session
+                .put(ctx, ARTIFACT_KIND, &current.id, ctx.actor(), &current)
+                .await?;
+            session.commit().await?;
+            *prepared = current;
+        }
+        // A reconnect may ask the existing runner for an already-persisted run;
+        // a started attempt without that receipt never reaches the runner again.
         let report = match runner.run(development.clone()).await {
             Ok(report) => report,
             Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
-            Err(error) => return Ok((attempts, Some(runner_stop_reason(number, &error)))),
-        };
-        match record_attempt(ctx, store, &control.id, &development, &report, cache_hit).await {
-            Ok(attempt) => {
-                let stop = uncertain_stop(&attempt);
-                attempts.push(attempt);
-                if stop.is_some() {
-                    return Ok((attempts, stop));
-                }
-            }
-            Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
             Err(error) => {
-                let reason = format!("attempt_unverified:{number}:{}", error_class(&error));
-                return Ok((attempts, Some(reason)));
+                prepared.state = PracticeSetStateV2::Draining;
+                return Ok((attempts, Some(runner_stop_reason(number, &error))));
             }
+        };
+        let attempt =
+            match record_attempt(ctx, store, &control.id, &development, &report, cache_hit).await {
+                Ok(attempt) => attempt,
+                Err(Error::ClockRegressed) => return Err(Error::ClockRegressed),
+                Err(error) => {
+                    prepared.state = PracticeSetStateV2::Draining;
+                    return Ok((
+                        attempts,
+                        Some(format!(
+                            "attempt_unverified:{number}:{}",
+                            error_class(&error)
+                        )),
+                    ));
+                }
+            };
+        let stop = uncertain_stop(&attempt);
+        attempts.push(attempt);
+        prepared.attempts = attempts.clone();
+        prepared.started = None;
+        prepared.state = if stop.is_some() {
+            PracticeSetStateV2::Draining
+        } else {
+            PracticeSetStateV2::Prepared
+        };
+        let mut session = store.session().await?;
+        require_live_sources(
+            &mut session,
+            ctx,
+            &control.source_ids,
+            request.revoke_watermark,
+        )
+        .await?;
+        session
+            .put(ctx, ARTIFACT_KIND, &prepared.id, ctx.actor(), prepared)
+            .await?;
+        for attempt in &attempts {
+            session
+                .put_edge(
+                    ctx,
+                    ARTIFACT_KIND,
+                    &prepared.id,
+                    ARTIFACT_KIND,
+                    &storage_id(RUN_RECEIPT_KIND, &attempt.execution_receipt_id)?,
+                )
+                .await?;
+        }
+        session.commit().await?;
+        if stop.is_some() {
+            return Ok((attempts, stop));
         }
     }
     Ok((attempts, None))
@@ -1259,11 +1433,27 @@ async fn run_attempts(
 /// `Incomplete` (finished attempts are kept, nothing is resent; trying again
 /// means a new set id, a new deliberate practice that never hits the stopped
 /// attempts, and for K=3 also a new registration, because a registration
-/// authorizes one set only and a stopped set has spent it). The set is written
-/// as an immutable artifact with dependency edges to the control's source runs,
-/// the control, every attempt's receipts and the registration, so a source
-/// revocation reaches it. No stage fact of any kind is written.
+/// authorizes one set only and a stopped set has spent it). A new set is first
+/// admitted against the instance practice capacity and persisted as a v2
+/// `Prepared` set, with its registration binding and dependency edges to the
+/// control's source runs, the control and the registration, before the first
+/// runner call; each attempt then records its receipts on that set, and a
+/// resumed set reuses the verified receipts and never resends a started
+/// attempt. A source revocation reaches the set through those edges. No stage
+/// fact of any kind is written.
+///
+/// The body is boxed: unoptimized builds keep each caller's copy of this large
+/// future on the caller's stack.
 pub async fn run_practice_set(
+    ctx: &Context,
+    store: &Store,
+    runner: &dyn DevRunner,
+    request: PracticeRunRequest,
+) -> Result<PracticeAttemptSetV1> {
+    Box::pin(run_practice_set_unboxed(ctx, store, runner, request)).await
+}
+
+async fn run_practice_set_unboxed(
     ctx: &Context,
     store: &Store,
     runner: &dyn DevRunner,
@@ -1296,23 +1486,95 @@ pub async fn run_practice_set(
     if let Some(registration) = &registration_id {
         ensure_registration_available(store, ctx, registration, &request.set_id).await?;
     }
+    let storage = practice_attempt_set_storage_id_v2(&request.set_id)?;
+    let mut session = store.session().await?;
+    require_live_sources(
+        &mut session,
+        ctx,
+        &control.source_ids,
+        request.revoke_watermark,
+    )
+    .await?;
+    let mut prepared = match session
+        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &storage)
+        .await?
     {
-        let mut session = store.session().await?;
-        require_live_sources(
-            &mut session,
-            ctx,
-            &control.source_ids,
-            request.revoke_watermark,
-        )
-        .await?;
-        session.commit().await?;
-    }
-    if let Some(registration) = &registration_id {
-        claim_registration(ctx, store, registration, &request.set_id).await?;
-    }
-
+        Some(value) => {
+            let existing = parse_set_v2(ctx, &request.set_id, value)?;
+            if existing.request_digest != request_digest || existing.control_id != control.id {
+                return Err(Error::Conflict(
+                    "practice set id is already recorded for a different request".into(),
+                ));
+            }
+            existing
+        }
+        None => {
+            session
+                .admit_capacity(&[(evo_core::capacity::CapacityItem::PracticeAttemptSet, 1)])
+                .await?;
+            if let Some(registration) = &registration_id {
+                bind_registration(&mut session, ctx, registration, &request.set_id).await?;
+            }
+            let prepared = PracticeAttemptSetV2 {
+                schema_version: PRACTICE_ATTEMPT_SET_SCHEMA_V2.into(),
+                id: storage.clone(),
+                set_id: request.set_id.clone(),
+                namespace: ctx.namespace().into(),
+                control_id: control.id.clone(),
+                request_digest: request_digest.clone(),
+                registration_id: registration_id.clone(),
+                state: PracticeSetStateV2::Prepared,
+                started: None,
+                attempts: vec![],
+                result: None,
+            };
+            session
+                .put(ctx, ARTIFACT_KIND, &storage, ctx.actor(), &prepared)
+                .await?;
+            for source in &control.source_ids {
+                session
+                    .put_edge(ctx, ARTIFACT_KIND, &storage, "run", source)
+                    .await?;
+            }
+            session
+                .put_edge(
+                    ctx,
+                    ARTIFACT_KIND,
+                    &storage,
+                    ARTIFACT_KIND,
+                    &storage_id(CONTROL_KIND, &control.id)?,
+                )
+                .await?;
+            if let Some(registration) = &registration_id {
+                session
+                    .put_edge(
+                        ctx,
+                        ARTIFACT_KIND,
+                        &storage,
+                        ARTIFACT_KIND,
+                        &practice_registration_storage_id(registration)?,
+                    )
+                    .await?;
+                session
+                    .put_edge(
+                        ctx,
+                        ARTIFACT_KIND,
+                        &practice_registration_binding_storage_id(registration)?,
+                        ARTIFACT_KIND,
+                        &storage,
+                    )
+                    .await?;
+            }
+            session
+                .audit(ctx, "practice.attempt_set.prepare", &request.set_id)
+                .await?;
+            prepared
+        }
+    };
+    session.commit().await?;
     let k = u32::from(request.plan.attempts_per_task);
-    let (attempts, stop) = run_attempts(ctx, store, runner, &control, &request, k).await?;
+    let (attempts, stop) =
+        run_attempts(ctx, store, runner, &control, &request, k, &mut prepared).await?;
     let outcome = match stop {
         Some(reason) => PracticeOutcomeV1::Incomplete { reason },
         // A single attempt has nothing to contrast with; K is never raised.
@@ -1325,8 +1587,8 @@ pub async fn run_practice_set(
         .map(|task| task.parent_family.as_str())
         .collect();
     let set = PracticeAttemptSetV1 {
-        schema_version: PRACTICE_ATTEMPT_SET_SCHEMA.into(),
-        id: practice_attempt_set_storage_id(&request.set_id)?,
+        schema_version: PRACTICE_ATTEMPT_SET_SCHEMA_V2.into(),
+        id: storage,
         set_id: request.set_id.clone(),
         namespace: ctx.namespace().into(),
         control_id: control.id.clone(),
@@ -1345,7 +1607,7 @@ pub async fn run_practice_set(
         created_at: request.created_at,
     };
     set.validate()?;
-    persist_set(ctx, store, &control, set).await
+    persist_set(ctx, store, &control, set, &mut prepared).await
 }
 
 /// Writes the set once. The live-source gate is re-checked inside the writing
@@ -1359,28 +1621,31 @@ async fn persist_set(
     store: &Store,
     control: &DevelopmentControlV1,
     set: PracticeAttemptSetV1,
+    prepared: &mut PracticeAttemptSetV2,
 ) -> Result<PracticeAttemptSetV1> {
     let storage = set.id.clone();
     let mut session = store.session().await?;
     require_live_sources(&mut session, ctx, &control.source_ids, set.revoke_watermark).await?;
-    if let Some(value) = session
-        .get::<serde_json::Value>(ctx, ARTIFACT_KIND, &storage)
-        .await?
-    {
-        let existing = parse_set(ctx, &set.set_id, value)?;
-        if existing.request_digest != set.request_digest {
-            return Err(Error::Conflict(
-                "practice set id is already recorded for a different request".into(),
-            ));
-        }
+    let current: PracticeAttemptSetV2 = session.need(ctx, ARTIFACT_KIND, &storage).await?;
+    if current.request_digest != set.request_digest {
+        return Err(Error::Conflict("practice set request changed".into()));
+    }
+    if let Some(result) = current.result {
         session.commit().await?;
-        return Ok(existing);
+        return Ok(result);
     }
     if let Some(registration) = &set.registration_id {
         bind_registration(&mut session, ctx, registration, &set.set_id).await?;
     }
+    prepared.state = if prepared.state == PracticeSetStateV2::Draining {
+        PracticeSetStateV2::Draining
+    } else {
+        PracticeSetStateV2::Completed
+    };
+    prepared.result = Some(set.clone());
+    prepared.attempts.clear();
     session
-        .put(ctx, ARTIFACT_KIND, &storage, ctx.actor(), &set)
+        .put(ctx, ARTIFACT_KIND, &storage, ctx.actor(), prepared)
         .await?;
     for source in &control.source_ids {
         session

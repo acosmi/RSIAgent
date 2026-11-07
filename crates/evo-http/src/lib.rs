@@ -551,11 +551,16 @@ fn to_json<T: Serialize>(value: T) -> std::result::Result<Json<Value>, HttpError
 struct HttpError {
     status: StatusCode,
     code: &'static str,
+    details: Option<evo_core::capacity::CapacityConflict>,
 }
 
 impl HttpError {
     fn new(status: StatusCode, code: &'static str) -> Self {
-        Self { status, code }
+        Self {
+            status,
+            code,
+            details: None,
+        }
     }
 }
 
@@ -566,6 +571,11 @@ impl From<Error> for HttpError {
             Error::Forbidden => Self::new(StatusCode::FORBIDDEN, "forbidden"),
             Error::NotFound => Self::new(StatusCode::NOT_FOUND, "not_found"),
             Error::Conflict(_) => Self::new(StatusCode::CONFLICT, "conflict"),
+            Error::Capacity(details) => Self {
+                status: StatusCode::CONFLICT,
+                code: "conflict",
+                details: Some(details),
+            },
             Error::Budget => Self::new(StatusCode::TOO_MANY_REQUESTS, "budget_unavailable"),
             Error::Cancelled => Self::new(StatusCode::CONFLICT, "cancelled"),
             Error::ClockRegressed => Self::new(StatusCode::CONFLICT, "clock_regressed"),
@@ -576,7 +586,11 @@ impl From<Error> for HttpError {
 
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({"error":{"code":self.code}}))).into_response()
+        let mut body = json!({"error":{"code":self.code}});
+        if let Some(details) = self.details {
+            body["error"]["details"] = json!(details);
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -609,6 +623,31 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
             json!({"error":{"code":"clock_regressed"}})
+        );
+    }
+    #[tokio::test]
+    async fn capacity_conflict_keeps_http_409_and_typed_details() {
+        let detail = evo_core::capacity::CapacityConflict {
+            item: evo_core::capacity::CapacityItem::Skill,
+            used: 1000,
+            limit: 1000,
+            delta: 1,
+        };
+        let response = HttpError::from(Error::Capacity(detail.clone())).into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"error":{"code":"conflict","details":detail}})
+        );
+        let old = HttpError::from(Error::Conflict("private conflict".into())).into_response();
+        assert_eq!(old.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(old.into_body(), 1024).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).unwrap(),
+            json!({"error":{"code":"conflict"}})
         );
     }
 }

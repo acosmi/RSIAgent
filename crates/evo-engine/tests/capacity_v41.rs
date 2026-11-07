@@ -247,10 +247,10 @@ fn test_v069_admit_v41_boundary_exact_limit_rejected_limit_minus_one_accepted() 
         let mut at_limit = base;
         set(&mut at_limit, limit);
         match admit_v41(&at_limit) {
-            Err(Error::Conflict(msg)) => assert!(
-                msg.contains(">= limit"),
-                "{name} at exactly {limit}: unexpected message {msg}"
-            ),
+            Err(Error::Capacity(detail)) => {
+                assert_eq!(detail.item.label(), name);
+                assert_eq!((detail.used, detail.limit, detail.delta), (limit, limit, 1));
+            }
             other => panic!("{name} at exactly limit {limit} must be refused, got {other:?}"),
         }
 
@@ -274,7 +274,15 @@ fn test_v069_admit_v41_boundary_exact_limit_rejected_limit_minus_one_accepted() 
     let mut two = base;
     two.concurrent_dispatches = 2;
     match admit_v41(&two) {
-        Err(Error::Conflict(msg)) => assert!(msg.contains("concurrent dispatches 2 > limit 1")),
+        Err(Error::Capacity(detail)) => assert_eq!(
+            (detail.item, detail.used, detail.limit, detail.delta),
+            (
+                evo_core::capacity::CapacityItem::ConcurrentManagementDispatch,
+                1,
+                1,
+                1
+            )
+        ),
         other => panic!("2 concurrent dispatches must be refused, got {other:?}"),
     }
 }
@@ -870,13 +878,10 @@ fn every_capacity_field_admits_limit_minus_one_and_refuses_the_limit() {
             // dispatch being admitted) and limit + 1 is refused.
             assert!(admit_field(field, limit, &limits).is_ok());
             match admit_field(field, limit + 1, &limits) {
-                Err(Error::Conflict(msg)) => assert_eq!(
-                    msg,
-                    format!(
-                        "MVP capacity exceeded: {label} {} > limit {limit}",
-                        limit + 1
-                    )
-                ),
+                Err(Error::Capacity(detail)) => {
+                    assert_eq!(detail.item.label(), label);
+                    assert_eq!((detail.used, detail.limit, detail.delta), (limit, limit, 1));
+                }
                 other => panic!("{label} above limit must be refused, got {other:?}"),
             }
             let mut over = empty;
@@ -889,10 +894,10 @@ fn every_capacity_field_admits_limit_minus_one_and_refuses_the_limit() {
             "{label} at limit-1 must be admitted"
         );
         match admit_field(field, limit, &limits) {
-            Err(Error::Conflict(msg)) => assert_eq!(
-                msg,
-                format!("MVP capacity exceeded: {label} {limit} >= limit {limit}")
-            ),
+            Err(Error::Capacity(detail)) => {
+                assert_eq!(detail.item.label(), label);
+                assert_eq!((detail.used, detail.limit, detail.delta), (limit, limit, 1));
+            }
             other => panic!("{label} at limit must be refused, got {other:?}"),
         }
         let mut below = empty;

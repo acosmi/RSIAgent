@@ -658,6 +658,10 @@ impl ManagementDispatcher {
                         tracing::error!(job_id = %job_id, error = %error, "management supervisor awaits storage or clock recovery");
                         tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                     }
+                    Err(Error::Capacity(_)) => {
+                        dispatcher.retry_claim_later(job_id.clone());
+                        break;
+                    }
                     Err(error) => {
                         tracing::error!(job_id = %job_id, error = %error, "management background supervisor failed");
                         if !matches!(&error, Error::Conflict(reason) if reason == "management job lease fence changed")
@@ -792,8 +796,8 @@ impl ManagementDispatcher {
         }
     }
 
-    /// Step recorded on a Queued job whose claim was deferred by an E16.5
-    /// capacity bound; the job stays retriable and is claimed later.
+    /// Legacy step name retained for reading previously capacity-deferred jobs.
+    /// New capacity refusals leave the job, diagnostics and audit unchanged.
     pub const CAPACITY_WAIT_STEP: &'static str = "capacity_wait";
     /// Delay before a capacity-deferred claim is retried.
     pub const CAPACITY_WAIT_RETRY: std::time::Duration = std::time::Duration::from_millis(200);
@@ -949,44 +953,10 @@ impl ManagementDispatcher {
             // One trusted clock observation precedes every new timing write.
             let at = now()?;
             let capacity_at = u64::try_from(at).map_err(|_| Error::ClockRegressed)?;
-            let usage: crate::capacity::V41CapacityUsage =
-                session.capacity_usage_v41(capacity_at).await?.into();
-            let limits = crate::capacity::CapacityLimits::default();
-            let admitted = crate::capacity::admit_field(
-                crate::capacity::CapacityField::ConcurrentDispatches,
-                usage.concurrent_dispatches.saturating_add(1),
-                &limits,
-            )
-            .and_then(|()| {
-                crate::capacity::admit_field(
-                    crate::capacity::CapacityField::ActiveLeases,
-                    usage.active_leases,
-                    &limits,
-                )
-            });
-            if let Err(refusal) = admitted {
-                if job.step != Self::CAPACITY_WAIT_STEP {
-                    let recorded_at = now()?;
-                    if job.diagnostics.len() >= 32 {
-                        job.diagnostics.remove(0);
-                    }
-                    job.diagnostics.push(ManagementDiagnostic {
-                        code: error_code(&refusal).into(),
-                        observed_generation: job.generation,
-                        recorded_at,
-                    });
-                    job.step = Self::CAPACITY_WAIT_STEP.into();
-                    session
-                        .put(trusted, "job", &job.id, trusted.actor(), &job)
-                        .await?;
-                    session
-                        .audit(trusted, "management.job.capacity_wait", &job.id)
-                        .await?;
-                }
-                session.commit().await?;
-                self.retry_claim_later(job.id);
-                return Ok((trusted.clone(), None));
-            }
+            let usage = session.capacity_usage_v41(capacity_at).await?;
+            evo_core::capacity::CapacityItem::ConcurrentManagementDispatch
+                .admit(usage.concurrent_dispatches, 1)?;
+            evo_core::capacity::CapacityItem::ActiveLease.admit(usage.active_leases, 1)?;
             let claim_at = now()?;
             job.generation = job
                 .generation
@@ -1186,6 +1156,9 @@ async fn persist_management(
     }
     let dependencies = private_dependencies(&request)?;
     ensure_dependencies_live(ctx, &mut session, &dependencies).await?;
+    session
+        .admit_capacity(&[(evo_core::capacity::CapacityItem::ManagementJobRecord, 1)])
+        .await?;
     let private = PrivateManagementInput {
         id: private_id.clone(),
         schema_version: INPUT_SCHEMA.into(),
@@ -2100,9 +2073,10 @@ async fn run_optimization_management(
 }
 
 fn execution_outcome(mut job: ManagementJobV2, result: Result<()>) -> Result<JobOutcome> {
-    if matches!(&result, Err(Error::ClockRegressed)) {
-        return Err(Error::ClockRegressed);
-    }
+    let result = match result {
+        Err(error @ Error::ClockRegressed) => return Err(error),
+        result => result,
+    };
     if let Err(error) = result {
         job.state = ManagementJobState::Failed;
         job.step = "failed".into();
@@ -3339,6 +3313,9 @@ async fn optimization_live_accounting_in_session(
             let object = input.as_object_mut().ok_or(Error::NotFound)?;
             object.remove("compiler_request");
             object.remove("compiler_binding");
+            if fact.schema_version == crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2 {
+                object.remove("job_scope");
+            }
             if fact.input_digest != fingerprint(&(fingerprint(&input)?, &binding))? {
                 return Ok(None);
             }
@@ -3694,10 +3671,21 @@ fn optimization_stage_reference_matches(
 ) -> Result<bool> {
     let value = evo_storage::lifecycle::parse_strict_json(body)?;
     if is_redacted(&value) {
+        let schema = match value["original_schema"].as_str() {
+            Some(crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA) => {
+                crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA
+            }
+            Some(crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2)
+                if reference.kind == "step_prepared" =>
+            {
+                crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA_V2
+            }
+            _ => return Ok(false),
+        };
         return Ok(optimization_object_redaction_matches(
             &value,
             &reference.artifact_id,
-            crate::optimization::OPTIMIZATION_STAGE_FACT_SCHEMA,
+            schema,
             &reference.record_digest,
         ) && value["metadata"]["artifact_id"].as_str()
             == Some(reference.artifact_id.as_str())
@@ -4721,6 +4709,7 @@ async fn consumer_progress_or_unknown(
             | Error::Forbidden
             | Error::NotFound
             | Error::Conflict(_)
+            | Error::Capacity(_)
             | Error::Budget
             | Error::Cancelled,
         ) => Ok(ConsumerProgress::Unknown),
@@ -5589,7 +5578,7 @@ fn error_code(error: &Error) -> &'static str {
         Error::Invalid(_) => "invalid_input",
         Error::Forbidden => "forbidden",
         Error::NotFound => "not_found",
-        Error::Conflict(_) => "conflict",
+        Error::Conflict(_) | Error::Capacity(_) => "conflict",
         Error::Budget => "budget_unavailable",
         Error::Cancelled => "cancelled",
         Error::ClockRegressed => "clock_regressed",
