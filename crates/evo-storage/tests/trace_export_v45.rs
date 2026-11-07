@@ -1,17 +1,23 @@
-//! AG-175 storage-layer trace export publication controls. These tests drive
-//! the real trace export tree primitives (`publish_trace_export_tree`,
-//! `verify_trace_export_tree`, `fsync_trace_export_tree`) on real directories.
-//! The member sets here are byte sets for the FS chain: the frozen digest is
-//! the only authority this layer takes, and the revocation-watermark and fence
-//! re-checks live in the engine entry that calls it.
+//! AG-175 storage-layer trace export publication controls. They drive the
+//! real trace export primitives (`stage_trace_export`,
+//! `publish_staged_trace_export`, `verify_trace_export_tree`) and the real
+//! revocation lifecycle (`LifecycleStore::begin_revoke`, `cleanup_step`) on
+//! real directories and a real record. The record body is engine-owned; these
+//! tests store it with exactly the engine's fields through the real put gate.
 use evo_core::{Context, Error, Role, hash};
-use evo_storage::lifecycle::redacted_object_body;
+use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef, redacted_object_body};
 use evo_storage::{
-    Store, TRACE_EXPORT_SCHEMA, TRACE_EXPORT_TREE_UNAVAILABLE, local_export_tree_digest,
+    Store, TRACE_EXPORT_SCHEMA, TRACE_EXPORT_TREE_UNAVAILABLE, TraceExportMember,
+    local_export_tree_digest,
 };
 use serde_json::{Value, json};
+use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::{Connection, SqliteConnection};
 use std::collections::BTreeMap;
 use std::path::Path;
+
+const DATABASE: &str = "trace-export.sqlite3";
+const DISCLAIMER: &str = "Local revocation stops future distribution and invalidates local usage; remote erasure of third-party downloaded copies cannot be guaranteed.";
 
 fn admin() -> Context {
     Context::new("trace-tenant", "admin", Role::Admin).unwrap()
@@ -19,9 +25,7 @@ fn admin() -> Context {
 
 async fn store() -> (tempfile::TempDir, Store, Context) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("trace-export.sqlite3"))
-        .await
-        .unwrap();
+    let store = Store::open(&dir.path().join(DATABASE)).await.unwrap();
     (dir, store, admin())
 }
 
@@ -32,60 +36,169 @@ fn files(marker: &str) -> Vec<evo_storage::LocalExportFile> {
             bytes: format!("native member bytes {marker}").into_bytes(),
         },
         evo_storage::LocalExportFile {
-            path: "report.json".into(),
-            bytes: format!("report bytes {marker}").into_bytes(),
+            path: "manifest.json".into(),
+            bytes: format!("manifest bytes {marker}").into_bytes(),
         },
     ]
 }
 
-/// A full image of every filesystem entry under the store root: the honest
-/// boundary for "zero effect", "preserved" and "residue released" claims.
-fn fs_image(root: &Path) -> BTreeMap<String, (bool, u32, Option<Vec<u8>>)> {
-    fn walk(root: &Path, dir: &Path, image: &mut BTreeMap<String, (bool, u32, Option<Vec<u8>>)>) {
+fn members(files: &[evo_storage::LocalExportFile]) -> Vec<TraceExportMember> {
+    files
+        .iter()
+        .map(|file| TraceExportMember {
+            path: file.path.clone(),
+            digest_sha256: hash(&file.bytes),
+            size_bytes: file.bytes.len() as u64,
+        })
+        .collect()
+}
+
+fn source_run(export_id: &str) -> String {
+    format!("source-{export_id}")
+}
+
+fn record_id(export_id: &str) -> String {
+    format!("trace-export-record-{export_id}")
+}
+
+/// A live captured source run and the `reviewed` record of one export over the
+/// frozen `files`, with its typed edge to that run, as the engine writes them.
+async fn reviewed_record(
+    store: &Store,
+    admin: &Context,
+    export_id: &str,
+    files: &[evo_storage::LocalExportFile],
+) -> Value {
+    let (candidate_digest, total_bytes) = local_export_tree_digest(files).unwrap();
+    let run = json!({"id": source_run(export_id), "facts": "captured service facts"});
+    let record = json!({
+        "schema_version": TRACE_EXPORT_SCHEMA,
+        "id": record_id(export_id),
+        "export_id": export_id,
+        "phase": "reviewed",
+        "prepare_job_id": "management-job-prepare",
+        "publish_job_id": "management-job-publish",
+        "candidate_digest": candidate_digest,
+        "members": members(files),
+        "delivery": null,
+        "local_cost": {"wall_seconds": 1, "bytes": total_bytes},
+        "source_snapshots": [{
+            "source_id": source_run(export_id),
+            "owner_actor": admin.actor(),
+            "storage_body_sha256": hash(run.to_string().as_bytes()),
+        }],
+        "owner_actor": admin.actor(),
+        "created_at": 1,
+        "updated_at": 2,
+    });
+    let mut session = store.session().await.unwrap();
+    session
+        .put(admin, "run", &source_run(export_id), admin.actor(), &run)
+        .await
+        .unwrap();
+    session
+        .put(
+            admin,
+            "artifact",
+            &record_id(export_id),
+            admin.actor(),
+            &record,
+        )
+        .await
+        .unwrap();
+    session
+        .put_edge(
+            admin,
+            "artifact",
+            &record_id(export_id),
+            "run",
+            &source_run(export_id),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    record
+}
+
+async fn record_body(store: &Store, admin: &Context, export_id: &str) -> String {
+    let mut session = store.session().await.unwrap();
+    let body = session
+        .object_row(admin, "artifact", &record_id(export_id))
+        .await
+        .unwrap()
+        .unwrap()
+        .body;
+    session.commit().await.unwrap();
+    body
+}
+
+async fn revoke(store: &Store, admin: &Context, run: &str) -> String {
+    LifecycleStore::begin_revoke(
+        admin,
+        store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: run.into(),
+        },
+        "trace export source revoked",
+        10,
+    )
+    .await
+    .unwrap()
+    .job_id
+}
+
+/// Every filesystem entry under the store root except the database files:
+/// the honest boundary for "zero effect", "preserved" and "released" claims.
+fn fs_image(root: &Path) -> BTreeMap<String, (bool, Option<Vec<u8>>)> {
+    fn walk(root: &Path, dir: &Path, image: &mut BTreeMap<String, (bool, Option<Vec<u8>>)>) {
         for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            let path = entry.unwrap().path();
             let relative = path
                 .strip_prefix(root)
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            #[cfg(unix)]
-            let mode = {
-                use std::os::unix::fs::PermissionsExt;
-                metadata.permissions().mode()
-            };
-            #[cfg(not(unix))]
-            let mode = 0;
-            if metadata.is_dir() {
-                image.insert(relative, (true, mode, None));
+            if relative.starts_with(DATABASE) {
+                continue;
+            }
+            if std::fs::symlink_metadata(&path).unwrap().is_dir() {
+                image.insert(relative, (true, None));
                 walk(root, &path, image);
             } else {
-                image.insert(relative, (false, mode, Some(std::fs::read(&path).unwrap())));
+                image.insert(relative, (false, Some(std::fs::read(&path).unwrap())));
             }
         }
     }
     let mut image = BTreeMap::new();
-    if root.exists() {
-        walk(root, root, &mut image);
-    }
+    walk(root, root, &mut image);
     image
 }
 
-/// The private staging residue this layer must release: leftover member
-/// files. The fixed `.export-staging` layout directories may remain empty.
+#[allow(clippy::permissions_set_readonly_false)]
+fn make_writable(path: &Path) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_readonly(false);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+fn make_readonly(path: &Path) {
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+/// Private staging members left anywhere under the staging root.
 fn staging_residue(root: &Path) -> Vec<String> {
     let staging = root.join(".export-staging");
-    let mut residue = Vec::new();
-    if staging.exists() {
-        for (path, (is_dir, _, bytes)) in fs_image(&staging) {
-            if !is_dir && bytes.is_some() {
-                residue.push(path);
-            }
-        }
+    if !staging.exists() {
+        return Vec::new();
     }
-    residue
+    fs_image(&staging)
+        .into_iter()
+        .filter(|(_, (is_dir, _))| !is_dir)
+        .map(|(path, _)| path)
+        .collect()
 }
 
 #[tokio::test]
@@ -93,19 +206,31 @@ async fn trace_export_stages_private_and_publishes_without_overwrite() {
     let (dir, store, admin) = store().await;
     let first = files("first");
     let (first_digest, first_bytes) = local_export_tree_digest(&first).unwrap();
-    let publication = store
-        .publish_trace_export_tree(&admin, "export-a", &first, &first_digest)
+    reviewed_record(&store, &admin, "export-a", &first).await;
+    let tree = store.trace_export_directory(&admin, "export-a").unwrap();
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-a"), &first)
         .await
         .unwrap();
-    assert!(publication.published_now);
-    assert!(publication.tree_fsynced);
-    assert_eq!(publication.verified_tree_digest, first_digest);
-    assert_eq!(publication.receipt.delivered_bytes, first_bytes);
     assert_eq!(
-        publication.receipt.local_export_ref,
-        format!("exports/{}/export-a", hash(admin.namespace().as_bytes()))
+        staging_residue(dir.path()).len(),
+        2,
+        "the staged candidate is private material only"
     );
-    let tree = store.local_export_directory(&admin, "export-a").unwrap();
+    assert!(!tree.exists(), "staging never reaches the formal location");
+    let receipt = store
+        .publish_staged_trace_export(&admin, staged)
+        .await
+        .unwrap();
+    assert_eq!(receipt.package_tree_digest, first_digest);
+    assert_eq!(receipt.delivered_bytes, first_bytes);
+    assert_eq!(
+        receipt.local_export_ref,
+        format!(
+            "trace-exports/{}/export-a",
+            hash(admin.namespace().as_bytes())
+        )
+    );
     assert_eq!(
         std::fs::read(tree.join("traces/0000.json")).unwrap(),
         first[0].bytes
@@ -119,363 +244,482 @@ async fn trace_export_stages_private_and_publishes_without_overwrite() {
             .mode();
         assert_eq!(mode & 0o222, 0, "published members are read-only");
     }
-    assert!(
-        staging_residue(dir.path()).is_empty(),
-        "no private staging member remains"
+    assert!(staging_residue(dir.path()).is_empty());
+    // Trace exports and E16 package exports never share a directory space.
+    assert_ne!(
+        store.local_export_directory(&admin, "export-a").unwrap(),
+        tree
     );
-    // The receipt the publication earned is exactly what re-verification of
-    // the published directory keeps earning.
-    let receipt = store
-        .verify_trace_export_tree(&admin, "export-a", &first)
-        .await
-        .unwrap();
+    assert!(!dir.path().join("exports").exists());
+    // The receipt the publication earned is what the published tree keeps
+    // earning against the frozen members.
     assert_eq!(
-        receipt.completion_receipt_digest,
-        publication.receipt.completion_receipt_digest
+        store
+            .verify_trace_export_tree(&admin, "export-a", &members(&first), &first_digest)
+            .await
+            .unwrap(),
+        receipt
     );
-    // The identical tree publishes again without any overwrite: the rename is
-    // not repeated and no NOREPLACE failure occurs.
+    // A second publication of the same record never overwrites the tree.
     let again = store
-        .publish_trace_export_tree(&admin, "export-a", &first, &first_digest)
+        .stage_trace_export(&admin, &record_id("export-a"), &first)
         .await
         .unwrap();
-    assert!(!again.published_now);
-    assert_eq!(
-        again.receipt.completion_receipt_digest,
-        publication.receipt.completion_receipt_digest
-    );
-    // Different bytes under the same export id never overwrite the published
-    // tree; the refusal names the existing tree.
-    let second = files("second");
-    let (second_digest, _) = local_export_tree_digest(&second).unwrap();
+    match store.publish_staged_trace_export(&admin, again).await {
+        Err(Error::Conflict(reason)) => assert_eq!(reason, "trace export target already exists"),
+        other => panic!("an existing tree must never be overwritten, got {other:?}"),
+    }
+    assert!(staging_residue(dir.path()).is_empty());
+    // Bytes that are not the frozen candidate never reach staging.
+    let before = fs_image(dir.path());
     match store
-        .publish_trace_export_tree(&admin, "export-a", &second, &second_digest)
+        .stage_trace_export(&admin, &record_id("export-a"), &files("second"))
         .await
     {
-        Err(Error::Conflict(reason)) => {
-            assert_eq!(reason, "existing trace export tree differs")
-        }
-        other => panic!("a differing tree must never overwrite, got {other:?}"),
+        Err(Error::Conflict(reason)) => assert_eq!(
+            reason,
+            "trace export candidate bytes differ from the frozen candidate"
+        ),
+        other => panic!(
+            "drifted bytes must be refused before staging, got {:?}",
+            other.err()
+        ),
     }
-    assert_eq!(
-        std::fs::read(tree.join("traces/0000.json")).unwrap(),
-        first[0].bytes,
-        "the published tree is untouched"
-    );
-    assert!(matches!(
-        store
-            .verify_trace_export_tree(&admin, "export-a", &second)
-            .await,
-        Err(Error::Conflict(reason)) if reason == TRACE_EXPORT_TREE_UNAVAILABLE
-    ));
+    assert_eq!(fs_image(dir.path()), before);
     // Only an Admin of the namespace owns this surface.
     let worker = Context::new("trace-tenant", "worker", Role::Worker).unwrap();
     assert!(matches!(
         store
-            .publish_trace_export_tree(&worker, "export-a", &first, &first_digest)
+            .stage_trace_export(&worker, &record_id("export-a"), &first)
             .await,
         Err(Error::Forbidden)
     ));
 }
 
-/// Refusals that land before the first write have zero filesystem effect: no
-/// staging directory, no export tree, nothing but the database itself. The
-/// frozen digest is the authority, so bytes that drifted from it (the storage
-/// face of a swapped dependency blob) never reach the staging writer.
+/// A source revoked before the first write: the fence refuses before any
+/// filesystem effect — no staging, no tree — and the record is untouched.
 #[tokio::test]
 async fn trace_export_revoke_before_first_write_is_zero_effect() {
     let (dir, store, admin) = store().await;
     let first = files("zero");
-    let second = files("drifted");
-    let (first_digest, _) = local_export_tree_digest(&first).unwrap();
-    let (second_digest, _) = local_export_tree_digest(&second).unwrap();
+    reviewed_record(&store, &admin, "export-b", &first).await;
+    let record = record_body(&store, &admin, "export-b").await;
+    revoke(&store, &admin, &source_run("export-b")).await;
     let before = fs_image(dir.path());
-    assert!(!dir.path().join("exports").exists());
     match store
-        .publish_trace_export_tree(&admin, "export-b", &first, &second_digest)
+        .stage_trace_export(&admin, &record_id("export-b"), &first)
         .await
     {
         Err(Error::Conflict(reason)) => {
-            assert_eq!(
-                reason,
-                "trace export candidate bytes differ from the frozen candidate"
-            )
+            assert_eq!(reason, "trace export source closure was revoked")
         }
-        other => panic!("drifted bytes must be refused before staging, got {other:?}"),
+        other => panic!(
+            "a revoked source must be refused before staging, got {:?}",
+            other.err()
+        ),
     }
-    assert!(matches!(
-        store
-            .publish_trace_export_tree(&admin, "export-b", &second, &first_digest)
-            .await,
-        Err(Error::Conflict(reason)) if reason ==
-            "trace export candidate bytes differ from the frozen candidate"
-    ));
-    let worker = Context::new("trace-tenant", "worker", Role::Worker).unwrap();
-    assert!(matches!(
-        store
-            .publish_trace_export_tree(&worker, "export-b", &first, &first_digest)
-            .await,
-        Err(Error::Forbidden)
-    ));
     assert_eq!(
         fs_image(dir.path()),
         before,
-        "every pre-first-write refusal leaves the filesystem untouched"
+        "the refusal has no filesystem effect at all"
     );
+    assert!(!dir.path().join(".export-staging").exists());
+    assert!(!dir.path().join("trace-exports").exists());
+    assert_eq!(record_body(&store, &admin, "export-b").await, record);
 }
 
-/// A decision that went stale after its private staging cannot succeed: the
-/// attempt's staging is released by its own guard and the already published
-/// tree stays the one delivery.
+/// A source revoked after staging: the publication fence refuses under the
+/// write lock, the staging guard releases the private tree, and nothing
+/// reaches the formal location.
 #[tokio::test]
 async fn trace_export_revoke_after_stage_prevents_success() {
     let (dir, store, admin) = store().await;
-    let first = files("published");
-    let (first_digest, _) = local_export_tree_digest(&first).unwrap();
-    store
-        .publish_trace_export_tree(&admin, "export-c", &first, &first_digest)
+    let first = files("stale-attempt");
+    reviewed_record(&store, &admin, "export-c", &first).await;
+    let record = record_body(&store, &admin, "export-c").await;
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-c"), &first)
         .await
         .unwrap();
-    // The stale attempt stages its own bytes first and only then meets the
-    // published tree, so its failure exercises the staging guard.
-    let second = files("stale-attempt");
-    let (second_digest, _) = local_export_tree_digest(&second).unwrap();
-    match store
-        .publish_trace_export_tree(&admin, "export-c", &second, &second_digest)
-        .await
-    {
+    assert!(!staging_residue(dir.path()).is_empty());
+    revoke(&store, &admin, &source_run("export-c")).await;
+    match store.publish_staged_trace_export(&admin, staged).await {
         Err(Error::Conflict(reason)) => {
-            assert_eq!(reason, "existing trace export tree differs")
+            assert_eq!(reason, "trace export source closure was revoked")
         }
-        other => panic!("a stale attempt must not succeed, got {other:?}"),
+        other => panic!("a revoked source must not publish, got {other:?}"),
     }
     assert!(
         staging_residue(dir.path()).is_empty(),
-        "the failed attempt released its private staging"
+        "the refused attempt released its private staging"
     );
-    for (_, (_, _, bytes)) in fs_image(dir.path()) {
+    assert!(
+        !store
+            .trace_export_directory(&admin, "export-c")
+            .unwrap()
+            .exists(),
+        "no tree reached the formal location"
+    );
+    for (_, (_, bytes)) in fs_image(dir.path()) {
         if let Some(bytes) = bytes {
             assert!(
                 !bytes
                     .windows(b"stale-attempt".len())
                     .any(|window| window == b"stale-attempt"),
-                "the stale attempt left no bytes anywhere"
+                "the refused attempt left no bytes anywhere"
             );
         }
     }
-    assert_eq!(
-        std::fs::read(
-            store
-                .local_export_directory(&admin, "export-c")
-                .unwrap()
-                .join("report.json")
-        )
-        .unwrap(),
-        first[1].bytes,
-        "the published delivery is unchanged"
-    );
+    assert_eq!(record_body(&store, &admin, "export-c").await, record);
 }
 
-/// A swapped member blob blocks publication through the frozen digest and is
-/// detected on the published surface, while the storage layer itself stays
-/// watermark-free by contract: it can neither revoke a delivered tree nor
-/// unilaterally block a new publication the engine entry still accepts.
+/// A swapped dependency blob — candidate bytes that drifted from the frozen
+/// digest, or a staged member changed after staging — blocks publication, and
+/// so does a revocation watermark move inside the record's own source closure
+/// (an upstream run of its source). A revocation outside that closure is not
+/// this export's watermark: an unrelated sibling never blocks it.
 #[tokio::test]
 async fn trace_export_dependency_blob_swap_or_watermark_change_blocks_publish() {
     let (dir, store, admin) = store().await;
     let first = files("authoritative");
-    let (first_digest, _) = local_export_tree_digest(&first).unwrap();
-    let publication = store
-        .publish_trace_export_tree(&admin, "export-d", &first, &first_digest)
-        .await
-        .unwrap();
-    // Same size, different content: the blob swap changes the tree digest.
+    reviewed_record(&store, &admin, "export-d", &first).await;
+    // Same size, different content.
     let mut swapped = first.clone();
     swapped[0].bytes = b"native member bytes swappedmember".to_vec();
-    let (swapped_digest, _) = local_export_tree_digest(&swapped).unwrap();
     assert_eq!(swapped[0].bytes.len(), first[0].bytes.len());
-    assert_ne!(swapped_digest, first_digest);
-    assert!(
-        matches!(
-            store
-                .publish_trace_export_tree(&admin, "export-d", &swapped, &first_digest)
-                .await,
-            Err(Error::Conflict(reason)) if reason ==
-                "trace export candidate bytes differ from the frozen candidate"
-        ),
-        "the swapped blob cannot publish under the frozen digest"
+    let before = fs_image(dir.path());
+    assert!(matches!(
+        store
+            .stage_trace_export(&admin, &record_id("export-d"), &swapped)
+            .await,
+        Err(Error::Conflict(reason)) if reason ==
+            "trace export candidate bytes differ from the frozen candidate"
+    ));
+    assert_eq!(
+        fs_image(dir.path()),
+        before,
+        "the swap never reached staging"
     );
+    // A staged member swapped after staging.
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-d"), &first)
+        .await
+        .unwrap();
+    let staged_member = fs_image(&dir.path().join(".export-staging"))
+        .into_iter()
+        .find(|(path, _)| path.ends_with("traces/0000.json"))
+        .map(|(path, _)| dir.path().join(".export-staging").join(path))
+        .unwrap();
+    make_writable(&staged_member);
+    std::fs::write(&staged_member, b"native member bytes swappedmember").unwrap();
+    assert!(matches!(
+        store.publish_staged_trace_export(&admin, staged).await,
+        Err(Error::Conflict(reason)) if reason == "staged trace export identity changed"
+    ));
+    assert!(staging_residue(dir.path()).is_empty());
     assert!(
-        matches!(
-            store
-                .verify_trace_export_tree(&admin, "export-d", &swapped)
-                .await,
-            Err(Error::Conflict(reason)) if reason == TRACE_EXPORT_TREE_UNAVAILABLE
-        ),
-        "the swap is detected against the published tree"
+        !store
+            .trace_export_directory(&admin, "export-d")
+            .unwrap()
+            .exists()
     );
-    // The real revocation watermark moves; the delivered local fact stays
-    // exactly verifiable. Blocking a *new* publication on that watermark is
-    // the engine entry's gate, not a power this layer claims.
+
+    // An unrelated sibling revocation moves the namespace watermark but not
+    // this export's closure: a second export still publishes.
+    let second = files("sibling-live");
+    reviewed_record(&store, &admin, "export-e", &second).await;
     let mut session = store.session().await.unwrap();
     session
-        .bump_watermark(&admin, "revoke-watermark-moved")
+        .put(
+            &admin,
+            "run",
+            "unrelated-sibling",
+            admin.actor(),
+            &json!({"id": "unrelated-sibling"}),
+        )
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let receipt = store
-        .verify_trace_export_tree(&admin, "export-d", &first)
+    revoke(&store, &admin, "unrelated-sibling").await;
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-e"), &second)
         .await
         .unwrap();
-    assert_eq!(
-        receipt.completion_receipt_digest,
-        publication.receipt.completion_receipt_digest
-    );
+    store
+        .publish_staged_trace_export(&admin, staged)
+        .await
+        .unwrap();
+
+    // An upstream run inside export-d's closure is revoked: blocked.
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "run",
+            "upstream-of-d",
+            admin.actor(),
+            &json!({"id": "upstream-of-d"}),
+        )
+        .await
+        .unwrap();
+    session
+        .put_edge(
+            &admin,
+            "run",
+            &source_run("export-d"),
+            "run",
+            "upstream-of-d",
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-d"), &first)
+        .await
+        .unwrap();
+    revoke(&store, &admin, "upstream-of-d").await;
+    assert!(matches!(
+        store.publish_staged_trace_export(&admin, staged).await,
+        Err(Error::Conflict(reason)) if reason == "trace export source closure was revoked"
+    ));
+    assert!(matches!(
+        store
+            .stage_trace_export(&admin, &record_id("export-d"), &first)
+            .await,
+        Err(Error::Conflict(reason)) if reason == "trace export source closure was revoked"
+    ));
+    assert!(staging_residue(dir.path()).is_empty());
     assert!(
-        staging_residue(dir.path()).is_empty(),
-        "no publication was attempted by the watermark read"
+        !store
+            .trace_export_directory(&admin, "export-d")
+            .unwrap()
+            .exists()
     );
 }
 
-/// A published tree that no longer matches is preserved as it is and reported
-/// as the honest unavailable conflict; the reader never cleans or repairs it.
+/// A wrong tree is preserved exactly as it is and reported: a published tree
+/// that no longer matches is the honest unavailable conflict, and a foreign
+/// tree already occupying an export's formal directory is never overwritten.
 #[tokio::test]
 async fn trace_export_existing_wrong_tree_is_preserved_and_reported() {
     let (_dir, store, admin) = store().await;
     let first = files("exact");
     let (first_digest, _) = local_export_tree_digest(&first).unwrap();
-    store
-        .publish_trace_export_tree(&admin, "export-e", &first, &first_digest)
+    reviewed_record(&store, &admin, "export-f", &first).await;
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-f"), &first)
         .await
         .unwrap();
-    let tree = store.local_export_directory(&admin, "export-e").unwrap();
-    // An operator's wrong extra member appears inside the published tree.
+    store
+        .publish_staged_trace_export(&admin, staged)
+        .await
+        .unwrap();
+    let tree = store.trace_export_directory(&admin, "export-f").unwrap();
+    let frozen = members(&first);
     std::fs::write(tree.join("extra-wrong.json"), b"wrong tree content").unwrap();
-    assert!(
-        matches!(
-            store
-                .verify_trace_export_tree(&admin, "export-e", &first)
-                .await,
-            Err(Error::Conflict(reason)) if reason == TRACE_EXPORT_TREE_UNAVAILABLE
-        ),
-        "the wrong tree is reported"
-    );
-    assert!(
-        tree.join("extra-wrong.json").exists(),
-        "the wrong tree is preserved exactly as it is"
-    );
-    // Removing the wrong member restores the exact tree and its receipt.
+    assert!(matches!(
+        store
+            .verify_trace_export_tree(&admin, "export-f", &frozen, &first_digest)
+            .await,
+        Err(Error::Conflict(reason)) if reason == TRACE_EXPORT_TREE_UNAVAILABLE
+    ));
+    assert!(tree.join("extra-wrong.json").exists(), "preserved as it is");
     std::fs::remove_file(tree.join("extra-wrong.json")).unwrap();
     assert!(
         store
-            .verify_trace_export_tree(&admin, "export-e", &first)
+            .verify_trace_export_tree(&admin, "export-f", &frozen, &first_digest)
             .await
             .is_ok()
     );
-    // Tampered member bytes are likewise preserved and reported.
-    let original = std::fs::read(tree.join("report.json")).unwrap();
-    std::fs::write(tree.join("report.json"), b"tampered report bytes").unwrap();
+    let original = std::fs::read(tree.join("manifest.json")).unwrap();
+    make_writable(&tree.join("manifest.json"));
+    std::fs::write(tree.join("manifest.json"), b"tampered manifest bytes").unwrap();
     assert!(matches!(
         store
-            .verify_trace_export_tree(&admin, "export-e", &first)
+            .verify_trace_export_tree(&admin, "export-f", &frozen, &first_digest)
             .await,
         Err(Error::Conflict(reason)) if reason == TRACE_EXPORT_TREE_UNAVAILABLE
     ));
     assert_eq!(
-        std::fs::read(tree.join("report.json")).unwrap(),
-        b"tampered report bytes",
+        std::fs::read(tree.join("manifest.json")).unwrap(),
+        b"tampered manifest bytes",
         "the tampered bytes are left in place"
     );
-    std::fs::write(tree.join("report.json"), original).unwrap();
+    std::fs::write(tree.join("manifest.json"), original).unwrap();
+    make_readonly(&tree.join("manifest.json"));
     assert!(
         store
-            .verify_trace_export_tree(&admin, "export-e", &first)
+            .verify_trace_export_tree(&admin, "export-f", &frozen, &first_digest)
             .await
             .is_ok()
     );
+
+    // A foreign tree already at another export's formal directory.
+    let second = files("second");
+    reviewed_record(&store, &admin, "export-g", &second).await;
+    let occupied = store.trace_export_directory(&admin, "export-g").unwrap();
+    std::fs::create_dir_all(&occupied).unwrap();
+    std::fs::write(occupied.join("foreign.json"), b"foreign tree").unwrap();
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-g"), &second)
+        .await
+        .unwrap();
+    assert!(matches!(
+        store.publish_staged_trace_export(&admin, staged).await,
+        Err(Error::Conflict(reason)) if reason == "trace export target already exists"
+    ));
+    assert_eq!(
+        std::fs::read(occupied.join("foreign.json")).unwrap(),
+        b"foreign tree"
+    );
+    assert_eq!(std::fs::read_dir(&occupied).unwrap().count(), 1);
 }
 
 /// A completed export whose tree is gone is unavailable, and the read-only
-/// proofs never resurrect or resend it.
+/// proof never resurrects or resends it; a partial tree proves nothing.
 #[tokio::test]
 async fn trace_export_completed_missing_tree_is_unavailable_without_resend() {
     let (_dir, store, admin) = store().await;
     let first = files("completed");
     let (first_digest, _) = local_export_tree_digest(&first).unwrap();
-    store
-        .publish_trace_export_tree(&admin, "export-f", &first, &first_digest)
+    reviewed_record(&store, &admin, "export-h", &first).await;
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-h"), &first)
         .await
         .unwrap();
-    let tree = store.local_export_directory(&admin, "export-f").unwrap();
+    store
+        .publish_staged_trace_export(&admin, staged)
+        .await
+        .unwrap();
+    let tree = store.trace_export_directory(&admin, "export-h").unwrap();
     std::fs::remove_dir_all(&tree).unwrap();
     match store
-        .verify_trace_export_tree(&admin, "export-f", &first)
+        .verify_trace_export_tree(&admin, "export-h", &members(&first), &first_digest)
         .await
     {
         Err(Error::Conflict(reason)) => assert_eq!(reason, TRACE_EXPORT_TREE_UNAVAILABLE),
         other => panic!("the missing tree must be unavailable, got {other:?}"),
     }
-    match store
-        .fsync_trace_export_tree(&admin, "export-f", &first)
-        .await
-    {
-        Err(Error::Conflict(reason)) => assert_eq!(reason, TRACE_EXPORT_TREE_UNAVAILABLE),
-        other => panic!("fsync of a missing tree must be unavailable, got {other:?}"),
-    }
     assert!(!tree.exists(), "no proof republished the tree");
-    // A partial tree is equally unavailable: one member alone proves nothing.
     std::fs::create_dir_all(tree.join("traces")).unwrap();
     std::fs::write(tree.join("traces/0000.json"), &first[0].bytes).unwrap();
+    make_readonly(&tree.join("traces/0000.json"));
     assert!(matches!(
         store
-            .verify_trace_export_tree(&admin, "export-f", &first)
+            .verify_trace_export_tree(&admin, "export-h", &members(&first), &first_digest)
             .await,
         Err(Error::Conflict(reason)) if reason == TRACE_EXPORT_TREE_UNAVAILABLE
     ));
 }
 
-/// Cleanup releases the failed attempt's private residue and preserves the
-/// delivery fact byte for byte. The delivery is local-only: no remote surface
-/// exists to erase, and none is claimed.
+/// The real revocation cleanup of a delivered export removes its published
+/// tree under control, keeps the delivery fact (receipt, local scope, cost)
+/// in the redacted record, states that remote erasure is not claimed, and
+/// never touches another export's tree.
 #[tokio::test]
 async fn trace_export_cleanup_preserves_delivery_fact_and_explains_remote_residual() {
     let (dir, store, admin) = store().await;
     let first = files("delivered");
-    let (first_digest, _) = local_export_tree_digest(&first).unwrap();
-    let publication = store
-        .publish_trace_export_tree(&admin, "export-g", &first, &first_digest)
+    let mut delivered = reviewed_record(&store, &admin, "export-i", &first).await;
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-i"), &first)
         .await
         .unwrap();
-    let exports_before = fs_image(&dir.path().join("exports"));
-    let second = files("undelivered-attempt");
-    let (second_digest, _) = local_export_tree_digest(&second).unwrap();
-    assert!(
-        matches!(
-            store
-                .publish_trace_export_tree(&admin, "export-g", &second, &second_digest)
-                .await,
-            Err(Error::Conflict(reason)) if reason == "existing trace export tree differs"
-        ),
-        "the refused attempt cleans up after itself"
-    );
-    assert_eq!(
-        fs_image(&dir.path().join("exports")),
-        exports_before,
-        "cleanup never touches the published export tree"
-    );
-    assert!(
-        staging_residue(dir.path()).is_empty(),
-        "the attempt's private staging residue is released"
-    );
     let receipt = store
-        .verify_trace_export_tree(&admin, "export-g", &first)
+        .publish_staged_trace_export(&admin, staged)
         .await
         .unwrap();
-    assert_eq!(
-        receipt.completion_receipt_digest, publication.receipt.completion_receipt_digest,
-        "the delivery fact survives the failed later attempt"
+    delivered["phase"] = json!("delivered");
+    delivered["delivery"] = json!({
+        "receipt_digest": receipt.completion_receipt_digest,
+        "local_export_ref": receipt.local_export_ref,
+        "remote_erasure_disclaimer": DISCLAIMER,
+    });
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "artifact",
+            &record_id("export-i"),
+            admin.actor(),
+            &delivered,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let other = files("other-live");
+    reviewed_record(&store, &admin, "export-j", &other).await;
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-j"), &other)
+        .await
+        .unwrap();
+    store
+        .publish_staged_trace_export(&admin, staged)
+        .await
+        .unwrap();
+    let other_tree = fs_image(&store.trace_export_directory(&admin, "export-j").unwrap());
+
+    let job = revoke(&store, &admin, &source_run("export-i")).await;
+    let mut clock = 10;
+    let status = loop {
+        clock += 1;
+        let status = LifecycleStore::cleanup_step(&admin, &store, &job, 8, clock)
+            .await
+            .unwrap();
+        if matches!(status.state, CleanupState::Complete | CleanupState::Failed) {
+            break status;
+        }
+        assert!(clock < 100, "the cleanup finishes");
+    };
+    assert_eq!(status.state, CleanupState::Complete, "{status:?}");
+    assert!(
+        !store
+            .trace_export_directory(&admin, "export-i")
+            .unwrap()
+            .exists(),
+        "the revoked export's local tree was removed"
     );
-    assert_eq!(receipt.delivery_kind, "local_directory_v1");
+    assert_eq!(
+        fs_image(&store.trace_export_directory(&admin, "export-j").unwrap()),
+        other_tree,
+        "another export's tree is untouched"
+    );
+    let redacted: Value =
+        serde_json::from_str(&record_body(&store, &admin, "export-i").await).unwrap();
+    assert_eq!(redacted["schema_version"], "rsia.redacted.v1");
+    assert_eq!(redacted["state"], "source_revoked");
+    assert_eq!(redacted["original_schema"], TRACE_EXPORT_SCHEMA);
+    for key in ["export_id", "phase", "delivery", "local_cost", "members"] {
+        assert_eq!(redacted["metadata"][key], delivered[key], "keeps {key}");
+    }
+    assert_eq!(
+        redacted["metadata"]["delivery"]["remote_erasure_disclaimer"],
+        DISCLAIMER
+    );
+    let mut connection = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(dir.path().join(DATABASE))
+            .read_only(true),
+    )
+    .await
+    .unwrap();
+    let details: Vec<String> = sqlx::query_scalar(
+        "SELECT details FROM revoke_cleanup_events
+         WHERE namespace=? AND job_id=? AND node_kind='artifact' AND node_id=?
+           AND event_kind='local_export_directory_deleted'",
+    )
+    .bind(admin.namespace())
+    .bind(&job)
+    .bind(record_id("export-i"))
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+    assert_eq!(details.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&details[0]).unwrap(),
+        json!({"remote_erasure_not_claimed": true})
+    );
 }
 
 /// The delivery receipt and the class's protected consumption survive the real
@@ -486,142 +730,90 @@ async fn trace_export_cleanup_preserves_delivery_fact_and_explains_remote_residu
 async fn trace_export_receipt_and_consumption_survive_redaction() {
     let (_dir, store, admin) = store().await;
     let first = files("receipt");
-    let (first_digest, delivered_bytes) = local_export_tree_digest(&first).unwrap();
-    let publication = store
-        .publish_trace_export_tree(&admin, "export-h", &first, &first_digest)
+    let (first_digest, _) = local_export_tree_digest(&first).unwrap();
+    let mut record = reviewed_record(&store, &admin, "export-k", &first).await;
+    let staged = store
+        .stage_trace_export(&admin, &record_id("export-k"), &first)
         .await
         .unwrap();
-    // The delivered facts of the record, with the receipt the real published
-    // bytes earned; the record body itself is engine-owned, so this mirrors
-    // its fields exactly as stored.
-    let record = json!({
-        "schema_version": TRACE_EXPORT_SCHEMA,
-        "id": "trace-export-record-h",
-        "export_id": "export-h",
-        "phase": "delivered",
-        "prepare_job_id": "management-job-prepare",
-        "publish_job_id": "management-job-publish",
-        "candidate_digest": first_digest,
-        "members": first
-            .iter()
-            .map(|file| {
-                json!({
-                    "path": file.path,
-                    "digest_sha256": evo_core::hash(&file.bytes),
-                    "size_bytes": file.bytes.len(),
-                })
-            })
-            .collect::<Vec<_>>(),
-        "candidate_storage": {"staged": false, "paths": []},
-        "delivery": {
-            "status": "delivered",
-            "receipt_digest": publication.receipt.completion_receipt_digest,
-        },
-        "durability": {
-            "tree_fsynced": true,
-            "verified_tree_digest": publication.verified_tree_digest,
-        },
-        "local_cost": {"wall_seconds": 1, "bytes": delivered_bytes},
-        "source_snapshots": [],
-        "source_watermark_seq": null,
-        "source_watermark_digest": null,
-        "owner_actor": admin.actor(),
-        "created_at": 1,
-        "updated_at": 2,
+    let receipt = store
+        .publish_staged_trace_export(&admin, staged)
+        .await
+        .unwrap();
+    record["phase"] = json!("delivered");
+    record["delivery"] = json!({
+        "receipt_digest": receipt.completion_receipt_digest,
+        "local_export_ref": receipt.local_export_ref,
+        "remote_erasure_disclaimer": DISCLAIMER,
     });
+    let id = record_id("export-k");
     let mut session = store.session().await.unwrap();
     session
-        .put(
-            &admin,
-            "artifact",
-            "trace-export-record-h",
-            admin.actor(),
-            &record,
-        )
+        .put(&admin, "artifact", &id, admin.actor(), &record)
         .await
         .unwrap();
     let body = session
-        .object_row(&admin, "artifact", "trace-export-record-h")
+        .object_row(&admin, "artifact", &id)
         .await
         .unwrap()
         .unwrap()
         .body;
     let tombstone = redacted_object_body(
         "artifact",
-        "trace-export-record-h",
+        &id,
         &serde_json::from_str::<Value>(&body).unwrap(),
         &body,
     );
-    // Exactly the lifecycle retained keys survive, including the receipt.
     let retained = [
+        "export_id",
         "phase",
         "prepare_job_id",
         "publish_job_id",
         "candidate_digest",
         "members",
-        "candidate_storage",
         "delivery",
-        "durability",
         "local_cost",
         "source_snapshots",
-        "source_watermark_seq",
-        "source_watermark_digest",
         "owner_actor",
     ];
     for key in retained {
         assert_eq!(
-            tombstone["metadata"][key],
-            serde_json::from_str::<Value>(&body).unwrap()[key],
+            tombstone["metadata"][key], record[key],
             "the redaction keeps {key}"
         );
     }
     assert_eq!(
         tombstone["metadata"]["delivery"]["receipt_digest"],
-        json!(publication.receipt.completion_receipt_digest)
+        json!(receipt.completion_receipt_digest)
     );
-    assert_eq!(tombstone["metadata"]["phase"], json!("delivered"));
     session
-        .put(
-            &admin,
-            "artifact",
-            "trace-export-record-h",
-            admin.actor(),
-            &tombstone,
-        )
+        .put(&admin, "artifact", &id, admin.actor(), &tombstone)
         .await
         .unwrap();
     // The consumed history stays retained and read-only through the real gate.
     assert!(matches!(
-        session
-            .delete(&admin, "artifact", "trace-export-record-h")
-            .await,
+        session.delete(&admin, "artifact", &id).await,
         Err(Error::Conflict(reason)) if reason == "trace export history must be retained"
     ));
     assert!(matches!(
-        session
-            .put(
-                &admin,
-                "artifact",
-                "trace-export-record-h",
-                admin.actor(),
-                &record,
-            )
-            .await,
+        session.put(&admin, "artifact", &id, admin.actor(), &record).await,
         Err(Error::Conflict(reason)) if reason == "redacted trace export history is read only"
     ));
-    let stored = session
-        .object_row(&admin, "artifact", "trace-export-record-h")
-        .await
-        .unwrap()
-        .unwrap();
-    let stored: Value = serde_json::from_str(&stored.body).unwrap();
+    let stored: Value = serde_json::from_str(
+        &session
+            .object_row(&admin, "artifact", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+    )
+    .unwrap();
     assert_eq!(stored, tombstone);
-    assert_eq!(stored["original_schema"], json!(TRACE_EXPORT_SCHEMA));
     session.commit().await.unwrap();
     // The delivered tree itself is untouched by the record's redaction.
     assert!(
         store
-            .verify_trace_export_tree(&admin, "export-h", &first)
+            .verify_trace_export_tree(&admin, "export-k", &members(&first), &first_digest)
             .await
             .is_ok()
     );

@@ -151,9 +151,10 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
             matches!(&error, Error::Invalid(message) if message == match (entry.name, entry.execution) {
                 ("optimization.step", _) => "invalid management payload",
                 // trace.export migrated from the unwired set to its real
-                // handler: its strict DTO now refuses this incomplete boundary
-                // payload exactly like optimization.step does, with zero writes.
-                ("trace.export", _) => "invalid management payload",
+                // handler, whose requests are only the prepare and publish
+                // schemas: this boundary schema is neither, so it is refused
+                // as unsupported before any session, with zero writes.
+                ("trace.export", _) => "unsupported management payload schema",
                 (_, ExecutionKind::AsyncJob) => "management_operation_not_wired",
                 _ => "management operation requires dedicated route",
             }),
@@ -185,7 +186,7 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
             .await
             .unwrap_err();
         assert!(
-            matches!(&error, Error::Invalid(ref message) if message == "management_operation_plane_mismatch"),
+            matches!(error, Error::Invalid(ref message) if message == "management_operation_plane_mismatch"),
             "{name}: {error:?}"
         );
         assert_eq!(

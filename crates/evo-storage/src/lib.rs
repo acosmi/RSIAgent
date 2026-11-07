@@ -38,6 +38,8 @@ pub const TRACE_EXPORT_SCHEMA: &str = "rsia.trace_export.v1";
 /// tell "no proof of publication" apart from a drifted source closure.
 pub const TRACE_EXPORT_TREE_UNAVAILABLE: &str = "published trace export tree is unavailable";
 pub const MVP_MAX_TRACE_EXPORTS: u64 = 1_000;
+/// The directory root of published trace export trees under the store root.
+pub const TRACE_EXPORT_ROOT: &str = "trace-exports";
 /// Schema identifiers the capacity measurement recognises. They mirror the
 /// engine's persisted schema versions; the engine asserts they stay equal.
 pub const CAPACITY_MANAGEMENT_JOB_SCHEMA: &str = "rsia.management_job.v1";
@@ -203,9 +205,10 @@ pub enum ManagementOptimizationResultV2 {
     },
 }
 
-/// Closed `trace.export` job results. They reference the real export record,
-/// its frozen candidate digest and the phase actually reached; the candidate
-/// artifacts themselves stay in the record, never a second copy here.
+/// Closed `trace.export` job results: the real export record, its frozen
+/// candidate digest and, for the publish job, the delivery receipt the
+/// published bytes earned. The variant is the phase the job completed; the
+/// candidate artifacts stay in the record, never a second copy here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
 pub enum ManagementTraceExportResultV2 {
@@ -213,24 +216,11 @@ pub enum ManagementTraceExportResultV2 {
         export_id: String,
         record_id: String,
         candidate_digest: String,
-        phase: String,
     },
-    TraceExportReviewed {
-        export_id: String,
-        record_id: String,
-        candidate_digest: String,
-        phase: String,
-    },
-    /// The publish job's terminal success: the record reached `delivered`
-    /// after the manifest and every member were really on disk and digest
-    /// verified, and `receipt_digest` is the delivery receipt those bytes
-    /// earned. The candidate artifacts stay in the record, never a second
-    /// copy here.
     TraceExportDelivered {
         export_id: String,
         record_id: String,
         candidate_digest: String,
-        phase: String,
         receipt_digest: String,
     },
 }
@@ -663,17 +653,27 @@ pub struct LocalExportReceipt {
     pub completion_receipt_digest: String,
 }
 
-/// The FS facts of one trace export tree publication: the delivery receipt the
-/// published bytes earn, the tree digest recomputed from the published
-/// directory's real bytes, whether this call fsynced the tree it verified, and
-/// whether this call's rename published it or a prior (crashed) call already
-/// had published the identical tree.
-#[derive(Debug, Clone)]
-pub struct TraceExportTreePublication {
-    pub receipt: LocalExportReceipt,
-    pub verified_tree_digest: String,
-    pub tree_fsynced: bool,
-    pub published_now: bool,
+/// One frozen member of a trace export candidate: its package path, content
+/// digest and size. The bytes themselves never enter a record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceExportMember {
+    pub path: String,
+    pub digest_sha256: String,
+    pub size_bytes: u64,
+}
+
+/// A frozen trace export candidate in private staging, already verified
+/// against its frozen digest. It is never downloadable: dropping it removes
+/// the staging directory, and only [`Store::publish_staged_trace_export`]
+/// moves it to the formal location.
+pub struct StagedTraceExport {
+    staging: PrivateStagedDirectory,
+    identity: Vec<LocalExportIdentityEntry>,
+    record_id: String,
+    export_id: String,
+    candidate_digest: String,
+    receipt: LocalExportReceipt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -923,84 +923,100 @@ async fn count_management_job_capacity(
 async fn count_objects_all_namespaces(
     conn: &mut sqlx::SqliteConnection,
     kind: &str,
-    schema: Option<&str>,
 ) -> Result<u64> {
-    if kind == "artifact" && schema == Some(TRACE_EXPORT_SCHEMA) {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT id,body FROM objects WHERE kind='artifact' AND (
-             json_extract(body,'$.schema_version')=? OR (
-               json_extract(body,'$.schema_version')='rsia.redacted.v1'
-               AND json_extract(body,'$.original_schema')=?))",
-        )
-        .bind(TRACE_EXPORT_SCHEMA)
-        .bind(TRACE_EXPORT_SCHEMA)
-        .fetch_all(&mut *conn)
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM objects WHERE kind=?")
+        .bind(kind)
+        .fetch_one(&mut *conn)
         .await
         .map_err(internal)?;
-        for (id, raw) in &rows {
-            if !is_trace_export_record(id, &lifecycle::parse_strict_json(raw)?)? {
-                return Err(Error::Conflict(
-                    "trace export capacity identity differs".into(),
-                ));
-            }
-        }
-        return u64::try_from(rows.len()).map_err(|_| Error::Internal);
-    }
+    count_to_u64(count)
+}
+
+/// Trace export records across every namespace, live or redacted: redacted
+/// history keeps its slot, so the instance bound is never freed by revocation.
+async fn count_trace_exports_all_namespaces(conn: &mut sqlx::SqliteConnection) -> Result<u64> {
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM objects WHERE kind=?
-         AND (? IS NULL OR json_extract(body,'$.schema_version')=?)",
+        "SELECT COUNT(*) FROM objects WHERE kind='artifact' AND (
+           json_extract(body,'$.schema_version')=?1 OR (
+             json_extract(body,'$.schema_version')='rsia.redacted.v1'
+             AND json_extract(body,'$.original_schema')=?1))",
     )
-    .bind(kind)
-    .bind(schema)
-    .bind(schema)
+    .bind(TRACE_EXPORT_SCHEMA)
     .fetch_one(&mut *conn)
     .await
     .map_err(internal)?;
     count_to_u64(count)
 }
 
-/// A retained class, never proof that its source or delivery is authorized.
+/// The retained trace export class, live or redacted; never proof that its
+/// source or delivery is authorized.
 pub(crate) fn is_trace_export_record(id: &str, value: &Value) -> Result<bool> {
-    if value["schema_version"] == TRACE_EXPORT_SCHEMA {
-        if value["id"].as_str() != Some(id) {
-            return Err(Error::Conflict(
-                "trace export physical identity differs".into(),
-            ));
-        }
-        return Ok(true);
-    }
-    if value["schema_version"] != "rsia.redacted.v1"
-        || value["original_schema"] != TRACE_EXPORT_SCHEMA
-    {
-        return Ok(false);
-    }
-    let fields = [
-        "id",
-        "schema_version",
-        "state",
-        "original_kind",
-        "original_schema",
-        "original_digest",
-        "metadata",
-    ];
-    if value.as_object().is_none_or(|object| {
-        object.len() != fields.len() || fields.iter().any(|key| !object.contains_key(*key))
-    }) || value["id"].as_str() != Some(id)
-        || value["state"] != "source_revoked"
-        || value["original_kind"] != "artifact"
-        || !value["metadata"].is_object()
-        || value["original_digest"].as_str().is_none_or(|digest| {
-            digest.len() != 64
-                || !digest
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        })
-    {
+    let class = value["schema_version"] == TRACE_EXPORT_SCHEMA
+        || (value["schema_version"] == "rsia.redacted.v1"
+            && value["original_schema"] == TRACE_EXPORT_SCHEMA);
+    if class && value["id"].as_str() != Some(id) {
         return Err(Error::Conflict(
-            "trace export redaction shape differs".into(),
+            "trace export physical identity differs".into(),
         ));
     }
-    Ok(true)
+    Ok(class)
+}
+
+/// The publication fence of one trace export record inside the caller's
+/// transaction. A no-op write takes the database write lock first, so no
+/// revocation can commit between this check and the caller's next step. The
+/// record must be the live `reviewed` publication, and no run or artifact of
+/// its typed source closure may carry a revocation tombstone or a redaction —
+/// the closure, not the namespace watermark, so an unrelated revocation never
+/// blocks it. Returns the record's export id and frozen candidate digest.
+async fn trace_export_publication_fence(
+    session: &mut Session,
+    ctx: &Context,
+    record_id: &str,
+) -> Result<(String, String)> {
+    let fenced = sqlx::query(
+        "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
+    )
+    .bind(ctx.namespace())
+    .bind(record_id)
+    .execute(&mut *session.tx)
+    .await
+    .map_err(internal)?;
+    if fenced.rows_affected() != 1 {
+        return Err(Error::NotFound);
+    }
+    let record: Value = session.need(ctx, "artifact", record_id).await?;
+    let (Some(export_id), Some(candidate_digest)) = (
+        record["export_id"].as_str(),
+        record["candidate_digest"].as_str(),
+    ) else {
+        return Err(Error::Conflict(
+            "trace export record is not a reviewed publication".into(),
+        ));
+    };
+    if record["schema_version"] != TRACE_EXPORT_SCHEMA || record["phase"] != "reviewed" {
+        return Err(Error::Conflict(
+            "trace export record is not a reviewed publication".into(),
+        ));
+    }
+    let closure = upstream_rows_in_tx(
+        &mut session.tx,
+        ctx.namespace(),
+        &[("artifact", record_id)],
+        10_000,
+        true,
+    )
+    .await?
+    .ok_or_else(|| Error::Conflict("trace export source closure is unbounded".into()))?;
+    if closure
+        .iter()
+        .any(|node| node.tombstone.is_some() || node.redacted)
+    {
+        return Err(Error::Conflict(
+            "trace export source closure was revoked".into(),
+        ));
+    }
+    Ok((export_id.into(), candidate_digest.into()))
 }
 
 /// Imported events of every known result version, v1 and v2 alike, across all
@@ -1200,7 +1216,37 @@ pub fn local_export_receipt(
     tree_digest: &str,
     delivered_bytes: u64,
 ) -> Result<LocalExportReceipt> {
-    let local_export_ref = local_export_ref(namespace, export_id);
+    directory_receipt(
+        local_export_ref(namespace, export_id),
+        export_id,
+        tree_digest,
+        delivered_bytes,
+    )
+}
+
+fn trace_export_receipt(
+    namespace: &str,
+    export_id: &str,
+    tree_digest: &str,
+    delivered_bytes: u64,
+) -> Result<LocalExportReceipt> {
+    directory_receipt(
+        format!(
+            "{TRACE_EXPORT_ROOT}/{}/{export_id}",
+            hash(namespace.as_bytes())
+        ),
+        export_id,
+        tree_digest,
+        delivered_bytes,
+    )
+}
+
+fn directory_receipt(
+    local_export_ref: String,
+    export_id: &str,
+    tree_digest: &str,
+    delivered_bytes: u64,
+) -> Result<LocalExportReceipt> {
     let completion_receipt_digest = fingerprint(&(
         "local_directory_v1",
         export_id,
@@ -1625,131 +1671,37 @@ async fn ensure_unlinked_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Build one member directory chain under the trace export staging root.
-/// Every missing directory is created with an explicit 0700 mode; an ancestor
-/// that already exists as a symlink or a non-directory is refused — a broken
-/// or foreign parent is never chmodded into shape, and an existing real
-/// directory keeps its own observed permissions.
-fn ensure_trace_staging_directory(root: &Path, directory: &Path) -> Result<()> {
-    let relative = directory
-        .strip_prefix(root)
-        .map_err(|_| Error::Invalid("trace export staging path escapes its private root".into()))?;
-    let mut built = root.to_path_buf();
-    for segment in relative.iter() {
-        built = built.join(segment);
-        match std::fs::symlink_metadata(&built) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                    return Err(Error::Conflict(
-                        "trace export staging ancestor is linked or non-directory".into(),
-                    ));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    std::fs::DirBuilder::new()
-                        .mode(0o700)
-                        .create(&built)
-                        .map_err(internal)?;
-                }
-                #[cfg(not(unix))]
-                std::fs::create_dir(&built).map_err(internal)?;
-            }
-            Err(error) => return Err(internal(error)),
-        }
-    }
-    Ok(())
-}
-
-fn sync_directory_blocking(path: &Path) -> Result<()> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(internal)
-}
-
-/// The trace export private staging writer. Each member is created with
-/// `create_new` (NOREPLACE: an existing file is never overwritten) and an
-/// explicit 0600 mode, fsynced, then made read-only so the shared published-
-/// tree verifier accepts the staged tree; every parent directory is fsynced
-/// after its members and the staging root is fsynced last. The bytes are the
-/// caller's frozen candidate members; path, size and member limits were
-/// already enforced by [`local_export_tree_digest`].
-async fn write_trace_export_staging(root: &Path, files: &[LocalExportFile]) -> Result<()> {
-    let root = root.to_path_buf();
-    let members: Vec<(String, Vec<u8>)> = files
-        .iter()
-        .map(|file| (file.path.clone(), file.bytes.clone()))
-        .collect();
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        use std::io::Write;
-        for (path, bytes) in &members {
-            let target = root.join(path);
-            let parent = target
-                .parent()
-                .ok_or_else(|| Error::Invalid("trace export member lacks a parent".into()))?;
-            ensure_trace_staging_directory(&root, parent)?;
-            #[cfg(unix)]
-            let mut file = {
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&target)
-                    .map_err(|error| {
-                        if error.kind() == std::io::ErrorKind::AlreadyExists {
-                            Error::Conflict("trace export staging member already exists".into())
-                        } else {
-                            internal(error)
-                        }
-                    })?
-            };
-            #[cfg(not(unix))]
-            let mut file = std::fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&target)
-                .map_err(internal)?;
-            file.write_all(bytes).map_err(internal)?;
-            file.sync_all().map_err(internal)?;
-            let mut permissions = file.metadata().map_err(internal)?.permissions();
-            permissions.set_readonly(true);
-            std::fs::set_permissions(&target, permissions).map_err(internal)?;
-        }
-        let mut parents = std::collections::BTreeSet::new();
-        for (path, _) in &members {
-            let mut parent = Path::new(path).parent();
-            while let Some(directory) = parent {
-                if !directory.as_os_str().is_empty() {
-                    parents.insert(root.join(directory));
-                }
-                parent = directory.parent();
-            }
-        }
-        for parent in parents {
-            sync_directory_blocking(&parent)?;
-        }
-        sync_directory_blocking(&root)
-    })
-    .await
-    .map_err(internal)?
-}
-
 async fn verify_local_export_directory(
     root: &Path,
     expected: &[LocalExportFile],
 ) -> Result<(String, u64)> {
+    verify_local_export_members(
+        root,
+        expected
+            .iter()
+            .map(|file| {
+                (
+                    file.path.clone(),
+                    (hash(&file.bytes), file.bytes.len() as u64),
+                )
+            })
+            .collect(),
+    )
+    .await
+}
+
+/// The published-tree verifier over expected `path -> (digest, size)`: every
+/// member must be a read-only, unlinked regular file with exactly that digest
+/// and size, with no extra member or directory; the tree digest is recomputed
+/// from the real bytes read.
+async fn verify_local_export_members(
+    root: &Path,
+    expected_map: std::collections::BTreeMap<String, (String, u64)>,
+) -> Result<(String, u64)> {
     let root = root.to_path_buf();
-    let mut expected_map = std::collections::BTreeMap::new();
     let mut expected_directories = std::collections::BTreeSet::new();
-    for file in expected {
-        expected_map.insert(
-            file.path.clone(),
-            (hash(&file.bytes), file.bytes.len() as u64),
-        );
-        let mut parent = Path::new(&file.path).parent();
+    for path in expected_map.keys() {
+        let mut parent = Path::new(path).parent();
         while let Some(directory) = parent {
             if directory.as_os_str().is_empty() {
                 break;
@@ -2466,6 +2418,19 @@ impl Store {
             .join(export_id))
     }
 
+    /// Trace export trees live under their own root,
+    /// `trace-exports/<namespace-hash>/<export_id>`, so a trace export id never
+    /// shares a directory space with an E16 package export id.
+    pub fn trace_export_directory(&self, ctx: &Context, export_id: &str) -> Result<PathBuf> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        validate_export_id(export_id)?;
+        Ok(self
+            .root
+            .join(TRACE_EXPORT_ROOT)
+            .join(hash(ctx.namespace().as_bytes()))
+            .join(export_id))
+    }
+
     pub async fn snapshot_local_export_dependencies(
         &self,
         ctx: &Context,
@@ -2860,204 +2825,143 @@ impl Store {
         session.commit().await
     }
 
-    /// Publish the frozen trace export candidate tree under
-    /// `exports/<namespace-hash>/<export_id>`, sharing the E16 local export
-    /// private IO layer (staging, digest re-verification, identity checks,
-    /// NOREPLACE rename) without any of the attempt.v2 bookkeeping: this
-    /// method opens no database session and checks no fence or watermark —
-    /// the caller owns those in its own transactions. The blob lock is taken
-    /// only around the rename barrier and never while any database connection
-    /// is held. The caller's frozen digest is the authority: bytes hashing to
-    /// anything else are refused before the first staging write of a member.
-    pub async fn publish_trace_export_tree(
+    /// Stage the frozen candidate of one `reviewed` trace export record. The
+    /// publication fence is checked before the first filesystem write, so a
+    /// record that is not the reviewed one or whose source closure was revoked
+    /// leaves no filesystem effect at all. The bytes must hash to the record's
+    /// frozen candidate digest; they are then written to private staging and
+    /// re-verified. The result is private material, never downloadable.
+    pub async fn stage_trace_export(
         &self,
         ctx: &Context,
-        export_id: &str,
+        record_id: &str,
         files: &[LocalExportFile],
-        frozen_candidate_digest: &str,
-    ) -> Result<TraceExportTreePublication> {
+    ) -> Result<StagedTraceExport> {
         ctx.require(&[evo_core::Role::Admin])?;
-        validate_export_id(export_id)?;
+        let (export_id, candidate_digest) = {
+            let mut session = self.session().await?;
+            // Dropping the session rolls back the fence's no-op write.
+            trace_export_publication_fence(&mut session, ctx, record_id).await?
+        };
         let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
-        if tree_digest != frozen_candidate_digest {
+        if tree_digest != candidate_digest {
             return Err(Error::Conflict(
                 "trace export candidate bytes differ from the frozen candidate".into(),
             ));
         }
         let receipt =
-            local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
-        let namespace_hash = hash(ctx.namespace().as_bytes());
+            trace_export_receipt(ctx.namespace(), &export_id, &tree_digest, delivered_bytes)?;
         let staging_root = self.root.join(".export-staging");
         ensure_unlinked_directory(&staging_root).await?;
-        let staging_parent = staging_root.join(&namespace_hash);
+        let staging_parent = staging_root.join(hash(ctx.namespace().as_bytes()));
         ensure_unlinked_directory(&staging_parent).await?;
         let staging_path = staging_parent.join(uuid::Uuid::new_v4().to_string());
-        // Controlled cleanup: the guard removes this attempt's own private
-        // staging residue on every failure path and is disarmed exactly when
-        // the directory has been renamed away. It never touches a published
-        // tree, another attempt's staging, or redacted history.
-        let mut staging = PrivateStagedDirectory::new(staging_path.clone());
-        {
-            #[cfg(unix)]
-            tokio::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&staging_path)
-                .await
-                .map_err(internal)?;
-            #[cfg(not(unix))]
-            tokio::fs::create_dir(&staging_path)
-                .await
-                .map_err(internal)?;
-        }
-        write_trace_export_staging(staging.path(), files).await?;
+        let staging = PrivateStagedDirectory::new(staging_path.clone());
+        tokio::fs::create_dir(&staging_path)
+            .await
+            .map_err(internal)?;
+        write_local_export_staging(staging.path(), files).await?;
         if verify_local_export_directory(staging.path(), files).await?
-            != (tree_digest.clone(), delivered_bytes)
+            != (tree_digest, delivered_bytes)
         {
             return Err(Error::Conflict("staged trace export tree changed".into()));
         }
-        let staging_identity = local_export_identity(staging.path()).await?;
+        let identity = local_export_identity(staging.path()).await?;
+        Ok(StagedTraceExport {
+            staging,
+            identity,
+            record_id: record_id.into(),
+            export_id,
+            candidate_digest,
+            receipt,
+        })
+    }
 
-        let final_path = self.local_export_directory(ctx, export_id)?;
+    /// Move a staged trace export to its formal directory. Under the blob lock
+    /// and a write-fenced transaction (no revocation can commit between this
+    /// check and the rename) the record must still be the same reviewed
+    /// publication with a live source closure, and the staged tree must be
+    /// unchanged; only then is it renamed NOREPLACE, never over an existing
+    /// tree. A refusal releases the staging through its guard. Nothing is
+    /// written to the database here: the caller records the delivery.
+    pub async fn publish_staged_trace_export(
+        &self,
+        ctx: &Context,
+        mut staged: StagedTraceExport,
+    ) -> Result<LocalExportReceipt> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        let final_path = self.trace_export_directory(ctx, &staged.export_id)?;
         let final_parent = final_path.parent().ok_or(Error::Internal)?;
-        ensure_unlinked_directory(&self.root.join("exports")).await?;
+        ensure_unlinked_directory(&self.root.join(TRACE_EXPORT_ROOT)).await?;
         ensure_unlinked_directory(final_parent).await?;
-        let mut preverified_final: Option<Vec<LocalExportIdentityEntry>> = None;
-        if tokio::fs::try_exists(&final_path).await.map_err(internal)? {
-            if verify_local_export_directory(&final_path, files).await?
-                != (tree_digest.clone(), delivered_bytes)
-            {
-                return Err(Error::Conflict("existing trace export tree differs".into()));
-            }
-            preverified_final = Some(local_export_identity(&final_path).await?);
-        }
-
         let _guard = self.blob_lock.write().await;
-        if local_export_identity(staging.path()).await? != staging_identity {
+        let mut session = self.session().await?;
+        if trace_export_publication_fence(&mut session, ctx, &staged.record_id).await?
+            != (staged.export_id.clone(), staged.candidate_digest.clone())
+        {
+            return Err(Error::Conflict(
+                "trace export record changed after staging".into(),
+            ));
+        }
+        if local_export_identity(staged.staging.path()).await? != staged.identity {
             return Err(Error::Conflict(
                 "staged trace export identity changed".into(),
             ));
         }
-        let published_now;
-        match &preverified_final {
-            Some(identity) => {
-                // An identical tree a prior (crashed) call already published:
-                // the rename is not repeated, only the equality under the
-                // lock. This attempt's staging temp is removed by its guard.
-                if local_export_identity(&final_path).await? != *identity {
-                    return Err(Error::Conflict(
-                        "existing trace export identity changed".into(),
-                    ));
-                }
-                published_now = false;
-            }
-            None => {
-                if tokio::fs::try_exists(&final_path).await.map_err(internal)? {
-                    return Err(Error::Conflict(
-                        "trace export target appeared after preflight".into(),
-                    ));
-                }
-                if !publish_blob_no_replace(staging.path(), &final_path)? {
-                    return Err(Error::Conflict(
-                        "trace export target raced after write fence".into(),
-                    ));
-                }
-                staging.disarm();
-                sync_directory(final_parent).await?;
-                if local_export_identity(&final_path).await? != staging_identity {
-                    return Err(Error::Conflict(
-                        "published trace export identity changed".into(),
-                    ));
-                }
-                published_now = true;
-            }
+        if !publish_blob_no_replace(staged.staging.path(), &final_path)? {
+            return Err(Error::Conflict("trace export target already exists".into()));
         }
-        // The digest recorded as "verified" is the one recomputed from the
-        // published directory's real bytes, never the input's self-assertion.
-        let (verified_tree_digest, verified_bytes) =
-            verify_local_export_directory(&final_path, files).await?;
-        if (verified_tree_digest.clone(), verified_bytes) != (tree_digest, delivered_bytes) {
-            return Err(Error::Conflict(
-                "published trace export tree changed".into(),
-            ));
-        }
-        Ok(TraceExportTreePublication {
-            receipt,
-            verified_tree_digest,
-            tree_fsynced: true,
-            published_now,
-        })
+        staged.staging.disarm();
+        sync_directory(final_parent).await?;
+        drop(session);
+        Ok(staged.receipt)
     }
 
-    /// Read-only proof that the published trace export tree is still the
-    /// exact frozen member set, returning the delivery receipt those bytes
-    /// earn. A missing or tampered tree is the `TRACE_EXPORT_TREE_UNAVAILABLE`
-    /// conflict, never a trigger to republish.
+    /// Read-only proof that a published trace export tree is still exactly the
+    /// frozen members (path, digest and size) and that the tree digest
+    /// recomputed from its real bytes is the frozen candidate digest; returns
+    /// the receipt those bytes earn. Nothing is regenerated: a missing,
+    /// partial, extra or tampered tree is `TRACE_EXPORT_TREE_UNAVAILABLE`,
+    /// never repaired and never a trigger to republish.
     pub async fn verify_trace_export_tree(
         &self,
         ctx: &Context,
         export_id: &str,
-        files: &[LocalExportFile],
+        members: &[TraceExportMember],
+        candidate_digest: &str,
     ) -> Result<LocalExportReceipt> {
-        ctx.require(&[evo_core::Role::Admin])?;
-        validate_export_id(export_id)?;
-        let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
-        let receipt =
-            local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
-        let path = self.local_export_directory(ctx, export_id)?;
-        if verify_local_export_directory(&path, files).await? != (tree_digest, delivered_bytes) {
-            return Err(Error::Conflict(TRACE_EXPORT_TREE_UNAVAILABLE.into()));
+        let path = self.trace_export_directory(ctx, export_id)?;
+        let unavailable = || Error::Conflict(TRACE_EXPORT_TREE_UNAVAILABLE.into());
+        match tokio::fs::symlink_metadata(&path).await {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(unavailable()),
+            Err(error) => return Err(internal(error)),
+            Ok(_) => {}
         }
-        Ok(receipt)
+        let expected = members
+            .iter()
+            .map(|member| {
+                (
+                    member.path.clone(),
+                    (member.digest_sha256.clone(), member.size_bytes),
+                )
+            })
+            .collect();
+        match verify_local_export_members(&path, expected).await {
+            Ok((tree_digest, delivered_bytes)) if tree_digest == candidate_digest => {
+                trace_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)
+            }
+            Ok(_) | Err(Error::Conflict(_)) => Err(unavailable()),
+            Err(error) => Err(error),
+        }
     }
 
-    /// A real durability pass over an already published tree: every member
-    /// file and every directory is fsynced now, so a completing writer
-    /// records a fact it observed itself instead of inheriting an unknown.
-    pub async fn fsync_trace_export_tree(
-        &self,
-        ctx: &Context,
-        export_id: &str,
-        files: &[LocalExportFile],
-    ) -> Result<()> {
-        ctx.require(&[evo_core::Role::Admin])?;
-        validate_export_id(export_id)?;
-        local_export_tree_digest(files)?;
-        let root = self.local_export_directory(ctx, export_id)?;
-        let members: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
-        let root = root.to_path_buf();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            use std::collections::BTreeSet;
-            let mut directories: BTreeSet<PathBuf> = BTreeSet::new();
-            for path in &members {
-                let member = root.join(path);
-                let metadata = std::fs::symlink_metadata(&member).map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        Error::Conflict(TRACE_EXPORT_TREE_UNAVAILABLE.into())
-                    } else {
-                        internal(error)
-                    }
-                })?;
-                if !metadata.file_type().is_file() {
-                    return Err(Error::Conflict(TRACE_EXPORT_TREE_UNAVAILABLE.into()));
-                }
-                File::open(&member)
-                    .and_then(|file| file.sync_all())
-                    .map_err(internal)?;
-                let mut parent = member.parent();
-                while let Some(directory) = parent {
-                    if !directory.as_os_str().is_empty() {
-                        directories.insert(directory.to_path_buf());
-                    }
-                    parent = directory.parent();
-                }
-            }
-            for directory in directories {
-                sync_directory_blocking(&directory)?;
-            }
-            sync_directory_blocking(&root)
-        })
-        .await
-        .map_err(internal)?
+    /// Make an already published trace export rename durable: the tree and
+    /// its parent directory are fsynced, so crash recovery records a delivery
+    /// whose directory entry it has itself made durable.
+    pub async fn sync_trace_export_tree(&self, ctx: &Context, export_id: &str) -> Result<()> {
+        let path = self.trace_export_directory(ctx, export_id)?;
+        sync_directory(&path).await?;
+        sync_directory(path.parent().ok_or(Error::Internal)?).await
     }
 
     /// Read a namespace-scoped content blob for a trusted management consumer.
@@ -3197,8 +3101,8 @@ impl Session {
             .map_err(|_| Error::Invalid("capacity clock is out of range".into()))?;
         let runs = count_runs_all_namespaces(&mut self.tx).await?;
         let imported_events = sum_imported_events_all_namespaces(&mut self.tx).await?;
-        let event_objects = count_objects_all_namespaces(&mut self.tx, "event", None).await?;
-        let skills = count_objects_all_namespaces(&mut self.tx, "candidate", None).await?;
+        let event_objects = count_objects_all_namespaces(&mut self.tx, "event").await?;
+        let skills = count_objects_all_namespaces(&mut self.tx, "candidate").await?;
         let exploration_nodes: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM objects WHERE kind='artifact'
                AND json_extract(body,'$.schema_version')=?
@@ -3414,7 +3318,7 @@ impl Session {
         }
         let used = sum_imported_events_all_namespaces(&mut self.tx)
             .await?
-            .checked_add(count_objects_all_namespaces(&mut self.tx, "event", None).await?)
+            .checked_add(count_objects_all_namespaces(&mut self.tx, "event").await?)
             .ok_or(Error::Internal)?;
         if used.checked_add(delta).is_none_or(|total| total > limit) {
             return Err(Error::Conflict(format!(
@@ -3574,9 +3478,16 @@ impl Session {
         if body.len() > 4 * 1024 * 1024 {
             return Err(Error::Invalid("object exceeds 4 MiB".into()));
         }
-        let value: Value = serde_json::from_str(&body).map_err(internal)?;
-        let trace_class = kind == "artifact" && is_trace_export_record(id, &value)?;
-        if trace_class {
+        // Only an artifact body that names the trace export schema can be in
+        // that class (serde never escapes its ASCII), so no other put parses.
+        let trace_value = if kind == "artifact" && body.contains(TRACE_EXPORT_SCHEMA) {
+            let value: Value = serde_json::from_str(&body).map_err(internal)?;
+            is_trace_export_record(id, &value)?.then_some(value)
+        } else {
+            None
+        };
+        let trace_class = trace_value.is_some();
+        if let Some(value) = trace_value {
             ctx.require(&[Role::Admin])?;
             let previous: Option<String> = sqlx::query_scalar(
                 "SELECT body FROM objects WHERE namespace=? AND kind='artifact' AND id=?",
@@ -3612,12 +3523,7 @@ impl Session {
                         "trace export redaction requires its original record".into(),
                     ));
                 }
-                let used = count_objects_all_namespaces(
-                    &mut self.tx,
-                    "artifact",
-                    Some(TRACE_EXPORT_SCHEMA),
-                )
-                .await?;
+                let used = count_trace_exports_all_namespaces(&mut self.tx).await?;
                 if used >= MVP_MAX_TRACE_EXPORTS {
                     return Err(mvp_capacity_exceeded(
                         "trace exports",
@@ -3665,12 +3571,13 @@ impl Session {
             .fetch_optional(&mut *self.tx)
             .await
             .map_err(internal)?;
-            if let Some(raw) = retained {
-                if is_trace_export_record(id, &lifecycle::parse_strict_json(&raw)?)? {
-                    return Err(Error::Conflict(
-                        "trace export history must be retained".into(),
-                    ));
-                }
+            if let Some(raw) = retained
+                && raw.contains(TRACE_EXPORT_SCHEMA)
+                && is_trace_export_record(id, &lifecycle::parse_strict_json(&raw)?)?
+            {
+                return Err(Error::Conflict(
+                    "trace export history must be retained".into(),
+                ));
             }
         }
         sqlx::query("DELETE FROM objects WHERE namespace=? AND kind=? AND id=?")

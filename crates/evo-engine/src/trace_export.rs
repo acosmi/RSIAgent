@@ -1,7 +1,8 @@
-//! Private in-memory Native candidates from authenticated local service facts.
-//! These bytes contain prospective scan/review declarations. They are not a
-//! review receipt or a deliverable; publication must bind a real Admin decision
-//! to these exact bytes after the complete publication checks.
+//! Native trace export from authenticated local service facts: private
+//! in-memory candidates, and the export record that binds the Admin publish
+//! decision to those exact frozen bytes. Candidate bytes carry prospective
+//! scan/review declarations; they are neither a review receipt nor a
+//! deliverable until the fenced publication records its delivery.
 
 use crate::evidence::{
     SERVICE_FACTS_LICENSE, SERVICE_FACTS_RECIPIENT, ServiceFactSourceV1, load_stored_source,
@@ -17,7 +18,7 @@ use serde_json::json;
 /// The actual Git identity recorded when this package was compiled. An unknown
 /// or dirty source does not disable readers; it cannot create Native candidates.
 pub fn compiled_exporter_identity() -> Result<NativeTraceExporter> {
-    let commit = option_env!("RSIA_EXPORTER_COMMIT").unwrap_or("unknown");
+    let commit = env!("RSIA_EXPORTER_COMMIT");
     if commit.len() != 40
         || !commit
             .bytes()
@@ -44,6 +45,14 @@ pub async fn prepare_native_candidate(
 ) -> Result<Vec<u8>> {
     ctx.require(&[Role::Admin])?;
     identifier(source_id)?;
+    native_candidate_bytes(ctx, session, source_id).await
+}
+
+async fn native_candidate_bytes(
+    ctx: &Context,
+    session: &mut Session,
+    source_id: &str,
+) -> Result<Vec<u8>> {
     let exporter = compiled_exporter_identity()?;
     let (source, source_bytes) = authenticated_native_source(ctx, session, source_id).await?;
 
@@ -104,7 +113,6 @@ pub struct NativeCandidateMembers {
     pub candidate_digest: String,
     pub total_bytes: u64,
     pub source_snapshots: Vec<NativeSourceSnapshot>,
-    pub source_watermark: Option<(i64, String)>,
 }
 
 /// Original storage provenance captured after the real Native source loader.
@@ -182,17 +190,16 @@ pub async fn prepare_native_members(
     source_ids: &[String],
 ) -> Result<NativeCandidateMembers> {
     ctx.require(&[Role::Admin])?;
-    if source_ids.is_empty() || source_ids.len() > crate::packages::MAX_FILES - 2 {
-        return Err(Error::Invalid(
-            "native trace source count is invalid".into(),
-        ));
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for id in source_ids {
-        if !seen.insert(id) {
-            return Err(Error::Invalid("duplicate native trace source".into()));
-        }
-    }
+    native_members(ctx, session, source_ids).await
+}
+
+/// The candidate builder behind the Admin entries; the source list was
+/// validated once at the request boundary.
+pub(crate) async fn native_members(
+    ctx: &Context,
+    session: &mut Session,
+    source_ids: &[String],
+) -> Result<NativeCandidateMembers> {
     let mut files = Vec::with_capacity(source_ids.len() + 2);
     let mut sources = Vec::with_capacity(source_ids.len());
     let mut source_snapshots = Vec::with_capacity(source_ids.len());
@@ -200,7 +207,7 @@ pub async fn prepare_native_members(
         let path = format!("traces/{index:04}.json");
         files.push(evo_storage::LocalExportFile {
             path: path.clone(),
-            bytes: prepare_native_candidate(ctx, session, source_id).await?,
+            bytes: native_candidate_bytes(ctx, session, source_id).await?,
         });
         let row = session
             .object_row(ctx, "run", source_id)
@@ -250,13 +257,11 @@ pub async fn prepare_native_members(
         ));
     }
     let (candidate_digest, total_bytes) = evo_storage::local_export_tree_digest(&files)?;
-    let source_watermark = session.watermark(ctx).await?;
     Ok(NativeCandidateMembers {
         files,
         candidate_digest,
         total_bytes,
         source_snapshots,
-        source_watermark,
     })
 }
 
@@ -330,49 +335,13 @@ async fn authenticated_native_source(
     Ok((source, authority.record.body.len() as u64))
 }
 
-/// Recheck the real captured sources without regenerating any frozen member.
-/// This reader grants neither review nor delivery and never reads a caller clock.
-pub async fn verify_native_source_snapshots(
-    ctx: &Context,
-    session: &mut Session,
-    snapshots: &[NativeSourceSnapshot],
-    watermark: Option<&(i64, String)>,
-) -> Result<()> {
-    ctx.require(&[Role::Admin])?;
-    if snapshots.is_empty() || snapshots.len() > crate::packages::MAX_FILES - 2 {
-        return Err(Error::Invalid(
-            "native trace source count is invalid".into(),
-        ));
-    }
-    for snapshot in snapshots {
-        identifier(&snapshot.source_id)?;
-        authenticated_native_source(ctx, session, &snapshot.source_id).await?;
-        let row = session
-            .object_row(ctx, "run", &snapshot.source_id)
-            .await?
-            .ok_or(Error::NotFound)?;
-        if row.owner != snapshot.owner_actor
-            || evo_core::hash(row.body.as_bytes()) != snapshot.storage_body_sha256
-        {
-            return Err(Error::Conflict(
-                "native trace source snapshot changed".into(),
-            ));
-        }
-    }
-    if session.watermark(ctx).await?.as_ref() != watermark {
-        return Err(Error::Conflict(
-            "native trace source watermark changed".into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Phases the export record actually moves through. Every variant names a real
-/// producer: the prepare job owns `prepared`, its publish decision `reviewed`,
-/// and the publication chain owns `delivered`, `aborted` (a pre-publication
-/// failure that removed only its own staging temp) and `failed` (a partial
-/// commit after real bytes reached the local export surface). `revoked` still
-/// has no writer — the revocation cleanup owns it later.
+/// Phases of the export record, each with one real writer: the prepare job
+/// writes `prepared`; its one publish job's decision transaction `reviewed`;
+/// the fenced publication's completion (or crash recovery that proves the
+/// exact published tree) `delivered`; a publication refused before its formal
+/// rename `aborted`. A revoked source turns the record into the lifecycle
+/// redaction (`rsia.redacted.v1`, state `source_revoked`): that cleanup removes
+/// the published tree, keeps the delivery facts, and is never served as live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TraceExportPhase {
@@ -380,67 +349,18 @@ pub(crate) enum TraceExportPhase {
     Reviewed,
     Delivered,
     Aborted,
-    Failed,
-    Revoked,
 }
 
-/// The wire word of a phase, shared by the record, the job result and the
-/// status view so all three name the same closed vocabulary.
-pub(crate) fn trace_phase_wire(phase: TraceExportPhase) -> Result<String> {
-    serde_json::to_value(phase)
-        .map_err(|_| Error::Internal)?
-        .as_str()
-        .map(str::to_owned)
-        .ok_or(Error::Internal)
-}
-
-/// One exact member of the frozen candidate: its package path, its content
-/// digest and its size. The bytes themselves never enter the record.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TraceExportMember {
-    pub path: String,
-    pub digest_sha256: String,
-    pub size_bytes: u64,
-}
-
-/// Where the frozen candidate bytes physically live. The publication chain
-/// keeps no private staging behind: its staging temp is either renamed into
-/// the published tree or removed by its own guard, and the published tree is
-/// referenced only through digests — never a private token or absolute path.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TraceExportCandidateStorage {
-    pub staged: bool,
-    pub paths: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TraceExportDeliveryStatus {
-    NotDelivered,
-    Delivered,
-}
-
-/// The delivery fact of the export. `delivered` is written only after the
-/// manifest and every member were really on disk and digest verified, with
-/// the receipt digest those bytes earned.
+/// The delivery fact, written only after the formal tree was renamed under
+/// the publication fence: the receipt those exact bytes earned, the local
+/// scope they were delivered to, and the residual statement that a later
+/// local revocation cannot erase copies already taken from that directory.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TraceExportDelivery {
-    pub status: TraceExportDeliveryStatus,
-    pub receipt_digest: Option<String>,
-}
-
-/// Durability facts about the published tree: `tree_fsynced` is true only
-/// when the writing completion itself fsynced the tree it verified, and
-/// `verified_tree_digest` is the digest recomputed from the published
-/// directory's real bytes. An unknown fact stays unset, never guessed.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct TraceExportDurability {
-    pub tree_fsynced: bool,
-    pub verified_tree_digest: Option<String>,
+    pub receipt_digest: String,
+    pub local_export_ref: String,
+    pub remote_erasure_disclaimer: String,
 }
 
 /// Only really observed local cost: `wall_seconds` is measured elapsed time
@@ -455,9 +375,9 @@ pub(crate) struct TraceExportLocalCost {
 
 /// The `rsia.trace_export.v1` main record (physical kind `artifact`): one
 /// logical export with its frozen candidate identity, the captured source
-/// snapshots, the revocation watermark and the phases its real producers
-/// advanced it through. It never carries the candidate bytes, private tokens
-/// or absolute paths, and at most one prepare and one publish job may own it.
+/// snapshots and the phases its real producers advanced it through. It never
+/// carries the candidate bytes, private tokens or absolute paths, and at most
+/// one prepare and one publish job may own it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TraceExportRecord {
@@ -468,40 +388,18 @@ pub(crate) struct TraceExportRecord {
     pub prepare_job_id: String,
     pub publish_job_id: Option<String>,
     pub candidate_digest: String,
-    pub members: Vec<TraceExportMember>,
-    pub candidate_storage: TraceExportCandidateStorage,
-    pub delivery: TraceExportDelivery,
-    pub durability: TraceExportDurability,
+    pub members: Vec<evo_storage::TraceExportMember>,
+    pub delivery: Option<TraceExportDelivery>,
     pub local_cost: TraceExportLocalCost,
     pub source_snapshots: Vec<NativeSourceSnapshot>,
-    pub source_watermark_seq: Option<i64>,
-    pub source_watermark_digest: Option<String>,
     pub owner_actor: String,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
-impl TraceExportRecord {
-    fn source_watermark(&self) -> Option<(i64, String)> {
-        match (
-            self.source_watermark_seq,
-            self.source_watermark_digest.clone(),
-        ) {
-            (Some(seq), Some(digest)) => Some((seq, digest)),
-            _ => None,
-        }
-    }
-}
-
-/// The physical record id of one logical export, shared by every writer and
-/// reader of that export in the namespace.
+/// The physical record id of one logical export (its id was validated at the
+/// request boundary), shared by every writer and reader of that export.
 pub(crate) fn trace_export_record_id(export_id: &str) -> Result<String> {
-    identifier(export_id)?;
-    if export_id.contains(['.', ':']) {
-        return Err(Error::Invalid(
-            "trace export identifiers are single segment".into(),
-        ));
-    }
     Ok(format!(
         "trace-export-{}",
         &fingerprint(&(evo_storage::TRACE_EXPORT_SCHEMA, export_id))?[..24]
@@ -515,7 +413,6 @@ pub(crate) async fn load_live_record(
     session: &mut Session,
     export_id: &str,
 ) -> Result<Option<TraceExportRecord>> {
-    ctx.require(&[Role::Admin])?;
     let record_id = trace_export_record_id(export_id)?;
     let Some(row) = session.object_row(ctx, "artifact", &record_id).await? else {
         return Ok(None);
@@ -544,10 +441,10 @@ pub(crate) async fn load_live_record(
 }
 
 /// First write of the main record inside the prepare job's own transaction.
-/// The storage `put` gate carries the Admin role, the all-instance first-slot
-/// quota and the immutable classification; this writer adds the one-prepare-
-/// job-per-record rule: a record another prepare job owns is a `Conflict`
-/// with zero writes, and this job's own record replays unchanged.
+/// The storage `put` gate carries the all-instance quota and the immutable
+/// classification; this writer adds the one-prepare-job-per-record rule: a
+/// record another prepare job owns is a `Conflict` with zero writes, and this
+/// job's own record replays unchanged.
 pub(crate) async fn write_prepared_record(
     ctx: &Context,
     session: &mut Session,
@@ -556,12 +453,9 @@ pub(crate) async fn write_prepared_record(
     members: &NativeCandidateMembers,
     started_at: i64,
 ) -> Result<TraceExportRecord> {
-    ctx.require(&[Role::Admin])?;
-    identifier(job_id)?;
-    let record_id = trace_export_record_id(export_id)?;
     let record = TraceExportRecord {
         schema_version: evo_storage::TRACE_EXPORT_SCHEMA.into(),
-        id: record_id.clone(),
+        id: trace_export_record_id(export_id)?,
         export_id: export_id.into(),
         phase: TraceExportPhase::Prepared,
         prepare_job_id: job_id.into(),
@@ -570,62 +464,30 @@ pub(crate) async fn write_prepared_record(
         members: members
             .files
             .iter()
-            .map(|file| TraceExportMember {
+            .map(|file| evo_storage::TraceExportMember {
                 path: file.path.clone(),
                 digest_sha256: hash(&file.bytes),
                 size_bytes: file.bytes.len() as u64,
             })
             .collect(),
-        candidate_storage: TraceExportCandidateStorage {
-            staged: false,
-            paths: Vec::new(),
-        },
-        delivery: TraceExportDelivery {
-            status: TraceExportDeliveryStatus::NotDelivered,
-            receipt_digest: None,
-        },
-        durability: TraceExportDurability {
-            tree_fsynced: false,
-            verified_tree_digest: None,
-        },
+        delivery: None,
         local_cost: TraceExportLocalCost {
             wall_seconds: elapsed_seconds(started_at)?,
             bytes: members.total_bytes,
         },
         source_snapshots: members.source_snapshots.clone(),
-        source_watermark_seq: members.source_watermark.as_ref().map(|(seq, _)| *seq),
-        source_watermark_digest: members
-            .source_watermark
-            .as_ref()
-            .map(|(_, digest)| digest.clone()),
         owner_actor: ctx.actor().into(),
         created_at: now()?,
         updated_at: now()?,
     };
-    if let Some(row) = session.object_row(ctx, "artifact", &record_id).await? {
-        let value = evo_storage::lifecycle::parse_strict_json(&row.body)?;
-        if value
-            .get("schema_version")
-            .and_then(|schema| schema.as_str())
-            != Some(evo_storage::TRACE_EXPORT_SCHEMA)
-        {
-            return Err(Error::Conflict(
-                "trace export identity belongs to another record class".into(),
-            ));
-        }
-        let old: TraceExportRecord = serde_json::from_value(value)
-            .map_err(|_| Error::Conflict("trace export record shape differs".into()))?;
+    if let Some(old) = load_live_record(ctx, session, export_id).await? {
         if old.prepare_job_id != job_id {
             return Err(Error::Conflict(
                 "trace export already has its one prepare job".into(),
             ));
         }
-        if old.export_id != record.export_id
-            || old.candidate_digest != record.candidate_digest
-            || old.members != record.members
+        if old.candidate_digest != record.candidate_digest
             || old.source_snapshots != record.source_snapshots
-            || old.source_watermark_seq != record.source_watermark_seq
-            || old.source_watermark_digest != record.source_watermark_digest
         {
             return Err(Error::Conflict(
                 "trace export candidate changed under its prepare job".into(),
@@ -635,488 +497,250 @@ pub(crate) async fn write_prepared_record(
         return Ok(old);
     }
     session
-        .put(ctx, "artifact", &record_id, ctx.actor(), &record)
+        .put(ctx, "artifact", &record.id, ctx.actor(), &record)
         .await?;
     for snapshot in &record.source_snapshots {
         session
-            .put_edge(ctx, "artifact", &record_id, "run", &snapshot.source_id)
+            .put_edge(ctx, "artifact", &record.id, "run", &snapshot.source_id)
             .await?;
     }
     Ok(record)
 }
 
-/// The publish decision point. The frozen candidate digest must equal the
-/// record's frozen value, every captured source and the revocation watermark
-/// are re-verified through the real closure (never by regenerating candidate
-/// bytes), and only then does the record's one publish job advance it to
-/// `reviewed`. The private FS staging and publication that follow run through
-/// [`stage_reviewed_candidate_for_publication`] after this transaction
-/// commits.
-pub(crate) async fn advance_reviewed_record(
+/// The publish decision (TX1 of the publish job). The request must name the
+/// record's frozen digest and this job must be the record's one publish job.
+/// The frozen members are re-derived through the same authenticated loader
+/// that froze them — source closure, license, recipient scope and the exact
+/// fact prefix, read once — and must reproduce the frozen tree digest (which
+/// covers every member's path, digest and size) from the same source
+/// snapshots; re-derived bytes are publication material, never a substitute
+/// candidate. Only then does the record move to `reviewed`; this job's own
+/// replay re-derives the same bytes without a second write.
+pub(crate) async fn review_frozen_candidate(
     ctx: &Context,
     session: &mut Session,
     export_id: &str,
     job_id: &str,
     candidate_digest: &str,
     started_at: i64,
-) -> Result<TraceExportRecord> {
-    ctx.require(&[Role::Admin])?;
-    identifier(job_id)?;
-    let mut record = load_live_record(ctx, session, export_id)?.ok_or(Error::NotFound)?;
+) -> Result<(TraceExportRecord, Vec<evo_storage::LocalExportFile>)> {
+    let mut record = load_live_record(ctx, session, export_id)
+        .await?
+        .ok_or(Error::NotFound)?;
     if record.candidate_digest != candidate_digest {
         return Err(Error::Conflict(
             "published candidate digest differs from the frozen candidate".into(),
         ));
     }
-    match record.publish_job_id.as_deref() {
-        Some(prior) if prior == job_id => {
-            if record.phase == TraceExportPhase::Reviewed {
-                // This job's own reviewed record replays unchanged.
-                return Ok(record);
-            }
-            return Err(Error::Conflict(
-                "trace export publish job cannot replay another phase".into(),
-            ));
-        }
-        Some(_) => {
+    let replay = match (record.phase, record.publish_job_id.as_deref()) {
+        (TraceExportPhase::Prepared, None) => false,
+        (TraceExportPhase::Reviewed, Some(prior)) if prior == job_id => true,
+        (_, Some(prior)) if prior != job_id => {
             return Err(Error::Conflict(
                 "trace export already has its one publish job".into(),
             ));
         }
-        None => {}
-    }
-    if record.phase != TraceExportPhase::Prepared {
+        _ => {
+            return Err(Error::Conflict(
+                "trace export phase cannot be published".into(),
+            ));
+        }
+    };
+    let source_ids: Vec<String> = record
+        .source_snapshots
+        .iter()
+        .map(|snapshot| snapshot.source_id.clone())
+        .collect();
+    let members = native_members(ctx, session, &source_ids).await?;
+    if members.candidate_digest != record.candidate_digest
+        || members.source_snapshots != record.source_snapshots
+    {
         return Err(Error::Conflict(
-            "trace export phase cannot be published".into(),
+            "re-derived trace export candidate differs from the frozen candidate".into(),
         ));
     }
-    verify_native_source_snapshots(
-        ctx,
-        session,
-        &record.source_snapshots,
-        record.source_watermark().as_ref(),
-    )
-    .await?;
-    record.phase = TraceExportPhase::Reviewed;
-    record.publish_job_id = Some(job_id.into());
-    record.local_cost.wall_seconds = record
-        .local_cost
-        .wall_seconds
-        .checked_add(elapsed_seconds(started_at)?)
-        .ok_or_else(|| Error::Conflict("trace export wall clock overflow".into()))?;
-    record.updated_at = now()?;
+    if !replay {
+        record.phase = TraceExportPhase::Reviewed;
+        record.publish_job_id = Some(job_id.into());
+        add_elapsed(&mut record, started_at)?;
+        session
+            .put(ctx, "artifact", &record.id, ctx.actor(), &record)
+            .await?;
+    }
+    Ok((record, members.files))
+}
+
+/// The one terminal write of a `reviewed` publication: `delivered` with the
+/// delivery fact when the formal tree was renamed under the publication fence
+/// (the receipt those bytes earned), else `aborted` — refused or failed before
+/// the rename, nothing delivered. Only the really observed cost is added.
+pub(crate) async fn finish_publication(
+    ctx: &Context,
+    session: &mut Session,
+    record: &TraceExportRecord,
+    receipt: Option<&evo_storage::LocalExportReceipt>,
+    started_at: i64,
+) -> Result<TraceExportRecord> {
+    let mut live = load_live_record(ctx, session, &record.export_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    if live.phase != TraceExportPhase::Reviewed
+        || live.publish_job_id != record.publish_job_id
+        || live.candidate_digest != record.candidate_digest
+    {
+        return Err(Error::Conflict(
+            "trace export record is not this reviewed publication".into(),
+        ));
+    }
+    match receipt {
+        Some(receipt) => {
+            live.phase = TraceExportPhase::Delivered;
+            live.delivery = Some(TraceExportDelivery {
+                receipt_digest: receipt.completion_receipt_digest.clone(),
+                local_export_ref: receipt.local_export_ref.clone(),
+                remote_erasure_disclaimer: crate::packages::REMOTE_ERASURE_DISCLAIMER.into(),
+            });
+        }
+        None => live.phase = TraceExportPhase::Aborted,
+    }
+    add_elapsed(&mut live, started_at)?;
     session
-        .put(ctx, "artifact", &record.id, ctx.actor(), &record)
+        .put(ctx, "artifact", &live.id, ctx.actor(), &live)
         .await?;
-    Ok(record)
+    Ok(live)
 }
 
 fn elapsed_seconds(started_at: i64) -> Result<i64> {
     now()?.checked_sub(started_at).ok_or(Error::ClockRegressed)
 }
 
-/// Re-derive the frozen candidate members read-only through the same
-/// authenticated loader that froze them. The record stays the authority: every
-/// re-derived member must hash to the frozen member digest and the whole tree
-/// to the frozen candidate digest, else this is a `Conflict` — re-derived
-/// bytes never silently replace the frozen candidate. This only produces
-/// proof material for publication or recovery; it is never a review.
-pub(crate) async fn regenerate_frozen_members(
-    ctx: &Context,
-    session: &mut Session,
-    record: &TraceExportRecord,
-) -> Result<Vec<evo_storage::LocalExportFile>> {
-    ctx.require(&[Role::Admin])?;
-    let source_ids: Vec<String> = record
-        .source_snapshots
-        .iter()
-        .map(|snapshot| snapshot.source_id.clone())
-        .collect();
-    let members = prepare_native_members(ctx, session, &source_ids).await?;
-    if members.candidate_digest != record.candidate_digest
-        || members.files.len() != record.members.len()
-        || members.source_watermark != record.source_watermark()
-    {
-        return Err(Error::Conflict(
-            "re-derived trace export candidate differs from the frozen candidate".into(),
-        ));
-    }
-    let mut frozen: std::collections::BTreeMap<&str, (&str, u64)> = record
-        .members
-        .iter()
-        .map(|member| {
-            (
-                member.path.as_str(),
-                (member.digest_sha256.as_str(), member.size_bytes),
-            )
-        })
-        .collect();
-    for file in &members.files {
-        match frozen.remove(file.path.as_str()) {
-            Some((digest, size))
-                if hash(&file.bytes) == digest && file.bytes.len() as u64 == size => {}
-            _ => {
-                return Err(Error::Conflict(
-                    "re-derived trace export member differs from the frozen candidate".into(),
-                ));
-            }
-        }
-    }
-    if !frozen.is_empty() {
-        return Err(Error::Conflict(
-            "re-derived trace export member differs from the frozen candidate".into(),
-        ));
-    }
-    Ok(members.files)
-}
-
-/// The real publication chain behind the reviewed decision. The entry
-/// re-verification runs in one real read Session (source closure, revocation
-/// watermark, and per-source license/recipient through the authenticated
-/// loader); only after that Session has committed and released its pooled
-/// connection does the first FS write happen. The FS chain itself — private
-/// staging, per-member fsync, NOREPLACE rename, digest re-verification —
-/// lives behind the storage blob lock alone and never nests a pool
-/// connection while doing FS.
-pub(crate) async fn stage_reviewed_candidate_for_publication(
-    ctx: &Context,
-    store: &evo_storage::Store,
-    record: &TraceExportRecord,
-    files: &[evo_storage::LocalExportFile],
-) -> Result<evo_storage::TraceExportTreePublication> {
-    ctx.require(&[Role::Admin])?;
-    {
-        let mut session = store.session().await?;
-        let live = load_live_record(ctx, &mut session, &record.export_id)
-            .await?
-            .ok_or(Error::NotFound)?;
-        if live.id != record.id
-            || live.phase != TraceExportPhase::Reviewed
-            || live.publish_job_id != record.publish_job_id
-            || live.candidate_digest != record.candidate_digest
-            || live.members != record.members
-            || live.updated_at != record.updated_at
-        {
-            return Err(Error::Conflict(
-                "trace export record changed after the reviewed decision".into(),
-            ));
-        }
-        verify_native_source_snapshots(
-            ctx,
-            &mut session,
-            &live.source_snapshots,
-            live.source_watermark().as_ref(),
-        )
-        .await?;
-        session.commit().await?;
-    }
-    store
-        .publish_trace_export_tree(ctx, &record.export_id, files, &record.candidate_digest)
-        .await
-}
-
-/// The delivery completion write: one more real re-verification of the source
-/// closure and the revocation watermark in the same transaction that records
-/// the delivery, so a revoke that raced the rename cannot be certified. Only
-/// the really observed cost is added and the receipt digest is the one the
-/// published bytes earned.
-pub(crate) async fn complete_delivered_record(
-    ctx: &Context,
-    session: &mut Session,
-    record: &TraceExportRecord,
-    publication: &evo_storage::TraceExportTreePublication,
-    started_at: i64,
-) -> Result<TraceExportRecord> {
-    ctx.require(&[Role::Admin])?;
-    let mut live = load_live_record(ctx, session, &record.export_id)?.ok_or(Error::NotFound)?;
-    if live.id != record.id
-        || live.phase != TraceExportPhase::Reviewed
-        || live.publish_job_id != record.publish_job_id
-        || live.candidate_digest != record.candidate_digest
-    {
-        return Err(Error::Conflict(
-            "trace export record cannot be completed as delivered".into(),
-        ));
-    }
-    verify_native_source_snapshots(
-        ctx,
-        session,
-        &live.source_snapshots,
-        live.source_watermark().as_ref(),
-    )
-    .await?;
-    live.phase = TraceExportPhase::Delivered;
-    live.delivery = TraceExportDelivery {
-        status: TraceExportDeliveryStatus::Delivered,
-        receipt_digest: Some(publication.receipt.completion_receipt_digest.clone()),
-    };
-    live.durability = TraceExportDurability {
-        tree_fsynced: publication.tree_fsynced,
-        verified_tree_digest: Some(publication.verified_tree_digest.clone()),
-    };
-    live.local_cost.wall_seconds = live
+fn add_elapsed(record: &mut TraceExportRecord, started_at: i64) -> Result<()> {
+    record.local_cost.wall_seconds = record
         .local_cost
         .wall_seconds
         .checked_add(elapsed_seconds(started_at)?)
         .ok_or_else(|| Error::Conflict("trace export wall clock overflow".into()))?;
-    live.updated_at = now()?;
-    session
-        .put(ctx, "artifact", &live.id, ctx.actor(), &live)
-        .await?;
-    Ok(live)
+    record.updated_at = now()?;
+    Ok(())
 }
 
-/// A failure before any committed FS effect: the reviewed decision and every
-/// real cost fact stay, the attempt's private staging temp was already removed
-/// by its own guard, and nothing was published. `aborted` never claims the
-/// export's bytes left this instance.
-pub(crate) async fn mark_aborted_record(
-    ctx: &Context,
-    session: &mut Session,
-    record: &TraceExportRecord,
-    started_at: i64,
-) -> Result<TraceExportRecord> {
-    ctx.require(&[Role::Admin])?;
-    let mut live = load_live_record(ctx, session, &record.export_id)?.ok_or(Error::NotFound)?;
-    if live.id != record.id
-        || live.phase != TraceExportPhase::Reviewed
-        || live.publish_job_id != record.publish_job_id
-        || live.candidate_digest != record.candidate_digest
-    {
-        return Err(Error::Conflict(
-            "trace export record cannot be aborted".into(),
-        ));
-    }
-    live.phase = TraceExportPhase::Aborted;
-    live.local_cost.wall_seconds = live
-        .local_cost
-        .wall_seconds
-        .checked_add(elapsed_seconds(started_at)?)
-        .ok_or_else(|| Error::Conflict("trace export wall clock overflow".into()))?;
-    live.updated_at = now()?;
-    session
-        .put(ctx, "artifact", &live.id, ctx.actor(), &live)
-        .await?;
-    Ok(live)
-}
-
-/// A partial commit after real bytes already reached the local export
-/// surface: the refs stay, the durability facts actually observed are
-/// recorded, the published tree is never deleted, zero side effect is never
-/// claimed, and the delivery fact stays uncertified — no delivery receipt was
-/// committed, and this export is never resent.
-pub(crate) async fn mark_failed_after_publication(
-    ctx: &Context,
-    session: &mut Session,
-    record: &TraceExportRecord,
-    publication: &evo_storage::TraceExportTreePublication,
-    started_at: i64,
-) -> Result<TraceExportRecord> {
-    ctx.require(&[Role::Admin])?;
-    let mut live = load_live_record(ctx, session, &record.export_id)?.ok_or(Error::NotFound)?;
-    if live.id != record.id
-        || live.publish_job_id != record.publish_job_id
-        || live.candidate_digest != record.candidate_digest
-        || live.phase != TraceExportPhase::Reviewed
-    {
-        return Err(Error::Conflict(
-            "trace export record cannot be marked failed".into(),
-        ));
-    }
-    live.phase = TraceExportPhase::Failed;
-    live.durability = TraceExportDurability {
-        tree_fsynced: publication.tree_fsynced,
-        verified_tree_digest: Some(publication.verified_tree_digest.clone()),
-    };
-    live.local_cost.wall_seconds = live
-        .local_cost
-        .wall_seconds
-        .checked_add(elapsed_seconds(started_at)?)
-        .ok_or_else(|| Error::Conflict("trace export wall clock overflow".into()))?;
-    live.updated_at = now()?;
-    session
-        .put(ctx, "artifact", &live.id, ctx.actor(), &live)
-        .await?;
-    Ok(live)
-}
-
-/// Crash recovery for one publish job, read-only until every fact matches.
-/// For a `reviewed` record the source closure, the typed record, the exact
-/// on-disk tree, its manifest and this job's ownership must all agree; only
-/// then is the terminal `delivered` state (and its receipt) completed, with a
-/// real fsync pass over the published tree first so the durability fact is
-/// observed, not inherited. A missing or tampered tree proves nothing:
-/// [`TraceExportRecovery::Pending`] keeps the refs blocking and republishes
-/// nothing here. An already delivered record is re-proved read-only.
-pub(crate) enum TraceExportRecovery {
-    Completed(TraceExportRecord),
-    Pending,
-}
-
-pub(crate) async fn reconcile_reviewed_publication(
+/// Crash recovery of one publish job, anchored on the record alone: no
+/// candidate is regenerated and no on-disk manifest proves anything by itself.
+/// A `prepared` record without a publish job proves the decision never
+/// committed; a `delivered` one is final. For this job's `reviewed` record the
+/// formal tree must be exactly the frozen members and digest — the rename
+/// happened under the publication fence — and only then is `delivered`
+/// completed with the receipt those bytes earn, after making the rename
+/// durable. A missing or differing tree proves no publication: `None`, and
+/// nothing is completed or republished here.
+pub(crate) async fn reconcile_publication(
     ctx: &Context,
     store: &evo_storage::Store,
     export_id: &str,
     publish_job_id: &str,
-) -> Result<TraceExportRecovery> {
-    ctx.require(&[Role::Admin])?;
-    identifier(publish_job_id)?;
+) -> Result<Option<TraceExportRecord>> {
     let started_at = now()?;
     let live = {
         let mut session = store.session().await?;
-        let live = load_live_record(ctx, &mut session, export_id)?.ok_or(Error::NotFound)?;
-        if live.publish_job_id.as_deref() != Some(publish_job_id) {
-            return Err(Error::Conflict(
-                "trace export record belongs to another publish job".into(),
-            ));
-        }
-        match live.phase {
-            TraceExportPhase::Reviewed | TraceExportPhase::Delivered => {}
-            _ => {
-                return Err(Error::Conflict(
-                    "trace export phase cannot be reconciled".into(),
-                ));
-            }
-        }
+        let live = load_live_record(ctx, &mut session, export_id)
+            .await?
+            .ok_or(Error::NotFound)?;
         session.commit().await?;
         live
     };
-    // The tree proof re-derives the frozen members read-only and re-verifies
-    // the closure in that same Session; the FS check runs only after it has
-    // committed and released its pooled connection.
-    let files = {
-        let mut session = store.session().await?;
-        let files = regenerate_frozen_members(ctx, &mut session, &live).await?;
-        session.commit().await?;
-        files
-    };
-    let receipt = match store.verify_trace_export_tree(ctx, export_id, &files).await {
+    match (live.phase, live.publish_job_id.as_deref()) {
+        (TraceExportPhase::Prepared, None) => return Ok(None),
+        (TraceExportPhase::Delivered, Some(job)) if job == publish_job_id => return Ok(Some(live)),
+        (TraceExportPhase::Reviewed, Some(job)) if job == publish_job_id => {}
+        _ => {
+            return Err(Error::Conflict(
+                "trace export record is not this publish job's".into(),
+            ));
+        }
+    }
+    let receipt = match store
+        .verify_trace_export_tree(ctx, export_id, &live.members, &live.candidate_digest)
+        .await
+    {
         Ok(receipt) => receipt,
         Err(Error::Conflict(reason)) if reason == evo_storage::TRACE_EXPORT_TREE_UNAVAILABLE => {
-            if live.phase == TraceExportPhase::Delivered {
-                // A delivered export whose tree is gone stays unavailable; it
-                // is never republished.
-                return Err(Error::Conflict(reason));
-            }
-            return Ok(TraceExportRecovery::Pending);
+            return Ok(None);
         }
         Err(error) => return Err(error),
     };
-    if live.phase == TraceExportPhase::Delivered {
-        return Ok(TraceExportRecovery::Completed(live));
-    }
-    store
-        .fsync_trace_export_tree(ctx, export_id, &files)
-        .await?;
-    let publication = evo_storage::TraceExportTreePublication {
-        verified_tree_digest: receipt.package_tree_digest.clone(),
-        receipt,
-        tree_fsynced: true,
-        published_now: false,
-    };
+    store.sync_trace_export_tree(ctx, export_id).await?;
     let mut session = store.session().await?;
-    let record = complete_delivered_record(ctx, &mut session, &live, &publication, started_at)?;
+    let record = finish_publication(ctx, &mut session, &live, Some(&receipt), started_at).await?;
     session.commit().await?;
-    Ok(TraceExportRecovery::Completed(record))
+    Ok(Some(record))
 }
 
-/// The unavailable surface of a delivered export: the source closure is
-/// re-verified read-only and the published tree must still be the exact
-/// frozen member set. A missing or tampered tree is the honest
-/// `unavailable` conflict, never a delivery claim and never a republish.
-pub(crate) async fn verify_delivered_tree(
-    ctx: &Context,
-    store: &evo_storage::Store,
-    export_id: &str,
-) -> Result<()> {
-    let live = {
-        let mut session = store.session().await?;
-        let live = load_live_record(ctx, &mut session, export_id)?.ok_or(Error::NotFound)?;
-        session.commit().await?;
-        live
-    };
-    if live.phase != TraceExportPhase::Delivered {
-        return Err(Error::Conflict(
-            "trace export record is not delivered".into(),
-        ));
-    }
-    let files = {
-        let mut session = store.session().await?;
-        let files = regenerate_frozen_members(ctx, &mut session, &live).await?;
-        session.commit().await?;
-        files
-    };
-    store
-        .verify_trace_export_tree(ctx, export_id, &files)
-        .await
-        .map(|_| ())
-}
-
-/// Re-read the record a stored job result references, through the live source
-/// closure, and prove the stored phase, record id and frozen candidate digest
-/// still name it. A status view is never served from a drifted or revoked
-/// export.
+/// The status view of a succeeded trace export job. The record its result
+/// names is re-read live (never a redacted one) with the same id and frozen
+/// digest and a live source closure; the phase it has reached since is not
+/// compared, so a prepare result stays servable after its publication. A
+/// delivered result must still be the record's delivery receipt, and the
+/// formal tree must still be exactly the frozen members — checked against the
+/// recorded digests, never by regenerating bytes; a missing or tampered tree
+/// is the honest `TRACE_EXPORT_TREE_UNAVAILABLE` conflict, never a resend.
 pub(crate) async fn verify_result_view(
     ctx: &Context,
-    session: &mut Session,
+    store: &evo_storage::Store,
     result: &evo_storage::ManagementTraceExportResultV2,
 ) -> Result<()> {
-    ctx.require(&[Role::Admin])?;
-    let (export_id, record_id, candidate_digest, phase, receipt_digest) = match result {
-        evo_storage::ManagementTraceExportResultV2::TraceExportPrepared {
+    use evo_storage::ManagementTraceExportResultV2 as R;
+    let (export_id, record_id, candidate_digest, receipt_digest) = match result {
+        R::TraceExportPrepared {
             export_id,
             record_id,
             candidate_digest,
-            phase,
-        }
-        | evo_storage::ManagementTraceExportResultV2::TraceExportReviewed {
+        } => (export_id, record_id, candidate_digest, None),
+        R::TraceExportDelivered {
             export_id,
             record_id,
             candidate_digest,
-            phase,
-        } => (export_id, record_id, candidate_digest, phase, None),
-        evo_storage::ManagementTraceExportResultV2::TraceExportDelivered {
-            export_id,
-            record_id,
-            candidate_digest,
-            phase,
             receipt_digest,
-        } => (
-            export_id,
-            record_id,
-            candidate_digest,
-            phase,
-            Some(receipt_digest),
-        ),
+        } => (export_id, record_id, candidate_digest, Some(receipt_digest)),
     };
-    let record = load_live_record(ctx, session, export_id)?.ok_or(Error::NotFound)?;
-    if &record.id != record_id
-        || record.candidate_digest != *candidate_digest
-        || trace_phase_wire(record.phase)? != *phase
-    {
+    let record = {
+        let mut session = store.session().await?;
+        let record = load_live_record(ctx, &mut session, export_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let dependencies: Vec<(String, String)> = record
+            .source_snapshots
+            .iter()
+            .map(|snapshot| ("run".to_string(), snapshot.source_id.clone()))
+            .collect();
+        crate::revocation_gate::ensure_dependencies_live(
+            ctx,
+            &mut session,
+            &dependencies,
+            "trace export result",
+        )
+        .await?;
+        session.commit().await?;
+        record
+    };
+    if &record.id != record_id || &record.candidate_digest != candidate_digest {
         return Err(Error::Conflict(
             "trace export record view differs from the stored result".into(),
         ));
     }
     if let Some(receipt_digest) = receipt_digest {
-        if record.phase != TraceExportPhase::Delivered
-            || record.delivery.status != TraceExportDeliveryStatus::Delivered
-            || record.delivery.receipt_digest.as_deref() != Some(receipt_digest.as_str())
+        if record
+            .delivery
+            .as_ref()
+            .map(|delivery| &delivery.receipt_digest)
+            != Some(receipt_digest)
         {
             return Err(Error::Conflict(
                 "trace export delivery view differs from the stored result".into(),
             ));
         }
+        store
+            .verify_trace_export_tree(ctx, export_id, &record.members, &record.candidate_digest)
+            .await?;
     }
-    let mut dependencies = Vec::with_capacity(record.source_snapshots.len());
-    for snapshot in &record.source_snapshots {
-        dependencies.push(("run".into(), snapshot.source_id.clone()));
-    }
-    crate::revocation_gate::ensure_dependencies_live(
-        ctx,
-        session,
-        &dependencies,
-        "trace export result",
-    )
-    .await
+    Ok(())
 }

@@ -733,8 +733,12 @@ impl HostService {
         store_trace_authority(&self.store, &self.trusted_host, authority).await
     }
 
-    /// Freeze only new authenticated service-success facts; this is not a dialogue
-    /// recorder, Native writer, Skill-use receipt, feedback verification or score.
+    /// Capture a service run's authenticated service-success facts exactly once:
+    /// the source id is fixed per (namespace, run), so a replay over the same
+    /// facts returns the same immutable source, and a later capture after new
+    /// facts is the `immutable source authority differs` conflict, never a
+    /// second source or a rewrite. This is not a dialogue recorder, Native
+    /// writer, Skill-use receipt, feedback verification or score.
     pub async fn record_service_facts(
         &self,
         caller: &Context,

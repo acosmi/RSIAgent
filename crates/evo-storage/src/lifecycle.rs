@@ -2544,7 +2544,8 @@ async fn cleanup_e16_envelope(
         && value["schema_version"].as_str() == Some("rsia.e16.export_attempt.v2")
         && !export_directory_rechecked
     {
-        remove_controlled_local_export(store, ctx, node, job_id, tx, now).await?;
+        remove_controlled_local_export(store, ctx, node, job_id, tx, now, "exports", &node.id)
+            .await?;
     }
 
     let mut blob_digests = Vec::new();
@@ -2680,6 +2681,10 @@ async fn has_failed_local_export(
     Ok(failed == 1)
 }
 
+/// Remove one controlled local export directory, `<root>/<namespace-hash>/<directory>`
+/// under the store root (`exports` for E16 package exports, `trace-exports` for
+/// trace exports), recording that remote erasure is not claimed.
+#[allow(clippy::too_many_arguments)]
 async fn remove_controlled_local_export(
     store: &Store,
     ctx: &Context,
@@ -2687,11 +2692,13 @@ async fn remove_controlled_local_export(
     job_id: &str,
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     now: i64,
+    root: &str,
+    directory: &str,
 ) -> Result<()> {
-    // The export attempt id names the directory under the namespace export
-    // root; an id such as ".." would resolve outside it, so refuse to touch
-    // the filesystem for any id the export entry points would not accept.
-    if crate::validate_export_id(&node.id).is_err() {
+    // The directory id names the directory under the namespace export root;
+    // an id such as ".." would resolve outside it, so refuse to touch the
+    // filesystem for any id the export entry points would not accept.
+    if crate::validate_export_id(directory).is_err() {
         return mark_unknown_scope(
             tx,
             ctx,
@@ -2702,7 +2709,7 @@ async fn remove_controlled_local_export(
         )
         .await;
     }
-    let export_root = store.root.join("exports");
+    let export_root = store.root.join(root);
     let namespace_root = export_root.join(evo_core::hash(ctx.namespace().as_bytes()));
     for ancestor in [&export_root, &namespace_root] {
         match tokio::fs::symlink_metadata(ancestor).await {
@@ -2734,7 +2741,7 @@ async fn remove_controlled_local_export(
             Err(error) => return Err(internal(error)),
         }
     }
-    let path = namespace_root.join(&node.id);
+    let path = namespace_root.join(directory);
     match tokio::fs::symlink_metadata(&path).await {
         Ok(metadata) => {
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -3307,7 +3314,8 @@ async fn cleanup_node_content(
                 .await;
             }
         }
-        remove_controlled_local_export(store, ctx, node, job_id, tx, now).await?;
+        remove_controlled_local_export(store, ctx, node, job_id, tx, now, "exports", &node.id)
+            .await?;
     }
     let (Some(body), Some(value), Some(owner)) = (body, value, owner) else {
         return Ok(());
@@ -3333,6 +3341,33 @@ async fn cleanup_node_content(
             now,
         )
         .await;
+    }
+    if node.kind == "artifact" && schema == crate::TRACE_EXPORT_SCHEMA {
+        // Controlled local cleanup of the export's own published tree, if any;
+        // the record is then redacted below, keeping its delivery facts and
+        // its statement that copies taken before this cleanup are not erased.
+        let Some(export_id) = value["export_id"].as_str() else {
+            return mark_unknown_scope(
+                tx,
+                ctx,
+                job_id,
+                node,
+                "blocked_unknown_scope:invalid_trace_export_record",
+                now,
+            )
+            .await;
+        };
+        remove_controlled_local_export(
+            store,
+            ctx,
+            node,
+            job_id,
+            tx,
+            now,
+            crate::TRACE_EXPORT_ROOT,
+            export_id,
+        )
+        .await?;
     }
     if node.kind == "artifact" && schema == crate::replay::REPLAY_STORE_ENVELOPE_SCHEMA {
         return redact_replay_store_envelope(tx, ctx, job_id, node, &body, &value, now).await;
@@ -3574,6 +3609,10 @@ async fn cleanup_node_content(
             _,
         ) => true,
         ("artifact", "rsia.resolved_bundle.v2", _) => true,
+        // A trace export record names its captured source runs and is
+        // redacted like the content derived from them; its published tree was
+        // removed just above.
+        ("artifact", crate::TRACE_EXPORT_SCHEMA, _) => true,
         // Monitoring content derived from source runs (environment and observation
         // identities, per-task pairings, the claim, the consolidation proposal with
         // its candidate bundle and the binding that reserves its candidate id) is
@@ -3751,19 +3790,19 @@ pub fn redacted_object_body(
         .unwrap_or("");
     let mut metadata = minimal_metadata(value);
     if schema == crate::TRACE_EXPORT_SCHEMA {
+        // Ids, digests, sizes, the delivery receipt with its scope and
+        // residual statement, and the observed cost: delivery and cost facts
+        // are never reversed by a revocation, and none of them is content.
         for key in [
+            "export_id",
             "phase",
             "prepare_job_id",
             "publish_job_id",
             "candidate_digest",
             "members",
-            "candidate_storage",
             "delivery",
-            "durability",
             "local_cost",
             "source_snapshots",
-            "source_watermark_seq",
-            "source_watermark_digest",
             "owner_actor",
         ] {
             if let Some(kept) = value.get(key) {

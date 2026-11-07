@@ -6,7 +6,7 @@ use evo_core::contract::{
     CapabilityLevel, HostCapabilities, HostSurfaceClassificationV2, HostSurfaceRegistrationV2,
     ReviewedHostSourceEnvelopeV1, SurfaceCoverage,
 };
-use evo_core::{ArtifactKind, Context, Error, Feedback, Outcome, Prepare, Proposal, Role};
+use evo_core::{Context, Error, Feedback, Outcome, Prepare, Role};
 use evo_engine::dispatch::{
     ManagementDispatcher, ManagementJobState, ManagementResultV2, ManagementTraceExportResultV2,
     VersionedManagementJob,
@@ -105,7 +105,7 @@ async fn setup() -> (tempfile::TempDir, HostService, Context) {
                 &agent,
                 Prepare {
                     request_key: format!("prepare-{key}"),
-                    goal: format!("private goal of {key}").into(),
+                    goal: format!("private goal of {key}"),
                     capabilities: vec!["fs_read".into()],
                 },
                 &config,
@@ -119,7 +119,7 @@ async fn setup() -> (tempfile::TempDir, HostService, Context) {
                     request_key: format!("feedback-{key}"),
                     run_id: prepared.run.id.clone(),
                     outcome: Outcome::Failure,
-                    details: format!("private feedback of {key}").into(),
+                    details: format!("private feedback of {key}"),
                     failure_class: evo_core::FailureClass::Reasoning,
                 },
             )
@@ -232,6 +232,37 @@ async fn healthy_export(
     (candidate_digest, published)
 }
 
+async fn revoke_run(
+    service: &HostService,
+    admin: &Context,
+    id: &str,
+) -> evo_storage::lifecycle::CleanupStatus {
+    evo_storage::lifecycle::LifecycleStore::begin_revoke(
+        admin,
+        service.store(),
+        evo_storage::lifecycle::TypedObjectRef {
+            kind: "run".into(),
+            id: id.into(),
+        },
+        "revoked between prepare and publish",
+        10,
+    )
+    .await
+    .unwrap()
+}
+
+/// The frozen members of a candidate as the record stores them.
+fn frozen(files: &[evo_storage::LocalExportFile]) -> Vec<evo_storage::TraceExportMember> {
+    files
+        .iter()
+        .map(|file| evo_storage::TraceExportMember {
+            path: file.path.clone(),
+            digest_sha256: evo_core::hash(&file.bytes),
+            size_bytes: file.bytes.len() as u64,
+        })
+        .collect()
+}
+
 async fn record_body(service: &HostService, admin: &Context, record_id: &str) -> Option<String> {
     let mut session = service.store().session().await.unwrap();
     let row = session
@@ -313,15 +344,18 @@ async fn trace_export_admin_role_precedes_payload_and_source_observation() {
         before,
         "every refused call leaves the whole database unchanged"
     );
+    let mut session = service.store().session().await.unwrap();
     for source in &sources {
         assert!(
-            record_body(&service, &admin, source)
+            session
+                .object_row(&admin, "run", source)
                 .await
                 .unwrap()
                 .is_some(),
-            "the captured source was observed by nobody"
+            "the captured source is still in place"
         );
     }
+    session.commit().await.unwrap();
     let (_digest, delivered) =
         healthy_export(&dispatcher, &admin, "role-order", &[sources[0].clone()]).await;
     assert_eq!(delivered.step(), "trace_export_delivered");
@@ -473,7 +507,6 @@ async fn trace_export_same_key_changed_run_scope_conflicts_without_io() {
     for changed in [
         prepare_payload("scope-key", "scope-export", &[sources[1].clone()]),
         prepare_payload("scope-key", "scope-export", &sources),
-        prepare_payload("scope-key", "scope-export", &[]),
         prepare_payload("scope-key", "other-export", &[sources[0].clone()]),
     ] {
         match dispatcher
@@ -487,8 +520,20 @@ async fn trace_export_same_key_changed_run_scope_conflicts_without_io() {
             other => panic!("changed scope must conflict, got {other:?}"),
         }
     }
+    // An empty scope is not a request at all: the boundary refuses it before
+    // the key is looked up, with the same zero I/O.
+    assert!(matches!(
+        dispatcher
+            .submit(
+                &admin,
+                "trace.export",
+                prepare_payload("scope-key", "scope-export", &[]),
+            )
+            .await,
+        Err(Error::Invalid(message)) if message == "trace export source count is invalid"
+    ));
     assert!(
-        !dir.path().join("exports").exists(),
+        !dir.path().join("trace-exports").exists(),
         "no download surface appeared"
     );
     assert_eq!(
@@ -499,7 +544,7 @@ async fn trace_export_same_key_changed_run_scope_conflicts_without_io() {
 }
 
 /// The job's visible progress and the record's effect share one fence: the
-/// served phase, the terminal step, the published tree and the receipt digest
+/// served result, the terminal step, the published tree and the receipt digest
 /// all name the same delivery, on every status read.
 #[tokio::test]
 async fn trace_export_progress_and_effect_use_same_fence() {
@@ -531,18 +576,15 @@ async fn trace_export_progress_and_effect_use_same_fence() {
     )
     .await;
     let ManagementTraceExportResultV2::TraceExportPrepared {
-        phase,
-        candidate_digest,
-        ..
+        candidate_digest, ..
     } = trace_result(&prepared)
     else {
         panic!("expected the prepared result");
     };
-    assert_eq!(phase, "prepared");
     assert!(
         !service
             .store()
-            .local_export_directory(&admin, "fence-export")
+            .trace_export_directory(&admin, "fence-export")
             .unwrap()
             .exists(),
         "no effect before the publish decision"
@@ -562,7 +604,6 @@ async fn trace_export_progress_and_effect_use_same_fence() {
     .await;
     assert_eq!(published.step(), "trace_export_delivered");
     let ManagementTraceExportResultV2::TraceExportDelivered {
-        phase,
         candidate_digest: delivered_digest,
         receipt_digest,
         ..
@@ -570,7 +611,6 @@ async fn trace_export_progress_and_effect_use_same_fence() {
     else {
         panic!("expected the delivered result");
     };
-    assert_eq!(phase, "delivered");
     assert_eq!(delivered_digest, candidate_digest);
     // The effect behind that progress is the exact frozen tree and receipt;
     // re-deriving the members read-only and re-verifying the published
@@ -595,38 +635,50 @@ async fn trace_export_progress_and_effect_use_same_fence() {
     assert_eq!(members.candidate_digest, candidate_digest);
     let receipt = service
         .store()
-        .verify_trace_export_tree(&admin, "fence-export", &members.files)
+        .verify_trace_export_tree(
+            &admin,
+            "fence-export",
+            &frozen(&members.files),
+            &members.candidate_digest,
+        )
         .await
         .unwrap();
     assert_eq!(receipt.completion_receipt_digest, receipt_digest);
     assert_eq!(receipt.package_tree_digest, candidate_digest);
-    // The watermark half of the same fence: a real revocation landing between
-    // one export's prepare and its publish moves the namespace watermark, and
-    // the publish job is refused with no tree and no delivery.
-    let second = run_to_terminal(
-        &dispatcher,
-        &admin,
-        dispatcher
-            .submit(
-                &admin,
-                "trace.export",
-                prepare_payload("fence-prepare-2", "fence-export-2", &sources),
-            )
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(second.identity().state, ManagementJobState::Succeeded);
-    let ManagementTraceExportResultV2::TraceExportPrepared {
-        candidate_digest: second_digest,
-        record_id: second_record,
-        ..
-    } = trace_result(&second)
-    else {
-        panic!("expected the second prepared result");
-    };
-    // An unrelated opaque trace in the same namespace is revoked through the
-    // real revoke API; the export's own sources stay live.
+    // The watermark half of the same fence is the export's own source
+    // closure, not the namespace watermark. Two more exports are prepared,
+    // then an unrelated opaque trace of the same namespace is revoked through
+    // the real revoke API: the namespace watermark moves, yet the delivered
+    // status and a later publication are unaffected.
+    let mut prepared = Vec::new();
+    for (key, export, source) in [
+        ("fence-prepare-2", "fence-export-2", &sources[0]),
+        ("fence-prepare-3", "fence-export-3", &sources[1]),
+    ] {
+        let job = run_to_terminal(
+            &dispatcher,
+            &admin,
+            dispatcher
+                .submit(
+                    &admin,
+                    "trace.export",
+                    prepare_payload(key, export, std::slice::from_ref(source)),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(job.identity().state, ManagementJobState::Succeeded);
+        let ManagementTraceExportResultV2::TraceExportPrepared {
+            candidate_digest,
+            record_id,
+            ..
+        } = trace_result(&job)
+        else {
+            panic!("expected the prepared result");
+        };
+        prepared.push((candidate_digest, record_id));
+    }
     let mut opaque = {
         let host = context("gateway-host", Role::Host);
         let mut session = service.store().session().await.unwrap();
@@ -647,54 +699,77 @@ async fn trace_export_progress_and_effect_use_same_fence() {
         .record_trace(&context("gateway-host", Role::Host), &opaque)
         .await
         .unwrap();
-    let cleanup = evo_storage::lifecycle::LifecycleStore::begin_revoke(
-        &admin,
-        service.store(),
-        evo_storage::lifecycle::TypedObjectRef {
-            kind: "run".into(),
-            id: opaque.record.id.clone(),
-        },
-        "unrelated sibling revoked between prepare and publish",
-        10,
-    )
-    .await
-    .unwrap();
+    let cleanup = revoke_run(&service, &admin, &opaque.record.id).await;
     assert_eq!(cleanup.state, evo_storage::lifecycle::CleanupState::Pending);
-    let refused = run_to_terminal(
+    assert_eq!(
+        serde_json::to_value(
+            dispatcher
+                .status(&admin, published.identity().id)
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&published).unwrap(),
+        "an unrelated revocation leaves the delivered view intact"
+    );
+    let sibling_published = run_to_terminal(
         &dispatcher,
         &admin,
         dispatcher
             .submit(
                 &admin,
                 "trace.export",
-                publish_payload("fence-publish-2", "fence-export-2", &second_digest),
+                publish_payload("fence-publish-2", "fence-export-2", &prepared[0].0),
             )
             .await
             .unwrap(),
     )
     .await;
-    assert_eq!(refused.identity().state, ManagementJobState::Failed);
-    assert_eq!(refused.error_code(), Some("conflict"));
+    assert_eq!(
+        sibling_published.identity().state,
+        ManagementJobState::Succeeded
+    );
+    assert_eq!(sibling_published.step(), "trace_export_delivered");
+    // A revocation inside the third export's own closure, between its prepare
+    // and its publish, refuses the publication before any write: no job, no
+    // tree, and the record keeps its honest prepared phase.
+    let before = record_body(&service, &admin, &prepared[1].1).await.unwrap();
+    revoke_run(&service, &admin, &sources[1]).await;
+    match dispatcher
+        .submit(
+            &admin,
+            "trace.export",
+            publish_payload("fence-publish-3", "fence-export-3", &prepared[1].0),
+        )
+        .await
+    {
+        Err(Error::Conflict(message)) => {
+            assert!(message.contains("whose source was revoked"), "{message}")
+        }
+        other => panic!("a revoked closure must refuse the publication, got {other:?}"),
+    }
     assert!(
         !service
             .store()
-            .local_export_directory(&admin, "fence-export-2")
+            .trace_export_directory(&admin, "fence-export-3")
             .unwrap()
             .exists(),
-        "the watermark change blocked every filesystem effect"
+        "the closure revocation blocked every filesystem effect"
     );
-    assert!(
-        record_body(&service, &admin, &second_record)
-            .await
-            .unwrap()
-            .contains("\"phase\":\"prepared\""),
-        "the blocked export keeps its honest prepared record"
+    assert_eq!(
+        record_body(&service, &admin, &prepared[1].1).await.unwrap(),
+        before
     );
-    // The first delivery is untouched by the sibling revocation.
+    // The first delivery is untouched by both revocations.
     assert_eq!(
         service
             .store()
-            .verify_trace_export_tree(&admin, "fence-export", &members.files)
+            .verify_trace_export_tree(
+                &admin,
+                "fence-export",
+                &frozen(&members.files),
+                &members.candidate_digest,
+            )
             .await
             .unwrap()
             .completion_receipt_digest,
@@ -852,15 +927,21 @@ async fn trace_export_restart_after_publish_recovers_exact_receipt() {
         serde_json::to_value(&published).unwrap(),
         "the exact receipt and terminal state survive the restart"
     );
+    let members = {
+        let mut session = reopened.session().await.unwrap();
+        let members = prepare_native_members(&admin, &mut session, &sources)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        members
+    };
     let receipt = reopened
-        .verify_trace_export_tree(&admin, "restart-export", {
-            let mut session = reopened.session().await.unwrap();
-            let members = prepare_native_members(&admin, &mut session, &sources)
-                .await
-                .unwrap();
-            session.commit().await.unwrap();
-            members.files
-        })
+        .verify_trace_export_tree(
+            &admin,
+            "restart-export",
+            &frozen(&members.files),
+            &members.candidate_digest,
+        )
         .await
         .unwrap();
     assert_eq!(receipt.completion_receipt_digest, receipt_digest);
@@ -868,7 +949,7 @@ async fn trace_export_restart_after_publish_recovers_exact_receipt() {
     // honest unavailable conflict; the receipt is never re-earned or resent.
     std::fs::remove_dir_all(
         reopened
-            .local_export_directory(&admin, "restart-export")
+            .trace_export_directory(&admin, "restart-export")
             .unwrap(),
     )
     .unwrap();
@@ -878,7 +959,7 @@ async fn trace_export_restart_after_publish_recovers_exact_receipt() {
     }
     assert!(
         !reopened
-            .local_export_directory(&admin, "restart-export")
+            .trace_export_directory(&admin, "restart-export")
             .unwrap()
             .exists(),
         "the read-only proof never republishes"
@@ -916,10 +997,11 @@ async fn trace_export_stale_owner_cannot_complete_or_delete_published_tree() {
         panic!("expected the delivered result");
     };
     let body = record_body(&service, &admin, &record_id).await.unwrap();
-    // A second owner's publish job cannot complete the delivered export again.
-    for (owner, key) in [
-        (&admin_two, "stale-owner-publish"),
-        (&other_namespace, "foreign-owner-publish"),
+    // A second owner's publish job cannot complete the delivered export again,
+    // and in a foreign namespace the export does not exist at all.
+    for (owner, key, code) in [
+        (&admin_two, "stale-owner-publish", "conflict"),
+        (&other_namespace, "foreign-owner-publish", "not_found"),
     ] {
         let refused = run_to_terminal(
             &dispatcher,
@@ -935,7 +1017,7 @@ async fn trace_export_stale_owner_cannot_complete_or_delete_published_tree() {
         )
         .await;
         assert_eq!(refused.identity().state, ManagementJobState::Failed);
-        assert_eq!(refused.error_code(), Some("conflict"));
+        assert_eq!(refused.error_code(), Some(code));
     }
     assert_eq!(
         record_body(&service, &admin, &record_id).await.unwrap(),
@@ -967,7 +1049,12 @@ async fn trace_export_stale_owner_cannot_complete_or_delete_published_tree() {
     session.commit().await.unwrap();
     let receipt = service
         .store()
-        .verify_trace_export_tree(&admin, "owned-export", &members.files)
+        .verify_trace_export_tree(
+            &admin,
+            "owned-export",
+            &frozen(&members.files),
+            &members.candidate_digest,
+        )
         .await
         .unwrap();
     let ManagementTraceExportResultV2::TraceExportDelivered { receipt_digest, .. } =

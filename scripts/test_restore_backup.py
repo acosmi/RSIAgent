@@ -690,7 +690,10 @@ class RestoreTests(unittest.TestCase):
             return {"path":path,"digest_sha256":digest,"size_bytes":size}
 
         candidate_digest=sha256_text("trace-export-candidate")
-        receipt_digest=sha256_text("trace-export-receipt")
+        delivery={
+            "receipt_digest":sha256_text("trace-export-receipt"),
+            "local_export_ref":"trace-exports/%s/restore-export"%sha256_text("legacy-a"),
+            "remote_erasure_disclaimer":"remote erasure of downloaded copies cannot be guaranteed"}
         record={
             "schema_version":"rsia.trace_export.v1",
             "id":"trace-export-6b1f2a9c0d4e5f60718293a4",
@@ -702,13 +705,9 @@ class RestoreTests(unittest.TestCase):
             "members":[
                 member("traces/0000.json",sha256_text("member-0"),32),
                 member("manifest.json",sha256_text("manifest"),32)],
-            "candidate_storage":{"staged":False,"paths":[]},
-            "delivery":{"status":"delivered","receipt_digest":receipt_digest},
-            "durability":{"tree_fsynced":True,"verified_tree_digest":candidate_digest},
+            "delivery":delivery,
             "local_cost":{"wall_seconds":1,"bytes":64},
             "source_snapshots":[],
-            "source_watermark_seq":None,
-            "source_watermark_digest":None,
             "owner_actor":"admin",
             "created_at":1,
             "updated_at":2}
@@ -724,12 +723,12 @@ class RestoreTests(unittest.TestCase):
             "original_schema":"rsia.trace_export.v1",
             "original_digest":sha256_text("revoked export record body"),
             "metadata":{
+                "export_id":"revoked-export",
                 "phase":"delivered",
                 "prepare_job_id":"management-job-prepare",
                 "publish_job_id":"management-job-publish",
                 "candidate_digest":candidate_digest,
-                "delivery":{"status":"delivered","receipt_digest":receipt_digest},
-                "durability":{"tree_fsynced":True,"verified_tree_digest":candidate_digest},
+                "delivery":delivery,
                 "owner_actor":"admin"}}
         scenario=Scenario(self,CURRENT)
         con=connect(scenario.history)

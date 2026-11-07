@@ -1,5 +1,6 @@
-//! AG-175 Native roundtrip controls: a real captured service run, frozen into
-//! a real Native candidate, read back through the real reader and in-memory
+//! AG-175 Native roundtrip controls: a real captured service run, exported by
+//! the real `trace.export` dispatcher jobs into a real published directory,
+//! read back from that directory through the real reader and the persistent
 //! import. Every import stays `UnverifiedImport`; no formal authority, review
 //! or delivery fact is created or claimed on the way back in.
 use evo_core::contract::{
@@ -9,15 +10,22 @@ use evo_core::contract::{
 use evo_core::evidence::{
     ExecutionAttestation, Purpose, SourceSelection, TaskOrigin, TraceCoverage,
 };
-use evo_core::{ArtifactKind, Context, Feedback, Outcome, Prepare, Proposal, Role};
+use evo_core::{ArtifactKind, Context, Feedback, Outcome, Prepare, Proposal, Role, hash};
+use evo_engine::dispatch::{
+    ManagementDispatcher, ManagementJobState, ManagementResultV2, ManagementTraceExportResultV2,
+    VersionedManagementJob,
+};
 use evo_engine::import::{
-    SourceFormat, detect_format, detect_format_from_bytes, ingest_imported_sources, parse_fixture,
+    IMPORT_REGISTRATION_SCHEMA, ImportRegistrationRequest, ImportResultState, ImportRetentionScope,
+    ImportSourceSpec, PersistentImportService, SourceFormat, detect_format,
+    detect_format_from_bytes, ingest_imported_sources, parse_fixture,
 };
 use evo_engine::release_store::ReleaseStore;
 use evo_engine::service::{CompleteHostPrepareConfig, HostService};
-use evo_engine::trace_export::prepare_native_members;
 use evo_storage::Store;
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 fn context(actor: &str, role: Role) -> Context {
     Context::new("tenant-a", actor, role).unwrap()
@@ -113,22 +121,41 @@ async fn setup() -> (
                 &agent,
                 Prepare {
                     request_key: format!("prepare-{key}"),
-                    goal: format!("private goal of {key}").into(),
+                    goal: format!("private goal of {key}"),
                     capabilities: vec!["fs_read".into()],
                 },
                 &config,
             )
             .await
             .unwrap();
-        service
+        let feedback = service
             .feedback(
                 &agent,
                 Feedback {
                     request_key: format!("feedback-{key}"),
                     run_id: prepared.run.id.clone(),
                     outcome: Outcome::Failure,
-                    details: format!("private feedback of {key}").into(),
+                    details: format!("private feedback of {key}"),
                     failure_class: evo_core::FailureClass::Reasoning,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .propose(
+                &agent,
+                Proposal {
+                    request_key: format!("propose-{key}"),
+                    run_id: prepared.run.id.clone(),
+                    kind: ArtifactKind::Skill,
+                    parent_snapshot: prepared.run.snapshot_id.clone(),
+                    hypothesis: format!("private hypothesis of {key}"),
+                    applicability: "reference host".into(),
+                    counterexample: "other hosts".into(),
+                    content: format!("private proposal of {key}"),
+                    evidence_refs: vec![feedback.id],
+                    required_capabilities: vec!["fs_read".into()],
+                    dependencies: vec![],
                 },
             )
             .await
@@ -143,18 +170,108 @@ async fn setup() -> (
     (dir, service, host, source_ids, run_ids)
 }
 
-/// The frozen members of the real captured sources, read in one transaction.
-async fn frozen_members(
-    service: &HostService,
-    admin: &Context,
-    source_ids: &[String],
-) -> Vec<evo_storage::LocalExportFile> {
-    let mut session = service.store().session().await.unwrap();
-    let members = prepare_native_members(admin, &mut session, source_ids)
+async fn run_to_terminal(
+    dispatcher: &ManagementDispatcher,
+    ctx: &Context,
+    payload: Value,
+) -> VersionedManagementJob {
+    let job = dispatcher
+        .submit(ctx, "trace.export", payload)
         .await
         .unwrap();
-    session.commit().await.unwrap();
-    members.files
+    let id = job.identity().id.to_owned();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let current = dispatcher.status(ctx, &id).await.unwrap();
+            if matches!(
+                current.identity().state,
+                ManagementJobState::Succeeded
+                    | ManagementJobState::Failed
+                    | ManagementJobState::Cancelled
+                    | ManagementJobState::Blocked
+            ) {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("trace export job must reach a terminal state")
+}
+
+/// One real export of the captured sources through the real dispatcher jobs,
+/// read back from its published directory: the canonical tree path and every
+/// member file exactly as it is on disk.
+async fn published(
+    service: &HostService,
+    admin: &Context,
+    export_id: &str,
+    source_ids: &[String],
+) -> (PathBuf, Vec<evo_storage::LocalExportFile>) {
+    let dispatcher =
+        ManagementDispatcher::new(service.store().clone(), vec![admin.clone()]).unwrap();
+    let prepared = run_to_terminal(
+        &dispatcher,
+        admin,
+        json!({
+            "schema_version": "rsia.management.trace_export.prepare.v1",
+            "request_key": format!("prepare-{export_id}"),
+            "export_id": export_id,
+            "source_ids": source_ids,
+        }),
+    )
+    .await;
+    let Some(ManagementResultV2::Trace(ManagementTraceExportResultV2::TraceExportPrepared {
+        candidate_digest,
+        ..
+    })) = prepared.result()
+    else {
+        panic!("expected the prepared result, got {prepared:?}");
+    };
+    let delivered = run_to_terminal(
+        &dispatcher,
+        admin,
+        json!({
+            "schema_version": "rsia.management.trace_export.publish.v1",
+            "request_key": format!("publish-{export_id}"),
+            "export_id": export_id,
+            "candidate_digest": candidate_digest,
+        }),
+    )
+    .await;
+    assert_eq!(delivered.step(), "trace_export_delivered", "{delivered:?}");
+    let tree = service
+        .store()
+        .trace_export_directory(admin, export_id)
+        .unwrap()
+        .canonicalize()
+        .unwrap();
+    fn collect(root: &Path, dir: &Path, files: &mut Vec<evo_storage::LocalExportFile>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(root, &path, files);
+            } else {
+                files.push(evo_storage::LocalExportFile {
+                    path: path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    bytes: std::fs::read(&path).unwrap(),
+                });
+            }
+        }
+    }
+    let mut files = Vec::new();
+    collect(&tree, &tree, &mut files);
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    assert_eq!(
+        evo_storage::local_export_tree_digest(&files).unwrap().0,
+        candidate_digest,
+        "the published directory is exactly the frozen candidate"
+    );
+    (tree, files)
 }
 
 fn selection(run_ids: &[String]) -> SourceSelection {
@@ -166,13 +283,14 @@ fn selection(run_ids: &[String]) -> SourceSelection {
     }
 }
 
-/// A real exported artifact comes back through the real reader and the real
-/// in-memory import as `UnverifiedImport` history, never as authority.
+/// A real exported artifact, read from its published directory, comes back
+/// through the real reader and the persistent import as `UnverifiedImport`
+/// history, never as authority.
 #[tokio::test]
 async fn trace_export_real_artifact_roundtrips_to_unverified_import() {
-    let (_dir, service, _host, source_ids, run_ids) = setup().await;
+    let (_dir, service, _host, source_ids, _run_ids) = setup().await;
     let admin = context("admin", Role::Admin);
-    let files = frozen_members(&service, &admin, &source_ids[..1]).await;
+    let (tree, files) = published(&service, &admin, "roundtrip-one", &source_ids[..1]).await;
     let trace = files
         .iter()
         .find(|file| file.path == "traces/0000.json")
@@ -191,29 +309,67 @@ async fn trace_export_real_artifact_roundtrips_to_unverified_import() {
         && event.attestation == ExecutionAttestation::UnverifiedImport
         && event.task_origin == TaskOrigin::ImportedHistory
         && event.format == SourceFormat::RsiaTraceV1));
-    let selection = selection(&run_ids[..1]);
-    let imported =
-        ingest_imported_sources(&selection, &[("trace0000", trace.bytes.as_slice())], None)
-            .unwrap();
-    assert_eq!(imported.events.len(), 3);
-    assert!(
-        imported
-            .events
+    // The persistent import reads the published file itself. Its registration
+    // requires a namespace revocation watermark, as every persistent import.
+    let mut session = service.store().session().await.unwrap();
+    session
+        .bump_watermark(&admin, &hash(b"roundtrip import watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let import = PersistentImportService::new(service.store().clone());
+    let registered = import
+        .register(
+            &admin,
+            ImportRegistrationRequest {
+                schema_version: IMPORT_REGISTRATION_SCHEMA.into(),
+                request_key: "roundtrip-import".into(),
+                roots: vec![tree.to_string_lossy().into_owned()],
+                purpose: Purpose::Development,
+                allow_model_excerpts: false,
+                outbound_authorized: false,
+                retention_scope: ImportRetentionScope::LocalPrivate,
+                sources: vec![ImportSourceSpec {
+                    source_id: "trace0000".into(),
+                    path: tree.join("traces/0000.json").to_string_lossy().into_owned(),
+                    reader: SourceFormat::RsiaTraceV1,
+                    expected_digest: hash(&trace.bytes),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    let result = import.execute(&admin, &registered.id).await.unwrap();
+    // The Native header declares only the captured service-fact prefix, never
+    // complete coverage, so the import is honestly partial, not complete.
+    assert_eq!(result.payload.state, ImportResultState::Partial);
+    assert!(!result.payload.native_traces[0].header.coverage.complete());
+    assert_eq!(
+        result
+            .payload
+            .event_records
             .iter()
-            .all(|event| event.attestation == ExecutionAttestation::UnverifiedImport)
+            .map(|event| (event.role.as_str(), event.kind.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            ("agent", "service.prepare"),
+            ("agent", "service.feedback"),
+            ("agent", "service.propose")
+        ]
     );
-    assert!(
-        imported
-            .evidence_set
-            .members
-            .iter()
-            .all(
-                |member| member.execution_attestation == ExecutionAttestation::UnverifiedImport
-                    && member.task_origin == TaskOrigin::ImportedHistory
-                    && member.purpose == Purpose::Development
-            )
+    assert_eq!(result.payload.native_traces.len(), 1);
+    let native: Value = serde_json::from_slice(&trace.bytes).unwrap();
+    assert_eq!(
+        serde_json::to_value(&result.payload.native_traces[0].header.exporter).unwrap(),
+        native["exporter"]
     );
-    assert_eq!(imported.evidence_set.members.len(), 1);
+    let evidence = result.payload.evidence_set.unwrap();
+    assert_eq!(evidence.members.len(), 1);
+    assert!(evidence.members.iter().all(|member| {
+        member.execution_attestation == ExecutionAttestation::UnverifiedImport
+            && member.task_origin == TaskOrigin::ImportedHistory
+            && member.purpose == Purpose::Development
+    }));
     // The manifest is an index, not a trace: it never parses as one.
     let manifest = files
         .iter()
@@ -235,7 +391,7 @@ async fn trace_export_real_artifact_roundtrips_to_unverified_import() {
 async fn trace_export_normalized_content_sequence_roles_and_coverage_match() {
     let (_dir, service, _host, source_ids, _run_ids) = setup().await;
     let admin = context("admin", Role::Admin);
-    let files = frozen_members(&service, &admin, &source_ids).await;
+    let (_tree, files) = published(&service, &admin, "roundtrip-all", &source_ids).await;
     let manifest: Value = serde_json::from_slice(
         &files
             .iter()
@@ -316,7 +472,7 @@ async fn trace_export_normalized_content_sequence_roles_and_coverage_match() {
 async fn trace_export_roundtrip_does_not_create_formal_authority() {
     let (_dir, service, _host, source_ids, run_ids) = setup().await;
     let admin = context("admin", Role::Admin);
-    let files = frozen_members(&service, &admin, &source_ids[..1]).await;
+    let (_tree, files) = published(&service, &admin, "roundtrip-first", &source_ids[..1]).await;
     let trace = files
         .iter()
         .find(|file| file.path == "traces/0000.json")
@@ -357,7 +513,7 @@ async fn trace_export_roundtrip_does_not_create_formal_authority() {
 async fn trace_export_truncated_or_redacted_coverage_is_not_claimed_complete() {
     let (_dir, service, _host, source_ids, _run_ids) = setup().await;
     let admin = context("admin", Role::Admin);
-    let files = frozen_members(&service, &admin, &source_ids[..1]).await;
+    let (_tree, files) = published(&service, &admin, "roundtrip-first", &source_ids[..1]).await;
     let trace = files
         .iter()
         .find(|file| file.path == "traces/0000.json")

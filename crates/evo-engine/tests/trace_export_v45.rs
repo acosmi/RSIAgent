@@ -231,7 +231,7 @@ async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity()
     ));
     session.commit().await.unwrap();
 
-    let audit_before_replay = service.store().verify_audit(&host).await.unwrap();
+    let audit_before_replay = service.store().verify_audit(&admin).await.unwrap();
     assert_eq!(
         service
             .prepare_complete(&agent, request, &config)
@@ -250,12 +250,12 @@ async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity()
         candidate.id
     );
     assert_eq!(
-        service.store().verify_audit(&host).await.unwrap(),
+        service.store().verify_audit(&admin).await.unwrap(),
         audit_before_replay
     );
     for caller in [
         agent.clone(),
-        admin,
+        admin.clone(),
         context("different-host", Role::Host),
         Context::new("other-namespace", host.actor(), Role::Host).unwrap(),
     ] {
@@ -301,7 +301,7 @@ async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity()
         assert!(!captured.trace.excerpt.contains(secret));
     }
     assert_eq!(captured.trace.excerpt.as_bytes(), captured.record.body);
-    let audit_after_capture = service.store().verify_audit(&host).await.unwrap();
+    let audit_after_capture = service.store().verify_audit(&admin).await.unwrap();
     assert_eq!(audit_after_capture, audit_before_replay + 1);
     let repeated = service
         .record_service_facts(&host, &prepared.run.id)
@@ -312,7 +312,7 @@ async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity()
         serde_json::to_value(&captured).unwrap()
     );
     assert_eq!(
-        service.store().verify_audit(&host).await.unwrap(),
+        service.store().verify_audit(&admin).await.unwrap(),
         audit_after_capture
     );
     let mut session = service.store().session().await.unwrap();
@@ -360,13 +360,13 @@ async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity()
         )
         .await
         .unwrap();
-    let audit_after_later = service.store().verify_audit(&host).await.unwrap();
+    let audit_after_later = service.store().verify_audit(&admin).await.unwrap();
     assert!(
         matches!(service.record_service_facts(&host, &prepared.run.id).await,
         Err(Error::Conflict(message)) if message == "immutable source authority differs")
     );
     assert_eq!(
-        service.store().verify_audit(&host).await.unwrap(),
+        service.store().verify_audit(&admin).await.unwrap(),
         audit_after_later
     );
     let mut session = service.store().session().await.unwrap();
@@ -391,7 +391,7 @@ async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity()
     );
     drop(session); // The deliberately invalid fixture audit is never committed.
     assert_eq!(
-        service.store().verify_audit(&host).await.unwrap(),
+        service.store().verify_audit(&admin).await.unwrap(),
         audit_after_later
     );
 
@@ -514,7 +514,7 @@ async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity()
     .await
     .unwrap();
     assert_eq!(cleanup.state, CleanupState::Pending);
-    let audit_before_refusal = service.store().verify_audit(&host).await.unwrap();
+    let audit_before_refusal = service.store().verify_audit(&admin).await.unwrap();
     let mut session = service.store().session().await.unwrap();
     let sources_before_refusal = session.namespace_object_count(&host, "run").await.unwrap();
     let refused_source_id = format!(
@@ -571,7 +571,7 @@ async fn trace_export_loads_actual_authorized_run_and_preserves_event_identity()
         Err(Error::Conflict(message)) if message == expected)
     );
     assert_eq!(
-        service.store().verify_audit(&host).await.unwrap(),
+        service.store().verify_audit(&admin).await.unwrap(),
         audit_before_refusal
     );
     let mut session = service.store().session().await.unwrap();
@@ -763,7 +763,7 @@ async fn trace_export_requires_frozen_native_event_shape_and_explicit_roles() {
 async fn trace_export_uses_compiled_exporter_identity() {
     let (_dir, service, admin, source) = captured_source().await;
     let mut session = service.store().session().await.unwrap();
-    let compiled = option_env!("RSIA_EXPORTER_COMMIT").unwrap_or("unknown");
+    let compiled = env!("RSIA_EXPORTER_COMMIT");
     if matches!(compiled, "dirty" | "unknown") {
         assert!(
             matches!(compiled_exporter_identity(), Err(Error::Invalid(message)) if message == "native exporter requires a clean known build commit")
@@ -982,20 +982,56 @@ async fn trace_export_removes_forbidden_content_before_publication() {
             .candidate_digest,
         candidate.candidate_digest
     );
+    // The package member bound holds for the builder itself: 99 traces plus
+    // the report and manifest exceed the 100-file limit.
     assert!(
-        matches!(prepare_native_members(&admin, &mut session, &[source_ids[0].clone(), source_ids[0].clone()]).await, Err(Error::Invalid(message)) if message == "duplicate native trace source")
-    );
-    assert!(
-        matches!(prepare_native_members(&admin, &mut session, &[]).await, Err(Error::Invalid(message)) if message == "native trace source count is invalid")
-    );
-    assert!(
-        matches!(prepare_native_members(&admin, &mut session, &vec![source_ids[0].clone(); 99]).await, Err(Error::Invalid(message)) if message == "native trace source count is invalid")
+        matches!(prepare_native_members(&admin, &mut session, &vec![source_ids[0].clone(); 99]).await, Err(Error::Invalid(message)) if message == "native candidate member validation failed")
     );
     assert_eq!(
         session.namespace_object_count(&admin, "run").await.unwrap(),
         run_count
     );
     session.commit().await.unwrap();
+    // The source list itself is validated once, at the request boundary.
+    let dispatcher = evo_engine::dispatch::ManagementDispatcher::new(
+        service.store().clone(),
+        vec![admin.clone()],
+    )
+    .unwrap();
+    for (sources, expected) in [
+        (
+            vec![source_ids[0].clone(), source_ids[0].clone()],
+            "duplicate trace export source",
+        ),
+        (Vec::new(), "trace export source count is invalid"),
+        (
+            vec![source_ids[0].clone(); 99],
+            "trace export source count is invalid",
+        ),
+        (
+            vec!["source.with.dots".into()],
+            "trace export identifiers are single segment",
+        ),
+    ] {
+        assert!(
+            matches!(
+                dispatcher
+                    .submit(
+                        &admin,
+                        "trace.export",
+                        json!({
+                            "schema_version": "rsia.management.trace_export.prepare.v1",
+                            "request_key": "members-boundary",
+                            "export_id": "members-boundary",
+                            "source_ids": sources,
+                        }),
+                    )
+                    .await,
+                Err(Error::Invalid(message)) if message == expected
+            ),
+            "{expected}"
+        );
+    }
     assert_eq!(service.store().verify_audit(&admin).await.unwrap(), before);
     let manifest: Value = serde_json::from_slice(
         &candidate

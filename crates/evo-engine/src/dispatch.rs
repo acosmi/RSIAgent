@@ -613,32 +613,15 @@ impl ManagementDispatcher {
             && job.identity().state == ManagementJobState::Succeeded
         {
             // A completed trace export job serves references only: the record
-            // it names is re-read through the live source closure and must
-            // still carry the stored phase and frozen candidate digest. Only
-            // actual phases, refs and the known-none fee view are served;
-            // private material, tokens and paths never enter this view.
+            // it names is re-read live with its source closure, and a delivered
+            // result must still name the exact published tree. Private
+            // material, tokens and paths never enter this view.
             let Some(ManagementResultV2::Trace(result)) = job.result() else {
                 return Err(Error::Conflict(
                     "trace export job succeeded without valid trace result".into(),
                 ));
             };
-            let delivered_export = match &result {
-                ManagementTraceExportResultV2::TraceExportDelivered { export_id, .. } => {
-                    Some(export_id.clone())
-                }
-                _ => None,
-            };
-            {
-                let mut session = self.store.session().await?;
-                crate::trace_export::verify_result_view(ctx, &mut session, &result).await?;
-                session.commit().await?;
-            }
-            if let Some(export_id) = delivered_export {
-                // A delivered export whose published tree is missing or
-                // tampered is served as the honest `unavailable` conflict,
-                // never as a delivery and never republished.
-                crate::trace_export::verify_delivered_tree(ctx, &self.store, &export_id).await?;
-            }
+            crate::trace_export::verify_result_view(ctx, &self.store, &result).await?;
         }
         Ok(job)
     }
@@ -2463,11 +2446,11 @@ fn public_evaluation_status(status: &StreamingEvaluationStatus) -> ManagementRes
 }
 
 /// `trace.export` prepare, one Session and one transaction from the live fence
-/// to the first record write and the terminal job state: the Admin gate, the
-/// authenticated source loader, the full snapshot/watermark verification and
-/// the storage put's own quota/classification gates all commit together, and
-/// a refusal (including a cancellation observed at the fence) rolls all of it
-/// back — no record, no download surface, zero export side effect.
+/// to the record write and the terminal job state: the claim and cancel fence,
+/// the authenticated source loader and the storage put's own quota and
+/// classification gates all commit together, and a refusal (including a
+/// cancellation observed at the fence) rolls all of it back — no record, no
+/// download surface, zero export side effect.
 async fn run_trace_export_prepare(
     ctx: &Context,
     store: &Store,
@@ -2503,24 +2486,8 @@ async fn trace_export_prepare_in_session(
     control: &WorkerControl,
 ) -> Result<ManagementJobV2> {
     let mut current = begin_management_step(ctx, session, claimed, control).await?;
-    current.step = "trace_export_preparing".into();
-    session
-        .put(ctx, "job", &current.id, ctx.actor(), &current)
-        .await?;
-    session
-        .audit(ctx, "management.job.checkpoint", &current.id)
-        .await?;
-
     let started = now()?;
-    let members =
-        crate::trace_export::prepare_native_members(ctx, session, &request.source_ids).await?;
-    crate::trace_export::verify_native_source_snapshots(
-        ctx,
-        session,
-        &members.source_snapshots,
-        members.source_watermark.as_ref(),
-    )
-    .await?;
+    let members = crate::trace_export::native_members(ctx, session, &request.source_ids).await?;
     let record = crate::trace_export::write_prepared_record(
         ctx,
         session,
@@ -2530,17 +2497,15 @@ async fn trace_export_prepare_in_session(
         started,
     )
     .await?;
-
     current.state = ManagementJobState::Succeeded;
     current.step = "trace_export_prepared".into();
     current.lease_token = None;
     current.lease_until = 0;
     current.result = Some(ManagementResultV2::Trace(
         ManagementTraceExportResultV2::TraceExportPrepared {
-            export_id: record.export_id.clone(),
-            record_id: record.id.clone(),
-            candidate_digest: record.candidate_digest.clone(),
-            phase: crate::trace_export::trace_phase_wire(record.phase)?,
+            export_id: record.export_id,
+            record_id: record.id,
+            candidate_digest: record.candidate_digest,
         },
     ));
     session
@@ -2552,17 +2517,18 @@ async fn trace_export_prepare_in_session(
     Ok(current)
 }
 
-/// `trace.export` publish. TX1 is the single fenced management transaction:
-/// the Admin gate, the frozen-digest equality, the whole captured source
-/// closure, license, recipient scope and revocation watermark re-verified
-/// through the real loader (candidate bytes are never regenerated as
-/// authority — they are re-derived read-only and must hash to the frozen
-/// member digests), advancing the record's one publish job to the `reviewed`
-/// decision. The FS publication chain then runs with no database connection
-/// held, and TX2 commits the phase transition and the terminal job state
-/// together: `delivered` on a fully verified tree, `aborted` when nothing was
-/// published, `failed` when real bytes already reached the local export
-/// surface but the chain did not complete.
+/// `trace.export` publish in three steps. TX1, on the job's claim fence, is the
+/// publish decision: the frozen digest, the record's one publish job and the
+/// frozen members re-derived once through the authenticated loader (source
+/// closure, license, recipient scope), moving the record to `reviewed`. The
+/// candidate is then staged privately and renamed into its formal directory
+/// under the storage publication fence, which re-checks the reviewed record
+/// and its source closure — not the namespace watermark — with the database
+/// write lock held across the rename. TX2 commits the delivery fact and the
+/// terminal job state together on the same claim. A refusal before the rename
+/// commits `aborted`; a failure after it is returned as an error, so recovery
+/// completes `delivered` from the exact published tree instead of claiming a
+/// zero-effect failure.
 async fn run_trace_export_publish(
     ctx: &Context,
     store: &Store,
@@ -2571,98 +2537,44 @@ async fn run_trace_export_publish(
     control: &WorkerControl,
 ) -> Result<ObservedWorkerExit> {
     let started = now()?;
-    let (record, files) = {
-        let mut session = store.session().await?;
-        let finished =
-            match trace_export_publish_in_session(ctx, &mut session, &claimed, &request, control)
-                .await
-            {
-                Ok(finished) => finished,
-                Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
-                Err(error) => {
-                    return execution_outcome(claimed, Err(error))
-                        .map(ObservedWorkerExit::BeforeCommitFailed);
-                }
-            };
-        session.commit().await?;
-        finished
-    };
-    // No Session is alive here: the publication chain's entry re-verification
-    // uses its own short read Session and the storage blob lock is taken only
-    // inside the FS write path, never nested on a pooled connection.
-    let publication = match crate::trace_export::stage_reviewed_candidate_for_publication(
-        ctx, store, &record, &files,
+    let mut session = store.session().await?;
+    let (record, files) = match trace_export_publish_decision(
+        ctx,
+        &mut session,
+        &claimed,
+        &request,
+        control,
+        started,
     )
     .await
     {
-        Ok(publication) => publication,
+        Ok(decided) => decided,
         Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
         Err(error) => {
-            // Pre-publication failure: the reviewed decision stays, this
-            // attempt's private staging temp was removed by its own guard,
-            // and TX2 records the honest aborted phase plus the terminal
-            // job failure together.
+            return execution_outcome(claimed, Err(error))
+                .map(ObservedWorkerExit::BeforeCommitFailed);
+        }
+    };
+    session.commit().await?;
+    let published = match store.stage_trace_export(ctx, &record.id, &files).await {
+        Ok(staged) => store.publish_staged_trace_export(ctx, staged).await,
+        Err(error) => Err(error),
+    };
+    let receipt = match published {
+        Ok(receipt) => receipt,
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
+        Err(error) => {
             return commit_trace_export_abort(ctx, store, claimed, &record, started, error).await;
         }
     };
-    // TX2: the delivery fact and the terminal job state commit together.
     let mut session = store.session().await?;
-    match commit_trace_export_delivery(ctx, &mut session, &claimed, &record, &publication, started)
-        .await
-    {
-        Ok(finished) => {
-            session.commit().await?;
-            let receipt_digest = publication.receipt.completion_receipt_digest.clone();
-            Ok(ObservedWorkerExit::Completed(JobOutcome {
-                state: ManagementJobState::Succeeded,
-                step: finished.step,
-                result: Some(ManagementResultV2::Trace(
-                    ManagementTraceExportResultV2::TraceExportDelivered {
-                        export_id: finished.export_id,
-                        record_id: finished.record_id,
-                        candidate_digest: finished.candidate_digest,
-                        phase: finished.phase,
-                        receipt_digest,
-                    },
-                )),
-                error_code: None,
-            }))
-        }
-        Err(error) => {
-            drop(session);
-            commit_trace_export_failure(ctx, store, claimed, &record, &publication, started, error)
-                .await
-        }
-    }
-}
-
-/// A small projection of TX2's terminal job state for the caller above.
-struct TraceExportDeliveryFinish {
-    export_id: String,
-    record_id: String,
-    candidate_digest: String,
-    phase: String,
-    step: String,
-}
-
-/// TX2 success path: still fenced on the same claim, the record moves to
-/// `delivered` with the receipt and durability facts, and the job's terminal
-/// success — including its result — commits in the same transaction.
-async fn commit_trace_export_delivery(
-    ctx: &Context,
-    session: &mut Session,
-    claimed: &ManagementJobV2,
-    record: &crate::trace_export::TraceExportRecord,
-    publication: &evo_storage::TraceExportTreePublication,
-    started_at: i64,
-) -> Result<TraceExportDeliveryFinish> {
-    let mut current = reload_same_claim_after_write(ctx, session, claimed).await?;
-    let delivered = crate::trace_export::complete_delivered_record(
+    let mut current = reload_same_claim_after_write(ctx, &mut session, &claimed).await?;
+    let delivered = crate::trace_export::finish_publication(
         ctx,
-        session,
-        record,
-        publication,
-        started_at,
+        &mut session,
+        &record,
+        Some(&receipt),
+        started,
     )
     .await?;
     current.state = ManagementJobState::Succeeded;
@@ -2670,17 +2582,16 @@ async fn commit_trace_export_delivery(
     current.lease_token = None;
     current.lease_until = 0;
     if current.cancel_requested {
-        // The bytes already left through the publication; the completion and
-        // the cancel arrival are both recorded honestly.
+        // The bytes already left through the fenced publication; the
+        // completion and the cancel arrival are both recorded honestly.
         current.cancel_arrival = Some(ManagementCancelArrival::AfterSideEffect);
     }
     current.result = Some(ManagementResultV2::Trace(
         ManagementTraceExportResultV2::TraceExportDelivered {
-            export_id: delivered.export_id.clone(),
-            record_id: delivered.id.clone(),
-            candidate_digest: delivered.candidate_digest.clone(),
-            phase: crate::trace_export::trace_phase_wire(delivered.phase)?,
-            receipt_digest: publication.receipt.completion_receipt_digest.clone(),
+            export_id: delivered.export_id,
+            record_id: delivered.id,
+            candidate_digest: delivered.candidate_digest,
+            receipt_digest: receipt.completion_receipt_digest,
         },
     ));
     session
@@ -2689,159 +2600,39 @@ async fn commit_trace_export_delivery(
     session
         .audit(ctx, "management.job.finish", &current.id)
         .await?;
-    Ok(TraceExportDeliveryFinish {
-        export_id: delivered.export_id,
-        record_id: delivered.id,
-        candidate_digest: delivered.candidate_digest,
-        phase: crate::trace_export::trace_phase_wire(delivered.phase)?,
+    session.commit().await?;
+    Ok(ObservedWorkerExit::Completed(JobOutcome {
+        state: current.state,
         step: current.step,
-    })
+        result: current.result,
+        error_code: None,
+    }))
 }
 
-/// TX2 for a publication that failed before its first committed FS effect:
-/// the record's honest `aborted` phase and the job's terminal failure commit
-/// together. The main record, its refs and every observed cost fact stay.
-async fn commit_trace_export_abort(
-    ctx: &Context,
-    store: &Store,
-    claimed: ManagementJobV2,
-    record: &crate::trace_export::TraceExportRecord,
-    started_at: i64,
-    error: Error,
-) -> Result<ObservedWorkerExit> {
-    let outcome = execution_outcome(claimed.clone(), Err(error));
-    let mut session = match store.session().await {
-        Ok(session) => session,
-        Err(_) => return outcome.map(ObservedWorkerExit::BeforeCommitFailed),
-    };
-    let step;
-    match reload_same_claim_after_write(ctx, &mut session, &claimed).await {
-        Ok(mut current) => {
-            match crate::trace_export::mark_aborted_record(ctx, &mut session, record, started_at)
-                .await
-            {
-                Ok(_) => {}
-                Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
-                // The record stays `reviewed` — recoverable, never erased.
-                Err(_) => return outcome.map(ObservedWorkerExit::BeforeCommitFailed),
-            }
-            current.state = ManagementJobState::Failed;
-            current.step = "trace_export_aborted".into();
-            current.lease_token = None;
-            current.lease_until = 0;
-            step = current.step.clone();
-            session
-                .put(ctx, "job", &current.id, ctx.actor(), &current)
-                .await?;
-            session
-                .audit(ctx, "management.job.finish", &current.id)
-                .await?;
-        }
-        Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
-        Err(_) => return outcome.map(ObservedWorkerExit::BeforeCommitFailed),
-    }
-    session.commit().await?;
-    let mut finished = outcome?;
-    finished.step = step;
-    Ok(ObservedWorkerExit::BeforeCommitFailed(finished))
-}
-
-/// TX3 for a partial commit after real bytes already reached the local export
-/// surface: the record moves to `failed` with the durability facts actually
-/// observed, the published tree is never deleted, zero side effect is never
-/// claimed, and the export is never resent.
-async fn commit_trace_export_failure(
-    ctx: &Context,
-    store: &Store,
-    claimed: ManagementJobV2,
-    record: &crate::trace_export::TraceExportRecord,
-    publication: &evo_storage::TraceExportTreePublication,
-    started_at: i64,
-    error: Error,
-) -> Result<ObservedWorkerExit> {
-    let outcome = execution_outcome(claimed.clone(), Err(error));
-    let mut session = match store.session().await {
-        Ok(session) => session,
-        Err(_) => return outcome.map(ObservedWorkerExit::BeforeCommitFailed),
-    };
-    let step;
-    match reload_same_claim_after_write(ctx, &mut session, &claimed).await {
-        Ok(mut current) => {
-            match crate::trace_export::mark_failed_after_publication(
-                ctx,
-                &mut session,
-                record,
-                publication,
-                started_at,
-            )
-            .await
-            {
-                Ok(_) => {}
-                Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
-                // The record stays `reviewed`; crash recovery can still prove
-                // the published tree and complete it. Nothing is erased.
-                Err(_) => return outcome.map(ObservedWorkerExit::BeforeCommitFailed),
-            }
-            current.state = ManagementJobState::Failed;
-            current.step = "trace_export_failed".into();
-            current.lease_token = None;
-            current.lease_until = 0;
-            step = current.step.clone();
-            session
-                .put(ctx, "job", &current.id, ctx.actor(), &current)
-                .await?;
-            session
-                .audit(ctx, "management.job.finish", &current.id)
-                .await?;
-        }
-        Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
-        Err(_) => return outcome.map(ObservedWorkerExit::BeforeCommitFailed),
-    }
-    session.commit().await?;
-    let mut finished = outcome?;
-    finished.step = step;
-    Ok(ObservedWorkerExit::BeforeCommitFailed(finished))
-}
-
-/// TX1 of the publish flow: the fenced recheck transaction. It claims the
-/// step through the real worker fence, advances the record to the `reviewed`
-/// decision (re-verifying the whole captured source closure and watermark
-/// through the real loader), and re-derives the frozen members read-only so
-/// the publication chain can prove every byte it writes hashes to the frozen
-/// candidate digest. It never touches the filesystem.
-async fn trace_export_publish_in_session(
+/// TX1 of the publish job: the claim fence, the visible `publishing` step and
+/// the reviewed decision with the re-derived frozen bytes. No filesystem
+/// effect happens here.
+async fn trace_export_publish_decision(
     ctx: &Context,
     session: &mut Session,
     claimed: &ManagementJobV2,
     request: &TraceExportPublishRequest,
     control: &WorkerControl,
+    started: i64,
 ) -> Result<(
     crate::trace_export::TraceExportRecord,
     Vec<evo_storage::LocalExportFile>,
 )> {
     let mut current = begin_management_step(ctx, session, claimed, control).await?;
-    current.step = "trace_export_publish_recheck".into();
-    session
-        .put(ctx, "job", &current.id, ctx.actor(), &current)
-        .await?;
-    session
-        .audit(ctx, "management.job.checkpoint", &current.id)
-        .await?;
-
-    let record = crate::trace_export::advance_reviewed_record(
+    let decided = crate::trace_export::review_frozen_candidate(
         ctx,
         session,
         &request.export_id,
         &current.id,
         &request.candidate_digest,
-        now()?,
+        started,
     )
     .await?;
-    // Re-derive the exact frozen bytes through the same authenticated loader;
-    // any drift from the frozen member digests is a Conflict before the first
-    // FS write, never a silent candidate swap.
-    let files = crate::trace_export::regenerate_frozen_members(ctx, session, &record).await?;
-
     current.step = "trace_export_publishing".into();
     session
         .put(ctx, "job", &current.id, ctx.actor(), &current)
@@ -2849,7 +2640,64 @@ async fn trace_export_publish_in_session(
     session
         .audit(ctx, "management.job.checkpoint", &current.id)
         .await?;
-    Ok((record, files))
+    Ok(decided)
+}
+
+/// A publication refused or failed before its formal rename: on the same
+/// claim, the record's `aborted` phase and the job's terminal failure commit
+/// together. The private staging was already released by its guard and
+/// nothing was delivered. When the claim moved on or the record can no longer
+/// be finished (a source revocation already redacted it), only the refusal is
+/// reported.
+async fn commit_trace_export_abort(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    record: &crate::trace_export::TraceExportRecord,
+    started: i64,
+    error: Error,
+) -> Result<ObservedWorkerExit> {
+    let outcome = execution_outcome(claimed.clone(), Err(error))?;
+    let mut session = store.session().await?;
+    match trace_export_abort_in_session(ctx, &mut session, &claimed, record, started, &outcome)
+        .await
+    {
+        Ok(aborted) => {
+            session.commit().await?;
+            Ok(ObservedWorkerExit::BeforeCommitFailed(aborted))
+        }
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(_) => Ok(ObservedWorkerExit::BeforeCommitFailed(outcome)),
+    }
+}
+
+async fn trace_export_abort_in_session(
+    ctx: &Context,
+    session: &mut Session,
+    claimed: &ManagementJobV2,
+    record: &crate::trace_export::TraceExportRecord,
+    started: i64,
+    outcome: &JobOutcome,
+) -> Result<JobOutcome> {
+    let mut current = reload_same_claim_after_write(ctx, session, claimed).await?;
+    crate::trace_export::finish_publication(ctx, session, record, None, started).await?;
+    current.state = ManagementJobState::Failed;
+    current.step = "trace_export_aborted".into();
+    current.error_code = outcome.error_code.clone();
+    current.lease_token = None;
+    current.lease_until = 0;
+    session
+        .put(ctx, "job", &current.id, ctx.actor(), &current)
+        .await?;
+    session
+        .audit(ctx, "management.job.finish", &current.id)
+        .await?;
+    Ok(JobOutcome {
+        state: current.state,
+        step: current.step,
+        result: None,
+        error_code: current.error_code,
+    })
 }
 
 async fn run_replay(
@@ -3040,17 +2888,7 @@ fn validate_trace_export_prepare_request(request: &TraceExportPrepareRequest) ->
 
 fn validate_trace_export_publish_request(request: &TraceExportPublishRequest) -> Result<()> {
     trace_export_segment_identifier(&request.export_id)?;
-    let digest = &request.candidate_digest;
-    if digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(Error::Invalid(
-            "trace export candidate digest is not sha256 hex".into(),
-        ));
-    }
-    Ok(())
+    crate::packages::validate_digest(&request.candidate_digest, "trace export candidate digest")
 }
 
 /// Why a job's private input could not be turned into a request.
@@ -4739,9 +4577,9 @@ async fn consumer_progress(
         }
         ParsedRequest::TraceExportPrepare(request) => {
             // Crash reconciliation: the record and the terminal job state were
-            // written by one transaction, so this job's own record with the
-            // frozen content is the proof its prepare committed.
-            let job_id = record.identity().id.to_owned();
+            // written by one transaction, so this job's own record is the
+            // proof its prepare committed.
+            let job_id = record.identity().id;
             let mut session = store.session().await?;
             let record =
                 crate::trace_export::load_live_record(ctx, &mut session, &request.export_id)
@@ -4754,10 +4592,9 @@ async fn consumer_progress(
                         step: "trace_export_prepared".into(),
                         result: Some(ManagementResultV2::Trace(
                             ManagementTraceExportResultV2::TraceExportPrepared {
-                                export_id: record.export_id.clone(),
-                                record_id: record.id.clone(),
-                                candidate_digest: record.candidate_digest.clone(),
-                                phase: crate::trace_export::trace_phase_wire(record.phase)?,
+                                export_id: record.export_id,
+                                record_id: record.id,
+                                candidate_digest: record.candidate_digest,
                             },
                         )),
                         error_code: None,
@@ -4767,50 +4604,35 @@ async fn consumer_progress(
             }
         }
         ParsedRequest::TraceExportPublish(request) => {
-            // Crash reconciliation: the reviewed decision (TX1) and the
-            // delivery fact (TX2) were each one transaction, and the FS
-            // publication between them is only proved by the real tree. The
-            // read-only recovery matches the source closure, the typed record,
-            // the exact on-disk tree and this job's ownership; only that
-            // consistency completes `delivered` (with a real fsync pass over
-            // the published tree first). A missing tree proves the crash
-            // preceded the rename, so nothing is reported committed and
-            // nothing is republished here — a tampered or drifted closure
-            // surfaces as an error, never as a delivery.
-            let job_id = record.identity().id.to_owned();
-            match crate::trace_export::reconcile_reviewed_publication(
+            // Crash reconciliation anchored on the record: only this job's
+            // reviewed record whose formal tree is exactly the frozen members
+            // completes `delivered`; a missing or differing tree proves no
+            // publication, and nothing is republished here.
+            match crate::trace_export::reconcile_publication(
                 ctx,
                 store,
                 &request.export_id,
-                &job_id,
+                record.identity().id,
             )
-            .await
+            .await?
             {
-                Ok(crate::trace_export::TraceExportRecovery::Completed(delivered)) => {
-                    let receipt_digest = delivered
-                        .delivery
-                        .receipt_digest
-                        .clone()
-                        .ok_or(Error::Internal)?;
-                    Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
-                        state: ManagementJobState::Succeeded,
-                        step: "trace_export_delivered".into(),
-                        result: Some(ManagementResultV2::Trace(
-                            ManagementTraceExportResultV2::TraceExportDelivered {
-                                export_id: delivered.export_id.clone(),
-                                record_id: delivered.id.clone(),
-                                candidate_digest: delivered.candidate_digest.clone(),
-                                phase: crate::trace_export::trace_phase_wire(delivered.phase)?,
-                                receipt_digest,
-                            },
-                        )),
-                        error_code: None,
-                    })))
-                }
-                Ok(crate::trace_export::TraceExportRecovery::Pending) => {
-                    Ok(ConsumerProgress::NotCommitted)
-                }
-                Err(error) => Err(error),
+                Some(delivered) => Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                    state: ManagementJobState::Succeeded,
+                    step: "trace_export_delivered".into(),
+                    result: Some(ManagementResultV2::Trace(
+                        ManagementTraceExportResultV2::TraceExportDelivered {
+                            receipt_digest: delivered
+                                .delivery
+                                .ok_or(Error::Internal)?
+                                .receipt_digest,
+                            export_id: delivered.export_id,
+                            record_id: delivered.id,
+                            candidate_digest: delivered.candidate_digest,
+                        },
+                    )),
+                    error_code: None,
+                }))),
+                None => Ok(ConsumerProgress::NotCommitted),
             }
         }
         ParsedRequest::OptimizationStep(_) => Err(Error::Internal),
@@ -5741,7 +5563,6 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             // The private input depends on every captured source run, so a
             // revoked source redacts the request with the job that holds it.
             for id in &request.source_ids {
-                trace_export_segment_identifier(id)?;
                 dependencies.push(("run".into(), id.clone()));
             }
         }
@@ -6114,33 +5935,26 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
             stage_fact_id: stage_fact_id.clone(),
             input_digest: input_digest.clone(),
         }],
-        Some(ManagementResultV2::Trace(
-            ManagementTraceExportResultV2::TraceExportPrepared {
-                export_id,
-                record_id,
-                candidate_digest,
-                phase,
-                ..
-            }
-            | ManagementTraceExportResultV2::TraceExportReviewed {
-                export_id,
-                record_id,
-                candidate_digest,
-                phase,
-                ..
-            }
-            | ManagementTraceExportResultV2::TraceExportDelivered {
-                export_id,
-                record_id,
-                candidate_digest,
-                phase,
-                ..
-            },
-        )) => vec![ManagementCommittedEffect::TraceExport {
+        Some(ManagementResultV2::Trace(ManagementTraceExportResultV2::TraceExportPrepared {
+            export_id,
+            record_id,
+            candidate_digest,
+        })) => vec![ManagementCommittedEffect::TraceExport {
             export_id: export_id.clone(),
             record_id: record_id.clone(),
             candidate_digest: candidate_digest.clone(),
-            phase: phase.clone(),
+            phase: "prepared".into(),
+        }],
+        Some(ManagementResultV2::Trace(ManagementTraceExportResultV2::TraceExportDelivered {
+            export_id,
+            record_id,
+            candidate_digest,
+            ..
+        })) => vec![ManagementCommittedEffect::TraceExport {
+            export_id: export_id.clone(),
+            record_id: record_id.clone(),
+            candidate_digest: candidate_digest.clone(),
+            phase: "delivered".into(),
         }],
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }

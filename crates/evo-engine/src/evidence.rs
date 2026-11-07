@@ -537,6 +537,8 @@ pub(crate) fn service_fact_authority(
         facts,
     };
     let body = serde_json::to_string(&source).map_err(|_| Error::Internal)?;
+    // One immutable source per (namespace, run): a run is captured once and is
+    // revoked as that one source.
     let source_id = format!(
         "service-facts-{}",
         &evo_core::fingerprint(&(namespace, service_run_id))?[..32]
