@@ -37,6 +37,9 @@ use evo_storage::replay::{
 };
 use serde_json::json;
 use std::collections::BTreeSet;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 const COST: u64 = 10;
 const STOP_REASON: &str = "no_legal_action_with_authorized_cost";
@@ -863,7 +866,13 @@ impl Persistent {
             serde_json::from_str(metadata["pool_utf8"].as_str().unwrap()).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("replay.sqlite3");
-        std::fs::write(&path, database).unwrap();
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path).unwrap();
+        file.write_all(database).unwrap();
+        drop(file);
         let store = Store::open(&path).await.unwrap();
         let worker = Context::new("ag103", "worker", Role::Worker).unwrap();
         let evaluator = Context::new("ag103", "evaluator", Role::Evaluator).unwrap();

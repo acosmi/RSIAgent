@@ -4,8 +4,11 @@
 use crate::startup_gate::{
     DATA_LOCK_FILE, GateDecision, StartupGate, StartupGateError, data_directory,
 };
+use evo_storage::{LocalPermissionError, LocalPermissionTarget, check_local_permissions};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Error, ErrorKind};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -15,15 +18,30 @@ pub struct DataDirectoryLock {
 
 impl DataDirectoryLock {
     pub fn acquire(data: &Path) -> std::io::Result<Self> {
+        check_local_permissions(LocalPermissionTarget::Database(data)).map_err(
+            |error| match error {
+                LocalPermissionError::Io(error) => error,
+                error @ LocalPermissionError::Insecure => {
+                    Error::new(ErrorKind::PermissionDenied, error)
+                }
+                error @ LocalPermissionError::Unsupported => {
+                    Error::new(ErrorKind::Unsupported, error)
+                }
+            },
+        )?;
         let directory = data_directory(data);
-        std::fs::create_dir_all(&directory)?;
+        if !directory.try_exists()? {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(0o700);
+            builder.create(&directory)?;
+        }
         let directory = directory.canonicalize()?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(directory.join(DATA_LOCK_FILE))?;
+        let mut options = OpenOptions::new();
+        options.create(true).read(true).write(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options.open(directory.join(DATA_LOCK_FILE))?;
         match file.try_lock() {
             Ok(()) => Ok(Self { _file: file }),
             Err(TryLockError::WouldBlock) => Err(Error::new(

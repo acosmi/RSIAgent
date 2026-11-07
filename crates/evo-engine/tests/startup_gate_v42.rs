@@ -21,7 +21,9 @@ use evo_storage::lifecycle::{
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -35,6 +37,15 @@ const ROOT_BUDGET_FACTS: &str = "INSERT INTO root_budgets(billing_scope,root_bud
 INSERT INTO root_budget_namespaces(billing_scope,namespace) VALUES('scope-a','n');
 INSERT INTO objects(namespace,kind,id,owner,body) VALUES('n','reservation','res-1','admin','{\"id\":\"res-1\",\"state\":\"reserved\"}');
 INSERT INTO objects(namespace,kind,id,owner,body) VALUES('n','artifact','ledger-1','admin','{\"schema_version\":\"rsia.typed_artifact_envelope.v1\",\"id\":\"ledger-1\",\"record_kind\":\"exposure_ledger_v1\",\"payload\":{\"spent\":1}}')";
+
+// The startup gate requires the data directory itself to be private; the
+// default tempdir follows the process umask, so D is created 0700 here.
+fn private_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
 
 fn ctx(actor: &str, role: Role) -> Context {
     Context::new("n", actor, role).unwrap()
@@ -235,7 +246,10 @@ impl Fixture {
     /// database (the live database is closed, so the copy is complete).
     fn independent_anchor(&self, name: &str) -> PathBuf {
         let dir = self.root.join(name);
-        std::fs::create_dir(&dir).unwrap();
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(&dir).unwrap();
         let anchor = dir.join("rsia.sqlite3");
         std::fs::copy(&self.live, &anchor).unwrap();
         anchor
@@ -271,6 +285,98 @@ async fn expect_quarantine(gate: &StartupGate, protected: &Path, needle: &str) -
     text
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct PermissionImageEntry {
+    kind: &'static str,
+    bytes: Vec<u8>,
+    target: Option<PathBuf>,
+    mode: u32,
+    uid: u32,
+    links: u64,
+    device: u64,
+    inode: u64,
+}
+
+// Only the five filesystem bad points whose first endpoint changed under §11.7.
+// The old quarantine and anchor-without-restore helpers stay strict and unchanged.
+async fn expect_permission_rejected(gate: &StartupGate, protected: &Path) {
+    fn image(root: &Path) -> BTreeMap<PathBuf, PermissionImageEntry> {
+        fn visit(root: &Path, path: &Path, out: &mut BTreeMap<PathBuf, PermissionImageEntry>) {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            #[cfg(unix)]
+            let (mode, uid, links, device, inode) = (
+                metadata.mode(),
+                metadata.uid(),
+                metadata.nlink(),
+                metadata.dev(),
+                metadata.ino(),
+            );
+            #[cfg(not(unix))]
+            let (mode, uid, links, device, inode) =
+                panic!("unsupported permission fixture platform");
+            let link = metadata.file_type().is_symlink();
+            let directory = metadata.is_dir();
+            out.insert(
+                path.strip_prefix(root).unwrap().to_path_buf(),
+                PermissionImageEntry {
+                    kind: if link {
+                        "symlink"
+                    } else if directory {
+                        "directory"
+                    } else if metadata.is_file() {
+                        "regular"
+                    } else {
+                        "special"
+                    },
+                    bytes: if metadata.is_file() && !link {
+                        std::fs::read(path).unwrap()
+                    } else {
+                        Vec::new()
+                    },
+                    target: if link {
+                        Some(std::fs::read_link(path).unwrap())
+                    } else {
+                        None
+                    },
+                    mode,
+                    uid,
+                    links,
+                    device,
+                    inode,
+                },
+            );
+            if directory && !link {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    visit(root, &entry.unwrap().path(), out);
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        visit(root, root, &mut out);
+        out
+    }
+    let before = image(protected);
+    let error = gate.evaluate().await.unwrap_err();
+    let StartupGateError::Rejected(payload) = &error else {
+        panic!("expected the exact permission rejection, got {error}");
+    };
+    assert_eq!(payload, "data_directory_insecure");
+    assert_eq!(
+        error.to_string(),
+        "startup_rejected: data_directory_insecure"
+    );
+    let after = image(protected);
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        before.keys().collect::<Vec<_>>(),
+        "a permission refusal added or removed a lock, database, temp or member"
+    );
+    assert_eq!(
+        after, before,
+        "permission refusal changed complete filesystem bytes or metadata"
+    );
+}
+
 async fn expect_rejected(gate: &StartupGate, protected: &Path) {
     let before = snapshot(protected);
     let error = gate.evaluate().await.unwrap_err();
@@ -294,7 +400,7 @@ fn no_admission_temp_files(dir: &Path) {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn an_ordinary_directory_is_normal_and_the_gate_writes_nothing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let data = dir.path().join("rsia.sqlite3");
     Store::open(&data).await.unwrap().close().await;
     let before = snapshot(dir.path());
@@ -317,12 +423,27 @@ async fn an_ordinary_directory_is_normal_and_the_gate_writes_nothing() {
     assert!(!dir.path().join("not-yet").exists());
 
     // A bare file name reads its empty parent as the current directory (the
-    // package root under `cargo test`, which holds no restore.json).
-    let decision = StartupGate::new(Path::new("rsia.sqlite3"), None)
+    // package root under `cargo test`, which holds no restore.json). That
+    // directory's own mode decides the permission gate, so the bare spelling
+    // must reach exactly the same outcome as the explicit current directory.
+    let bare = StartupGate::new(Path::new("rsia.sqlite3"), None)
         .evaluate()
-        .await
-        .unwrap();
-    assert_eq!(decision.posture(), RecoveryPosture::Normal);
+        .await;
+    let explicit = StartupGate::new(&std::env::current_dir().unwrap().join("rsia.sqlite3"), None)
+        .evaluate()
+        .await;
+    match (bare, explicit) {
+        (Ok(bare), Ok(explicit)) => {
+            assert_eq!(bare.posture(), RecoveryPosture::Normal);
+            assert_eq!(explicit.posture(), RecoveryPosture::Normal);
+        }
+        (Err(bare), Err(explicit)) => assert_eq!(bare.to_string(), explicit.to_string()),
+        (bare, explicit) => panic!(
+            "bare {:?} differs from explicit {:?}",
+            bare.err(),
+            explicit.err()
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -635,12 +756,15 @@ async fn an_anchor_must_be_independent_of_the_data_directory() {
     // a hard link to it (also created outside the directory)
     let hard_link = fixture.root.join("hard-link.sqlite3");
     std::fs::hard_link(&fixture.data, &hard_link).unwrap();
-    expect_quarantine(
-        &fixture.with_anchor(&hard_link),
-        &fixture.restored,
-        "same device and inode",
-    )
-    .await;
+    let data_meta = std::fs::metadata(&fixture.data).unwrap();
+    let alias_meta = std::fs::metadata(&hard_link).unwrap();
+    assert_eq!(
+        (data_meta.dev(), data_meta.ino()),
+        (alias_meta.dev(), alias_meta.ino())
+    );
+    assert_eq!(data_meta.nlink(), 2);
+    assert_eq!(alias_meta.nlink(), 2);
+    expect_permission_rejected(&fixture.with_anchor(&hard_link), &fixture.root).await;
     std::fs::remove_file(&hard_link).unwrap();
 
     // a copy inside the data directory
@@ -681,7 +805,10 @@ async fn an_anchor_must_be_independent_of_the_data_directory() {
         "must be absolute",
     )
     .await;
-    std::fs::create_dir(fixture.root.join("sub")).unwrap();
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(fixture.root.join("sub")).unwrap();
     expect_quarantine(
         &fixture.with_anchor(&fixture.root.join("sub").join("..").join("rsia.sqlite3")),
         &fixture.restored,
@@ -711,7 +838,15 @@ async fn an_anchor_must_be_independent_of_the_data_directory() {
     )
     .await;
     let not_sqlite = fixture.root.join("not-sqlite.db");
-    std::fs::write(&not_sqlite, vec![b'x'; 200]).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(&not_sqlite)
+        .unwrap()
+        .write_all(&[b'x'; 200])
+        .unwrap();
     expect_quarantine(
         &fixture.with_anchor(&not_sqlite),
         &fixture.restored,
@@ -731,6 +866,7 @@ async fn an_anchor_directory_locked_by_a_running_rsia_process_is_refused() {
     let holder = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&lock_path)
         .unwrap();
     holder.lock().unwrap();
@@ -950,32 +1086,41 @@ async fn malformed_restore_receipts_are_quarantined() {
 
     // a symlink to an otherwise perfect receipt
     let elsewhere = fixture.root.join("elsewhere.json");
-    std::fs::write(&elsewhere, original.as_bytes()).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(&elsewhere)
+        .unwrap()
+        .write_all(original.as_bytes())
+        .unwrap();
     std::fs::remove_file(fixture.receipt_path()).unwrap();
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&elsewhere, fixture.receipt_path()).unwrap();
-        expect_quarantine(
-            &fixture.anchored(),
-            &fixture.restored,
-            "must not be a symlink",
-        )
-        .await;
-        expect_quarantine(
-            &fixture.unanchored(),
-            &fixture.restored,
-            "must not be a symlink",
-        )
-        .await;
+        expect_permission_rejected(&fixture.anchored(), &fixture.restored).await;
+        expect_permission_rejected(&fixture.unanchored(), &fixture.restored).await;
         std::fs::remove_file(fixture.receipt_path()).unwrap();
     }
     // a directory where the receipt should be
-    std::fs::create_dir(fixture.receipt_path()).unwrap();
-    expect_quarantine(&fixture.anchored(), &fixture.restored, "not a regular file").await;
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(fixture.receipt_path()).unwrap();
+    expect_permission_rejected(&fixture.anchored(), &fixture.restored).await;
     std::fs::remove_dir(fixture.receipt_path()).unwrap();
 
     // the genuine receipt verifies again
-    std::fs::write(fixture.receipt_path(), original.as_bytes()).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(fixture.receipt_path())
+        .unwrap()
+        .write_all(original.as_bytes())
+        .unwrap();
     assert_eq!(
         fixture.anchored().evaluate().await.unwrap().posture(),
         RecoveryPosture::RestoredVerified
@@ -1170,8 +1315,16 @@ async fn a_migration_checksum_change_in_either_database_is_quarantined() {
 
     // a database that is not an RSIA database at all
     let foreign = fixture.root.join("foreign");
-    std::fs::create_dir(&foreign).unwrap();
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(&foreign).unwrap();
     let foreign = foreign.join("rsia.sqlite3");
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    drop(options.open(&foreign).unwrap());
     sql(&foreign, "CREATE TABLE t(x)");
     expect_quarantine(
         &fixture.with_anchor(&foreign),
@@ -1187,7 +1340,7 @@ async fn a_migration_checksum_change_in_either_database_is_quarantined() {
 #[tokio::test]
 async fn an_anchor_is_rejected_unless_the_directory_is_restored_and_unadmitted() {
     // never restored
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let data = dir.path().join("rsia.sqlite3");
     Store::open(&data).await.unwrap().close().await;
     let anchor = Path::new("/anchor/rsia.sqlite3");
@@ -1302,22 +1455,33 @@ async fn an_admission_record_that_does_not_match_the_receipt_quarantines_the_dir
 
     // a symlinked admission record
     let elsewhere = fixture.root.join("admission-elsewhere.json");
-    std::fs::write(&elsewhere, admission.as_bytes()).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(&elsewhere)
+        .unwrap()
+        .write_all(admission.as_bytes())
+        .unwrap();
     std::fs::remove_file(fixture.admission_path()).unwrap();
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(&elsewhere, fixture.admission_path()).unwrap();
-        expect_quarantine(
-            &fixture.unanchored(),
-            &fixture.restored,
-            "must not be a symlink",
-        )
-        .await;
+        expect_permission_rejected(&fixture.unanchored(), &fixture.restored).await;
         std::fs::remove_file(fixture.admission_path()).unwrap();
     }
 
     // a valid record, but the receipt it covered was replaced
-    std::fs::write(fixture.admission_path(), admission.as_bytes()).unwrap();
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+        .open(fixture.admission_path())
+        .unwrap()
+        .write_all(admission.as_bytes())
+        .unwrap();
     assert_eq!(
         fixture.unanchored().evaluate().await.unwrap().posture(),
         RecoveryPosture::AdmittedPreviously
@@ -1474,7 +1638,7 @@ fn protected_fact_selectors_match_restore_backup_py() {
     assert!(script.contains("SELECT namespace,seq,digest FROM revoke_watermark"));
     assert!(script.contains(&format!("\"schema_version\":\"{RESTORE_RECEIPT_SCHEMA}\"")));
     assert!(script.contains(&format!("\"receipt_scope\":\"{RECEIPT_SCOPE}\"")));
-    assert!(script.contains(&format!("(temp/\"{RESTORE_RECEIPT_FILE}\")")));
+    assert!(script.contains(&format!("os.open(temp/\"{RESTORE_RECEIPT_FILE}\",")));
 }
 
 // ---------------------------------------------------------------------------
@@ -1483,7 +1647,7 @@ fn protected_fact_selectors_match_restore_backup_py() {
 #[tokio::test]
 async fn every_posture_reports_code_execution_disabled_and_no_sandbox() {
     let fixture = Fixture::new().await;
-    let normal_dir = tempfile::tempdir().unwrap();
+    let normal_dir = private_tempdir();
     let normal = StartupGate::new(&normal_dir.path().join("rsia.sqlite3"), None)
         .evaluate()
         .await
@@ -1518,4 +1682,29 @@ async fn every_posture_reports_code_execution_disabled_and_no_sandbox() {
     assert!(
         !config.allow_code_execution && !config.sandbox_enabled && !config.allow_external_network
     );
+}
+
+#[tokio::test]
+async fn restore_admission_is_created_0600_with_original_receipt_binding() {
+    let fixture = Fixture::new().await;
+    let receipt = fixture.receipt_bytes();
+    let decision = fixture.anchored().evaluate().await.unwrap();
+    assert_eq!(decision.posture(), RecoveryPosture::RestoredVerified);
+    decision.admit().unwrap();
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::metadata(fixture.admission_path()).unwrap().mode() & 0o777,
+        0o600
+    );
+    let admission: Value =
+        serde_json::from_slice(&std::fs::read(fixture.admission_path()).unwrap()).unwrap();
+    assert_eq!(admission["schema_version"], RESTORE_ADMISSION_SCHEMA);
+    assert_eq!(admission["receipt_sha256"], hash(&receipt));
+    assert_eq!(admission["scope"], RECEIPT_SCOPE);
+    assert_eq!(fixture.receipt_bytes(), receipt);
+    assert_eq!(
+        fixture.unanchored().evaluate().await.unwrap().posture(),
+        RecoveryPosture::AdmittedPreviously
+    );
+    no_admission_temp_files(&fixture.restored);
 }

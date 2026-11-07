@@ -534,6 +534,11 @@ async fn register_current_ingress(
     control: &evo_engine::streaming_evaluator::RegisteredEvaluationControlV3,
 ) {
     std::fs::set_permissions(&fx.db, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(
+        fx.db.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let socket_dir = tempfile::Builder::new()
         .prefix("ag192-ingress-")
         .tempdir_in("/tmp")

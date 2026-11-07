@@ -212,8 +212,13 @@ fn required_management_token() -> Result<String> {
     environment_token("RSIA_MANAGEMENT_TOKEN")?.context("RSIA_MANAGEMENT_TOKEN is required")
 }
 
+fn main() -> Result<()> {
+    evo_storage::initialize_private_process_umask()?;
+    async_main()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn async_main() -> Result<()> {
     // Parse diagnostics can contain arbitrary argv values, including a rejected
     // credential. Help/version contain only the fixed argument model.
     let cli = match Cli::try_parse() {
@@ -536,7 +541,13 @@ mod tests {
                 "rsia-main-test-{label}-{}-{unique}",
                 std::process::id()
             ));
-            std::fs::create_dir_all(&path).unwrap();
+            let mut directory = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                directory.mode(0o700);
+            }
+            directory.create(&path).unwrap();
             Self(path.canonicalize().unwrap())
         }
         fn listing(&self) -> Vec<String> {
@@ -774,9 +785,31 @@ mod tests {
 
         // a restored directory without an anchor is quarantined before any lock exists
         let restored = scratch.0.join("restored");
-        std::fs::create_dir(&restored).unwrap();
-        std::fs::write(restored.join(RESTORE_RECEIPT_FILE), b"{}").unwrap();
-        std::fs::write(restored.join("rsia.sqlite3"), b"not opened").unwrap();
+        let mut directory = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            directory.mode(0o700);
+        }
+        directory.create(&restored).unwrap();
+        for (name, bytes) in [
+            (RESTORE_RECEIPT_FILE, &b"{}"[..]),
+            ("rsia.sqlite3", &b"not opened"[..]),
+        ] {
+            use std::io::Write as _;
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                options.mode(0o600);
+            }
+            options
+                .open(restored.join(name))
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        }
         let before = std::fs::read_dir(&restored).unwrap().count();
         let error = mount_gate(&restored.join("rsia.sqlite3"), None)
             .await

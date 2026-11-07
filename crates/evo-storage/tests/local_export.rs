@@ -2,8 +2,26 @@ use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
 use evo_storage::{LocalExportFile, Store, local_export_receipt, local_export_tree_digest};
 use serde_json::{Value, json};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::sync::Arc;
 use tokio::sync::Barrier;
+
+fn private_directory(path: &std::path::Path) {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.recursive(true).create(path).unwrap();
+}
+
+fn private_member(path: &std::path::Path, bytes: &[u8]) {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path).unwrap().write_all(bytes).unwrap();
+}
 
 async fn prepared_fixture() -> (
     tempfile::TempDir,
@@ -240,10 +258,8 @@ async fn restart_removes_private_export_staging_directories() {
         .join(".export-staging")
         .join("namespace")
         .join("stale");
-    tokio::fs::create_dir_all(&stale).await.unwrap();
-    tokio::fs::write(stale.join("secret.tmp"), b"secret")
-        .await
-        .unwrap();
+    private_directory(&stale);
+    private_member(&stale.join("secret.tmp"), b"secret");
     let reopened = Store::open(&database).await.unwrap();
     assert!(
         !tokio::fs::try_exists(directory.path().join(".export-staging"))
@@ -268,11 +284,9 @@ async fn registered_local_export_rejects_symlink_target_without_completion() {
         .await
         .unwrap();
     let target = store.local_export_directory(&admin, &export_id).unwrap();
-    tokio::fs::create_dir_all(target.parent().unwrap())
-        .await
-        .unwrap();
+    private_directory(target.parent().unwrap());
     let elsewhere = directory.path().join("elsewhere");
-    tokio::fs::create_dir_all(&elsewhere).await.unwrap();
+    private_directory(&elsewhere);
     symlink(&elsewhere, &target).unwrap();
     assert!(
         store
@@ -804,10 +818,10 @@ async fn f19_cleanup_refuses_export_attempt_whose_id_escapes_the_namespace_root(
     let other_root = directory.path().join("exports").join(hash(b"other"));
     let own_canary = namespace_root.join("legit-export").join("manifest.json");
     let other_canary = other_root.join("other-export").join("manifest.json");
-    std::fs::create_dir_all(own_canary.parent().unwrap()).unwrap();
-    std::fs::create_dir_all(other_canary.parent().unwrap()).unwrap();
-    std::fs::write(&own_canary, b"{}").unwrap();
-    std::fs::write(&other_canary, b"{}").unwrap();
+    private_directory(own_canary.parent().unwrap());
+    private_directory(other_canary.parent().unwrap());
+    private_member(&own_canary, b"{}");
+    private_member(&other_canary, b"{}");
     let source = json!({"id":"f19-run","schema_version":"rsia.optimization.source.v1","body":"x"});
     let mut session = store.session().await.unwrap();
     session

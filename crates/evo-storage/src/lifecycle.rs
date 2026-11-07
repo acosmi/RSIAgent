@@ -1052,15 +1052,22 @@ pub(crate) async fn backup_consistent(store: &Store, destination: &Path) -> Resu
     if destination.exists() {
         return Err(Error::Conflict("backup destination already exists".into()));
     }
+    super::check_local_permissions(super::LocalPermissionTarget::BackupPublication(destination))
+        .map_err(|error| match error {
+            super::LocalPermissionError::Io(error) => internal(error),
+            other => Error::Invalid(other.to_string()),
+        })?;
     evo_core::now()?;
-    let parent = destination.parent().unwrap_or(Path::new("."));
-    tokio::fs::create_dir_all(parent).await.map_err(internal)?;
+    let parent = super::local_data_directory(destination);
     let name = destination
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| Error::Invalid("backup destination needs a UTF-8 name".into()))?;
     let temp = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
-    tokio::fs::create_dir(&temp).await.map_err(internal)?;
+    let mut directory = tokio::fs::DirBuilder::new();
+    #[cfg(unix)]
+    directory.mode(0o700);
+    directory.create(&temp).await.map_err(internal)?;
     let result = backup_into_temp(store, &temp).await;
     if let Err(error) = result {
         let _ = tokio::fs::remove_dir_all(&temp).await;
@@ -1112,6 +1119,21 @@ async fn backup_into_temp(store: &Store, temp: &Path) -> Result<()> {
     let _blob_guard = store.blob_lock.write().await;
     let mut connection = store.pool.acquire().await.map_err(internal)?;
     let database_path = temp.join("rsia.sqlite3");
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    drop(options.open(&database_path).map_err(internal)?);
+    #[cfg(test)]
+    super::AG157_BACKUP_VACUUM_FACT.with(|fact| {
+        *fact.borrow_mut() = Some((
+            database_path.clone(),
+            std::fs::symlink_metadata(&database_path),
+        ));
+    });
     sqlx::query("VACUUM INTO ?")
         .bind(database_path.to_string_lossy().as_ref())
         .execute(&mut *connection)
@@ -1134,10 +1156,7 @@ async fn backup_into_temp(store: &Store, temp: &Path) -> Result<()> {
     };
     let manifest_path = temp.join("backup-manifest.json");
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(internal)?;
-    tokio::fs::write(&manifest_path, bytes)
-        .await
-        .map_err(internal)?;
-    sync_file(&manifest_path).await?;
+    super::write_synced_temp(&manifest_path, &bytes).await?;
     sync_directory(temp.to_path_buf()).await
 }
 
@@ -1269,14 +1288,16 @@ async fn copy_backup_blobs(store: &Store, temp: &Path) -> Result<Vec<BackupFileE
             if evo_core::hash(&bytes) != file_text {
                 return Err(Error::Conflict("blob filename digest mismatch".into()));
             }
-            tokio::fs::create_dir_all(&target_namespace)
+            let mut directories = tokio::fs::DirBuilder::new();
+            directories.recursive(true);
+            #[cfg(unix)]
+            directories.mode(0o700);
+            directories
+                .create(&target_namespace)
                 .await
                 .map_err(internal)?;
             let destination = target_namespace.join(&file_name);
-            tokio::fs::write(&destination, &bytes)
-                .await
-                .map_err(internal)?;
-            sync_file(&destination).await?;
+            super::write_synced_temp(&destination, &bytes).await?;
             entries.push(BackupFileEntry {
                 path: relative,
                 sha256: evo_core::hash(&bytes),
