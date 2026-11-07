@@ -1441,7 +1441,19 @@ async fn run_attempts(
 /// resumed set reuses the verified receipts and never resends a started
 /// attempt. A source revocation reaches the set through those edges. No stage
 /// fact of any kind is written.
+///
+/// The body is boxed: unoptimized builds keep each caller's copy of this large
+/// future on the caller's stack.
 pub async fn run_practice_set(
+    ctx: &Context,
+    store: &Store,
+    runner: &dyn DevRunner,
+    request: PracticeRunRequest,
+) -> Result<PracticeAttemptSetV1> {
+    Box::pin(run_practice_set_unboxed(ctx, store, runner, request)).await
+}
+
+async fn run_practice_set_unboxed(
     ctx: &Context,
     store: &Store,
     runner: &dyn DevRunner,

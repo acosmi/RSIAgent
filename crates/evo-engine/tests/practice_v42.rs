@@ -2749,8 +2749,10 @@ async fn a_set_is_never_stored_next_to_a_binding_of_another_set() {
     let prepared = fixture
         .raw_artifact(&practice_attempt_set_storage_id_v2("set-rebound").unwrap())
         .await;
+    // All three attempts recorded their receipts, so no attempt is in flight:
+    // the refused persist leaves the v2 record at its between-attempts state.
     assert!(prepared["result"].is_null());
-    assert_eq!(prepared["state"], "running");
+    assert_eq!(prepared["state"], "prepared");
 }
 
 // ---------------------------------------------------------------------------
