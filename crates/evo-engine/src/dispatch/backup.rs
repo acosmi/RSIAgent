@@ -348,8 +348,8 @@ pub(super) async fn finish_observed(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
-    #![cfg(unix)]
     use super::*;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     use std::path::PathBuf;
