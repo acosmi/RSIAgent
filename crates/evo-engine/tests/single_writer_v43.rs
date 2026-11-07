@@ -13,6 +13,15 @@ use std::process::{Command, Output, Stdio};
 // test thread's file descriptor and keep its OS lock alive past parent drop.
 static PROCESS_FIXTURES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+// The startup gate requires the data directory itself to be private; the
+// default tempdir follows the process umask, so D is created 0700 here.
+fn private_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .permissions(<fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
 fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
     fn visit(root: &Path, directory: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
         for entry in fs::read_dir(directory).unwrap() {
@@ -90,7 +99,7 @@ fn live_artifacts(root: &Path) {
 fn locked_formal_grade_and_finalize_leave_live_writer_bytes_unchanged() {
     let _fixture = PROCESS_FIXTURES.blocking_lock();
     for operation in ["grade", "finalize"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         live_artifacts(dir.path());
         let mut options = File::options();
         options.create_new(true).write(true);
@@ -115,7 +124,7 @@ fn locked_formal_grade_and_finalize_leave_live_writer_bytes_unchanged() {
 fn restored_formal_commands_refuse_before_lock_or_database_writes() {
     let _fixture = PROCESS_FIXTURES.blocking_lock();
     for operation in ["grade", "finalize"] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         live_artifacts(dir.path());
         let mut options = File::options();
         options.create_new(true).write(true);
@@ -142,7 +151,7 @@ fn restored_formal_commands_refuse_before_lock_or_database_writes() {
 #[test]
 fn different_database_names_and_canonical_aliases_share_one_lock() {
     let _fixture = PROCESS_FIXTURES.blocking_lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let first = DataDirectoryLock::acquire(&dir.path().join("a.sqlite3")).unwrap();
     for path in [dir.path().join("b.sqlite3"), dir.path().join("./a.sqlite3")] {
         assert_eq!(
@@ -157,7 +166,7 @@ fn different_database_names_and_canonical_aliases_share_one_lock() {
 #[tokio::test]
 async fn closed_store_releases_guard_only_after_connections_close() {
     let _fixture = PROCESS_FIXTURES.lock().await;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let data = dir.path().join("database.sqlite3");
     let (guard, decision) = mount_gate(&data, None).await.unwrap();
     let store = Store::open(&data).await.unwrap();
@@ -177,7 +186,7 @@ async fn closed_store_releases_guard_only_after_connections_close() {
 #[test]
 fn failed_formal_operation_closes_and_unlocks_for_next_writer() {
     let _fixture = PROCESS_FIXTURES.blocking_lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let data = dir.path().join("database.sqlite3");
     for _ in 0..2 {
         let output = formal(&data, "finalize");
@@ -199,7 +208,7 @@ async fn live_dispatched_call_and_execution_close_facts_survive_formal_refusal()
     use evo_storage::budget::{
         BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
     };
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let data = dir.path().join("database.sqlite3");
     let (guard, gate) = mount_gate(&data, None).await.unwrap();
     let store = Store::open(&data).await.unwrap();

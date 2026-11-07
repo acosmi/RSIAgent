@@ -38,6 +38,15 @@ INSERT INTO root_budget_namespaces(billing_scope,namespace) VALUES('scope-a','n'
 INSERT INTO objects(namespace,kind,id,owner,body) VALUES('n','reservation','res-1','admin','{\"id\":\"res-1\",\"state\":\"reserved\"}');
 INSERT INTO objects(namespace,kind,id,owner,body) VALUES('n','artifact','ledger-1','admin','{\"schema_version\":\"rsia.typed_artifact_envelope.v1\",\"id\":\"ledger-1\",\"record_kind\":\"exposure_ledger_v1\",\"payload\":{\"spent\":1}}')";
 
+// The startup gate requires the data directory itself to be private; the
+// default tempdir follows the process umask, so D is created 0700 here.
+fn private_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
 fn ctx(actor: &str, role: Role) -> Context {
     Context::new("n", actor, role).unwrap()
 }
@@ -391,7 +400,7 @@ fn no_admission_temp_files(dir: &Path) {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn an_ordinary_directory_is_normal_and_the_gate_writes_nothing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let data = dir.path().join("rsia.sqlite3");
     Store::open(&data).await.unwrap().close().await;
     let before = snapshot(dir.path());
@@ -414,12 +423,27 @@ async fn an_ordinary_directory_is_normal_and_the_gate_writes_nothing() {
     assert!(!dir.path().join("not-yet").exists());
 
     // A bare file name reads its empty parent as the current directory (the
-    // package root under `cargo test`, which holds no restore.json).
-    let decision = StartupGate::new(Path::new("rsia.sqlite3"), None)
+    // package root under `cargo test`, which holds no restore.json). That
+    // directory's own mode decides the permission gate, so the bare spelling
+    // must reach exactly the same outcome as the explicit current directory.
+    let bare = StartupGate::new(Path::new("rsia.sqlite3"), None)
         .evaluate()
-        .await
-        .unwrap();
-    assert_eq!(decision.posture(), RecoveryPosture::Normal);
+        .await;
+    let explicit = StartupGate::new(&std::env::current_dir().unwrap().join("rsia.sqlite3"), None)
+        .evaluate()
+        .await;
+    match (bare, explicit) {
+        (Ok(bare), Ok(explicit)) => {
+            assert_eq!(bare.posture(), RecoveryPosture::Normal);
+            assert_eq!(explicit.posture(), RecoveryPosture::Normal);
+        }
+        (Err(bare), Err(explicit)) => assert_eq!(bare.to_string(), explicit.to_string()),
+        (bare, explicit) => panic!(
+            "bare {:?} differs from explicit {:?}",
+            bare.err(),
+            explicit.err()
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,7 +1340,7 @@ async fn a_migration_checksum_change_in_either_database_is_quarantined() {
 #[tokio::test]
 async fn an_anchor_is_rejected_unless_the_directory_is_restored_and_unadmitted() {
     // never restored
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let data = dir.path().join("rsia.sqlite3");
     Store::open(&data).await.unwrap().close().await;
     let anchor = Path::new("/anchor/rsia.sqlite3");
@@ -1614,7 +1638,7 @@ fn protected_fact_selectors_match_restore_backup_py() {
     assert!(script.contains("SELECT namespace,seq,digest FROM revoke_watermark"));
     assert!(script.contains(&format!("\"schema_version\":\"{RESTORE_RECEIPT_SCHEMA}\"")));
     assert!(script.contains(&format!("\"receipt_scope\":\"{RECEIPT_SCOPE}\"")));
-    assert!(script.contains(&format!("(temp/\"{RESTORE_RECEIPT_FILE}\")")));
+    assert!(script.contains(&format!("os.open(temp/\"{RESTORE_RECEIPT_FILE}\",")));
 }
 
 // ---------------------------------------------------------------------------
@@ -1623,7 +1647,7 @@ fn protected_fact_selectors_match_restore_backup_py() {
 #[tokio::test]
 async fn every_posture_reports_code_execution_disabled_and_no_sandbox() {
     let fixture = Fixture::new().await;
-    let normal_dir = tempfile::tempdir().unwrap();
+    let normal_dir = private_tempdir();
     let normal = StartupGate::new(&normal_dir.path().join("rsia.sqlite3"), None)
         .evaluate()
         .await

@@ -1,7 +1,7 @@
 //! Local filesystem fixtures; no execution, formal authority or multi-UID claim.
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
-use evo_core::{Context, Error, Role, hash};
+use evo_core::{Context, Role, hash};
 use evo_engine::data_directory_lock::{DataDirectoryLock, mount_gate};
 use evo_engine::startup_gate::{
     AdmissionRecord, DATA_LOCK_FILE, RECEIPT_SCOPE, RESTORE_ADMISSION_FILE,
@@ -275,14 +275,9 @@ async fn linked_managed_member_is_refused_before_staging_cleanup() {
     symlink(&actual, namespace.join("payload.tmp")).unwrap();
     permission_refusal(&database, root.path()).await;
     let before = image(root.path());
-    match Store::open(&database).await {
-        Err(Error::Invalid(reason)) => assert_eq!(reason, "data_directory_insecure"),
-        Err(error) => panic!("unexpected Store refusal: {error}"),
-        Ok(store) => {
-            store.close().await;
-            panic!("Store opened an insecure staging member");
-        }
-    }
+    let error = DataDirectoryLock::acquire(&database).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert_eq!(error.to_string(), "data_directory_insecure");
     assert_eq!(image(root.path()), before);
 }
 
