@@ -79,7 +79,7 @@ async fn fixture(payer: &str, bind: bool) -> Fixture {
         .unwrap();
 
     let mut v1 = ExperimentPlan::first_low_risk("formal-e05", 60).unwrap();
-    v1.n_planned = 1;
+    v1.n_planned = 2;
     v1.monetary_budget = money("0.001");
     v1.frozen = true;
     v1.frozen_at = Some(1);
@@ -136,7 +136,7 @@ async fn fixture(payer: &str, bind: bool) -> Fixture {
         d("sampling"),
         d("common-mean"),
         FormalStatisticalUnit::IndependentTaskCluster,
-        1,
+        2,
     )
     .unwrap();
     let grader = FixedGraderSpec {
@@ -218,14 +218,16 @@ async fn bind_plan(
 }
 
 async fn control_exists(fixture: &Fixture) -> bool {
-    let mut session = fixture.store.session().await.unwrap();
-    let found = session
-        .get::<serde_json::Value>(&fixture.evaluator, CONTROL_KIND, &fixture.control.id)
-        .await
-        .unwrap()
-        .is_some();
-    session.commit().await.unwrap();
-    found
+    IndependentEvaluationControl::registration_progress(
+        &fixture.evaluator,
+        &fixture.store,
+        &fixture.control.id,
+        "unused-holdout",
+    )
+    .await
+    .unwrap()
+    .control_digest
+    .is_some()
 }
 
 #[tokio::test]

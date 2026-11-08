@@ -32,7 +32,7 @@ fn money(amount: &str) -> Money {
 }
 
 fn set_stage(
-    stages: &mut Vec<StageMoneyBudget>,
+    stages: &mut [StageMoneyBudget],
     stage: OptimizationStage,
     per_call: &str,
     total: &str,
@@ -186,51 +186,25 @@ async fn binding_compares_every_root_authorization_field() {
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     authorize(&store, &admin, 10_000).await;
 
-    let mut cases: Vec<(&str, Box<dyn Fn(&mut RootStageBudgetPlanV1)>)> = vec![
-        (
-            "payer",
-            Box::new(|plan: &mut RootStageBudgetPlanV1| {
-                plan.optimization_budget.payer_id = "other".into();
-            }),
-        ),
-        (
-            "currency",
-            Box::new(|plan: &mut RootStageBudgetPlanV1| {
-                plan.optimization_budget.root_total.currency = "EUR".into();
-            }),
-        ),
-        (
-            "pricing",
-            Box::new(|plan: &mut RootStageBudgetPlanV1| {
+    for label in ["payer", "currency", "pricing", "total", "receipt", "scope"] {
+        let mut plan = plan_with("0.01", Some(("0.002", "0.006")));
+        match label {
+            "payer" => plan.optimization_budget.payer_id = "other".into(),
+            "currency" => plan.optimization_budget.root_total.currency = "EUR".into(),
+            "pricing" => {
                 plan.optimization_budget.root_total.pricing_version = "pv2".into();
                 for stage in &mut plan.optimization_budget.stages {
                     stage.per_call_limit.pricing_version = "pv2".into();
                     stage.experiment_total.pricing_version = "pv2".into();
                 }
-            }),
-        ),
-        (
-            "total",
-            Box::new(|plan: &mut RootStageBudgetPlanV1| {
-                plan.optimization_budget.root_total.amount = "0.02".into();
-            }),
-        ),
-        (
-            "receipt",
-            Box::new(|plan: &mut RootStageBudgetPlanV1| {
+            }
+            "total" => plan.optimization_budget.root_total.amount = "0.02".into(),
+            "receipt" => {
                 plan.optimization_budget.admin_authorization_receipt_digest = Some(d("other"));
-            }),
-        ),
-        (
-            "scope",
-            Box::new(|plan: &mut RootStageBudgetPlanV1| {
-                plan.optimization_budget.root_budget_scope_id = "other-scope".into();
-            }),
-        ),
-    ];
-    for (label, mutate) in cases.drain(..) {
-        let mut plan = plan_with("0.01", Some(("0.002", "0.006")));
-        mutate(&mut plan);
+            }
+            "scope" => plan.optimization_budget.root_budget_scope_id = "other-scope".into(),
+            _ => unreachable!(),
+        }
         let error = store
             .bind_root_stage_plan(&admin, &bind_request(0, plan, 2))
             .await
