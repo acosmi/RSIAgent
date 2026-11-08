@@ -2595,7 +2595,6 @@ impl IndependentEvaluationControl {
             return Err(Error::Forbidden);
         }
         let control: ReadRegisteredEvaluationControl = control.into();
-        validate_root_budget(ctx, store, &control).await?;
         let mut session = store.session().await?;
         if get_record::<ReadRegisteredEvaluationControl>(
             &mut session,
@@ -2610,6 +2609,20 @@ impl IndependentEvaluationControl {
                 "evaluation control already registered".into(),
             ));
         }
+        // The final write Session re-reads the root and requires the active
+        // frozen plan, not a green read from another Session.
+        validate_root_budget_in_session(&mut session, ctx, &control).await?;
+        let binding = session
+            .active_root_stage_plan(ctx, &control.billing_scope)
+            .await?
+            .ok_or_else(|| {
+                Error::Conflict("registered_control_requires_active_root_stage_plan".into())
+            })?;
+        if binding.plan.optimization_budget.digest()? != control.optimization_budget.digest()? {
+            return Err(Error::Conflict(
+                "registered control budget differs from the active root stage plan".into(),
+            ));
+        }
         let digest = control.digest()?;
         put_record(
             &mut session,
@@ -2621,6 +2634,16 @@ impl IndependentEvaluationControl {
         )
         .await?;
         crate::formal_authority::bind_control_principals(&mut session, ctx, &control).await?;
+        session
+            .record_root_stage_plan_control(
+                ctx,
+                &control.billing_scope,
+                CONTROL_KIND,
+                &control.id,
+                &digest,
+                control.created_at_unix_seconds,
+            )
+            .await?;
         session
             .audit(ctx, "register_evaluation_control", &control.id)
             .await?;
@@ -2821,7 +2844,6 @@ impl IndependentEvaluationControl {
         let issue_control_digest = fingerprint(&control)?;
         let issue_holdout_digest = fingerprint(&holdout)?;
         session.commit().await?;
-        validate_root_budget(ctx, store, &control).await?;
         let mut session = store.session().await?;
         let control: ReadRegisteredEvaluationControl =
             need_record(&mut session, ctx, CONTROL_KIND, &request.registration_id).await?;
@@ -2837,6 +2859,28 @@ impl IndependentEvaluationControl {
         {
             return Err(Error::Conflict(
                 "registration facts changed during ticket issue".into(),
+            ));
+        }
+        // The final write Session rechecks the root and that this control still
+        // references the active version. A switched plan makes it stale here,
+        // before any ticket write.
+        validate_root_budget_in_session(&mut session, ctx, &control).await?;
+        let active = session
+            .active_root_stage_plan(ctx, &control.billing_scope)
+            .await?
+            .ok_or_else(|| {
+                Error::Conflict("registered_control_requires_active_root_stage_plan".into())
+            })?;
+        let relation = session
+            .root_stage_plan_control_ref(ctx, CONTROL_KIND, &control.id)
+            .await?
+            .ok_or_else(|| Error::Conflict("registered_control_has_no_stage_plan_ref".into()))?;
+        if relation.control_digest != issue_control_digest
+            || relation.binding_seq != active.seq
+            || relation.plan_digest != active.plan_digest
+        {
+            return Err(Error::Conflict(
+                "registered control is not bound to the active root stage plan".into(),
             ));
         }
         let Some((candidate, candidate_binding)) =
@@ -7701,12 +7745,25 @@ async fn validate_root_budget(
     store: &Store,
     control: &ReadRegisteredEvaluationControl,
 ) -> Result<()> {
+    let mut session = store.session().await?;
+    validate_root_budget_in_session(&mut session, ctx, control).await?;
+    session.commit().await?;
+    Ok(())
+}
+
+/// The same financial checks in the caller's Session. A final ticket write and
+/// a control registration must not rely on a green read from another Session.
+async fn validate_root_budget_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    control: &ReadRegisteredEvaluationControl,
+) -> Result<()> {
     if control.billing_scope != control.optimization_budget.root_budget_scope_id {
         return Err(Error::Invalid(
             "registered billing scope differs from the formal root budget".into(),
         ));
     }
-    let root = store
+    let root = session
         .root_budget(ctx, &control.billing_scope)
         .await?
         .ok_or(Error::Budget)?;
@@ -7734,6 +7791,11 @@ async fn validate_root_budget(
     {
         return Err(Error::Conflict(
             "persistent root budget differs from the registered formal budget".into(),
+        ));
+    }
+    if root.payment_subject != control.optimization_budget.payer_id {
+        return Err(Error::Conflict(
+            "persistent root payment subject differs from the registered payer".into(),
         ));
     }
     Ok(())

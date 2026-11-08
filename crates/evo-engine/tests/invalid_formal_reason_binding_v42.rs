@@ -8,7 +8,8 @@ use evo_core::contract::{
 };
 use evo_core::evaluation::{
     ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec, FormalExperimentPlanV41,
-    FormalStatisticalUnit, Money, OptimizationBudgetPlan, OptimizerComparisonContract, Verdict,
+    FormalStatisticalUnit, Money, OptimizationBudgetPlan, OptimizerComparisonContract,
+    RootStageBudgetPlanV1, Verdict,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::holdout::{
@@ -34,7 +35,7 @@ use evo_engine::streaming_evaluator::{
 use evo_storage::Store;
 use evo_storage::budget::{
     BudgetCallFence, BudgetCallReservation, BudgetCallState, BudgetStage, RootBudgetAuthorization,
-    UsageCharge,
+    RootStagePlanBindRequest, UsageCharge,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -429,7 +430,8 @@ async fn current_fixture(case: &str, schema: &str) -> Fixture {
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded(BILLING_SCOPE, "payer", "USD").unwrap();
+    let mut budget =
+        OptimizationBudgetPlan::unfunded(BILLING_SCOPE, "local-software-fixture", "USD").unwrap();
     budget.root_total = money("0.02");
     budget.admin_authorization_receipt_digest = Some(digest("fixture-budget-authorization"));
     for stage in &mut budget.stages {
@@ -486,6 +488,20 @@ async fn current_fixture(case: &str, schema: &str) -> Fixture {
         created_at_unix_seconds: 2,
     };
     let registered = current_control(&control);
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: registered.billing_scope.clone(),
+                expected_seq: 0,
+                plan: RootStageBudgetPlanV1::from_optimization_budget(
+                    registered.optimization_budget.clone(),
+                ),
+                now: registered.created_at_unix_seconds,
+            },
+        )
+        .await
+        .unwrap();
     IndependentEvaluationControl::register_current_control(&evaluator, &store, registered.clone())
         .await
         .unwrap();

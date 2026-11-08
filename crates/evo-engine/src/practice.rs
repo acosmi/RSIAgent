@@ -83,6 +83,7 @@ use crate::optimization::{
 use evo_core::evidence::Purpose;
 use evo_core::strategy::PracticePlan;
 use evo_core::{Context, Error, Result, Role, fingerprint, identifier};
+use evo_storage::budget::BudgetStage;
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -94,6 +95,13 @@ pub const PRACTICE_REGISTRATION_BINDING_SCHEMA: &str = "rsia.practice_registrati
 pub const PRACTICE_REQUEST_CLOSURE_SCHEMA: &str = "rsia.practice.request_closure.v1";
 /// The only expanded K. K=1 is the default and needs no registration.
 pub const REGISTERED_PRACTICE_ATTEMPTS: u8 = 3;
+
+/// A practice attempt reserves through the registered development runner, so
+/// its ledger row remains `development_execution`; it is never reclassified as
+/// `practice` or `curriculum`.
+pub fn practice_budget_stage() -> BudgetStage {
+    BudgetStage::DevelopmentExecution
+}
 
 const ARTIFACT_KIND: &str = "artifact";
 const REDACTED_SCHEMA: &str = "rsia.redacted.v1";

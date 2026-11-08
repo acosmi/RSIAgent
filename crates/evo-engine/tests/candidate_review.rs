@@ -10,7 +10,7 @@ use evo_core::contract::{
 use evo_core::evaluation::{
     ControlCondition, ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
     FormalExperimentPlanV41, FormalStatisticalUnit, Money, OptimizationBudgetPlan,
-    OptimizerComparisonContract, ProfileKind,
+    OptimizerComparisonContract, ProfileKind, RootStageBudgetPlanV1,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, SourceSelection, TaskOrigin};
 use evo_core::holdout::{
@@ -53,7 +53,7 @@ use evo_engine::streaming_evaluator::{
 use evo_storage::Store;
 use evo_storage::budget::{
     BudgetCallFence, BudgetCallRef, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
-    UsageCharge,
+    RootStagePlanBindRequest, UsageCharge,
 };
 use evo_storage::lifecycle::{REVOKE_TOMBSTONE_SCHEMA, RevokeTombstone};
 use serde_json::{Value, json};
@@ -1935,7 +1935,7 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
+    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "fixture-only", "USD").unwrap();
     budget.root_total = money("0.001");
     budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
     for stage in &mut budget.stages {
@@ -2017,6 +2017,20 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         evidence_scope: EvaluationEvidenceScope::ProgramFixture,
         created_at_unix_seconds: 2,
     };
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: control.billing_scope.clone(),
+                expected_seq: 0,
+                plan: RootStageBudgetPlanV1::from_optimization_budget(
+                    control.optimization_budget.clone(),
+                ),
+                now: control.created_at_unix_seconds,
+            },
+        )
+        .await
+        .unwrap();
     IndependentEvaluationControl::register_current_control(&evaluator, &store, control.clone())
         .await
         .unwrap();

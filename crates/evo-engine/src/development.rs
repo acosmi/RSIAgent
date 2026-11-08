@@ -28,7 +28,8 @@ use evo_storage::budget::{
     BudgetDispatchDecision, BudgetExecutionProvenance, BudgetStage,
     REGISTERED_EXECUTION_SETTLEMENT_SCHEMA, ReadRegisteredExecutionSettlement,
     RegisteredExecutionProvenance, RegisteredExecutionSettlement, RegisteredExecutionSettlementV2,
-    RootBudgetRecord, UsageCharge,
+    RootBudgetRecord, StagePlanAttribution, StagePlanControlSelector, StagePlanRefusal,
+    UsageCharge,
 };
 use evo_storage::{PersistentContractState, PersistentContractVersion, Session, Store};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1377,7 +1378,9 @@ pub async fn register_development_control(
     {
         return Err(Error::Forbidden);
     }
-    let root = store
+    let digest = control.digest()?;
+    let mut session = store.session().await?;
+    let root = session
         .root_budget(ctx, &control.billing_scope)
         .await?
         .ok_or(Error::Budget)?;
@@ -1386,8 +1389,86 @@ pub async fn register_development_control(
             "control root budget differs from the persisted billing scope".into(),
         ));
     }
+    register_development_control_record_in_session(&mut session, ctx, &control, &digest).await?;
+    // A legacy registration on an unbound root stays Outside (root-only). When
+    // the Admin already bound a plan, the control references that version in
+    // this same Session; a later switch makes this control stale.
+    if session
+        .active_root_stage_plan(ctx, &control.billing_scope)
+        .await?
+        .is_some()
+    {
+        session
+            .record_root_stage_plan_control(
+                ctx,
+                &control.billing_scope,
+                CONTROL_KIND,
+                &control.id,
+                &digest,
+                control.created_at_unix_seconds,
+            )
+            .await?;
+    }
+    session.commit().await?;
+    Ok(digest)
+}
+
+/// Binds one Admin-selected root stage plan and registers the development
+/// control that references it, in one Session and one commit. The original
+/// `register_development_control` signature is unchanged.
+pub async fn register_development_control_with_stage_plan(
+    ctx: &Context,
+    store: &Store,
+    control: DevelopmentControlV1,
+    bind: &evo_storage::budget::RootStagePlanBindRequest,
+) -> Result<(String, evo_storage::budget::RootStagePlanBinding)> {
+    ctx.require(&[Role::Admin])?;
+    control.validate()?;
+    if runner_candidate_consumption(&control.runner_digest)?.is_none() {
+        return Err(Error::Invalid(
+            "legacy development runner contract cannot register a new control".into(),
+        ));
+    }
+    if control.namespace != ctx.namespace()
+        || ctx.actor() == control.executor_actor
+        || ctx.actor() == control.grader_actor
+        || control.billing_scope != bind.billing_scope
+    {
+        return Err(Error::Forbidden);
+    }
     let digest = control.digest()?;
     let mut session = store.session().await?;
+    let root = session
+        .root_budget(ctx, &control.billing_scope)
+        .await?
+        .ok_or(Error::Budget)?;
+    if root.root_budget_id != control.root_budget_id {
+        return Err(Error::Conflict(
+            "control root budget differs from the persisted billing scope".into(),
+        ));
+    }
+    let binding = session.bind_root_stage_plan(ctx, bind).await?;
+    register_development_control_record_in_session(&mut session, ctx, &control, &digest).await?;
+    session
+        .record_root_stage_plan_control(
+            ctx,
+            &control.billing_scope,
+            CONTROL_KIND,
+            &control.id,
+            &digest,
+            control.created_at_unix_seconds,
+        )
+        .await?;
+    session.commit().await?;
+    Ok((digest, binding))
+}
+
+async fn register_development_control_record_in_session(
+    session: &mut Session,
+    ctx: &Context,
+    control: &DevelopmentControlV1,
+    digest: &str,
+) -> Result<()> {
     for source in &control.source_ids {
         if session
             .get::<serde_json::Value>(ctx, "tombstone", source)
@@ -1396,21 +1477,19 @@ pub async fn register_development_control(
         {
             return Err(Error::Forbidden);
         }
-        load_stored_source(&mut session, ctx, source).await?;
+        load_stored_source(session, ctx, source).await?;
     }
     if let Some(existing) =
-        get_record::<DevelopmentControlV1>(&mut session, ctx, CONTROL_KIND, &control.id).await?
+        get_record::<DevelopmentControlV1>(session, ctx, CONTROL_KIND, &control.id).await?
     {
         if fingerprint(&existing)? != digest {
             return Err(Error::Conflict(
                 "development control already registered with different content".into(),
             ));
         }
-        session.commit().await?;
-        return Ok(digest);
+        return Ok(());
     }
-    let control_storage_id =
-        put_record(&mut session, ctx, CONTROL_KIND, &control.id, &control).await?;
+    let control_storage_id = put_record(session, ctx, CONTROL_KIND, &control.id, control).await?;
     for source in &control.source_ids {
         session
             .put_edge(ctx, "artifact", &control_storage_id, "run", source)
@@ -1419,8 +1498,7 @@ pub async fn register_development_control(
     session
         .audit(ctx, "development.control.register", &control.id)
         .await?;
-    session.commit().await?;
-    Ok(digest)
+    Ok(())
 }
 
 pub async fn load_development_control(
@@ -2603,6 +2681,36 @@ impl RegisteredDevelopmentRunner {
         Ok(now)
     }
 
+    /// A stage refusal records exactly one ledger fact in a fresh Session,
+    /// after the reservation Session was rolled back. It never releases money
+    /// or writes a call.
+    async fn append_stage_plan_refusal(
+        &self,
+        ctx: &Context,
+        billing_scope: &str,
+        stage: BudgetStage,
+        refusal: &evo_storage::budget::BudgetPreDispatchRefusal,
+        now: i64,
+    ) -> Result<()> {
+        let evo_storage::budget::BudgetPreDispatchRefusal::StagePlan { kind, .. } = refusal else {
+            return Ok(());
+        };
+        let mut session = self.store.session().await?;
+        session
+            .append_stage_plan_refusal(
+                ctx,
+                &StagePlanRefusal {
+                    billing_scope: billing_scope.into(),
+                    stage,
+                    kind: *kind,
+                    now,
+                },
+            )
+            .await?;
+        session.commit().await?;
+        Ok(())
+    }
+
     async fn existing_receipt(
         &self,
         control: &DevelopmentControlV1,
@@ -2735,14 +2843,36 @@ impl RegisteredDevelopmentRunner {
                 claim.admit_new(&mut session).await?;
             }
         }
-        let call = session
-            .reserve_budget_call_with_sources_typed(
+        let attribution = StagePlanAttribution::Control(StagePlanControlSelector {
+            control_kind: CONTROL_KIND.into(),
+            namespace: self.executor.namespace().into(),
+            control_id: self.control_id.clone(),
+        });
+        let call = match session
+            .reserve_budget_call_with_stage_plan_typed(
                 &self.executor,
                 &reservation,
                 &control.source_ids,
+                &attribution,
             )
             .await?
-            .map_err(evo_storage::budget::BudgetPreDispatchRefusal::into_reservation_error)?;
+        {
+            Ok(call) => call,
+            Err(refusal) => {
+                if refusal.is_stage_plan() {
+                    drop(session);
+                    self.append_stage_plan_refusal(
+                        &self.executor,
+                        &reservation.billing_scope,
+                        reservation.stage,
+                        &refusal,
+                        now,
+                    )
+                    .await?;
+                }
+                return Err(refusal.into_reservation_error());
+            }
+        };
         if let Some(claim) = &self.management {
             let artifact = reservation
                 .request_artifact
@@ -3037,6 +3167,7 @@ impl RegisteredDevelopmentRunner {
             Err(refusal) => {
                 if original_call.state == BudgetCallState::Reserved
                     && refusal != evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked
+                    && !refusal.is_stage_plan()
                 {
                     session
                         .release_undispatched_budget_call(
@@ -3142,6 +3273,14 @@ impl RegisteredDevelopmentRunner {
 
 #[async_trait]
 impl DevRunner for RegisteredDevelopmentRunner {
+    fn development_control_selector(&self) -> Option<crate::model::DevelopmentControlSelector> {
+        Some(crate::model::DevelopmentControlSelector {
+            kind: CONTROL_KIND.into(),
+            namespace: self.executor.namespace().into(),
+            id: self.control_id.clone(),
+        })
+    }
+
     async fn run(&self, request: DevelopmentRunRequest) -> Result<DevelopmentRunReport> {
         validate_development_request(&request)?;
         let control =

@@ -4,8 +4,8 @@
 //! a separately authorized `ModelTransport`; the default transport is disabled.
 
 use crate::model::{
-    ModelExecutionProvenance, ModelExecutionReceipt, ModelPort, ModelRejectionKind, ModelResponse,
-    RejectedDispatch,
+    DevelopmentControlSelector, ModelExecutionProvenance, ModelExecutionReceipt, ModelPort,
+    ModelRejectionKind, ModelResponse, RejectedDispatch,
 };
 use async_trait::async_trait;
 use evo_core::optimization::{ModelRequest, ModelStage};
@@ -15,7 +15,8 @@ use evo_core::{
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallRefence, BudgetCallReservation,
     BudgetCallState, BudgetDispatchDecision, BudgetExecutionProvenance, BudgetPreDispatchRefusal,
-    BudgetStage, ModelCallSettlementEvidence, RootBudgetRecord, UsageCharge,
+    BudgetStage, ModelCallSettlementEvidence, RootBudgetRecord, StagePlanAttribution,
+    StagePlanControlSelector, StagePlanRefusal, UsageCharge,
 };
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
@@ -860,6 +861,18 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                 request,
                 &BudgetPreDispatchRefusal::SourceRevoked,
             ))),
+            Err(refusal) if refusal.is_stage_plan() => {
+                drop(session);
+                self.append_stage_plan_refusal(
+                    ctx,
+                    &fence.billing_scope,
+                    model_stage_budget(request.stage),
+                    &refusal,
+                    fence.now,
+                )
+                .await?;
+                Ok(Err(pre_dispatch_refusal(request, &refusal)))
+            }
             Err(refusal) => Ok(Err(self
                 .release_pre_dispatch(session, ctx, request, root, fence, refusal.code())
                 .await?)),
@@ -1051,15 +1064,54 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
         &self,
         bound: crate::model::ReadBoundModelRequest,
     ) -> Result<ModelResponse> {
-        self.dispatch_management_bound(bound, None).await
+        self.dispatch_management_bound(bound, None, None).await
+    }
+
+    async fn dispatch_compiler_bound_with_development_control(
+        &self,
+        bound: crate::model::ReadBoundModelRequest,
+        selector: Option<DevelopmentControlSelector>,
+    ) -> Result<ModelResponse> {
+        self.dispatch_management_bound(bound, None, selector.as_ref())
+            .await
     }
 }
 
 impl<T: ModelTransport> PersistentModelBroker<T> {
+    /// Records the one refusal fact in a fresh Session after the reservation
+    /// Session is dropped. It writes no group, call, amount or caller fact.
+    async fn append_stage_plan_refusal(
+        &self,
+        ctx: &Context,
+        billing_scope: &str,
+        stage: BudgetStage,
+        refusal: &BudgetPreDispatchRefusal,
+        now: i64,
+    ) -> Result<()> {
+        let BudgetPreDispatchRefusal::StagePlan { kind, .. } = refusal else {
+            return Ok(());
+        };
+        let mut session = self.store.session().await?;
+        session
+            .append_stage_plan_refusal(
+                ctx,
+                &StagePlanRefusal {
+                    billing_scope: billing_scope.into(),
+                    stage,
+                    kind: *kind,
+                    now,
+                },
+            )
+            .await?;
+        session.commit().await?;
+        Ok(())
+    }
+
     async fn dispatch_management_bound(
         &self,
         bound: crate::model::ReadBoundModelRequest,
         management: Option<&crate::dispatch::ManagementOptimizationClaim>,
+        development_control: Option<&DevelopmentControlSelector>,
     ) -> Result<ModelResponse> {
         bound.validate()?;
         let request = bound.request.clone();
@@ -1191,12 +1243,38 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
             }
             return Err(error);
         }
+        let attribution = match development_control {
+            Some(selector) => StagePlanAttribution::Control(StagePlanControlSelector {
+                control_kind: selector.kind.clone(),
+                namespace: selector.namespace.clone(),
+                control_id: selector.id.clone(),
+            }),
+            None => StagePlanAttribution::Unattributed,
+        };
         let mut call = match session
-            .reserve_budget_call_with_sources_typed(&ctx, &reservation, &source_ids)
+            .reserve_budget_call_with_stage_plan_typed(
+                &ctx,
+                &reservation,
+                &source_ids,
+                &attribution,
+            )
             .await?
         {
             Ok(call) => call,
-            Err(refusal) => return Ok(pre_dispatch_refusal(&request, &refusal)),
+            Err(refusal) => {
+                if refusal.is_stage_plan() {
+                    drop(session);
+                    self.append_stage_plan_refusal(
+                        &ctx,
+                        &reservation.billing_scope,
+                        reservation.stage,
+                        &refusal,
+                        now,
+                    )
+                    .await?;
+                }
+                return Ok(pre_dispatch_refusal(&request, &refusal));
+            }
         };
         if call.state == BudgetCallState::Reserved && now > call.lease_until {
             call = session
@@ -1266,6 +1344,20 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                         &request,
                         &BudgetPreDispatchRefusal::SourceRevoked,
                     ));
+                }
+                Err(refusal) if refusal.is_stage_plan() => {
+                    // The reservation is rolled back with this Session. A stage
+                    // refusal is not the generic undispatched-release branch.
+                    drop(session);
+                    self.append_stage_plan_refusal(
+                        &ctx,
+                        &call.billing_scope,
+                        call.stage,
+                        &refusal,
+                        now,
+                    )
+                    .await?;
+                    return Ok(pre_dispatch_refusal(&request, &refusal));
                 }
                 Err(refusal) => {
                     let released = session
@@ -1396,7 +1488,17 @@ impl<T: ModelTransport> ModelPort for ManagementOptimizationModelPort<T> {
         bound: crate::model::ReadBoundModelRequest,
     ) -> Result<ModelResponse> {
         self.broker
-            .dispatch_management_bound(bound, Some(&self.claim))
+            .dispatch_management_bound(bound, Some(&self.claim), None)
+            .await
+    }
+
+    async fn dispatch_compiler_bound_with_development_control(
+        &self,
+        bound: crate::model::ReadBoundModelRequest,
+        selector: Option<DevelopmentControlSelector>,
+    ) -> Result<ModelResponse> {
+        self.broker
+            .dispatch_management_bound(bound, Some(&self.claim), selector.as_ref())
             .await
     }
 }
@@ -1761,6 +1863,7 @@ fn pre_dispatch_refusal(
         | BudgetPreDispatchRefusal::PerCallCapExceeded
         | BudgetPreDispatchRefusal::RootBudgetExhausted
         | BudgetPreDispatchRefusal::BudgetArithmeticOverflow
+        | BudgetPreDispatchRefusal::StagePlan { .. }
         | BudgetPreDispatchRefusal::ActiveLeaseCapacity { .. } => {
             ModelRejectionKind::BudgetUnavailable
         }

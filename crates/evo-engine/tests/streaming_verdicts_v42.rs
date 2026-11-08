@@ -10,8 +10,8 @@ use evo_core::contract::{
 use evo_core::evaluation::{
     BernsteinReport, ClusterObservation, ControlCondition, ExperimentPlan, FixedOptimizerArm,
     FixedOptimizerSpec, FormalExperimentPlanV41, FormalStatisticalUnit, Money,
-    OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind, Verdict, decide,
-    empirical_bernstein,
+    OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind, RootStageBudgetPlanV1,
+    Verdict, decide, empirical_bernstein,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::holdout::{
@@ -39,7 +39,8 @@ use evo_engine::streaming_evaluator::{
 };
 use evo_storage::Store;
 use evo_storage::budget::{
-    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization, UsageCharge,
+    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
+    RootStagePlanBindRequest, UsageCharge,
 };
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use serde_json::{Value, json};
@@ -372,7 +373,7 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
+    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "fixture-only", "USD").unwrap();
     budget.root_total = money("0.001");
     budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
     for stage in &mut budget.stages {
@@ -670,7 +671,7 @@ async fn unregistered_current_fixture(
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
+    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "fixture-only", "USD").unwrap();
     budget.root_total = money("0.1");
     budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
     for stage in &mut budget.stages {
@@ -749,6 +750,20 @@ async fn unregistered_current_fixture(
     };
     let current_control = current_control(&control, max_regression);
     let (source, watermark) = prepare_current_source(&store).await;
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: current_control.billing_scope.clone(),
+                expected_seq: 0,
+                plan: RootStageBudgetPlanV1::from_optimization_budget(
+                    current_control.optimization_budget.clone(),
+                ),
+                now: current_control.created_at_unix_seconds,
+            },
+        )
+        .await
+        .unwrap();
     IndependentEvaluationControl::register_current_control(
         &evaluator,
         &store,

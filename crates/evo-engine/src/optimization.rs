@@ -20,7 +20,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::compiler::compile_skill_edits;
-use crate::model::{ModelExecutionReceipt, ModelPort, ModelRejectionKind, ModelResponse};
+use crate::model::{
+    DevelopmentControlSelector, ModelExecutionReceipt, ModelPort, ModelRejectionKind, ModelResponse,
+};
 
 fn validate_digest(value: &str, name: &str) -> Result<()> {
     if value.len() != 64
@@ -320,6 +322,12 @@ pub(crate) fn validate_development_request(request: &DevelopmentRunRequest) -> R
 #[async_trait]
 pub trait DevRunner: Send + Sync {
     async fn run(&self, request: DevelopmentRunRequest) -> Result<DevelopmentRunReport>;
+    /// The actual persisted control this runner will use. The default is
+    /// Unknown: a model call is then never treated as planned by name, root or
+    /// stage, and a bound root refuses it as unattributed.
+    fn development_control_selector(&self) -> Option<DevelopmentControlSelector> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4037,6 +4045,7 @@ struct RecoveryModel<'a> {
     journal: &'a RecoveryJournal<'a>,
     context: &'a ModelRequestContext,
     uncertain: &'a std::sync::Mutex<Option<StepTerminalClass>>,
+    development_control: Option<DevelopmentControlSelector>,
 }
 
 /// What the journal keeps of a model's answer: all of it, except the words a rejection
@@ -4114,7 +4123,14 @@ impl ModelPort for RecoveryModel<'_> {
                 Some(StepTerminalClass::ModelDispatchConcurrent);
             return Err(Error::Conflict("model dispatch already claimed".into()));
         }
-        let response = match self.port.dispatch_compiler_bound(bound).await {
+        let response = match self
+            .port
+            .dispatch_compiler_bound_with_development_control(
+                bound,
+                self.development_control.clone(),
+            )
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 // The error is the port's own and is not kept: the outcome is unknown.
@@ -4173,6 +4189,10 @@ struct RecoveryRunner<'a> {
 }
 #[async_trait]
 impl DevRunner for RecoveryRunner<'_> {
+    fn development_control_selector(&self) -> Option<DevelopmentControlSelector> {
+        self.runner.development_control_selector()
+    }
+
     async fn run(&self, request: DevelopmentRunRequest) -> Result<DevelopmentRunReport> {
         let prepared = recovery_fact(
             self.context,
@@ -4728,11 +4748,13 @@ async fn run_step_unboxed(
         return decode_current_outcome(old.payload);
     }
     let uncertain = std::sync::Mutex::new(None);
+    let development_control = runner.and_then(|runner| runner.development_control_selector());
     let model = RecoveryModel {
         port: model.ok_or(Error::NotFound)?,
         journal: &recovery,
         context: &context,
         uncertain: &uncertain,
+        development_control,
     };
     let runner = RecoveryRunner {
         runner: runner.ok_or(Error::NotFound)?,

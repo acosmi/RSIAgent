@@ -6,7 +6,8 @@
 use super::lifecycle::{BudgetRequestSources, budget_request_source_ids};
 use super::{MVP_MAX_ACTIVE_LEASES, Session, Store, count_active_leases, internal};
 use crate::typed_budget::{self, E16CallMode};
-use evo_core::evaluation::OptimizationStage;
+use evo_core::capacity::CapacityItem;
+use evo_core::evaluation::{OptimizationStage, RootStageBudgetPlanV1, money_micros};
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, text};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -135,14 +136,46 @@ pub enum BudgetPreDispatchRefusal {
     PerCallCapExceeded,
     RootBudgetExhausted,
     BudgetArithmeticOverflow,
-    ActiveLeaseCapacity { used: u64, limit: u64 },
+    ActiveLeaseCapacity {
+        used: u64,
+        limit: u64,
+    },
     Unauthorized,
     CallNamespaceMismatch,
     GroupNamespaceMismatch,
-    InvalidRequest { message: String },
+    InvalidRequest {
+        message: String,
+    },
     InvalidArtifactDigest,
     DuplicateSource,
     SourceClosureChanged,
+    /// A bound root's stage plan refused the call before any business write.
+    StagePlan {
+        stage: BudgetStage,
+        kind: StagePlanRefusalKind,
+    },
+}
+
+/// The determinate reasons a bound root's stage plan can refuse a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagePlanRefusalKind {
+    Unknown,
+    Inactive,
+    Unallocated,
+    PerCallExceeded,
+    Exhausted,
+}
+
+impl StagePlanRefusalKind {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Unknown => "stage_plan_unknown",
+            Self::Inactive => "stage_plan_inactive",
+            Self::Unallocated => "stage_plan_unallocated",
+            Self::PerCallExceeded => "stage_plan_per_call_exceeded",
+            Self::Exhausted => "stage_plan_exhausted",
+        }
+    }
 }
 
 /// `Ok(Err(..))` is a known refusal; `Err(..)` is not evidence of no dispatch.
@@ -167,7 +200,12 @@ impl BudgetPreDispatchRefusal {
             Self::InvalidRequest { .. } | Self::InvalidArtifactDigest => "invalid_request",
             Self::DuplicateSource => "duplicate_source",
             Self::SourceClosureChanged => "source_closure_changed",
+            Self::StagePlan { kind, .. } => kind.code(),
         }
+    }
+
+    pub fn is_stage_plan(&self) -> bool {
+        matches!(self, Self::StagePlan { .. })
     }
 
     /// Exact historical reservation error, including validation/capacity text.
@@ -189,7 +227,8 @@ impl BudgetPreDispatchRefusal {
             Self::RootAuthorizationMissing
             | Self::PerCallCapExceeded
             | Self::RootBudgetExhausted
-            | Self::BudgetArithmeticOverflow => Error::Budget,
+            | Self::BudgetArithmeticOverflow
+            | Self::StagePlan { .. } => Error::Budget,
             Self::ActiveLeaseCapacity { used, limit } => {
                 Error::Capacity(evo_core::capacity::CapacityConflict {
                     item: evo_core::capacity::CapacityItem::ActiveLease,
@@ -271,6 +310,136 @@ pub struct RootBudgetRecord {
     pub stop_reason: Option<String>,
     pub stop_committed_at: Option<i64>,
     pub created_at: i64,
+}
+
+pub const ROOT_STAGE_PLAN_REPORT_SCHEMA: &str = "rsia.root_stage_plan_report.v1";
+
+/// One append-only root stage plan version. `seq` is monotone per billing
+/// scope; the greatest `seq` is the only active version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootStagePlanBinding {
+    pub billing_scope: String,
+    pub seq: i64,
+    pub plan_digest: String,
+    pub plan: RootStageBudgetPlanV1,
+    pub payer_id: String,
+    pub root_total_micros: i64,
+    pub currency: String,
+    pub pricing_version: String,
+    pub authorization_receipt_digest: String,
+    pub authorizing_namespace: String,
+    pub bound_by_actor: String,
+    pub created_at: i64,
+}
+
+/// A trusted Admin bind request. `now` is a typed field supplied by trusted
+/// engine code from its clock, never a request body.
+#[derive(Debug, Clone)]
+pub struct RootStagePlanBindRequest {
+    pub billing_scope: String,
+    pub expected_seq: i64,
+    pub plan: RootStageBudgetPlanV1,
+    pub now: i64,
+}
+
+/// The immutable control-to-active-plan relation written in the control's own
+/// registration Session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootStagePlanControlRef {
+    pub billing_scope: String,
+    pub namespace: String,
+    pub control_kind: String,
+    pub control_id: String,
+    pub control_digest: String,
+    pub binding_seq: i64,
+    pub plan_digest: String,
+    pub created_at: i64,
+}
+
+/// The relation recording that one reserved call was admitted under one
+/// binding version. It never authorizes a refund or reinterprets history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootStagePlanCallRef {
+    pub billing_scope: String,
+    pub call_id: String,
+    pub namespace: String,
+    pub stage: BudgetStage,
+    pub binding_seq: i64,
+    pub plan_digest: String,
+    pub course_producer_ref: Option<String>,
+    pub created_at: i64,
+}
+
+/// The actual persisted control a caller names as its plan origin. The storage
+/// gate reloads the relation; this selector carries no authority by itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagePlanControlSelector {
+    pub control_kind: String,
+    pub namespace: String,
+    pub control_id: String,
+}
+
+/// What a reservation claims about its plan origin. `Unattributed` is not
+/// evidence of `Outside`: on a bound root it is refused as Unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum StagePlanAttribution {
+    #[default]
+    Unattributed,
+    Control(StagePlanControlSelector),
+}
+
+/// The single refusal fact a caller may append to a still-clean Session. It
+/// writes no group, call, money or other caller write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagePlanRefusal {
+    pub billing_scope: String,
+    pub stage: BudgetStage,
+    pub kind: StagePlanRefusalKind,
+    pub now: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootStagePlanEnforcement {
+    Enforced,
+    NoBinding,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootStagePlanStageAllocation {
+    pub stage: BudgetStage,
+    pub per_call_limit_micros: Option<i64>,
+    pub allocated_micros: Option<i64>,
+    pub occupied_micros: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootStagePlanRefusalCount {
+    pub stage: BudgetStage,
+    pub reason: String,
+    pub count: u64,
+}
+
+/// A separate report DTO: the original `RootBudgetMonetarySnapshot` wire and
+/// digest are unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootStagePlanReport {
+    pub schema_version: String,
+    pub billing_scope: String,
+    pub enforcement: RootStagePlanEnforcement,
+    pub binding: Option<RootStagePlanBinding>,
+    pub stages: Vec<RootStagePlanStageAllocation>,
+    pub refusals: Vec<RootStagePlanRefusalCount>,
+    pub course_share_bps: u16,
+    pub course_occupied_micros: i64,
+    pub course_producer_wired: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -844,6 +1013,52 @@ impl Store {
         Ok(root)
     }
 
+    /// Appends one root stage plan version as a real Admin. The highest seq is
+    /// the only active version; old versions are never updated or removed.
+    pub async fn bind_root_stage_plan(
+        &self,
+        ctx: &Context,
+        request: &RootStagePlanBindRequest,
+    ) -> Result<RootStagePlanBinding> {
+        ctx.require(&[Role::Admin])?;
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        let binding = bind_root_stage_plan_in_tx(&mut tx, ctx, request).await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(binding)
+    }
+
+    /// Reads the active (highest-seq) binding. A malformed or unsupported
+    /// active version fails closed and never falls back to an older one.
+    pub async fn root_stage_plan_binding(
+        &self,
+        ctx: &Context,
+        billing_scope: &str,
+    ) -> Result<Option<RootStagePlanBinding>> {
+        require_budget_reader(ctx)?;
+        identifier(billing_scope)?;
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        require_namespace(&mut tx, billing_scope, ctx.namespace()).await?;
+        let binding = active_root_stage_plan_in_tx(&mut tx, billing_scope).await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(binding)
+    }
+
+    /// Admin-only stage plan report. It is a new DTO derived from the binding,
+    /// relation and event facts; the monetary snapshot wire is unchanged.
+    pub async fn root_stage_plan_report(
+        &self,
+        ctx: &Context,
+        billing_scope: &str,
+    ) -> Result<RootStagePlanReport> {
+        ctx.require(&[Role::Admin])?;
+        identifier(billing_scope)?;
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        require_namespace(&mut tx, billing_scope, ctx.namespace()).await?;
+        let report = root_stage_plan_report_in_tx(&mut tx, billing_scope).await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(report)
+    }
+
     /// Reserves a call with no registered source closure. The reservation has no
     /// source for a revocation tombstone to refuse. The dispatch and the model
     /// settlement of the call read the closure its persisted request names instead
@@ -933,9 +1148,14 @@ impl Store {
         {
             return Err(typed_budget::mode_mismatch());
         }
-        let outcome =
-            reserve_budget_call_with_sources_in_tx_typed(&mut tx, ctx, request, &source_ids)
-                .await?;
+        let outcome = reserve_budget_call_with_sources_in_tx_typed(
+            &mut tx,
+            ctx,
+            request,
+            &source_ids,
+            &StagePlanAttribution::Unattributed,
+        )
+        .await?;
         if outcome.is_ok() {
             tx.commit().await.map_err(internal)?;
         }
@@ -1011,9 +1231,15 @@ impl Store {
         {
             return Err(typed_budget::sources_unavailable());
         }
-        let call = reserve_budget_call_with_sources_in_tx_typed(&mut tx, ctx, request, &[])
-            .await?
-            .map_err(BudgetPreDispatchRefusal::into_reservation_error)?;
+        let call = reserve_budget_call_with_sources_in_tx_typed(
+            &mut tx,
+            ctx,
+            request,
+            &[],
+            &StagePlanAttribution::Unattributed,
+        )
+        .await?
+        .map_err(BudgetPreDispatchRefusal::into_reservation_error)?;
         if existing.is_none() {
             typed_budget::create_ref_in_tx(&mut tx, ctx, &call).await?;
         }
@@ -2008,6 +2234,142 @@ impl Session {
         root_budget_in_tx(&mut self.tx, ctx, billing_scope).await
     }
 
+    /// Appends one root stage plan version in the caller's Session. The
+    /// control registration Session uses this so its relation and the binding
+    /// share one commit.
+    pub async fn bind_root_stage_plan(
+        &mut self,
+        ctx: &Context,
+        request: &RootStagePlanBindRequest,
+    ) -> Result<RootStagePlanBinding> {
+        ctx.require(&[Role::Admin])?;
+        bind_root_stage_plan_in_tx(&mut self.tx, ctx, request).await
+    }
+
+    /// Reads the active (highest-seq) binding in this Session.
+    pub async fn active_root_stage_plan(
+        &mut self,
+        ctx: &Context,
+        billing_scope: &str,
+    ) -> Result<Option<RootStagePlanBinding>> {
+        require_budget_reader(ctx)?;
+        identifier(billing_scope)?;
+        require_namespace(&mut self.tx, billing_scope, ctx.namespace()).await?;
+        active_root_stage_plan_in_tx(&mut self.tx, billing_scope).await
+    }
+
+    /// Writes the immutable control-to-active-plan relation in the control's
+    /// registration Session. The binding itself never stores a control ref.
+    pub async fn record_root_stage_plan_control(
+        &mut self,
+        ctx: &Context,
+        billing_scope: &str,
+        control_kind: &str,
+        control_id: &str,
+        control_digest: &str,
+        now: i64,
+    ) -> Result<RootStagePlanControlRef> {
+        ctx.require(&[Role::Admin, Role::Evaluator])?;
+        identifier(billing_scope)?;
+        identifier(control_kind)?;
+        identifier(control_id)?;
+        validate_digest(control_digest, "control_digest")?;
+        valid_time(now)?;
+        require_namespace(&mut self.tx, billing_scope, ctx.namespace()).await?;
+        let active = active_root_stage_plan_in_tx(&mut self.tx, billing_scope)
+            .await?
+            .ok_or_else(|| {
+                Error::Conflict("registered_control_requires_active_root_stage_plan".into())
+            })?;
+        if let Some(existing) =
+            load_root_stage_plan_control(&mut self.tx, ctx.namespace(), control_kind, control_id)
+                .await?
+        {
+            if existing.control_digest != control_digest
+                || existing.billing_scope != billing_scope
+                || existing.binding_seq != active.seq
+                || existing.plan_digest != active.plan_digest
+            {
+                return Err(Error::Conflict(
+                    "root_stage_plan_control_ref_is_immutable".into(),
+                ));
+            }
+            return Ok(existing);
+        }
+        sqlx::query(
+            "INSERT INTO root_budget_stage_plan_controls(
+               billing_scope,namespace,control_kind,control_id,control_digest,
+               binding_seq,plan_digest,created_at
+             ) VALUES(?,?,?,?,?,?,?,?)",
+        )
+        .bind(billing_scope)
+        .bind(ctx.namespace())
+        .bind(control_kind)
+        .bind(control_id)
+        .bind(control_digest)
+        .bind(active.seq)
+        .bind(&active.plan_digest)
+        .bind(now)
+        .execute(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        load_root_stage_plan_control(&mut self.tx, ctx.namespace(), control_kind, control_id)
+            .await?
+            .ok_or(Error::Internal)
+    }
+
+    /// Reads the relation written by a control registration. The caller still
+    /// compares its `binding_seq`/`plan_digest` with the active version.
+    pub async fn root_stage_plan_control_ref(
+        &mut self,
+        ctx: &Context,
+        control_kind: &str,
+        control_id: &str,
+    ) -> Result<Option<RootStagePlanControlRef>> {
+        require_budget_reader(ctx)?;
+        identifier(control_kind)?;
+        identifier(control_id)?;
+        load_root_stage_plan_control(&mut self.tx, ctx.namespace(), control_kind, control_id).await
+    }
+
+    /// Appends exactly one `stage_plan_refused` event to a caller-held clean
+    /// Session. It writes no group, call, amount or other caller fact and does
+    /// not commit; the caller owns the commit.
+    pub async fn append_stage_plan_refusal(
+        &mut self,
+        ctx: &Context,
+        refusal: &StagePlanRefusal,
+    ) -> Result<()> {
+        require_budget_caller(ctx)?;
+        identifier(&refusal.billing_scope)?;
+        valid_time(refusal.now)?;
+        if matches!(
+            refusal.stage,
+            BudgetStage::TaskExecution | BudgetStage::FormalEvaluation
+        ) {
+            return Err(Error::Invalid(
+                "acceptance stages do not carry a stage plan refusal".into(),
+            ));
+        }
+        require_namespace(&mut self.tx, &refusal.billing_scope, ctx.namespace()).await?;
+        let active = active_root_stage_plan_in_tx(&mut self.tx, &refusal.billing_scope)
+            .await?
+            .ok_or_else(|| Error::Conflict("stage_plan_refusal_requires_active_plan".into()))?;
+        insert_event(
+            &mut self.tx,
+            &refusal.billing_scope,
+            None,
+            STAGE_PLAN_REFUSED_EVENT,
+            refusal.now,
+            json!({
+                "stage": refusal.stage,
+                "reason": refusal.kind.code(),
+                "binding_seq": active.seq,
+            }),
+        )
+        .await
+    }
+
     pub async fn reserve_budget_call(
         &mut self,
         ctx: &Context,
@@ -2047,10 +2409,34 @@ impl Session {
         request: &BudgetCallReservation,
         source_ids: &[String],
     ) -> BudgetPreDispatchResult<BudgetCallRecord> {
+        self.reserve_budget_call_with_stage_plan_typed(
+            ctx,
+            request,
+            source_ids,
+            &StagePlanAttribution::Unattributed,
+        )
+        .await
+    }
+
+    /// Reserves a call whose producer names a real persisted control relation.
+    /// The stage gate reads that relation and the active version in this same
+    /// Session before the first group/call/event/ref write.
+    pub async fn reserve_budget_call_with_stage_plan_typed(
+        &mut self,
+        ctx: &Context,
+        request: &BudgetCallReservation,
+        source_ids: &[String],
+        attribution: &StagePlanAttribution,
+    ) -> BudgetPreDispatchResult<BudgetCallRecord> {
         let mut savepoint = (&mut self.tx).begin().await.map_err(internal)?;
-        let result =
-            reserve_budget_call_with_sources_in_tx_typed(&mut savepoint, ctx, request, source_ids)
-                .await;
+        let result = reserve_budget_call_with_sources_in_tx_typed(
+            &mut savepoint,
+            ctx,
+            request,
+            source_ids,
+            attribution,
+        )
+        .await;
         match result {
             Ok(Ok(call)) => {
                 savepoint.commit().await.map_err(internal)?;
@@ -2832,6 +3218,7 @@ async fn reserve_budget_call_with_sources_in_tx_typed(
     ctx: &Context,
     request: &BudgetCallReservation,
     source_ids: &[String],
+    attribution: &StagePlanAttribution,
 ) -> BudgetPreDispatchResult<BudgetCallRecord> {
     if require_budget_caller(ctx).is_err() {
         return Ok(Err(BudgetPreDispatchRefusal::Unauthorized));
@@ -2915,6 +3302,21 @@ async fn reserve_budget_call_with_sources_in_tx_typed(
             limit: MVP_MAX_ACTIVE_LEASES,
         }));
     }
+    let root_currency: String = row.try_get("currency").map_err(internal)?;
+    let root_pricing: String = row.try_get("pricing_version").map_err(internal)?;
+    let stage_binding = match stage_plan_admission_in_tx(
+        tx,
+        ctx,
+        request,
+        attribution,
+        &root_currency,
+        &root_pricing,
+    )
+    .await?
+    {
+        Ok(binding) => binding,
+        Err(refusal) => return Ok(Err(refusal)),
+    };
     if group.is_none() {
         sqlx::query(
             "INSERT INTO root_budget_dispatch_groups(
@@ -3003,6 +3405,24 @@ async fn reserve_budget_call_with_sources_in_tx_typed(
     let call = load_call(tx, &request.billing_scope, &request.call_id)
         .await?
         .ok_or(Error::Internal)?;
+    if let Some((binding_seq, plan_digest)) = stage_binding {
+        sqlx::query(
+            "INSERT INTO root_budget_stage_plan_calls(
+               billing_scope,call_id,namespace,stage,binding_seq,plan_digest,
+               course_producer_ref,created_at
+             ) VALUES(?,?,?,?,?,?,NULL,?)",
+        )
+        .bind(&request.billing_scope)
+        .bind(&request.call_id)
+        .bind(ctx.namespace())
+        .bind(request.stage.as_str())
+        .bind(binding_seq)
+        .bind(plan_digest)
+        .bind(request.now)
+        .execute(&mut **tx)
+        .await
+        .map_err(internal)?;
+    }
     if !source_ids.is_empty()
         && let Err(refusal) = ensure_budget_call_ref_typed(tx, ctx, &call, &source_ids).await?
     {
@@ -3347,6 +3767,9 @@ async fn begin_budget_dispatch_in_tx_typed(
     if source_closure_blocked(tx, &call.namespace, &source_ids).await? {
         return Ok(Err(BudgetPreDispatchRefusal::SourceRevoked));
     }
+    if let Err(refusal) = stage_plan_dispatch_admission_in_tx(tx, &call).await? {
+        return Ok(Err(refusal));
+    }
     let active: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM root_budget_calls
          WHERE billing_scope=? AND call_id<>? AND (
@@ -3389,6 +3812,697 @@ async fn begin_budget_dispatch_in_tx_typed(
         call,
         new_dispatch: true,
     }))
+}
+
+const STAGE_PLAN_REFUSED_EVENT: &str = "stage_plan_refused";
+
+fn optimization_stage_for(stage: BudgetStage) -> Option<OptimizationStage> {
+    match stage {
+        BudgetStage::Reflection => Some(OptimizationStage::Reflection),
+        BudgetStage::Merge => Some(OptimizationStage::Merge),
+        BudgetStage::Ranking => Some(OptimizationStage::Ranking),
+        BudgetStage::DevelopmentExecution => Some(OptimizationStage::DevelopmentExecution),
+        BudgetStage::DevelopmentScoring => Some(OptimizationStage::DevelopmentScoring),
+        BudgetStage::Practice => Some(OptimizationStage::Practice),
+        BudgetStage::Consolidation => Some(OptimizationStage::Consolidation),
+        BudgetStage::Guidance => Some(OptimizationStage::Guidance),
+        BudgetStage::HistoryCollection => Some(OptimizationStage::HistoryCollection),
+        BudgetStage::StorageCpu => Some(OptimizationStage::StorageCpu),
+        BudgetStage::HumanReview => Some(OptimizationStage::HumanReview),
+        BudgetStage::TaskExecution
+        | BudgetStage::CandidateGeneration
+        | BudgetStage::FormalEvaluation
+        | BudgetStage::Curriculum
+        | BudgetStage::MetaEvaluation
+        | BudgetStage::GrayOperations => None,
+    }
+}
+
+/// `(per_call_limit, stage_total)` in exact integer micros. `None` means the
+/// stage was not allocated, which is distinct from an allocated zero.
+fn plan_stage_limits_micros(
+    plan: &RootStageBudgetPlanV1,
+    stage: BudgetStage,
+) -> Result<Option<(i64, i64)>> {
+    let caps = match stage {
+        BudgetStage::Curriculum => plan.curriculum.as_ref(),
+        BudgetStage::CandidateGeneration => plan.candidate_generation.as_ref(),
+        BudgetStage::MetaEvaluation => plan.meta_evaluation.as_ref(),
+        BudgetStage::GrayOperations => plan.gray_operations.as_ref(),
+        BudgetStage::TaskExecution | BudgetStage::FormalEvaluation => return Ok(None),
+        other => {
+            let old = optimization_stage_for(other).ok_or(Error::Internal)?;
+            return plan
+                .optimization_budget
+                .stages
+                .iter()
+                .find(|entry| entry.stage == old)
+                .map(|entry| {
+                    Ok((
+                        money_micros(&entry.per_call_limit, "per_call_limit")?,
+                        money_micros(&entry.experiment_total, "experiment_total")?,
+                    ))
+                })
+                .transpose();
+        }
+    };
+    caps.map(|caps| {
+        Ok((
+            money_micros(&caps.per_call_limit, "per_call_limit")?,
+            money_micros(&caps.experiment_total, "experiment_total")?,
+        ))
+    })
+    .transpose()
+}
+
+fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RootStagePlanBinding> {
+    let body: String = row.try_get("plan_body").map_err(internal)?;
+    let plan: RootStageBudgetPlanV1 = serde_json::from_str(&body)
+        .map_err(|_| Error::Conflict("root_stage_plan_body_invalid".into()))?;
+    let plan_schema: String = row.try_get("plan_schema").map_err(internal)?;
+    if plan_schema != plan.schema_version {
+        return Err(Error::Conflict("root_stage_plan_schema_mismatch".into()));
+    }
+    Ok(RootStagePlanBinding {
+        billing_scope: row.try_get("billing_scope").map_err(internal)?,
+        seq: row.try_get("seq").map_err(internal)?,
+        plan_digest: row.try_get("plan_digest").map_err(internal)?,
+        plan,
+        payer_id: row.try_get("payer_id").map_err(internal)?,
+        root_total_micros: row.try_get("root_total_micros").map_err(internal)?,
+        currency: row.try_get("currency").map_err(internal)?,
+        pricing_version: row.try_get("pricing_version").map_err(internal)?,
+        authorization_receipt_digest: row
+            .try_get("authorization_receipt_digest")
+            .map_err(internal)?,
+        authorizing_namespace: row.try_get("authorizing_namespace").map_err(internal)?,
+        bound_by_actor: row.try_get("bound_by_actor").map_err(internal)?,
+        created_at: row.try_get("created_at").map_err(internal)?,
+    })
+}
+
+fn control_ref_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<RootStagePlanControlRef> {
+    Ok(RootStagePlanControlRef {
+        billing_scope: row.try_get("billing_scope").map_err(internal)?,
+        namespace: row.try_get("namespace").map_err(internal)?,
+        control_kind: row.try_get("control_kind").map_err(internal)?,
+        control_id: row.try_get("control_id").map_err(internal)?,
+        control_digest: row.try_get("control_digest").map_err(internal)?,
+        binding_seq: row.try_get("binding_seq").map_err(internal)?,
+        plan_digest: row.try_get("plan_digest").map_err(internal)?,
+        created_at: row.try_get("created_at").map_err(internal)?,
+    })
+}
+
+async fn load_root_stage_plan_control(
+    tx: &mut Transaction<'_, Sqlite>,
+    namespace: &str,
+    control_kind: &str,
+    control_id: &str,
+) -> Result<Option<RootStagePlanControlRef>> {
+    let row = sqlx::query(
+        "SELECT * FROM root_budget_stage_plan_controls
+         WHERE namespace=? AND control_kind=? AND control_id=?",
+    )
+    .bind(namespace)
+    .bind(control_kind)
+    .bind(control_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    row.as_ref().map(control_ref_from_row).transpose()
+}
+
+async fn active_root_stage_plan_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    billing_scope: &str,
+) -> Result<Option<RootStagePlanBinding>> {
+    let row = sqlx::query(
+        "SELECT * FROM root_budget_stage_plan_bindings
+         WHERE billing_scope=? ORDER BY seq DESC LIMIT 1",
+    )
+    .bind(billing_scope)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    let Some(row) = row else { return Ok(None) };
+    let binding = binding_from_row(&row)?;
+    binding
+        .plan
+        .validate()
+        .map_err(|_| Error::Conflict("active_root_stage_plan_unsupported".into()))?;
+    let digest = binding
+        .plan
+        .digest()
+        .map_err(|_| Error::Conflict("active_root_stage_plan_unsupported".into()))?;
+    if digest != binding.plan_digest {
+        return Err(Error::Conflict(
+            "active_root_stage_plan_digest_mismatch".into(),
+        ));
+    }
+    let budget = &binding.plan.optimization_budget;
+    if budget.payer_id != binding.payer_id
+        || budget.root_total.currency != binding.currency
+        || budget.root_total.pricing_version != binding.pricing_version
+        || money_micros(&budget.root_total, "root_total")? != binding.root_total_micros
+        || budget.admin_authorization_receipt_digest.as_deref()
+            != Some(binding.authorization_receipt_digest.as_str())
+        || binding.billing_scope != budget.root_budget_scope_id
+    {
+        return Err(Error::Conflict(
+            "active_root_stage_plan_metadata_mismatch".into(),
+        ));
+    }
+    Ok(Some(binding))
+}
+
+async fn bind_root_stage_plan_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    request: &RootStagePlanBindRequest,
+) -> Result<RootStagePlanBinding> {
+    ctx.require(&[Role::Admin])?;
+    identifier(&request.billing_scope)?;
+    valid_time(request.now)?;
+    if request.expected_seq < 0 {
+        return Err(Error::Invalid(
+            "root stage plan expected_seq must be nonnegative".into(),
+        ));
+    }
+    request.plan.validate()?;
+    let budget = &request.plan.optimization_budget;
+    let row = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
+        .bind(&request.billing_scope)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal)?
+        .ok_or(Error::Budget)?;
+    let root = root_from_row(&row, load_namespaces(tx, &request.billing_scope).await?)?;
+    if root.authorizing_namespace != ctx.namespace() {
+        return Err(Error::Forbidden);
+    }
+    if root.stopped {
+        return Err(Error::Conflict("root_budget_stopped".into()));
+    }
+    if budget.root_budget_scope_id != request.billing_scope
+        || root.billing_scope != request.billing_scope
+    {
+        return Err(Error::Conflict("root_stage_plan_scope_mismatch".into()));
+    }
+    if budget.payer_id != root.payment_subject {
+        return Err(Error::Conflict("root_stage_plan_payer_mismatch".into()));
+    }
+    if budget.root_total.currency != root.currency
+        || budget.root_total.pricing_version != root.pricing_version
+    {
+        return Err(Error::Conflict(
+            "root_stage_plan_currency_or_pricing_mismatch".into(),
+        ));
+    }
+    if money_micros(&budget.root_total, "root_total")? != root.total_limit_micros {
+        return Err(Error::Conflict(
+            "root_stage_plan_root_total_mismatch".into(),
+        ));
+    }
+    let receipt = budget
+        .admin_authorization_receipt_digest
+        .as_deref()
+        .ok_or(Error::Budget)?;
+    if receipt != root.authorization_receipt_digest {
+        return Err(Error::Conflict("root_stage_plan_receipt_mismatch".into()));
+    }
+    let max_seq: Option<i64> = sqlx::query_scalar(
+        "SELECT MAX(seq) FROM root_budget_stage_plan_bindings WHERE billing_scope=?",
+    )
+    .bind(&request.billing_scope)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(internal)?;
+    let max_seq = max_seq.unwrap_or(0);
+    let next_seq = request
+        .expected_seq
+        .checked_add(1)
+        .ok_or_else(|| Error::Conflict("root_stage_plan_seq_overflow".into()))?;
+    let digest = request.plan.digest()?;
+    let body = serde_json::to_string(&request.plan).map_err(|_| Error::Internal)?;
+    if let Some(existing_row) =
+        sqlx::query("SELECT * FROM root_budget_stage_plan_bindings WHERE billing_scope=? AND seq=?")
+            .bind(&request.billing_scope)
+            .bind(next_seq)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(internal)?
+    {
+        let existing_body: String = existing_row.try_get("plan_body").map_err(internal)?;
+        let existing = binding_from_row(&existing_row)?;
+        if existing_body == body
+            && existing.plan_digest == digest
+            && existing.payer_id == budget.payer_id
+            && existing.root_total_micros == root.total_limit_micros
+            && existing.currency == root.currency
+            && existing.pricing_version == root.pricing_version
+            && existing.authorization_receipt_digest == root.authorization_receipt_digest
+            && existing.authorizing_namespace == ctx.namespace()
+            && existing.billing_scope == request.billing_scope
+        {
+            return Ok(existing);
+        }
+        return Err(Error::Conflict(
+            "root_stage_plan_version_already_bound".into(),
+        ));
+    }
+    if request.expected_seq != max_seq {
+        return Err(Error::Conflict(
+            "root_stage_plan_expected_seq_mismatch".into(),
+        ));
+    }
+    let used: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM root_budget_stage_plan_bindings WHERE billing_scope=?",
+    )
+    .bind(&request.billing_scope)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(internal)?;
+    CapacityItem::RootStagePlanVersionPerRoot
+        .admit(u64::try_from(used).map_err(|_| Error::Internal)?, 1)?;
+    for stage in BudgetStage::ALL {
+        if matches!(
+            stage,
+            BudgetStage::TaskExecution | BudgetStage::FormalEvaluation
+        ) {
+            continue;
+        }
+        let occupied = stage_occupied_micros_in_tx(
+            tx,
+            &request.billing_scope,
+            stage,
+            &root.currency,
+            &root.pricing_version,
+        )
+        .await?;
+        let allocation = plan_stage_limits_micros(&request.plan, stage)?
+            .map(|(_, total)| total)
+            .unwrap_or(0);
+        if occupied > i128::from(allocation) {
+            return Err(Error::Conflict(
+                "root_stage_plan_below_occupied_stage_usage".into(),
+            ));
+        }
+    }
+    let insert = sqlx::query(
+        "INSERT INTO root_budget_stage_plan_bindings(
+           billing_scope,seq,plan_schema,plan_digest,plan_body,payer_id,root_total_micros,
+           currency,pricing_version,authorization_receipt_digest,authorizing_namespace,
+           bound_by_actor,created_at
+         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&request.billing_scope)
+    .bind(next_seq)
+    .bind(&request.plan.schema_version)
+    .bind(&digest)
+    .bind(&body)
+    .bind(&budget.payer_id)
+    .bind(root.total_limit_micros)
+    .bind(&root.currency)
+    .bind(&root.pricing_version)
+    .bind(&root.authorization_receipt_digest)
+    .bind(ctx.namespace())
+    .bind(ctx.actor())
+    .bind(request.now)
+    .execute(&mut **tx)
+    .await;
+    if let Err(error) = insert {
+        if error
+            .as_database_error()
+            .is_some_and(|error| error.is_unique_violation())
+        {
+            return Err(Error::Conflict("root_stage_plan_seq_cas_conflict".into()));
+        }
+        return Err(internal(error));
+    }
+    let row = sqlx::query(
+        "SELECT * FROM root_budget_stage_plan_bindings WHERE billing_scope=? AND seq=?",
+    )
+    .bind(&request.billing_scope)
+    .bind(next_seq)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(internal)?;
+    binding_from_row(&row)
+}
+
+async fn stage_occupied_micros_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    billing_scope: &str,
+    stage: BudgetStage,
+    root_currency: &str,
+    root_pricing: &str,
+) -> Result<i128> {
+    let mut occupied = 0_i128;
+    let mut after = String::new();
+    loop {
+        let rows = sqlx::query(
+            "SELECT call_id,state,reserved_micros,actual_cost_micros,actual_currency,
+                    actual_pricing_version
+             FROM root_budget_calls
+             WHERE billing_scope=? AND stage=? AND call_id>?
+             ORDER BY call_id LIMIT 1000",
+        )
+        .bind(billing_scope)
+        .bind(stage.as_str())
+        .bind(&after)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(internal)?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            let call_id: String = row.try_get("call_id").map_err(internal)?;
+            after = call_id;
+            let state = BudgetCallState::parse(row.try_get("state").map_err(internal)?)?;
+            let reserved: i64 = row.try_get("reserved_micros").map_err(internal)?;
+            let actual: Option<i64> = row.try_get("actual_cost_micros").map_err(internal)?;
+            let currency: Option<String> = row.try_get("actual_currency").map_err(internal)?;
+            let pricing: Option<String> =
+                row.try_get("actual_pricing_version").map_err(internal)?;
+            let charging = match state {
+                BudgetCallState::Reserved
+                | BudgetCallState::Dispatched
+                | BudgetCallState::Uncertain => reserved,
+                BudgetCallState::Finalized => match actual {
+                    Some(actual)
+                        if currency.as_deref() == Some(root_currency)
+                            && pricing.as_deref() == Some(root_pricing) =>
+                    {
+                        actual
+                    }
+                    _ => reserved,
+                },
+                BudgetCallState::Released | BudgetCallState::Cancelled => 0,
+            };
+            occupied = occupied
+                .checked_add(i128::from(charging))
+                .ok_or(Error::Internal)?;
+        }
+    }
+    Ok(occupied)
+}
+
+async fn stage_plan_admission_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    request: &BudgetCallReservation,
+    attribution: &StagePlanAttribution,
+    root_currency: &str,
+    root_pricing: &str,
+) -> BudgetPreDispatchResult<Option<(i64, String)>> {
+    let Some(active) = active_root_stage_plan_in_tx(tx, &request.billing_scope).await? else {
+        return Ok(Ok(None));
+    };
+    if matches!(
+        request.stage,
+        BudgetStage::TaskExecution | BudgetStage::FormalEvaluation
+    ) {
+        return Ok(Ok(None));
+    }
+    let selector = match attribution {
+        StagePlanAttribution::Unattributed => {
+            return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+                stage: request.stage,
+                kind: StagePlanRefusalKind::Unknown,
+            }));
+        }
+        StagePlanAttribution::Control(selector) => selector,
+    };
+    if selector.namespace != ctx.namespace() {
+        return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+            stage: request.stage,
+            kind: StagePlanRefusalKind::Unknown,
+        }));
+    }
+    if let Err(error) =
+        identifier(&selector.control_kind).and_then(|_| identifier(&selector.control_id))
+    {
+        return reservation_validation_refusal(error);
+    }
+    let Some(relation) = load_root_stage_plan_control(
+        tx,
+        &selector.namespace,
+        &selector.control_kind,
+        &selector.control_id,
+    )
+    .await?
+    else {
+        return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+            stage: request.stage,
+            kind: StagePlanRefusalKind::Unknown,
+        }));
+    };
+    if relation.billing_scope != request.billing_scope
+        || relation.binding_seq != active.seq
+        || relation.plan_digest != active.plan_digest
+    {
+        return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+            stage: request.stage,
+            kind: StagePlanRefusalKind::Inactive,
+        }));
+    }
+    let Some((per_call, total)) = plan_stage_limits_micros(&active.plan, request.stage)? else {
+        return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+            stage: request.stage,
+            kind: StagePlanRefusalKind::Unallocated,
+        }));
+    };
+    if total <= 0 {
+        return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+            stage: request.stage,
+            kind: StagePlanRefusalKind::Unallocated,
+        }));
+    }
+    if request.max_cost_micros > per_call {
+        return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+            stage: request.stage,
+            kind: StagePlanRefusalKind::PerCallExceeded,
+        }));
+    }
+    let occupied = stage_occupied_micros_in_tx(
+        tx,
+        &request.billing_scope,
+        request.stage,
+        root_currency,
+        root_pricing,
+    )
+    .await?;
+    let next = occupied
+        .checked_add(i128::from(request.max_cost_micros))
+        .ok_or(Error::Internal)?;
+    if next > i128::from(total) {
+        return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+            stage: request.stage,
+            kind: StagePlanRefusalKind::Exhausted,
+        }));
+    }
+    Ok(Ok(Some((active.seq, active.plan_digest))))
+}
+
+async fn stage_plan_dispatch_admission_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    call: &BudgetCallRecord,
+) -> BudgetPreDispatchResult<()> {
+    let Some(active) = active_root_stage_plan_in_tx(tx, &call.billing_scope).await? else {
+        return Ok(Ok(()));
+    };
+    if matches!(
+        call.stage,
+        BudgetStage::TaskExecution | BudgetStage::FormalEvaluation
+    ) {
+        return Ok(Ok(()));
+    }
+    let row = sqlx::query(
+        "SELECT binding_seq,plan_digest FROM root_budget_stage_plan_calls
+         WHERE billing_scope=? AND call_id=?",
+    )
+    .bind(&call.billing_scope)
+    .bind(&call.call_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    let Some(row) = row else {
+        return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+            stage: call.stage,
+            kind: StagePlanRefusalKind::Unknown,
+        }));
+    };
+    let binding_seq: i64 = row.try_get("binding_seq").map_err(internal)?;
+    let plan_digest: String = row.try_get("plan_digest").map_err(internal)?;
+    if binding_seq != active.seq || plan_digest != active.plan_digest {
+        return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+            stage: call.stage,
+            kind: StagePlanRefusalKind::Inactive,
+        }));
+    }
+    Ok(Ok(()))
+}
+
+async fn stage_plan_course_occupied_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    billing_scope: &str,
+    root_currency: &str,
+    root_pricing: &str,
+) -> Result<i64> {
+    let mut occupied = 0_i128;
+    let mut after = String::new();
+    loop {
+        let rows = sqlx::query(
+            "SELECT c.call_id,c.state,c.reserved_micros,c.actual_cost_micros,
+                    c.actual_currency,c.actual_pricing_version
+             FROM root_budget_stage_plan_calls r
+             JOIN root_budget_calls c
+               ON c.billing_scope=r.billing_scope AND c.call_id=r.call_id
+             WHERE r.billing_scope=? AND r.course_producer_ref IS NOT NULL AND c.call_id>?
+             ORDER BY c.call_id LIMIT 1000",
+        )
+        .bind(billing_scope)
+        .bind(&after)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(internal)?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            let call_id: String = row.try_get("call_id").map_err(internal)?;
+            after = call_id;
+            let state = BudgetCallState::parse(row.try_get("state").map_err(internal)?)?;
+            let reserved: i64 = row.try_get("reserved_micros").map_err(internal)?;
+            let actual: Option<i64> = row.try_get("actual_cost_micros").map_err(internal)?;
+            let currency: Option<String> = row.try_get("actual_currency").map_err(internal)?;
+            let pricing: Option<String> =
+                row.try_get("actual_pricing_version").map_err(internal)?;
+            let charging = match state {
+                BudgetCallState::Reserved
+                | BudgetCallState::Dispatched
+                | BudgetCallState::Uncertain => reserved,
+                BudgetCallState::Finalized => match actual {
+                    Some(actual)
+                        if currency.as_deref() == Some(root_currency)
+                            && pricing.as_deref() == Some(root_pricing) =>
+                    {
+                        actual
+                    }
+                    _ => reserved,
+                },
+                BudgetCallState::Released | BudgetCallState::Cancelled => 0,
+            };
+            occupied = occupied
+                .checked_add(i128::from(charging))
+                .ok_or(Error::Internal)?;
+        }
+    }
+    i64::try_from(occupied)
+        .map_err(|_| Error::Conflict("course_stage_occupancy_exceeds_i64".into()))
+}
+
+async fn root_stage_plan_report_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    billing_scope: &str,
+) -> Result<RootStagePlanReport> {
+    let row = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
+        .bind(billing_scope)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal)?
+        .ok_or(Error::NotFound)?;
+    let root = root_from_row(&row, load_namespaces(tx, billing_scope).await?)?;
+    let binding = active_root_stage_plan_in_tx(tx, billing_scope).await?;
+    let mut stages = Vec::with_capacity(BudgetStage::ALL.len());
+    for stage in BudgetStage::ALL {
+        if matches!(
+            stage,
+            BudgetStage::TaskExecution | BudgetStage::FormalEvaluation
+        ) {
+            continue;
+        }
+        let limits = match &binding {
+            Some(binding) => plan_stage_limits_micros(&binding.plan, stage)?,
+            None => None,
+        };
+        let occupied = stage_occupied_micros_in_tx(
+            tx,
+            billing_scope,
+            stage,
+            &root.currency,
+            &root.pricing_version,
+        )
+        .await?;
+        stages.push(RootStagePlanStageAllocation {
+            stage,
+            per_call_limit_micros: limits.map(|(per_call, _)| per_call),
+            allocated_micros: limits.map(|(_, total)| total),
+            occupied_micros: i64::try_from(occupied)
+                .map_err(|_| Error::Conflict("stage_occupancy_exceeds_i64".into()))?,
+        });
+    }
+    let mut counts: BTreeMap<(BudgetStage, String), u64> = BTreeMap::new();
+    let mut after_sequence = 0_i64;
+    loop {
+        let rows = sqlx::query(
+            "SELECT seq,details FROM root_budget_events
+             WHERE billing_scope=? AND event_kind=? AND seq>? ORDER BY seq LIMIT 1000",
+        )
+        .bind(billing_scope)
+        .bind(STAGE_PLAN_REFUSED_EVENT)
+        .bind(after_sequence)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(internal)?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            after_sequence = row.try_get("seq").map_err(internal)?;
+            let details: String = row.try_get("details").map_err(internal)?;
+            let value: serde_json::Value =
+                serde_json::from_str(&details).map_err(|_| Error::Internal)?;
+            let stage = value
+                .get("stage")
+                .and_then(|value| value.as_str())
+                .ok_or(Error::Internal)?;
+            let reason = value
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .ok_or(Error::Internal)?;
+            let stage = BudgetStage::parse(stage)?;
+            *counts.entry((stage, reason.to_owned())).or_insert(0) += 1;
+        }
+    }
+    let refusals = counts
+        .into_iter()
+        .map(|((stage, reason), count)| RootStagePlanRefusalCount {
+            stage,
+            reason,
+            count,
+        })
+        .collect();
+    let course_occupied =
+        stage_plan_course_occupied_in_tx(tx, billing_scope, &root.currency, &root.pricing_version)
+            .await?;
+    Ok(RootStagePlanReport {
+        schema_version: ROOT_STAGE_PLAN_REPORT_SCHEMA.into(),
+        billing_scope: billing_scope.into(),
+        enforcement: if binding.is_some() {
+            RootStagePlanEnforcement::Enforced
+        } else {
+            RootStagePlanEnforcement::NoBinding
+        },
+        binding,
+        stages,
+        refusals,
+        course_share_bps: evo_core::curriculum::CURRICULUM_BUDGET_SHARE_BPS,
+        course_occupied_micros: course_occupied,
+        course_producer_wired: false,
+    })
 }
 
 async fn stop_dispatch_group_in_tx(

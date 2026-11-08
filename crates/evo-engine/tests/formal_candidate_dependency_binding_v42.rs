@@ -10,7 +10,7 @@ use evo_core::contract::{
 use evo_core::evaluation::{
     ControlCondition, ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
     FormalExperimentPlanV41, FormalStatisticalUnit, Money, OptimizationBudgetPlan,
-    OptimizerComparisonContract, ProfileKind, Verdict,
+    OptimizerComparisonContract, ProfileKind, RootStageBudgetPlanV1, Verdict,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::holdout::{
@@ -35,7 +35,8 @@ use evo_engine::streaming_evaluator::{
 };
 use evo_storage::Store;
 use evo_storage::budget::{
-    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization, UsageCharge,
+    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
+    RootStagePlanBindRequest, UsageCharge,
 };
 use evo_storage::lifecycle::{
     LifecycleStore, REVOKE_TOMBSTONE_SCHEMA, RevokeTombstone, TypedObjectRef,
@@ -209,7 +210,7 @@ async fn unregistered_current_fixture(n: u32) -> Fixture {
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
+    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "fixture-only", "USD").unwrap();
     budget.root_total = money("0.001");
     budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
     for stage in &mut budget.stages {
@@ -291,6 +292,20 @@ async fn unregistered_current_fixture(n: u32) -> Fixture {
             .unwrap();
     }
     let current_control = current_control(&control);
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: current_control.billing_scope.clone(),
+                expected_seq: 0,
+                plan: RootStageBudgetPlanV1::from_optimization_budget(
+                    current_control.optimization_budget.clone(),
+                ),
+                now: current_control.created_at_unix_seconds,
+            },
+        )
+        .await
+        .unwrap();
     IndependentEvaluationControl::register_current_control(
         &evaluator,
         &store,
