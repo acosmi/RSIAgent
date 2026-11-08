@@ -2432,7 +2432,9 @@ c.execute('ROLLBACK');c.close();print(json.dumps({'schema':[[a.hex(),b.hex(),d.h
         .unwrap();
     assert!(
         output.status.success(),
-        "owned readonly full database image failed"
+        "owned readonly full database image failed for {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }
@@ -2947,6 +2949,17 @@ async fn derived_economic_audit_propagates_real_formal_source_legacy() {
     let store = Store::open(&path).await.unwrap();
     assert_eq!(store.integrity().await.unwrap(), "ok");
     let assert_unchanged_except_0008 = |image: &serde_json::Value, action: &str| {
+        fn decode_hex(value: &str) -> String {
+            assert_eq!(value.len() % 2, 0, "schema image hex is not byte aligned");
+            let bytes: Vec<u8> = value
+                .as_bytes()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect();
+            String::from_utf8(bytes).unwrap()
+        }
         let before_tables = before["tables"].as_array().unwrap();
         let after_tables = image["tables"].as_array().unwrap();
         for old in before_tables {
@@ -2960,10 +2973,68 @@ async fn derived_economic_audit_propagates_real_formal_source_legacy() {
                 .unwrap_or_else(|| panic!("table {name} disappeared at {action}"));
             assert_eq!(old, new, "{action} refreshed {name}");
         }
+        // Every pre-0008 schema object (table, explicit index, automatic index,
+        // DDL text and root page) stays byte-identical. The nine objects
+        // appended by 0008 are asserted separately instead of folded into
+        // "unchanged", so the original full-schema comparison is not weakened.
+        let before_schema = before["schema"].as_array().unwrap();
+        let after_schema = image["schema"].as_array().unwrap();
+        let (stage_plan_schema, pre_schema): (Vec<_>, Vec<_>) =
+            after_schema.iter().cloned().partition(|row| {
+                decode_hex(row[2].as_str().unwrap()).starts_with("root_budget_stage_plan_")
+            });
+        assert_eq!(
+            &pre_schema, before_schema,
+            "{action} changed a pre-0008 schema object"
+        );
+        assert_eq!(
+            stage_plan_schema.len(),
+            9,
+            "{action} did not append exactly the 0008 schema objects"
+        );
+        let names: std::collections::BTreeSet<String> = stage_plan_schema
+            .iter()
+            .map(|row| decode_hex(row[1].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            names,
+            std::collections::BTreeSet::from([
+                "root_budget_stage_plan_bindings".to_string(),
+                "root_budget_stage_plan_bindings_digest".to_string(),
+                "root_budget_stage_plan_calls".to_string(),
+                "root_budget_stage_plan_calls_scope".to_string(),
+                "root_budget_stage_plan_controls".to_string(),
+                "root_budget_stage_plan_controls_scope".to_string(),
+                "sqlite_autoindex_root_budget_stage_plan_bindings_1".to_string(),
+                "sqlite_autoindex_root_budget_stage_plan_calls_1".to_string(),
+                "sqlite_autoindex_root_budget_stage_plan_controls_1".to_string(),
+            ]),
+            "{action} appended a different 0008 schema object set"
+        );
         // Opening records migration 0008: three empty root stage plan tables.
         // The ledger row and those tables are schema metadata; every pre-0008
         // table bytes and the financial call rows stay identical.
         assert_eq!(after_tables.len(), before_tables.len() + 3);
+        let new_tables: Vec<_> = after_tables
+            .iter()
+            .filter(|table| {
+                table["name"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("root_budget_stage_plan_")
+            })
+            .collect();
+        assert_eq!(
+            new_tables.len(),
+            3,
+            "{action} changed the added table count"
+        );
+        assert!(
+            new_tables
+                .iter()
+                .all(|table| table["rows"].as_array().unwrap().is_empty()),
+            "{action} wrote rows into a new 0008 table"
+        );
         assert_eq!(image["calls"], before["calls"], "{action} changed calls");
     };
     let after = ag163_image(&path);

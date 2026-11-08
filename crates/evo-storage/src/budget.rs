@@ -2337,7 +2337,10 @@ impl Session {
 
     /// Writes the immutable control-to-active-plan relation in the control's
     /// registration Session. The binding itself never stores a control ref.
-    /// `created_at` is the same-Session trusted clock.
+    /// `created_at` is the same-Session trusted clock. Relation identity
+    /// `billing_scope + binding_seq + plan_digest` is immutable across active
+    /// versions; the same writer may update only its own `control_digest`
+    /// within one active version (W1 2026-11-08 ruling).
     pub async fn record_root_stage_plan_control(
         &mut self,
         ctx: &Context,
@@ -2363,12 +2366,14 @@ impl Session {
             load_root_stage_plan_control(&mut self.tx, ctx.namespace(), control_kind, control_id)
                 .await?
         {
-            // The relation is immutable across plan switches: a re-registration
-            // that names another active version is refused, so an old control
-            // never becomes current again. Within the same active version an
-            // authenticated re-registration may replace its own control digest
-            // (for example a changed regression threshold) without touching the
-            // binding sequence or plan digest.
+            // W1 ruling (2026-11-08): the relation identity
+            // `billing_scope + binding_seq + plan_digest` is immutable. A
+            // re-registration that names another active version is refused, so
+            // an old control never becomes current again. Within the same
+            // active version the same writer may update its own
+            // `control_digest`; that is the real re-registration semantic (for
+            // example a changed regression threshold) and it does not touch the
+            // binding sequence or the plan digest.
             if existing.billing_scope != billing_scope
                 || existing.binding_seq != active.seq
                 || existing.plan_digest != active.plan_digest
@@ -3929,6 +3934,13 @@ async fn begin_budget_dispatch_in_tx_typed(
 
 const STAGE_PLAN_REFUSED_EVENT: &str = "stage_plan_refused";
 
+/// The single record kind under which the formal evaluation ticket is
+/// persisted as `kind='artifact'`. It is the same literal the engine's
+/// `streaming_evaluator::TICKET_KIND` writes and the recovery reader already
+/// recognises; storage pins it so an internal caller cannot substitute another
+/// artifact record kind for the E05 ticket witness.
+const FORMAL_EVALUATION_TICKET_RECORD_KIND: &str = "evaluation_ticket_v2";
+
 fn optimization_stage_for(stage: BudgetStage) -> Option<OptimizationStage> {
     match stage {
         BudgetStage::Reflection => Some(OptimizationStage::Reflection),
@@ -4404,8 +4416,17 @@ async fn stage_plan_admission_in_tx(
         {
             return reservation_validation_refusal(error);
         }
-        let ticket: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM objects
+        // The witness may only name the real formal ticket record kind. A
+        // caller-supplied kind would otherwise let any artifact with the same
+        // payload id stand in for the ticket.
+        if witness.ticket_kind != FORMAL_EVALUATION_TICKET_RECORD_KIND {
+            return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+                stage: request.stage,
+                kind: StagePlanRefusalKind::E05Required,
+            }));
+        }
+        let ticket: Option<String> = sqlx::query_scalar(
+            "SELECT body FROM objects
              WHERE namespace=? AND kind='artifact' AND id=? AND json_valid(body)
                AND json_extract(body,'$.record_kind')=?
                AND json_extract(body,'$.payload.id')=?",
@@ -4417,7 +4438,20 @@ async fn stage_plan_admission_in_tx(
         .fetch_optional(&mut **tx)
         .await
         .map_err(internal)?;
-        if ticket.is_none() {
+        let Some(body) = ticket else {
+            return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+                stage: request.stage,
+                kind: StagePlanRefusalKind::E05Required,
+            }));
+        };
+        // Bind the witness to the persisted ticket body itself. The canonical
+        // digest is the one cross-side rule in `evo_core`; a typo, an edited
+        // envelope or a witness for another ticket no longer matches.
+        let body: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+            Error::Conflict("persisted formal evaluation ticket is not valid JSON".into())
+        })?;
+        let stored_digest = evo_core::canonical_fingerprint(&body)?;
+        if stored_digest != witness.ticket_digest {
             return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
                 stage: request.stage,
                 kind: StagePlanRefusalKind::E05Required,

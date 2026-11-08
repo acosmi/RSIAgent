@@ -211,11 +211,26 @@ async fn binding_compares_every_root_authorization_field() {
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     authorize(&store, &admin, 10_000).await;
 
-    for label in ["payer", "currency", "pricing", "total", "receipt", "scope"] {
+    for (label, expected) in [
+        ("payer", "root_stage_plan_payer_mismatch"),
+        ("currency", "root_stage_plan_currency_or_pricing_mismatch"),
+        ("pricing", "root_stage_plan_currency_or_pricing_mismatch"),
+        ("total", "root_stage_plan_root_total_mismatch"),
+        ("receipt", "root_stage_plan_receipt_mismatch"),
+        ("scope", "root_stage_plan_scope_mismatch"),
+    ] {
         let mut plan = plan_with("0.01", Some(("0.002", "0.006")));
         match label {
             "payer" => plan.optimization_budget.payer_id = "other".into(),
-            "currency" => plan.optimization_budget.root_total.currency = "EUR".into(),
+            "currency" => {
+                // Keep the plan internally consistent so validation cannot
+                // reject it before the binding gate compares it with the root.
+                plan.optimization_budget.root_total.currency = "EUR".into();
+                for stage in &mut plan.optimization_budget.stages {
+                    stage.per_call_limit.currency = "EUR".into();
+                    stage.experiment_total.currency = "EUR".into();
+                }
+            }
             "pricing" => {
                 plan.optimization_budget.root_total.pricing_version = "pv2".into();
                 for stage in &mut plan.optimization_budget.stages {
@@ -230,15 +245,17 @@ async fn binding_compares_every_root_authorization_field() {
             "scope" => plan.optimization_budget.root_budget_scope_id = "other-scope".into(),
             _ => unreachable!(),
         }
+        // Every mutation above is a valid plan on its own; the only refusal is
+        // the exact root-authorization comparison in the binding gate.
+        plan.validate().unwrap_or_else(|error| {
+            panic!("{label}: the mutation must pass plan validation first: {error:?}")
+        });
         let error = store
             .bind_root_stage_plan(&admin, &bind_request(0, plan, 2))
             .await
             .expect_err(label);
         assert!(
-            matches!(
-                error,
-                Error::Conflict(_) | Error::Invalid(_) | Error::Budget
-            ),
+            matches!(&error, Error::Conflict(message) if message == expected),
             "{label}: {error:?}"
         );
     }
@@ -785,30 +802,123 @@ async fn acceptance_stages_require_an_e05_ticket_not_a_stage_label() {
 
     // A real persisted ticket object is the storage-side witness. Only
     // TaskExecution has an engine producer today; FormalEvaluation has none and
-    // is not claimed.
+    // is not claimed. Storage binds the witness to the persisted body digest
+    // and to the one formal ticket record kind; the engine separately verified
+    // the ticket content and its frozen task view.
     let storage_id = ticket_storage_id("ticket-1");
+    let stored_body = serde_json::json!({
+        "id": storage_id,
+        "schema_version": "rsia.typed_artifact_envelope.v1",
+        "record_kind": "evaluation_ticket_v2",
+        "payload": {"id": "ticket-1"},
+    });
+    let stored_digest = evo_core::canonical_fingerprint(&stored_body).unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "artifact", &storage_id, admin.actor(), &stored_body)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+
+    // A witness for the real object with a wrong digest is refused, zero write.
+    let tampered = StagePlanAttribution::E05Ticket(E05TicketWitness {
+        ticket_kind: "evaluation_ticket_v2".into(),
+        ticket_id: "ticket-1".into(),
+        ticket_storage_id: storage_id.clone(),
+        ticket_digest: d("tampered-ticket-digest"),
+    });
+    let refusal = reserve_planned(
+        &store,
+        &worker,
+        &reservation("call-3b", "group-3b", BudgetStage::TaskExecution, 100, 10),
+        &tampered,
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(
+        refusal,
+        BudgetPreDispatchRefusal::StagePlan {
+            kind: StagePlanRefusalKind::E05Required,
+            ..
+        }
+    ));
+
+    // Another artifact record kind with the same logical payload id and a
+    // matching body digest is still refused: storage pins the ticket kind.
+    let decoy_kind = "evaluation_ticket_v1";
+    let decoy_storage_id = format!(
+        "e05-{}",
+        evo_core::fingerprint(&(decoy_kind, "ticket-1")).unwrap()
+    );
+    let decoy_body = serde_json::json!({
+        "id": decoy_storage_id,
+        "schema_version": "rsia.typed_artifact_envelope.v1",
+        "record_kind": decoy_kind,
+        "payload": {"id": "ticket-1"},
+    });
+    let decoy_digest = evo_core::canonical_fingerprint(&decoy_body).unwrap();
     let mut session = store.session().await.unwrap();
     session
         .put(
             &admin,
             "artifact",
-            &storage_id,
+            &decoy_storage_id,
             admin.actor(),
-            &serde_json::json!({
-                "id": storage_id,
-                "schema_version": "rsia.typed_artifact_envelope.v1",
-                "record_kind": "evaluation_ticket_v2",
-                "payload": {"id": "ticket-1"},
-            }),
+            &decoy_body,
         )
         .await
         .unwrap();
     session.commit().await.unwrap();
+    let wrong_kind = StagePlanAttribution::E05Ticket(E05TicketWitness {
+        ticket_kind: decoy_kind.into(),
+        ticket_id: "ticket-1".into(),
+        ticket_storage_id: decoy_storage_id,
+        ticket_digest: decoy_digest,
+    });
+    let refusal = reserve_planned(
+        &store,
+        &worker,
+        &reservation("call-3c", "group-3c", BudgetStage::TaskExecution, 100, 10),
+        &wrong_kind,
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(
+        refusal,
+        BudgetPreDispatchRefusal::StagePlan {
+            kind: StagePlanRefusalKind::E05Required,
+            ..
+        }
+    ));
+    assert_eq!(counts(&path).await, before);
+
+    // The refusal event API itself refuses acceptance stages: the fixed
+    // `stage_plan_e05_ticket_required` code is a return value only and never
+    // becomes a `stage_plan_refused` event or a report count.
+    let mut session = store.session().await.unwrap();
+    let error = session
+        .append_stage_plan_refusal(
+            &worker,
+            &StagePlanRefusal {
+                billing_scope: SCOPE.into(),
+                stage: BudgetStage::TaskExecution,
+                kind: StagePlanRefusalKind::E05Required,
+            },
+        )
+        .await
+        .expect_err("acceptance stages do not carry a plan refusal event");
+    assert!(matches!(&error, Error::Invalid(message)
+        if message == "acceptance stages do not carry a stage plan refusal"));
+    drop(session);
+    assert_eq!(counts(&path).await, before);
+
     let ticket = StagePlanAttribution::E05Ticket(E05TicketWitness {
         ticket_kind: "evaluation_ticket_v2".into(),
         ticket_id: "ticket-1".into(),
         ticket_storage_id: storage_id,
-        ticket_digest: d("ticket-1"),
+        ticket_digest: stored_digest,
     });
     let reserved = reserve_planned(
         &store,
@@ -937,6 +1047,7 @@ async fn report_counts_refusals_by_stage() {
         .await
         .unwrap();
     record_control(&store, &admin, "control-1").await;
+    let before_clock = evo_core::now().unwrap();
     for _ in [10, 11] {
         let mut session = store.session().await.unwrap();
         session
@@ -952,6 +1063,7 @@ async fn report_counts_refusals_by_stage() {
             .unwrap();
         session.commit().await.unwrap();
     }
+    let after_clock = evo_core::now().unwrap();
     let report = store.root_stage_plan_report(&admin, SCOPE).await.unwrap();
     assert_eq!(report.refusals.len(), 1);
     assert_eq!(report.refusals[0].stage, BudgetStage::Practice);
@@ -961,6 +1073,29 @@ async fn report_counts_refusals_by_stage() {
     assert_eq!(report.schema_version, "rsia.root_stage_plan_report.v1");
     assert_eq!(report.binding.as_ref().unwrap().seq, 1);
     assert_eq!(report.course_occupied_micros, 0);
+    // `stage_plan_refused.event_at` uses the same-Session trusted clock, never
+    // the fixture's now=10/11 and never the caller's time.
+    let mut session = store.session().await.unwrap();
+    let snapshot = session
+        .root_budget_monetary_snapshot(&admin, SCOPE)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let refusals: Vec<_> = snapshot
+        .ledger_events
+        .iter()
+        .filter(|event| event.event_kind == "stage_plan_refused")
+        .collect();
+    assert_eq!(refusals.len(), 2);
+    for event in refusals {
+        assert!(
+            event.event_at >= before_clock && event.event_at <= after_clock,
+            "event_at {} is outside the trusted interval [{before_clock}, {after_clock}]",
+            event.event_at
+        );
+        assert_ne!(event.event_at, 10);
+        assert_ne!(event.event_at, 11);
+    }
     store.close().await;
 }
 
@@ -1079,6 +1214,120 @@ async fn concurrent_binding_transactions_have_exactly_one_winner() {
         .await
         .unwrap();
     assert_eq!(versions.len(), 1);
+    store.close().await;
+}
+
+/// Two truly independent Stores (each a separate SQLite pool/connection on the
+/// same file) race on the same `(billing_scope, seq)` key. Exactly one append
+/// wins and the loser writes nothing. Which fixed storage refusal the loser
+/// sees depends on interleaving: the unique-key CAS conflict, the already-bound
+/// version when it reads after the winner commits, the expected-seq mismatch, or
+/// SQLite's WAL snapshot/busy refusal when it upgrades a stale read transaction.
+/// The deterministic unique-branch mapping is pinned by the trigger test below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_stores_have_exactly_one_winner_and_no_partial_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let first_store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    authorize(&first_store, &admin, 10_000).await;
+    let before = counts(&path).await;
+    let second_store = Store::open(&path).await.unwrap();
+    let mut other = plan_with("0.01", Some(("0.002", "0.006")));
+    other.curriculum = Some(evo_core::evaluation::StageMoneyCaps {
+        per_call_limit: money("0.001"),
+        experiment_total: money("0.001"),
+    });
+    other.validate().unwrap();
+    let first_request = bind_request(0, plan_with("0.01", Some(("0.002", "0.006"))), 2);
+    let second_request = bind_request(0, other, 2);
+    let (first, second) = tokio::join!(
+        first_store.bind_root_stage_plan(&admin, &first_request),
+        second_store.bind_root_stage_plan(&admin, &second_request)
+    );
+    let winners = usize::from(first.is_ok()) + usize::from(second.is_ok());
+    assert_eq!(winners, 1, "first={first:?} second={second:?}");
+    let loser = if first.is_err() { &first } else { &second };
+    assert!(
+        matches!(
+            loser,
+            Err(Error::Conflict(message))
+                if message == "root_stage_plan_seq_cas_conflict"
+                    || message == "root_stage_plan_version_already_bound"
+                    || message == "root_stage_plan_expected_seq_mismatch"
+        ) || matches!(loser, Err(Error::Internal)),
+        "{loser:?}"
+    );
+    let versions = first_store
+        .root_stage_plan_binding_versions(&admin, SCOPE)
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].seq, 1);
+    // The failed append left no group, call, ledger event, stage-plan relation,
+    // reservation or call reference behind.
+    assert_eq!(counts(&path).await, before);
+    first_store.close().await;
+    second_store.close().await;
+}
+
+/// Deterministically reaches the `is_unique_violation` branch at the binding
+/// INSERT. A temporary BEFORE INSERT trigger inserts a row with the same
+/// `(billing_scope, seq)` as the statement's own row. The outer INSERT then
+/// raises SQLITE_CONSTRAINT_UNIQUE, which storage must map to the fixed
+/// `root_stage_plan_seq_cas_conflict` error. The statement rollback also removes
+/// the trigger's row, so the failed attempt leaves no partial binding or other
+/// root-budget write.
+#[tokio::test]
+async fn binding_unique_conflict_maps_to_the_fixed_cas_error_without_partial_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    authorize(&store, &admin, 10_000).await;
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER inject_binding_conflict
+         BEFORE INSERT ON root_budget_stage_plan_bindings
+         BEGIN
+           INSERT INTO root_budget_stage_plan_bindings(
+             billing_scope,seq,plan_schema,plan_digest,plan_body,payer_id,
+             root_total_micros,currency,pricing_version,authorization_receipt_digest,
+             authorizing_namespace,bound_by_actor,created_at)
+           VALUES(
+             NEW.billing_scope,NEW.seq,NEW.plan_schema,NEW.plan_digest,NEW.plan_body,
+             NEW.payer_id,NEW.root_total_micros,NEW.currency,NEW.pricing_version,
+             NEW.authorization_receipt_digest,NEW.authorizing_namespace,
+             NEW.bound_by_actor,NEW.created_at);
+         END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let before = counts(&path).await;
+    let error = store
+        .bind_root_stage_plan(
+            &admin,
+            &bind_request(0, plan_with("0.01", Some(("0.002", "0.006"))), 2),
+        )
+        .await
+        .expect_err("the injected duplicate must lose the CAS");
+    assert!(
+        matches!(&error, Error::Conflict(message)
+            if message == "root_stage_plan_seq_cas_conflict"),
+        "{error:?}"
+    );
+    assert!(
+        store
+            .root_stage_plan_binding(&admin, SCOPE)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(counts(&path).await, before);
     store.close().await;
 }
 

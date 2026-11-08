@@ -19,19 +19,25 @@ impl E05Reserve for evo_storage::Store {
         ctx: &evo_core::Context,
         request: &evo_storage::budget::BudgetCallReservation,
     ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord> {
+        let ticket_storage_id = format!(
+            "e05-{}",
+            evo_core::fingerprint(&("evaluation_ticket_v2", &request.dispatch_group_id)).unwrap()
+        );
+        let mut session = self.session().await.unwrap();
+        let stored = session
+            .object_row(ctx, "artifact", &ticket_storage_id)
+            .await
+            .unwrap()
+            .expect("the fixture ticket must be persisted before its E05 reservation");
+        let ticket_body: serde_json::Value = serde_json::from_str(&stored.body).unwrap();
         let witness = evo_storage::budget::StagePlanAttribution::E05Ticket(
             evo_storage::budget::E05TicketWitness {
                 ticket_kind: "evaluation_ticket_v2".into(),
                 ticket_id: request.dispatch_group_id.clone(),
-                ticket_storage_id: format!(
-                    "e05-{}",
-                    evo_core::fingerprint(&("evaluation_ticket_v2", &request.dispatch_group_id))
-                        .unwrap()
-                ),
-                ticket_digest: evo_core::hash(request.actual_input_digest.as_bytes()),
+                ticket_storage_id,
+                ticket_digest: evo_core::canonical_fingerprint(&ticket_body).unwrap(),
             },
         );
-        let mut session = self.session().await.unwrap();
         let result = session
             .reserve_budget_call_with_stage_plan_typed(ctx, request, &[], &witness)
             .await

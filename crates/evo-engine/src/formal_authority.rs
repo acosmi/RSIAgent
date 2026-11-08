@@ -4794,6 +4794,21 @@ pub(crate) async fn verify_formal_task_in_session(
     }
     Ok((candidate, billing))
 }
+/// The canonical digest of the persisted formal ticket envelope, computed from
+/// the same stored body the storage-side E05 witness gate re-reads. The broker
+/// passes this digest in `E05TicketWitness`; storage compares it with its own
+/// canonical digest, so the witness is bound to the actual ticket bytes rather
+/// than to a caller-chosen task value.
+pub(crate) async fn stored_formal_ticket_digest(
+    s: &mut Session,
+    ctx: &Context,
+    ticket_id: &str,
+) -> Result<String> {
+    let storage_id =
+        crate::streaming_evaluator::storage_id(crate::streaming_evaluator::TICKET_KIND, ticket_id)?;
+    let envelope: serde_json::Value = s.need(ctx, "artifact", &storage_id).await?;
+    content_digest(&envelope)
+}
 pub(crate) async fn persist_formal_capture(
     s: &mut Session,
     ctx: &Context,
