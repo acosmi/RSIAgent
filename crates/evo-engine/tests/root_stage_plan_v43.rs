@@ -13,7 +13,7 @@ use evo_core::sequential::{AlphaAllocation, FormalClaimKind, ResearchFamilyAlpha
 use evo_core::{Context, Error, Role, hash};
 use evo_engine::streaming_evaluator::{
     EvaluationEvidenceScope, FixedGraderMethod, FixedGraderSpec, IndependentEvaluationControl,
-    RegisteredEvaluationControlV3,
+    RegisteredEvaluationControl, RegisteredEvaluationControlV3,
 };
 use evo_storage::Store;
 use evo_storage::budget::{
@@ -211,7 +211,6 @@ async fn bind_plan(
                 billing_scope: SCOPE.into(),
                 expected_seq,
                 plan: RootStageBudgetPlanV1::from_optimization_budget(budget.clone()),
-                now: 2,
             },
         )
         .await
@@ -241,7 +240,8 @@ async fn unbound_root_refuses_formal_control_with_zero_writes() {
     .await
     .expect_err("unbound root must refuse the control");
     assert!(
-        matches!(error, Error::Conflict(_) | Error::Forbidden | Error::Budget),
+        matches!(&error, Error::Conflict(message)
+            if message == "registered_control_requires_active_root_stage_plan"),
         "{error:?}"
     );
     assert!(!control_exists(&fixture).await);
@@ -257,7 +257,11 @@ async fn payer_mismatch_is_refused_before_the_active_plan() {
     )
     .await
     .expect_err("payer mismatch must refuse the control");
-    assert!(matches!(error, Error::Conflict(_)), "{error:?}");
+    assert!(
+        matches!(&error, Error::Conflict(message)
+            if message == "persistent root payment subject differs from the registered payer"),
+        "{error:?}"
+    );
     assert!(!control_exists(&fixture).await);
 }
 
@@ -426,4 +430,44 @@ async fn unplanned_reflection_is_outside_only_on_a_zero_binding_root() {
             .iter()
             .all(|stage| stage.allocated_micros.is_none())
     );
+}
+
+#[tokio::test]
+async fn legacy_register_is_an_explicit_refusal_not_a_silent_dead_end() {
+    let fixture = fixture(SUBJECT, false).await;
+    let legacy = RegisteredEvaluationControl {
+        schema_version: RegisteredEvaluationControl::SCHEMA.into(),
+        id: fixture.control.id.clone(),
+        v1_plan_snapshot: fixture.control.v1_plan_snapshot.clone(),
+        formal_plan: fixture.control.formal_plan.clone(),
+        alpha_plan: fixture.control.alpha_plan.clone(),
+        optimizer_comparison: fixture.control.optimizer_comparison.clone(),
+        optimization_budget: fixture.control.optimization_budget.clone(),
+        early_stop_plan: fixture.control.early_stop_plan.clone(),
+        anchor_matrix: fixture.control.anchor_matrix.clone(),
+        attempt_id: fixture.control.attempt_id.clone(),
+        fixed_sample_claim_id: fixture.control.fixed_sample_claim_id.clone(),
+        billing_scope: fixture.control.billing_scope.clone(),
+        executor_actor: fixture.control.executor_actor.clone(),
+        evaluator_actor: fixture.control.evaluator_actor.clone(),
+        proposer_actor: fixture.control.proposer_actor.clone(),
+        approver_actor: fixture.control.approver_actor.clone(),
+        oracle_digest: fixture.control.oracle_digest.clone(),
+        grader_digest: fixture.control.grader_digest.clone(),
+        fixed_grader: fixture.control.fixed_grader.clone(),
+        evidence_scope: fixture.control.evidence_scope,
+        created_at_unix_seconds: fixture.control.created_at_unix_seconds,
+    };
+    legacy.validate().unwrap();
+    let error =
+        IndependentEvaluationControl::register_control(&fixture.evaluator, &fixture.store, legacy)
+            .await
+            .expect_err("legacy controls have no Current registration path");
+    assert!(
+        matches!(&error, Error::Conflict(message)
+            if message == "legacy registered control is not Current input"),
+        "{error:?}"
+    );
+    assert!(!control_exists(&fixture).await);
+    fixture.store.close().await;
 }

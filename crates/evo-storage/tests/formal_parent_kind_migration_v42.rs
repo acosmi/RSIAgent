@@ -27,7 +27,7 @@ const LEGACY_KINDS: [&str; 15] = [
     "tombstone",
 ];
 const PRIOR_VERSIONS: [i64; 5] = [1, 2, 4, 5, 6];
-const CURRENT_VERSIONS: [i64; 6] = [1, 2, 4, 5, 6, 7];
+const CURRENT_VERSIONS: [i64; 7] = [1, 2, 4, 5, 6, 7, 8];
 
 type ObjectRow = (i64, String, String, String, String, String, i64);
 type MigrationRow = (i64, String, String, bool, Vec<u8>, i64);
@@ -474,8 +474,52 @@ async fn historical_sqlx_ledger_upgrades_without_changing_rows_order_or_other_fa
     let after = snapshot(&mut connection).await;
     assert_eq!(after.objects, before.objects);
     assert_eq!(after.object_indexes, before.object_indexes);
-    assert_eq!(after.unrelated_schema, before.unrelated_schema);
-    assert_eq!(after.unrelated_rows, before.unrelated_rows);
+    // Opening an older history also appends 0008. Every pre-0008 schema object
+    // and every pre-0008 table row must stay byte-identical; the three new
+    // empty tables and their three explicit plus three automatic indexes are
+    // asserted separately, never folded into "unchanged".
+    let (stage_plan_schema, unrelated_schema): (Vec<_>, Vec<_>) = after
+        .unrelated_schema
+        .iter()
+        .cloned()
+        .partition(|row| row.2.starts_with("root_budget_stage_plan_"));
+    let (stage_plan_rows, unrelated_rows): (Vec<_>, Vec<_>) = after
+        .unrelated_rows
+        .iter()
+        .cloned()
+        .partition(|row| row.0.starts_with("root_budget_stage_plan_"));
+    assert_eq!(&unrelated_schema, &before.unrelated_schema);
+    assert_eq!(&unrelated_rows, &before.unrelated_rows);
+    assert_eq!(stage_plan_schema.len(), 9);
+    assert_eq!(
+        stage_plan_schema
+            .iter()
+            .map(|row| row.1.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "root_budget_stage_plan_bindings",
+            "root_budget_stage_plan_bindings_digest",
+            "root_budget_stage_plan_calls",
+            "root_budget_stage_plan_calls_scope",
+            "root_budget_stage_plan_controls",
+            "root_budget_stage_plan_controls_scope",
+            "sqlite_autoindex_root_budget_stage_plan_bindings_1",
+            "sqlite_autoindex_root_budget_stage_plan_calls_1",
+            "sqlite_autoindex_root_budget_stage_plan_controls_1",
+        ])
+    );
+    assert_eq!(
+        stage_plan_rows
+            .iter()
+            .map(|row| row.0.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            "root_budget_stage_plan_bindings",
+            "root_budget_stage_plan_calls",
+            "root_budget_stage_plan_controls",
+        ])
+    );
+    assert!(stage_plan_rows.iter().all(|row| row.1.is_empty()));
     assert_eq!(
         &after.ledger[..before.ledger.len()],
         before.ledger.as_slice()

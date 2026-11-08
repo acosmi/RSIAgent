@@ -6435,7 +6435,7 @@ mod response_bound_tests {
                     allowed_namespaces: vec!["n".into()],
                     currency: "USD".into(),
                     pricing_version: "pricing-v1".into(),
-                    payment_subject: "software-fixture".into(),
+                    payment_subject: "payer".into(),
                     authorization_receipt_digest: hash(b"authorization"),
                     per_call_cap_micros: 100,
                     total_limit_micros: 1000,
@@ -6450,6 +6450,20 @@ mod response_bound_tests {
         // fixture principals do not become external-host execution authority.
         control.evidence_scope =
             crate::streaming_evaluator::EvaluationEvidenceScope::ProgramFixture;
+        // A Current control registers only against a real active root stage plan.
+        store
+            .bind_root_stage_plan(
+                &admin,
+                &evo_storage::budget::RootStagePlanBindRequest {
+                    billing_scope: control.billing_scope.clone(),
+                    expected_seq: 0,
+                    plan: evo_core::evaluation::RootStageBudgetPlanV1::from_optimization_budget(
+                        control.optimization_budget.clone(),
+                    ),
+                },
+            )
+            .await
+            .unwrap();
         let command = FormalOperatorCommand::RegisterControlCurrent {
             control: Box::new(control.clone()),
         };

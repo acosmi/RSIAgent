@@ -34,12 +34,14 @@ use std::collections::BTreeSet;
 /// Selections, proposals and oracles have no corresponding plan stage, so the
 /// ledger records them under `curriculum`. A call that does have a corresponding
 /// stage (practice, development execution) must keep that stage instead.
+/// Test-only contract: no paid curriculum producer is wired yet.
 pub fn selection_budget_stage() -> BudgetStage {
     BudgetStage::Curriculum
 }
 
 /// The existing §8 twenty-percent contract. This is a share of the same ledger,
 /// not a second budget; no paid curriculum producer is wired here.
+/// Test-only contract: the report discloses `course_producer_wired=false`.
 pub fn course_share_bps() -> u16 {
     evo_core::curriculum::CURRICULUM_BUDGET_SHARE_BPS
 }

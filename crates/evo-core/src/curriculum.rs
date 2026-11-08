@@ -113,6 +113,7 @@ pub const CURRICULUM_BUDGET_SHARE_BPS: u16 = 2_000;
 
 /// The course quota upper bound in exact integer micros. This is not a second
 /// budget: course calls are charged from the same ledger and merely capped.
+/// Test-only contract until a real curriculum producer is wired.
 pub fn curriculum_share_limit_micros(root_limit_micros: i64) -> Result<i64> {
     if root_limit_micros < 0 {
         return Err(Error::Invalid(

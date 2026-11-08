@@ -4,6 +4,48 @@ use evo_core::Strategy;
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
+#[allow(async_fn_in_trait)]
+trait E05Reserve {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord>;
+}
+
+impl E05Reserve for evo_storage::Store {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord> {
+        let witness = evo_storage::budget::StagePlanAttribution::E05Ticket(
+            evo_storage::budget::E05TicketWitness {
+                ticket_kind: "evaluation_ticket_v2".into(),
+                ticket_id: request.dispatch_group_id.clone(),
+                ticket_storage_id: format!(
+                    "e05-{}",
+                    evo_core::fingerprint(&("evaluation_ticket_v2", &request.dispatch_group_id))
+                        .unwrap()
+                ),
+                ticket_digest: evo_core::hash(request.actual_input_digest.as_bytes()),
+            },
+        );
+        let mut session = self.session().await.unwrap();
+        let result = session
+            .reserve_budget_call_with_stage_plan_typed(ctx, request, &[], &witness)
+            .await
+            .unwrap();
+        match result {
+            Ok(call) => {
+                session.commit().await.unwrap();
+                Ok(call)
+            }
+            Err(refusal) => Err(refusal.into_reservation_error()),
+        }
+    }
+}
+
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, SkillPatch, SkillSnapshot,
 };
@@ -301,7 +343,6 @@ async fn unregistered_current_fixture(n: u32) -> Fixture {
                 plan: RootStageBudgetPlanV1::from_optimization_budget(
                     current_control.optimization_budget.clone(),
                 ),
-                now: current_control.created_at_unix_seconds,
             },
         )
         .await
@@ -442,7 +483,7 @@ async fn execute_output(
     let now = 10 + i64::from(ordinal) * 5;
     fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),
@@ -1340,7 +1381,7 @@ async fn start_refusal_is_atomic_for_reserved_budget_slot_dispatch_and_exposure(
     .await
     .unwrap();
     fx.store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fx.worker,
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),
@@ -2302,7 +2343,7 @@ con.close()
                 now: 11,
             };
             fx.store
-                .reserve_budget_call(
+                .reserve_budget_call_with_e05_ticket(
                     &fx.worker,
                     &BudgetCallReservation {
                         billing_scope: fence.billing_scope.clone(),
@@ -2438,7 +2479,7 @@ async fn revocation_preserves_dispatched_unknown_usage_and_late_receipt_settleme
         now: 11,
     };
     fx.store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fx.worker,
             &BudgetCallReservation {
                 billing_scope: fence.billing_scope.clone(),

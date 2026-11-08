@@ -29,7 +29,7 @@ use evo_core::optimization::{
 use evo_core::sequential::{AlphaAllocation, FormalClaimKind, ResearchFamilyAlphaPlan};
 use evo_core::skill_edit::EvidenceRef;
 use evo_core::strategy::SimulationContext;
-use evo_storage::budget::RootBudgetAuthorization;
+use evo_storage::budget::{RootBudgetAuthorization, RootStagePlanBindRequest};
 use serde_json::json;
 
 // These are the necessary data builders from the existing management and
@@ -781,7 +781,7 @@ async fn setup_evaluation(store: &Store) {
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
+    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "fixture-only", "USD").unwrap();
     budget.root_total = money("0.001");
     budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
     for stage in &mut budget.stages {
@@ -839,6 +839,20 @@ async fn setup_evaluation(store: &Store) {
         evidence_scope: EvaluationEvidenceScope::ProgramFixture,
         created_at_unix_seconds: 2,
     };
+    // A Current control registers only against a real active root stage plan.
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: "billing-1".into(),
+                expected_seq: 0,
+                plan: evo_core::evaluation::RootStageBudgetPlanV1::from_optimization_budget(
+                    control.optimization_budget.clone(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
     IndependentEvaluationControl::register_current_control(&evaluator, store, control.clone())
         .await
         .unwrap();

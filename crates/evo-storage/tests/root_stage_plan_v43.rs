@@ -9,8 +9,9 @@ use evo_core::{Context, Error, Role, hash};
 use evo_storage::Store;
 use evo_storage::budget::{
     BudgetCallFence, BudgetCallRecord, BudgetCallReservation, BudgetPreDispatchRefusal,
-    BudgetStage, RootBudgetAuthorization, RootStagePlanBindRequest, RootStagePlanEnforcement,
-    StagePlanAttribution, StagePlanControlSelector, StagePlanRefusal, StagePlanRefusalKind,
+    BudgetStage, E05TicketWitness, RootBudgetAuthorization, RootStagePlanBindRequest,
+    RootStagePlanEnforcement, StagePlanAttribution, StagePlanControlSelector, StagePlanRefusal,
+    StagePlanRefusalKind,
 };
 use evo_storage::lifecycle::read_control_plane_facts;
 use std::path::Path;
@@ -68,13 +69,12 @@ fn plan_with(root_amount: &str, development: Option<(&str, &str)>) -> RootStageB
 fn bind_request(
     expected_seq: i64,
     plan: RootStageBudgetPlanV1,
-    now: i64,
+    _now: i64,
 ) -> RootStagePlanBindRequest {
     RootStagePlanBindRequest {
         billing_scope: SCOPE.into(),
         expected_seq,
         plan,
-        now,
     }
 }
 
@@ -154,11 +154,17 @@ async fn record_control(store: &Store, ctx: &Context, control_id: &str) {
             CONTROL_KIND,
             control_id,
             &d(&format!("control-{control_id}")),
-            2,
         )
         .await
         .unwrap();
     session.commit().await.unwrap();
+}
+
+fn ticket_storage_id(id: &str) -> String {
+    format!(
+        "e05-{}",
+        evo_core::fingerprint(&("evaluation_ticket_v2", id)).unwrap()
+    )
 }
 
 fn table_len(facts: &evo_storage::lifecycle::ControlPlaneFacts, table: &str) -> usize {
@@ -168,13 +174,32 @@ fn table_len(facts: &evo_storage::lifecycle::ControlPlaneFacts, table: &str) -> 
         .map_or(0, std::vec::Vec::len)
 }
 
-async fn counts(path: &Path) -> (usize, usize, usize, usize) {
+async fn counts(path: &Path) -> (usize, usize, usize, usize, i64, i64) {
     let facts = read_control_plane_facts(path).await.unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    let reserved: i64 =
+        sqlx::query_scalar("SELECT reserved_micros FROM root_budgets WHERE billing_scope=?")
+            .bind(SCOPE)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let call_refs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM objects WHERE namespace='n' AND json_valid(body)
+         AND json_extract(body,'$.schema_version')='rsia.budget_call_ref.v1'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
     (
         table_len(&facts, "root_budget_dispatch_groups"),
         table_len(&facts, "root_budget_calls"),
         table_len(&facts, "root_budget_events"),
         table_len(&facts, "root_budget_stage_plan_calls"),
+        reserved,
+        call_refs,
     )
 }
 
@@ -491,7 +516,6 @@ async fn stage_gate_precedes_group_call_event_and_ref_writes() {
                 billing_scope: SCOPE.into(),
                 stage: BudgetStage::Practice,
                 kind: StagePlanRefusalKind::Unallocated,
-                now: 11,
             },
         )
         .await
@@ -673,6 +697,8 @@ async fn zero_and_missing_allocations_refuse_by_stage() {
         (BudgetStage::Curriculum, "call-1", "group-1"),
         (BudgetStage::CandidateGeneration, "call-2", "group-2"),
         (BudgetStage::DevelopmentExecution, "call-3", "group-3"),
+        (BudgetStage::MetaEvaluation, "call-4", "group-4"),
+        (BudgetStage::GrayOperations, "call-5", "group-5"),
     ] {
         let refusal = reserve_planned(
             &store,
@@ -695,7 +721,7 @@ async fn zero_and_missing_allocations_refuse_by_stage() {
 }
 
 #[tokio::test]
-async fn acceptance_stages_require_only_the_root() {
+async fn acceptance_stages_require_an_e05_ticket_not_a_stage_label() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("plan.sqlite3");
     let store = Store::open(&path).await.unwrap();
@@ -706,20 +732,99 @@ async fn acceptance_stages_require_only_the_root() {
         .bind_root_stage_plan(&admin, &bind_request(0, plan_with("0.01", None), 2))
         .await
         .unwrap();
+    let before = counts(&path).await;
     for (stage, call, group) in [
         (BudgetStage::TaskExecution, "call-1", "group-1"),
         (BudgetStage::FormalEvaluation, "call-2", "group-2"),
     ] {
-        let reserved = reserve_planned(
+        let refusal = reserve_planned(
             &store,
             &worker,
             &reservation(call, group, stage, 100, 10),
             &StagePlanAttribution::Unattributed,
         )
         .await
-        .unwrap();
-        assert!(reserved.is_ok(), "{stage:?}");
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(
+                refusal,
+                BudgetPreDispatchRefusal::StagePlan {
+                    kind: StagePlanRefusalKind::E05Required,
+                    ..
+                }
+            ),
+            "{stage:?}: {refusal:?}"
+        );
     }
+    assert_eq!(counts(&path).await, before);
+
+    // A witness whose ticket object was never persisted is still refused.
+    let missing = StagePlanAttribution::E05Ticket(E05TicketWitness {
+        ticket_kind: "evaluation_ticket_v2".into(),
+        ticket_id: "ticket-missing".into(),
+        ticket_storage_id: ticket_storage_id("ticket-missing"),
+        ticket_digest: d("ticket-missing"),
+    });
+    let refusal = reserve_planned(
+        &store,
+        &worker,
+        &reservation("call-3", "group-3", BudgetStage::TaskExecution, 100, 10),
+        &missing,
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(
+        refusal,
+        BudgetPreDispatchRefusal::StagePlan {
+            kind: StagePlanRefusalKind::E05Required,
+            ..
+        }
+    ));
+
+    // A real persisted ticket object is the storage-side witness. Only
+    // TaskExecution has an engine producer today; FormalEvaluation has none and
+    // is not claimed.
+    let storage_id = ticket_storage_id("ticket-1");
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "artifact",
+            &storage_id,
+            admin.actor(),
+            &serde_json::json!({
+                "id": storage_id,
+                "schema_version": "rsia.typed_artifact_envelope.v1",
+                "record_kind": "evaluation_ticket_v2",
+                "payload": {"id": "ticket-1"},
+            }),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let ticket = StagePlanAttribution::E05Ticket(E05TicketWitness {
+        ticket_kind: "evaluation_ticket_v2".into(),
+        ticket_id: "ticket-1".into(),
+        ticket_storage_id: storage_id,
+        ticket_digest: d("ticket-1"),
+    });
+    let reserved = reserve_planned(
+        &store,
+        &worker,
+        &reservation("call-4", "group-4", BudgetStage::TaskExecution, 100, 10),
+        &ticket,
+    )
+    .await
+    .unwrap();
+    assert!(reserved.is_ok(), "{reserved:?}");
+    let after = counts(&path).await;
+    assert_eq!(after.0, before.0 + 1);
+    assert_eq!(after.1, before.1 + 1);
+    // Acceptance stages never consume a stage allocation or relation.
+    assert_eq!(after.3, before.3);
+    assert_eq!(after.4, before.4 + 100);
     store.close().await;
 }
 
@@ -832,7 +937,7 @@ async fn report_counts_refusals_by_stage() {
         .await
         .unwrap();
     record_control(&store, &admin, "control-1").await;
-    for now in [10, 11] {
+    for _ in [10, 11] {
         let mut session = store.session().await.unwrap();
         session
             .append_stage_plan_refusal(
@@ -841,7 +946,6 @@ async fn report_counts_refusals_by_stage() {
                     billing_scope: SCOPE.into(),
                     stage: BudgetStage::Practice,
                     kind: StagePlanRefusalKind::Unallocated,
-                    now,
                 },
             )
             .await
@@ -854,5 +958,413 @@ async fn report_counts_refusals_by_stage() {
     assert_eq!(report.refusals[0].reason, "stage_plan_unallocated");
     assert_eq!(report.refusals[0].count, 2);
     assert_eq!(report.enforcement, RootStagePlanEnforcement::Enforced);
+    assert_eq!(report.schema_version, "rsia.root_stage_plan_report.v1");
+    assert_eq!(report.binding.as_ref().unwrap().seq, 1);
+    assert_eq!(report.course_occupied_micros, 0);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn binding_and_relations_use_the_trusted_clock_not_the_fixture_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    authorize(&store, &admin, 10_000).await;
+    let before = evo_core::now().unwrap();
+    let binding = store
+        .bind_root_stage_plan(
+            &admin,
+            &bind_request(0, plan_with("0.01", Some(("0.003", "0.006"))), 2),
+        )
+        .await
+        .unwrap();
+    let after = evo_core::now().unwrap();
+    assert!(binding.created_at >= before && binding.created_at <= after);
+    assert_ne!(binding.created_at, 2);
+    let before = evo_core::now().unwrap();
+    let mut session = store.session().await.unwrap();
+    let relation = session
+        .record_root_stage_plan_control(
+            &admin,
+            SCOPE,
+            CONTROL_KIND,
+            "control-1",
+            &d("control-control-1"),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let after = evo_core::now().unwrap();
+    assert!(relation.created_at >= before && relation.created_at <= after);
+    assert_ne!(relation.created_at, 2);
+    let worker = Context::new("n", "worker", Role::Worker).unwrap();
+    reserve_planned(
+        &store,
+        &worker,
+        &reservation(
+            "call-1",
+            "group-1",
+            BudgetStage::DevelopmentExecution,
+            1_000,
+            10,
+        ),
+        &attribution("n", "control-1"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    let created_at: i64 = sqlx::query_scalar(
+        "SELECT created_at FROM root_budget_stage_plan_calls WHERE billing_scope=? AND call_id=?",
+    )
+    .bind(SCOPE)
+    .bind("call-1")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert!(created_at >= before && created_at <= after);
+    assert_ne!(created_at, 10);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn binding_digest_recomputes_from_the_full_stored_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    authorize(&store, &admin, 10_000).await;
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &bind_request(0, plan_with("0.01", Some(("0.002", "0.006"))), 2),
+        )
+        .await
+        .unwrap();
+    let version = store
+        .root_stage_plan_binding_version(&admin, SCOPE, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.plan.digest().unwrap(), version.plan_digest);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn concurrent_binding_transactions_have_exactly_one_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    authorize(&store, &admin, 10_000).await;
+    let mut other = plan_with("0.01", Some(("0.002", "0.006")));
+    other.curriculum = Some(evo_core::evaluation::StageMoneyCaps {
+        per_call_limit: money("0.001"),
+        experiment_total: money("0.001"),
+    });
+    other.validate().unwrap();
+    let first_request = bind_request(0, plan_with("0.01", Some(("0.002", "0.006"))), 2);
+    let second_request = bind_request(0, other, 2);
+    let first = store.bind_root_stage_plan(&admin, &first_request);
+    let second = store.bind_root_stage_plan(&admin, &second_request);
+    let (first, second) = tokio::join!(first, second);
+    let winners = usize::from(first.is_ok()) + usize::from(second.is_ok());
+    assert_eq!(winners, 1, "first={first:?} second={second:?}");
+    let versions = store
+        .root_stage_plan_binding_versions(&admin, SCOPE)
+        .await
+        .unwrap();
+    assert_eq!(versions.len(), 1);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn caller_cannot_authorize_a_dispatch_with_a_claimed_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let worker = Context::new("n", "worker", Role::Worker).unwrap();
+    authorize(&store, &admin, 10_000).await;
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &bind_request(0, plan_with("0.01", Some(("0.003", "0.006"))), 2),
+        )
+        .await
+        .unwrap();
+    record_control(&store, &admin, "control-1").await;
+    let before = counts(&path).await;
+    for (namespace, control) in [("n", "ghost"), ("n2", "control-1")] {
+        let refusal = reserve_planned(
+            &store,
+            &worker,
+            &reservation(
+                "call-1",
+                "group-1",
+                BudgetStage::DevelopmentExecution,
+                1,
+                10,
+            ),
+            &attribution(namespace, control),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(
+            matches!(
+                refusal,
+                BudgetPreDispatchRefusal::StagePlan {
+                    kind: StagePlanRefusalKind::Unknown,
+                    ..
+                }
+            ),
+            "{namespace}/{control}: {refusal:?}"
+        );
+    }
+    assert_eq!(counts(&path).await, before);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn control_relation_is_immutable_after_a_plan_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    authorize(&store, &admin, 10_000).await;
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &bind_request(0, plan_with("0.01", Some(("0.003", "0.006"))), 2),
+        )
+        .await
+        .unwrap();
+    record_control(&store, &admin, "control-1").await;
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &bind_request(1, plan_with("0.01", Some(("0.003", "0.006"))), 3),
+        )
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    let error = session
+        .record_root_stage_plan_control(
+            &admin,
+            SCOPE,
+            CONTROL_KIND,
+            "control-1",
+            &d("control-control-1"),
+        )
+        .await
+        .expect_err("a stale relation must not follow the new active version");
+    assert!(
+        matches!(&error, Error::Conflict(message) if message == "root_stage_plan_control_ref_is_immutable"),
+        "{error:?}"
+    );
+    let relation = session
+        .root_stage_plan_control_ref(&admin, CONTROL_KIND, "control-1")
+        .await
+        .unwrap()
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(relation.binding_seq, 1);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn course_producer_ref_has_no_writer_and_is_not_fabricated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let worker = Context::new("n", "worker", Role::Worker).unwrap();
+    authorize(&store, &admin, 10_000).await;
+    let mut plan = plan_with("0.01", None);
+    plan.curriculum = Some(evo_core::evaluation::StageMoneyCaps {
+        per_call_limit: money("0.002"),
+        experiment_total: money("0.004"),
+    });
+    plan.validate().unwrap();
+    store
+        .bind_root_stage_plan(&admin, &bind_request(0, plan, 2))
+        .await
+        .unwrap();
+    record_control(&store, &admin, "control-1").await;
+    let reserved = reserve_planned(
+        &store,
+        &worker,
+        &reservation("call-1", "group-1", BudgetStage::Curriculum, 2_000, 10),
+        &attribution("n", "control-1"),
+    )
+    .await
+    .unwrap();
+    assert!(reserved.is_ok());
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    let course_ref: Option<String> = sqlx::query_scalar(
+        "SELECT course_producer_ref FROM root_budget_stage_plan_calls WHERE billing_scope=? AND call_id=?",
+    )
+    .bind(SCOPE)
+    .bind("call-1")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert!(course_ref.is_none());
+    let report = store.root_stage_plan_report(&admin, SCOPE).await.unwrap();
+    assert_eq!(report.course_share_bps, 2_000);
+    assert!(!report.course_producer_wired);
+    assert_eq!(report.course_occupied_micros, 0);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn binding_versions_are_readable_and_old_versions_stay_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    authorize(&store, &admin, 10_000).await;
+    for seq in 0..3 {
+        store
+            .bind_root_stage_plan(
+                &admin,
+                &bind_request(seq, plan_with("0.01", Some(("0.003", "0.006"))), 2),
+            )
+            .await
+            .unwrap();
+    }
+    let versions = store
+        .root_stage_plan_binding_versions(&admin, SCOPE)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions
+            .iter()
+            .map(|version| version.seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
+    let first = store
+        .root_stage_plan_binding_version(&admin, SCOPE, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.seq, 1);
+    assert_eq!(first.plan.digest().unwrap(), first.plan_digest);
+    store.close().await;
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", path.display()))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE root_budget_stage_plan_bindings SET plan_digest=? WHERE billing_scope=? AND seq=2",
+    )
+    .bind(d("tampered"))
+    .bind(SCOPE)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    let store = Store::open(&path).await.unwrap();
+    let error = store
+        .root_stage_plan_binding_version(&admin, SCOPE, 2)
+        .await
+        .expect_err("a tampered old version must not read as valid");
+    assert!(matches!(error, Error::Conflict(_)), "{error:?}");
+    store.close().await;
+}
+
+#[tokio::test]
+async fn undispatched_release_preserves_existing_accounting_rules() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let worker = Context::new("n", "worker", Role::Worker).unwrap();
+    authorize(&store, &admin, 10_000).await;
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &bind_request(0, plan_with("0.01", Some(("0.003", "0.006"))), 2),
+        )
+        .await
+        .unwrap();
+    record_control(&store, &admin, "control-1").await;
+    let call = reserve_planned(
+        &store,
+        &worker,
+        &reservation(
+            "call-1",
+            "group-1",
+            BudgetStage::DevelopmentExecution,
+            2_000,
+            10,
+        ),
+        &attribution("n", "control-1"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let fence = BudgetCallFence {
+        billing_scope: SCOPE.into(),
+        call_id: call.call_id.clone(),
+        actual_input_digest: call.actual_input_digest.clone(),
+        lease_token: call.lease_token.clone(),
+        lease_epoch: call.lease_epoch,
+        now: 11,
+    };
+    let released = store
+        .release_undispatched_budget_call(&worker, &fence, "test_release")
+        .await
+        .unwrap();
+    assert_eq!(
+        released.state,
+        evo_storage::budget::BudgetCallState::Released
+    );
+    let report = store.root_stage_plan_report(&admin, SCOPE).await.unwrap();
+    let development = report
+        .stages
+        .iter()
+        .find(|stage| stage.stage == BudgetStage::DevelopmentExecution)
+        .unwrap();
+    assert_eq!(development.occupied_micros, 0);
+    let facts = read_control_plane_facts(&path).await.unwrap();
+    assert_eq!(table_len(&facts, "root_budget_stage_plan_calls"), 1);
+    store.close().await;
+}
+
+#[tokio::test]
+async fn control_relation_follows_new_content_only_within_the_same_active_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("plan.sqlite3");
+    let store = Store::open(&path).await.unwrap();
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    authorize(&store, &admin, 10_000).await;
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &bind_request(0, plan_with("0.01", Some(("0.003", "0.006"))), 2),
+        )
+        .await
+        .unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .record_root_stage_plan_control(&admin, SCOPE, CONTROL_KIND, "control-1", &d("first"))
+        .await
+        .unwrap();
+    let updated = session
+        .record_root_stage_plan_control(&admin, SCOPE, CONTROL_KIND, "control-1", &d("second"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(updated.control_digest, d("second"));
+    assert_eq!(updated.binding_seq, 1);
     store.close().await;
 }

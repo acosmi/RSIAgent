@@ -924,7 +924,6 @@ async fn prepare_control_ingress(order: TicketOrder) -> Option<IngressFx> {
                     plan: RootStageBudgetPlanV1::from_optimization_budget(
                         current.optimization_budget.clone(),
                     ),
-                    now: current.created_at_unix_seconds,
                 },
             )
             .await

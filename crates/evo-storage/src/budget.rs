@@ -164,6 +164,9 @@ pub enum StagePlanRefusalKind {
     Unallocated,
     PerCallExceeded,
     Exhausted,
+    /// An acceptance stage (`task_execution`/`formal_evaluation`) on a bound
+    /// root without the engine-verified E05 ticket witness.
+    E05Required,
 }
 
 impl StagePlanRefusalKind {
@@ -174,6 +177,7 @@ impl StagePlanRefusalKind {
             Self::Unallocated => "stage_plan_unallocated",
             Self::PerCallExceeded => "stage_plan_per_call_exceeded",
             Self::Exhausted => "stage_plan_exhausted",
+            Self::E05Required => "stage_plan_e05_ticket_required",
         }
     }
 }
@@ -333,14 +337,14 @@ pub struct RootStagePlanBinding {
     pub created_at: i64,
 }
 
-/// A trusted Admin bind request. `now` is a typed field supplied by trusted
-/// engine code from its clock, never a request body.
+/// A trusted Admin bind request. The persisted `created_at` is always the
+/// same-Session trusted clock (`evo_core::now()`); the request carries no
+/// caller-supplied time.
 #[derive(Debug, Clone)]
 pub struct RootStagePlanBindRequest {
     pub billing_scope: String,
     pub expected_seq: i64,
     pub plan: RootStageBudgetPlanV1,
-    pub now: i64,
 }
 
 /// The immutable control-to-active-plan relation written in the control's own
@@ -383,23 +387,37 @@ pub struct StagePlanControlSelector {
     pub control_id: String,
 }
 
+/// The persisted ticket an engine already verified in this Session. Storage
+/// re-reads the ticket object before it lets an acceptance stage pass a bound
+/// root. It is an internal trusted-call witness, not an external input schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct E05TicketWitness {
+    pub ticket_kind: String,
+    pub ticket_id: String,
+    pub ticket_storage_id: String,
+    pub ticket_digest: String,
+}
+
 /// What a reservation claims about its plan origin. `Unattributed` is not
-/// evidence of `Outside`: on a bound root it is refused as Unknown.
+/// evidence of `Outside`: on a bound root it is refused as Unknown. Acceptance
+/// stages require the engine-verified `E05Ticket` witness instead.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StagePlanAttribution {
     #[default]
     Unattributed,
     Control(StagePlanControlSelector),
+    E05Ticket(E05TicketWitness),
 }
 
-/// The single refusal fact a caller may append to a still-clean Session. It
-/// writes no group, call, money or other caller write.
+/// The single refusal fact an internal trusted refusal path may append to a
+/// still-clean Session. It writes no group, call, money or other caller write;
+/// `event_at` is the same-Session trusted clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StagePlanRefusal {
     pub billing_scope: String,
     pub stage: BudgetStage,
     pub kind: StagePlanRefusalKind,
-    pub now: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1041,6 +1059,65 @@ impl Store {
         let binding = active_root_stage_plan_in_tx(&mut tx, billing_scope).await?;
         tx.commit().await.map_err(internal)?;
         Ok(binding)
+    }
+
+    /// Reads one stored binding version by seq, including superseded legacy
+    /// versions. The full plan body and digest are revalidated; a tampered or
+    /// unsupported version fails closed instead of being treated as active.
+    pub async fn root_stage_plan_binding_version(
+        &self,
+        ctx: &Context,
+        billing_scope: &str,
+        seq: i64,
+    ) -> Result<Option<RootStagePlanBinding>> {
+        require_budget_reader(ctx)?;
+        identifier(billing_scope)?;
+        if seq <= 0 {
+            return Err(Error::Invalid(
+                "root stage plan version seq must be positive".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        require_namespace(&mut tx, billing_scope, ctx.namespace()).await?;
+        let binding = binding_version_in_tx(&mut tx, billing_scope, seq).await?;
+        tx.commit().await.map_err(internal)?;
+        Ok(binding)
+    }
+
+    /// Lists every append-only binding version oldest first. The highest seq is
+    /// the active version; every lower seq is a read-only legacy version and is
+    /// never rewritten or removed here.
+    pub async fn root_stage_plan_binding_versions(
+        &self,
+        ctx: &Context,
+        billing_scope: &str,
+    ) -> Result<Vec<RootStagePlanBinding>> {
+        require_budget_reader(ctx)?;
+        identifier(billing_scope)?;
+        let mut tx = self.pool.begin().await.map_err(internal)?;
+        require_namespace(&mut tx, billing_scope, ctx.namespace()).await?;
+        let rows = sqlx::query(
+            "SELECT * FROM root_budget_stage_plan_bindings
+             WHERE billing_scope=? ORDER BY seq ASC LIMIT 101",
+        )
+        .bind(billing_scope)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(internal)?;
+        if rows.len() > 100 {
+            return Err(Error::Capacity(evo_core::capacity::CapacityConflict {
+                item: evo_core::capacity::CapacityItem::RootStagePlanVersionPerRoot,
+                used: u64::try_from(rows.len()).map_err(|_| Error::Internal)?,
+                limit: 100,
+                delta: 1,
+            }));
+        }
+        let mut versions = Vec::with_capacity(rows.len());
+        for row in &rows {
+            versions.push(validate_binding_version(row)?);
+        }
+        tx.commit().await.map_err(internal)?;
+        Ok(versions)
     }
 
     /// Admin-only stage plan report. It is a new DTO derived from the binding,
@@ -2260,6 +2337,7 @@ impl Session {
 
     /// Writes the immutable control-to-active-plan relation in the control's
     /// registration Session. The binding itself never stores a control ref.
+    /// `created_at` is the same-Session trusted clock.
     pub async fn record_root_stage_plan_control(
         &mut self,
         ctx: &Context,
@@ -2267,14 +2345,14 @@ impl Session {
         control_kind: &str,
         control_id: &str,
         control_digest: &str,
-        now: i64,
     ) -> Result<RootStagePlanControlRef> {
         ctx.require(&[Role::Admin, Role::Evaluator])?;
         identifier(billing_scope)?;
         identifier(control_kind)?;
         identifier(control_id)?;
         validate_digest(control_digest, "control_digest")?;
-        valid_time(now)?;
+        let trusted_now = evo_core::now()?;
+        valid_time(trusted_now)?;
         require_namespace(&mut self.tx, billing_scope, ctx.namespace()).await?;
         let active = active_root_stage_plan_in_tx(&mut self.tx, billing_scope)
             .await?
@@ -2285,8 +2363,13 @@ impl Session {
             load_root_stage_plan_control(&mut self.tx, ctx.namespace(), control_kind, control_id)
                 .await?
         {
-            if existing.control_digest != control_digest
-                || existing.billing_scope != billing_scope
+            // The relation is immutable across plan switches: a re-registration
+            // that names another active version is refused, so an old control
+            // never becomes current again. Within the same active version an
+            // authenticated re-registration may replace its own control digest
+            // (for example a changed regression threshold) without touching the
+            // binding sequence or plan digest.
+            if existing.billing_scope != billing_scope
                 || existing.binding_seq != active.seq
                 || existing.plan_digest != active.plan_digest
             {
@@ -2294,7 +2377,30 @@ impl Session {
                     "root_stage_plan_control_ref_is_immutable".into(),
                 ));
             }
-            return Ok(existing);
+            if existing.control_digest == control_digest {
+                return Ok(existing);
+            }
+            sqlx::query(
+                "UPDATE root_budget_stage_plan_controls
+                 SET control_digest=?,created_at=?
+                 WHERE namespace=? AND control_kind=? AND control_id=?",
+            )
+            .bind(control_digest)
+            .bind(trusted_now)
+            .bind(ctx.namespace())
+            .bind(control_kind)
+            .bind(control_id)
+            .execute(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+            return load_root_stage_plan_control(
+                &mut self.tx,
+                ctx.namespace(),
+                control_kind,
+                control_id,
+            )
+            .await?
+            .ok_or(Error::Internal);
         }
         sqlx::query(
             "INSERT INTO root_budget_stage_plan_controls(
@@ -2309,7 +2415,7 @@ impl Session {
         .bind(control_digest)
         .bind(active.seq)
         .bind(&active.plan_digest)
-        .bind(now)
+        .bind(trusted_now)
         .execute(&mut *self.tx)
         .await
         .map_err(internal)?;
@@ -2333,8 +2439,10 @@ impl Session {
     }
 
     /// Appends exactly one `stage_plan_refused` event to a caller-held clean
-    /// Session. It writes no group, call, amount or other caller fact and does
-    /// not commit; the caller owns the commit.
+    /// Session. It is an internal trusted refusal path (`#[doc(hidden)]`): it
+    /// writes no group, call, amount or other caller fact and does not commit;
+    /// the caller owns the commit. `event_at` is the same-Session trusted clock.
+    #[doc(hidden)]
     pub async fn append_stage_plan_refusal(
         &mut self,
         ctx: &Context,
@@ -2342,7 +2450,8 @@ impl Session {
     ) -> Result<()> {
         require_budget_caller(ctx)?;
         identifier(&refusal.billing_scope)?;
-        valid_time(refusal.now)?;
+        let trusted_now = evo_core::now()?;
+        valid_time(trusted_now)?;
         if matches!(
             refusal.stage,
             BudgetStage::TaskExecution | BudgetStage::FormalEvaluation
@@ -2360,7 +2469,7 @@ impl Session {
             &refusal.billing_scope,
             None,
             STAGE_PLAN_REFUSED_EVENT,
-            refusal.now,
+            trusted_now,
             json!({
                 "stage": refusal.stage,
                 "reason": refusal.kind.code(),
@@ -3406,6 +3515,10 @@ async fn reserve_budget_call_with_sources_in_tx_typed(
         .await?
         .ok_or(Error::Internal)?;
     if let Some((binding_seq, plan_digest)) = stage_binding {
+        // The call relation's occurrence time comes from the same-Session
+        // trusted clock, not the reservation caller's `now`.
+        let relation_now = evo_core::now()?;
+        valid_time(relation_now)?;
         sqlx::query(
             "INSERT INTO root_budget_stage_plan_calls(
                billing_scope,call_id,namespace,stage,binding_seq,plan_digest,
@@ -3418,7 +3531,7 @@ async fn reserve_budget_call_with_sources_in_tx_typed(
         .bind(request.stage.as_str())
         .bind(binding_seq)
         .bind(plan_digest)
-        .bind(request.now)
+        .bind(relation_now)
         .execute(&mut **tx)
         .await
         .map_err(internal)?;
@@ -3933,6 +4046,54 @@ async fn load_root_stage_plan_control(
     row.as_ref().map(control_ref_from_row).transpose()
 }
 
+async fn binding_version_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    billing_scope: &str,
+    seq: i64,
+) -> Result<Option<RootStagePlanBinding>> {
+    let row = sqlx::query(
+        "SELECT * FROM root_budget_stage_plan_bindings
+         WHERE billing_scope=? AND seq=?",
+    )
+    .bind(billing_scope)
+    .bind(seq)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(internal)?;
+    row.as_ref().map(validate_binding_version).transpose()
+}
+
+fn validate_binding_version(row: &sqlx::sqlite::SqliteRow) -> Result<RootStagePlanBinding> {
+    let binding = binding_from_row(row)?;
+    binding
+        .plan
+        .validate()
+        .map_err(|_| Error::Conflict("root_stage_plan_version_unsupported".into()))?;
+    let digest = binding
+        .plan
+        .digest()
+        .map_err(|_| Error::Conflict("root_stage_plan_version_unsupported".into()))?;
+    if digest != binding.plan_digest {
+        return Err(Error::Conflict(
+            "root_stage_plan_version_digest_mismatch".into(),
+        ));
+    }
+    let budget = &binding.plan.optimization_budget;
+    if budget.payer_id != binding.payer_id
+        || budget.root_total.currency != binding.currency
+        || budget.root_total.pricing_version != binding.pricing_version
+        || money_micros(&budget.root_total, "root_total")? != binding.root_total_micros
+        || budget.admin_authorization_receipt_digest.as_deref()
+            != Some(binding.authorization_receipt_digest.as_str())
+        || binding.billing_scope != budget.root_budget_scope_id
+    {
+        return Err(Error::Conflict(
+            "root_stage_plan_version_metadata_mismatch".into(),
+        ));
+    }
+    Ok(binding)
+}
+
 async fn active_root_stage_plan_in_tx(
     tx: &mut Transaction<'_, Sqlite>,
     billing_scope: &str,
@@ -3983,7 +4144,9 @@ async fn bind_root_stage_plan_in_tx(
 ) -> Result<RootStagePlanBinding> {
     ctx.require(&[Role::Admin])?;
     identifier(&request.billing_scope)?;
-    valid_time(request.now)?;
+    // Binding facts use the same-Session trusted clock, never a caller time.
+    let trusted_now = evo_core::now()?;
+    valid_time(trusted_now)?;
     if request.expected_seq < 0 {
         return Err(Error::Invalid(
             "root stage plan expected_seq must be nonnegative".into(),
@@ -4128,7 +4291,7 @@ async fn bind_root_stage_plan_in_tx(
     .bind(&root.authorization_receipt_digest)
     .bind(ctx.namespace())
     .bind(ctx.actor())
-    .bind(request.now)
+    .bind(trusted_now)
     .execute(&mut **tx)
     .await;
     if let Err(error) = insert {
@@ -4224,10 +4387,46 @@ async fn stage_plan_admission_in_tx(
         request.stage,
         BudgetStage::TaskExecution | BudgetStage::FormalEvaluation
     ) {
+        // The two acceptance stages are root-only, but they are not exempt on a
+        // stage label alone. The engine must pass the ticket it verified in this
+        // Session; storage re-reads that persisted ticket before admitting the
+        // call. Without the witness the bound root refuses the call.
+        let StagePlanAttribution::E05Ticket(witness) = attribution else {
+            return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+                stage: request.stage,
+                kind: StagePlanRefusalKind::E05Required,
+            }));
+        };
+        if let Err(error) = identifier(&witness.ticket_kind)
+            .and_then(|_| identifier(&witness.ticket_id))
+            .and_then(|_| identifier(&witness.ticket_storage_id))
+            .and_then(|_| validate_digest(&witness.ticket_digest, "ticket_digest"))
+        {
+            return reservation_validation_refusal(error);
+        }
+        let ticket: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM objects
+             WHERE namespace=? AND kind='artifact' AND id=? AND json_valid(body)
+               AND json_extract(body,'$.record_kind')=?
+               AND json_extract(body,'$.payload.id')=?",
+        )
+        .bind(ctx.namespace())
+        .bind(&witness.ticket_storage_id)
+        .bind(&witness.ticket_kind)
+        .bind(&witness.ticket_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal)?;
+        if ticket.is_none() {
+            return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
+                stage: request.stage,
+                kind: StagePlanRefusalKind::E05Required,
+            }));
+        }
         return Ok(Ok(None));
     }
     let selector = match attribution {
-        StagePlanAttribution::Unattributed => {
+        StagePlanAttribution::Unattributed | StagePlanAttribution::E05Ticket(_) => {
             return Ok(Err(BudgetPreDispatchRefusal::StagePlan {
                 stage: request.stage,
                 kind: StagePlanRefusalKind::Unknown,

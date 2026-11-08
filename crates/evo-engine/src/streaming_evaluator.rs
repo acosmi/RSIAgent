@@ -38,7 +38,7 @@ const CONTROL_KIND: &str = "registered_evaluation_control_v41";
 const HOLDOUT_KIND: &str = "protected_holdout_v41";
 const LEDGER_KIND: &str = "exposure_ledger_v1";
 const ALPHA_USE_KIND: &str = "alpha_claim_reservation_v1";
-const TICKET_KIND: &str = "evaluation_ticket_v2";
+pub(crate) const TICKET_KIND: &str = "evaluation_ticket_v2";
 const TICKET_RECEIPT_KIND: &str = "evaluation_ticket_issue_receipt_v1";
 const EXECUTION_RECEIPT_KIND: &str = "execution_receipt_v2";
 const GRADER_RECEIPT_KIND: &str = "independent_grader_receipt_v2";
@@ -2641,7 +2641,6 @@ impl IndependentEvaluationControl {
                 CONTROL_KIND,
                 &control.id,
                 &digest,
-                control.created_at_unix_seconds,
             )
             .await?;
         session
@@ -2861,27 +2860,32 @@ impl IndependentEvaluationControl {
                 "registration facts changed during ticket issue".into(),
             ));
         }
-        // The final write Session rechecks the root and that this control still
-        // references the active version. A switched plan makes it stale here,
-        // before any ticket write.
+        // The final write Session rechecks the root and that a Current control
+        // still references the active version. A switched plan makes it stale
+        // here, before any ticket write. Legacy v1/v2 controls are frozen
+        // history and keep their original candidate-presence path.
         validate_root_budget_in_session(&mut session, ctx, &control).await?;
-        let active = session
-            .active_root_stage_plan(ctx, &control.billing_scope)
-            .await?
-            .ok_or_else(|| {
-                Error::Conflict("registered_control_requires_active_root_stage_plan".into())
-            })?;
-        let relation = session
-            .root_stage_plan_control_ref(ctx, CONTROL_KIND, &control.id)
-            .await?
-            .ok_or_else(|| Error::Conflict("registered_control_has_no_stage_plan_ref".into()))?;
-        if relation.control_digest != issue_control_digest
-            || relation.binding_seq != active.seq
-            || relation.plan_digest != active.plan_digest
-        {
-            return Err(Error::Conflict(
-                "registered control is not bound to the active root stage plan".into(),
-            ));
+        if control.current().is_ok() {
+            let active = session
+                .active_root_stage_plan(ctx, &control.billing_scope)
+                .await?
+                .ok_or_else(|| {
+                    Error::Conflict("registered_control_requires_active_root_stage_plan".into())
+                })?;
+            let relation = session
+                .root_stage_plan_control_ref(ctx, CONTROL_KIND, &control.id)
+                .await?
+                .ok_or_else(|| {
+                    Error::Conflict("registered_control_has_no_stage_plan_ref".into())
+                })?;
+            if relation.control_digest != issue_control_digest
+                || relation.binding_seq != active.seq
+                || relation.plan_digest != active.plan_digest
+            {
+                return Err(Error::Conflict(
+                    "registered control is not bound to the active root stage plan".into(),
+                ));
+            }
         }
         let Some((candidate, candidate_binding)) =
             bind_candidate_record_in_session(&mut session, ctx, &control, &holdout).await?
@@ -7793,7 +7797,10 @@ async fn validate_root_budget_in_session(
             "persistent root budget differs from the registered formal budget".into(),
         ));
     }
-    if root.payment_subject != control.optimization_budget.payer_id {
+    // The payer gate belongs to Current controls: legacy v1/v2 control bytes
+    // are frozen history and keep their original refusal classes. A Current
+    // control must name the root's payment subject exactly.
+    if control.current().is_ok() && root.payment_subject != control.optimization_budget.payer_id {
         return Err(Error::Conflict(
             "persistent root payment subject differs from the registered payer".into(),
         ));

@@ -9,6 +9,48 @@ fn current_management_job(record: evo_storage::VersionedManagementJob) -> Manage
 
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
+
+#[allow(async_fn_in_trait)]
+trait E05Reserve {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord>;
+}
+
+impl E05Reserve for evo_storage::Store {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord> {
+        let witness = evo_storage::budget::StagePlanAttribution::E05Ticket(
+            evo_storage::budget::E05TicketWitness {
+                ticket_kind: "evaluation_ticket_v2".into(),
+                ticket_id: request.dispatch_group_id.clone(),
+                ticket_storage_id: format!(
+                    "e05-{}",
+                    evo_core::fingerprint(&("evaluation_ticket_v2", &request.dispatch_group_id))
+                        .unwrap()
+                ),
+                ticket_digest: evo_core::hash(request.actual_input_digest.as_bytes()),
+            },
+        );
+        let mut session = self.session().await.unwrap();
+        let result = session
+            .reserve_budget_call_with_stage_plan_typed(ctx, request, &[], &witness)
+            .await
+            .unwrap();
+        match result {
+            Ok(call) => {
+                session.commit().await.unwrap();
+                Ok(call)
+            }
+            Err(refusal) => Err(refusal.into_reservation_error()),
+        }
+    }
+}
 use evo_core::evaluation::{
     ControlCondition, ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
     FormalExperimentPlanV41, FormalStatisticalUnit, Money, OptimizationBudgetPlan,
@@ -406,7 +448,6 @@ async fn fixture(n: u32, sequential: bool) -> Fixture {
                 plan: RootStageBudgetPlanV1::from_optimization_budget(
                     control.optimization_budget.clone(),
                 ),
-                now: control.created_at_unix_seconds,
             },
         )
         .await
@@ -559,7 +600,7 @@ async fn execute_output(
     let now = 10 + i64::from(ordinal) * 5;
     fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),
@@ -696,7 +737,7 @@ async fn start_without_receipt(
     let now = 100 + i64::from(ordinal) * 5;
     fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),
@@ -980,7 +1021,7 @@ async fn out_of_order_stop_is_persistent_and_blocks_new_dispatch() {
 
     let blocked = fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),
@@ -1392,7 +1433,7 @@ async fn unattributed_dispatched_group_call_prevents_clean_terminal_accounting()
     };
     fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),
@@ -1494,7 +1535,7 @@ async fn dropped_start_transaction_rolls_back_dispatch_and_slot_side_effects() {
     };
     fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: fence.billing_scope.clone(),
@@ -1837,4 +1878,52 @@ async fn management_dispatch_recovers_registered_inputs_and_existing_ticket_with
         Some(fixture.control.digest().unwrap())
     );
     assert_eq!(damaged.holdout_digest, None);
+}
+
+#[tokio::test]
+async fn old_control_cannot_issue_a_new_ticket_after_a_plan_switch() {
+    let fixture = fixture(2, false).await;
+    let admin = Context::new("n", "admin", Role::Admin).unwrap();
+    let second = fixture
+        .store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: "billing-1".into(),
+                expected_seq: 1,
+                plan: RootStageBudgetPlanV1::from_optimization_budget(
+                    fixture.control.optimization_budget.clone(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.seq, 2);
+    let error = IndependentEvaluationControl::issue_ticket(
+        &fixture.evaluator,
+        &fixture.store,
+        IssueTicketRequest {
+            ticket_id: "ticket-2".into(),
+            registration_id: "control-1".into(),
+            holdout_id: "holdout-1".into(),
+            issued_at_unix_seconds: 6,
+        },
+    )
+    .await
+    .expect_err("the old control relation is stale after a plan switch");
+    assert!(
+        matches!(&error, Error::Conflict(message)
+            if message == "registered control is not bound to the active root stage plan"),
+        "{error:?}"
+    );
+    // The already-issued ticket keeps its own stored version and stays readable.
+    let status = IndependentEvaluationControl::status(
+        &fixture.evaluator,
+        &fixture.store,
+        &fixture.ticket_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(status.ticket.id, fixture.ticket_id);
+    fixture.store.close().await;
 }

@@ -15,8 +15,8 @@ use evo_core::{
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallRefence, BudgetCallReservation,
     BudgetCallState, BudgetDispatchDecision, BudgetExecutionProvenance, BudgetPreDispatchRefusal,
-    BudgetStage, ModelCallSettlementEvidence, RootBudgetRecord, StagePlanAttribution,
-    StagePlanControlSelector, StagePlanRefusal, UsageCharge,
+    BudgetStage, E05TicketWitness, ModelCallSettlementEvidence, RootBudgetRecord,
+    StagePlanAttribution, StagePlanControlSelector, StagePlanRefusal, UsageCharge,
 };
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
@@ -306,8 +306,20 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                 .ok_or(Error::Budget)?,
             now,
         };
+        // The actual formal task was verified in this Session above. Storage
+        // still re-reads the persisted ticket before admitting TaskExecution on
+        // a bound root; a stage label alone never bypasses the stage gate.
+        let ticket_witness = StagePlanAttribution::E05Ticket(E05TicketWitness {
+            ticket_kind: crate::streaming_evaluator::TICKET_KIND.into(),
+            ticket_id: request.task.ticket_id.clone(),
+            ticket_storage_id: crate::streaming_evaluator::storage_id(
+                crate::streaming_evaluator::TICKET_KIND,
+                &request.task.ticket_id,
+            )?,
+            ticket_digest: fingerprint(&request.task)?,
+        });
         let call = s
-            .reserve_budget_call_with_sources(
+            .reserve_budget_call_with_stage_plan_typed(
                 &ctx,
                 &reservation,
                 &candidate
@@ -315,8 +327,10 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                     .iter()
                     .map(|v| v.id.clone())
                     .collect::<Vec<_>>(),
+                &ticket_witness,
             )
-            .await?;
+            .await?
+            .map_err(BudgetPreDispatchRefusal::into_reservation_error)?;
         s.commit().await?;
         let fence = BudgetCallFence {
             billing_scope: billing.clone(),
@@ -868,7 +882,6 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                     &fence.billing_scope,
                     model_stage_budget(request.stage),
                     &refusal,
-                    fence.now,
                 )
                 .await?;
                 Ok(Err(pre_dispatch_refusal(request, &refusal)))
@@ -1086,7 +1099,6 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         billing_scope: &str,
         stage: BudgetStage,
         refusal: &BudgetPreDispatchRefusal,
-        now: i64,
     ) -> Result<()> {
         let BudgetPreDispatchRefusal::StagePlan { kind, .. } = refusal else {
             return Ok(());
@@ -1099,7 +1111,6 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                     billing_scope: billing_scope.into(),
                     stage,
                     kind: *kind,
-                    now,
                 },
             )
             .await?;
@@ -1269,7 +1280,6 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                         &reservation.billing_scope,
                         reservation.stage,
                         &refusal,
-                        now,
                     )
                     .await?;
                 }
@@ -1349,14 +1359,8 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                     // The reservation is rolled back with this Session. A stage
                     // refusal is not the generic undispatched-release branch.
                     drop(session);
-                    self.append_stage_plan_refusal(
-                        &ctx,
-                        &call.billing_scope,
-                        call.stage,
-                        &refusal,
-                        now,
-                    )
-                    .await?;
+                    self.append_stage_plan_refusal(&ctx, &call.billing_scope, call.stage, &refusal)
+                        .await?;
                     return Ok(pre_dispatch_refusal(&request, &refusal));
                 }
                 Err(refusal) => {

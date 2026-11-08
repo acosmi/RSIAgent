@@ -5,7 +5,7 @@
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 use evo_core::curriculum::{CurriculumControlProfileV1, LearnerStateV2};
-use evo_core::evaluation::DataUse;
+use evo_core::evaluation::{DataUse, Money, OptimizationBudgetPlan, RootStageBudgetPlanV1};
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::{Context, Error, Role, fingerprint, hash};
@@ -42,7 +42,7 @@ use evo_storage::budget::{
     REGISTERED_EXECUTION_REQUEST_SCHEMA, REGISTERED_EXECUTION_SETTLEMENT_SCHEMA,
     REGISTERED_EXECUTION_SETTLEMENT_SCHEMA_V2, ReadRegisteredExecutionSettlement,
     RegisteredExecutionProvenance, RegisteredExecutionSettlement, RootBudgetAuthorization,
-    UsageCharge,
+    RootStagePlanBindRequest, UsageCharge,
 };
 use evo_storage::lifecycle::CleanupState;
 use std::sync::Arc;
@@ -3729,5 +3729,140 @@ async fn legacy_receipts_and_stage_cache_never_gain_current_authority() {
         }
     }
     session.commit().await.unwrap();
+    fixture.store.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn begin_stage_refusal_releases_the_reserved_micro_and_writes_one_event() {
+    let fixture = Fixture::new().await;
+    let mut budget = OptimizationBudgetPlan::unfunded(SCOPE, "fixture-only", "USD").unwrap();
+    budget.root_total = Money {
+        currency: "USD".into(),
+        pricing_version: "pricing-v1".into(),
+        amount: "0.001".into(),
+    };
+    budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
+    for stage in &mut budget.stages {
+        stage.per_call_limit = Money {
+            currency: "USD".into(),
+            pricing_version: "pricing-v1".into(),
+            amount: "0".into(),
+        };
+        stage.experiment_total = Money {
+            currency: "USD".into(),
+            pricing_version: "pricing-v1".into(),
+            amount: "0".into(),
+        };
+    }
+    let development = budget
+        .stages
+        .iter_mut()
+        .find(|entry| entry.stage == evo_core::evaluation::OptimizationStage::DevelopmentExecution)
+        .unwrap();
+    development.per_call_limit.amount = "0.000001".into();
+    development.experiment_total.amount = "0.001".into();
+    budget.validate().unwrap();
+    let plan = RootStageBudgetPlanV1::from_optimization_budget(budget);
+    fixture
+        .store
+        .bind_root_stage_plan(
+            &fixture.admin,
+            &RootStagePlanBindRequest {
+                billing_scope: SCOPE.into(),
+                expected_seq: 0,
+                plan: plan.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    // Re-registering the identical control writes its relation to version 1.
+    register_development_control(&fixture.admin, &fixture.store, fixture.control.clone())
+        .await
+        .unwrap();
+
+    let request = fixture.request();
+    let paused = Arc::new(tokio::sync::Notify::new());
+    let clock_paused = paused.clone();
+    let reads = Arc::new(AtomicUsize::new(0));
+    let (resume, waiting) = std::sync::mpsc::channel();
+    let waiting = std::sync::Mutex::new(waiting);
+    let runner = RegisteredDevelopmentRunner::with_clock(
+        fixture.store.clone(),
+        fixture.executor.clone(),
+        fixture.grader.clone(),
+        CONTROL_ID,
+        600,
+        Arc::new(move || {
+            if reads.fetch_add(1, Ordering::SeqCst) == 1 {
+                // The second read follows the committed reserve and precedes
+                // the actual dispatch boundary.
+                clock_paused.notify_one();
+                if tokio::task::block_in_place(|| {
+                    waiting
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                })
+                .is_err()
+                {
+                    return -1;
+                }
+            }
+            100
+        }),
+    )
+    .unwrap();
+    let running = tokio::spawn(async move { runner.run(request.clone()).await });
+    tokio::time::timeout(std::time::Duration::from_secs(30), paused.notified())
+        .await
+        .unwrap();
+    // A new active version makes the control relation stale before dispatch.
+    fixture
+        .store
+        .bind_root_stage_plan(
+            &fixture.admin,
+            &RootStagePlanBindRequest {
+                billing_scope: SCOPE.into(),
+                expected_seq: 1,
+                plan,
+            },
+        )
+        .await
+        .unwrap();
+    resume.send(()).unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), running)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(result, Err(Error::Budget)), "{result:?}");
+    let mut snapshot_session = fixture.store.session().await.unwrap();
+    let snapshot = snapshot_session
+        .root_budget_monetary_snapshot(&fixture.admin, SCOPE)
+        .await
+        .unwrap();
+    snapshot_session.commit().await.unwrap();
+    assert_eq!(snapshot.root.reserved_micros, 0);
+    let released: Vec<_> = snapshot
+        .calls
+        .iter()
+        .filter(|call| call.dispatch_group_id == "episode-1")
+        .collect();
+    assert_eq!(released.len(), 1, "{released:?}");
+    for call in released {
+        assert_eq!(call.state, BudgetCallState::Released);
+        assert_eq!(
+            call.terminal_reason.as_deref(),
+            Some("development_pre_dispatch_v1.stage_plan_inactive")
+        );
+        assert_eq!(call.dispatch_id, None);
+    }
+    let refusals: Vec<_> = snapshot
+        .ledger_events
+        .iter()
+        .filter(|event| event.event_kind == "stage_plan_refused")
+        .collect();
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
+    assert!(refusals[0].details.contains("stage_plan_inactive"));
+    assert!(refusals[0].details.contains("development_execution"));
     fixture.store.close().await;
 }

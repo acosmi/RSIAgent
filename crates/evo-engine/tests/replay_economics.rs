@@ -2946,10 +2946,28 @@ async fn derived_economic_audit_propagates_real_formal_source_legacy() {
     let evaluator = Context::new(namespace, actor, Role::Evaluator).unwrap();
     let store = Store::open(&path).await.unwrap();
     assert_eq!(store.integrity().await.unwrap(), "ok");
-    assert!(
-        ag163_image(&path) == before,
-        "opening the original economic history refreshed persistent facts"
-    );
+    let assert_unchanged_except_0008 = |image: &serde_json::Value, action: &str| {
+        let before_tables = before["tables"].as_array().unwrap();
+        let after_tables = image["tables"].as_array().unwrap();
+        for old in before_tables {
+            let name = old["name"].as_str().unwrap();
+            if name == "_sqlx_migrations" {
+                continue;
+            }
+            let new = after_tables
+                .iter()
+                .find(|table| table["name"] == old["name"])
+                .unwrap_or_else(|| panic!("table {name} disappeared at {action}"));
+            assert_eq!(old, new, "{action} refreshed {name}");
+        }
+        // Opening records migration 0008: three empty root stage plan tables.
+        // The ledger row and those tables are schema metadata; every pre-0008
+        // table bytes and the financial call rows stay identical.
+        assert_eq!(after_tables.len(), before_tables.len() + 3);
+        assert_eq!(image["calls"], before["calls"], "{action} changed calls");
+    };
+    let after = ag163_image(&path);
+    assert_unchanged_except_0008(&after, "opening the original economic history");
     let status = evo_engine::streaming_evaluator::IndependentEvaluationControl::status(
         &evaluator, &store, ticket_id,
     )
@@ -3049,13 +3067,13 @@ async fn derived_economic_audit_propagates_real_formal_source_legacy() {
         serde_json::to_value(&durable_status).unwrap() == metadata["status"],
         "economic audit changed the original indexed job, outcome or cost facts"
     );
-    assert!(
-        ag163_image(&path) == before,
-        "public readers changed any original typed fact, raw TEXT, rowid, sequence or fee"
+    assert_unchanged_except_0008(
+        &ag163_image(&path),
+        "public readers of the original typed facts",
     );
     store.close().await;
-    assert!(
-        ag163_image(&path) == before,
-        "normal close changed any of the 22 original typed tables or accounting facts"
+    assert_unchanged_except_0008(
+        &ag163_image(&path),
+        "normal close of the original typed tables",
     );
 }

@@ -27,6 +27,48 @@
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
+#[allow(async_fn_in_trait)]
+trait E05Reserve {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord>;
+}
+
+impl E05Reserve for evo_storage::Store {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord> {
+        let witness = evo_storage::budget::StagePlanAttribution::E05Ticket(
+            evo_storage::budget::E05TicketWitness {
+                ticket_kind: "evaluation_ticket_v2".into(),
+                ticket_id: request.dispatch_group_id.clone(),
+                ticket_storage_id: format!(
+                    "e05-{}",
+                    evo_core::fingerprint(&("evaluation_ticket_v2", &request.dispatch_group_id))
+                        .unwrap()
+                ),
+                ticket_digest: evo_core::hash(request.actual_input_digest.as_bytes()),
+            },
+        );
+        let mut session = self.session().await.unwrap();
+        let result = session
+            .reserve_budget_call_with_stage_plan_typed(ctx, request, &[], &witness)
+            .await
+            .unwrap();
+        match result {
+            Ok(call) => {
+                session.commit().await.unwrap();
+                Ok(call)
+            }
+            Err(refusal) => Err(refusal.into_reservation_error()),
+        }
+    }
+}
+
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, SkillPatch, SkillSnapshot,
 };
@@ -363,7 +405,6 @@ fn fixture(sequential: bool) -> Boxed<'static, Fixture> {
                     plan: RootStageBudgetPlanV1::from_optimization_budget(
                         control.optimization_budget.clone(),
                     ),
-                    now: control.created_at_unix_seconds,
                 },
             )
             .await
@@ -568,7 +609,7 @@ fn execute_raw<'a>(
         let lease = format!("lease-{ordinal}");
         fixture
             .store
-            .reserve_budget_call(
+            .reserve_budget_call_with_e05_ticket(
                 &fixture.worker,
                 &BudgetCallReservation {
                     billing_scope: BILLING_SCOPE.into(),
@@ -1228,7 +1269,7 @@ fn start_pending(fixture: &Fixture, now: i64) -> Boxed<'_, Pending> {
         .unwrap();
         fixture
             .store
-            .reserve_budget_call(
+            .reserve_budget_call_with_e05_ticket(
                 &fixture.worker,
                 &BudgetCallReservation {
                     billing_scope: BILLING_SCOPE.into(),

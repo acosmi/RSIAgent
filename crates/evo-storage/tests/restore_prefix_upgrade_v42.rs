@@ -34,7 +34,7 @@ const RESTORE_SCRIPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../scripts/restore_backup.py"
 );
-const CURRENT_VERSIONS: [i64; 6] = [1, 2, 4, 5, 6, 7];
+const CURRENT_VERSIONS: [i64; 7] = [1, 2, 4, 5, 6, 7, 8];
 const LEGACY_KINDS: [&str; 14] = [
     "run",
     "feedback",
@@ -857,12 +857,17 @@ async fn upgrade_matches_store_open(versions: &[i64], applied: &[i64]) {
 
 #[tokio::test]
 async fn a_backup_on_0001_to_0006_is_upgraded_exactly_like_store_open() {
-    upgrade_matches_store_open(&[1, 2, 4, 5, 6], &[7]).await;
+    upgrade_matches_store_open(&[1, 2, 4, 5, 6], &[7, 8]).await;
+}
+
+#[tokio::test]
+async fn a_backup_on_0001_to_0007_is_upgraded_exactly_like_store_open() {
+    upgrade_matches_store_open(&[1, 2, 4, 5, 6, 7], &[8]).await;
 }
 
 #[tokio::test]
 async fn a_backup_on_0001_to_0005_is_upgraded_exactly_like_store_open() {
-    upgrade_matches_store_open(&[1, 2, 4, 5], &[6, 7]).await;
+    upgrade_matches_store_open(&[1, 2, 4, 5], &[6, 7, 8]).await;
 }
 
 #[tokio::test]
@@ -917,7 +922,7 @@ async fn a_0005_backup_replays_a_revocation_made_after_the_binary_upgrade() {
         Some((vec![event], base.seq + 1, revoked.watermark_digest.clone())),
     );
     let (restored, output) = scenario.restore(&backup, &anchor, &delta, "restored");
-    assert_restored(&output, 1, "6,7");
+    assert_restored(&output, 1, "6,7,8");
     let record = migrations_record(&restored);
     assert_eq!(record["source_versions"], json!(versions));
     assert_eq!(record["current_versions"], json!(CURRENT_VERSIONS));
@@ -1136,7 +1141,7 @@ async fn every_other_migration_ledger_is_still_isolated() {
         "database migration checksums differ from current code",
     );
     let (restored, output) = prefix.restore(&backup, &anchor, &delta, "restored-valid");
-    assert_restored(&output, 0, "7");
+    assert_restored(&output, 0, "7,8");
     assert_gate_facts_admit(&restored, &anchor).await;
 
     // A migration that cannot apply to the copy isolates the restore, and the

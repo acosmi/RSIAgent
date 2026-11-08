@@ -1405,7 +1405,6 @@ pub async fn register_development_control(
                 CONTROL_KIND,
                 &control.id,
                 &digest,
-                control.created_at_unix_seconds,
             )
             .await?;
     }
@@ -1456,7 +1455,6 @@ pub async fn register_development_control_with_stage_plan(
             CONTROL_KIND,
             &control.id,
             &digest,
-            control.created_at_unix_seconds,
         )
         .await?;
     session.commit().await?;
@@ -2690,7 +2688,6 @@ impl RegisteredDevelopmentRunner {
         billing_scope: &str,
         stage: BudgetStage,
         refusal: &evo_storage::budget::BudgetPreDispatchRefusal,
-        now: i64,
     ) -> Result<()> {
         let evo_storage::budget::BudgetPreDispatchRefusal::StagePlan { kind, .. } = refusal else {
             return Ok(());
@@ -2703,7 +2700,6 @@ impl RegisteredDevelopmentRunner {
                     billing_scope: billing_scope.into(),
                     stage,
                     kind: *kind,
-                    now,
                 },
             )
             .await?;
@@ -2866,7 +2862,6 @@ impl RegisteredDevelopmentRunner {
                         &reservation.billing_scope,
                         reservation.stage,
                         &refusal,
-                        now,
                     )
                     .await?;
                 }
@@ -3167,15 +3162,44 @@ impl RegisteredDevelopmentRunner {
             Err(refusal) => {
                 if original_call.state == BudgetCallState::Reserved
                     && refusal != evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked
-                    && !refusal.is_stage_plan()
                 {
-                    session
-                        .release_undispatched_budget_call(
-                            &self.executor,
-                            fence,
-                            &format!("development_pre_dispatch_v1.{}", refusal.code()),
-                        )
-                        .await?;
+                    if refusal.is_stage_plan() {
+                        // A live stage refusal releases only this undispatched
+                        // reservation and writes exactly one refusal event in the
+                        // same Session and commit. It must not stay reserved and
+                        // must not take the silent generic-release branch.
+                        session
+                            .release_undispatched_budget_call(
+                                &self.executor,
+                                fence,
+                                &format!("development_pre_dispatch_v1.{}", refusal.code()),
+                            )
+                            .await?;
+                        let evo_storage::budget::BudgetPreDispatchRefusal::StagePlan {
+                            kind, ..
+                        } = &refusal
+                        else {
+                            unreachable!("is_stage_plan checked above");
+                        };
+                        session
+                            .append_stage_plan_refusal(
+                                &self.executor,
+                                &StagePlanRefusal {
+                                    billing_scope: original_call.billing_scope.clone(),
+                                    stage: original_call.stage,
+                                    kind: *kind,
+                                },
+                            )
+                            .await?;
+                    } else {
+                        session
+                            .release_undispatched_budget_call(
+                                &self.executor,
+                                fence,
+                                &format!("development_pre_dispatch_v1.{}", refusal.code()),
+                            )
+                            .await?;
+                    }
                 }
                 Ok(Err(refusal.into_dispatch_error()))
             }

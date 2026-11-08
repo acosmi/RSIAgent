@@ -98,7 +98,7 @@ pub const REGISTERED_PRACTICE_ATTEMPTS: u8 = 3;
 
 /// A practice attempt reserves through the registered development runner, so
 /// its ledger row remains `development_execution`; it is never reclassified as
-/// `practice` or `curriculum`.
+/// `practice` or `curriculum`. Test-only contract until a real producer is wired.
 pub fn practice_budget_stage() -> BudgetStage {
     BudgetStage::DevelopmentExecution
 }

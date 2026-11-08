@@ -169,3 +169,30 @@ fn a_stage_total_may_equal_the_root() {
     );
     current.validate().unwrap();
 }
+
+#[test]
+fn formal_plan_versions_bind_distinct_budget_preimages() {
+    let old = old_plan("0.01");
+    let first = RootStageBudgetPlanV1::from_optimization_budget(old.clone());
+    let mut second = first.clone();
+    second.curriculum = Some(StageMoneyCaps {
+        per_call_limit: money("0.001"),
+        experiment_total: money("0.002"),
+    });
+    second.validate().unwrap();
+    // The new version has its own digest while the embedded original 11-stage
+    // plan and its digest stay byte-identical.
+    assert_ne!(first.digest().unwrap(), second.digest().unwrap());
+    assert_eq!(
+        first.optimization_budget.digest().unwrap(),
+        second.optimization_budget.digest().unwrap()
+    );
+    assert_eq!(
+        serde_json::to_string(&first.optimization_budget).unwrap(),
+        serde_json::to_string(&second.optimization_budget).unwrap()
+    );
+    assert_eq!(
+        first.optimization_budget.digest().unwrap(),
+        old.digest().unwrap()
+    );
+}
