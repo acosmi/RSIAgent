@@ -155,6 +155,10 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
                 // schemas: this boundary schema is neither, so it is refused
                 // as unsupported before any session, with zero writes.
                 ("trace.export", _) => "unsupported management payload schema",
+                // backup.create now has its real handler: this boundary payload
+                // lacks relative_name, so the strict request DTO refuses it
+                // before any session, with zero writes.
+                ("backup.create", _) => "invalid management payload",
                 (_, ExecutionKind::AsyncJob) => "management_operation_not_wired",
                 _ => "management operation requires dedicated route",
             }),
