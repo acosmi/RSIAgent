@@ -66,10 +66,21 @@ async fn issue_controlled_source(fixture: &Fixture, id: &str, body: Vec<u8>) {
         .unwrap();
 }
 async fn setup() -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("replay-v3.sqlite3"))
-        .await
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
         .unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join("replay-v3.sqlite3"))
+            .unwrap();
+    }
+    let store = Store::open(&root.join("replay-v3.sqlite3")).await.unwrap();
     let admin = Context::new("n", "admin", Role::Admin).unwrap();
     let host = Context::new("n", "host", Role::Host).unwrap();
     let mut registered = ExplorationWorldV1 {
@@ -723,8 +734,17 @@ async fn actual_current_world_backup_restore_reuses_the_full_loader_in_a_new_sto
         .unwrap();
     let root = fixture.dir.path().canonicalize().unwrap();
     let source_path = root.join("replay-v3.sqlite3");
-    let backup = root.join("qualified-world-backup");
-    fixture.store.backup(&backup).await.unwrap();
+    let backup = root.join("backups/qualified-world-backup");
+    fixture
+        .store
+        .backup(
+            &fixture.admin,
+            evo_storage::lifecycle::BackupName::parse("qualified-world-backup").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     let manifest_bytes = std::fs::read(backup.join("backup-manifest.json")).unwrap();
     let manifest: evo_storage::lifecycle::BackupManifest =
         serde_json::from_slice(&manifest_bytes).unwrap();
@@ -828,8 +848,17 @@ async fn committed_root_slot_branch_and_action_identity_are_each_checked_before_
             replay_observation_bytes_v3(&world.manifest, &transition).unwrap(),
         )
         .await;
-        let before = fixture.dir.path().join("before-uncommitted-append");
-        fixture.store.backup(&before).await.unwrap();
+        let before = fixture.dir.path().join("backups/before-uncommitted-append");
+        fixture
+            .store
+            .backup(
+                &fixture.admin,
+                evo_storage::lifecycle::BackupName::parse("before-uncommitted-append").unwrap(),
+            )
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
         let result = collect_replay_transition_v3(
             &fixture.admin,
             &fixture.store,
@@ -849,8 +878,17 @@ async fn committed_root_slot_branch_and_action_identity_are_each_checked_before_
                 panic!("{mutation}: expected exact typed root mapping refusal, got {other:?}");
             }
         }
-        let after = fixture.dir.path().join("after-uncommitted-append");
-        fixture.store.backup(&after).await.unwrap();
+        let after = fixture.dir.path().join("backups/after-uncommitted-append");
+        fixture
+            .store
+            .backup(
+                &fixture.admin,
+                evo_storage::lifecycle::BackupName::parse("after-uncommitted-append").unwrap(),
+            )
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read(before.join("rsia.sqlite3")).unwrap(),
             std::fs::read(after.join("rsia.sqlite3")).unwrap(),

@@ -31,8 +31,22 @@ fn ctx(actor: &str, role: Role) -> Context {
 }
 
 async fn database() -> (tempfile::TempDir, Store) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("rsia.sqlite3")).await.unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.path().join("rsia.sqlite3"))
+            .unwrap();
+    }
+    let store = Store::open(&dir.path().canonicalize().unwrap().join("rsia.sqlite3"))
+        .await
+        .unwrap();
     (dir, store)
 }
 
@@ -967,8 +981,19 @@ async fn make_backup() -> (tempfile::TempDir, Store, std::path::PathBuf, String)
         .unwrap();
     session.commit().await.unwrap();
     let blob = store.put_blob(&admin, b"blob-data").await.unwrap();
-    let backup = dir.path().join("backup");
-    store.backup(&backup).await.unwrap();
+    let backup = dir.path().join("backups/backup");
+    store
+        .backup(
+            &ctx("admin", Role::Admin),
+            evo_storage::lifecycle::BackupName::parse(
+                backup.file_name().unwrap().to_str().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     (dir, store, backup, blob)
 }
 
@@ -1004,12 +1029,15 @@ fn exact_delta(backup: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn restore(backup: &std::path::Path, dest: &std::path::Path, delta: &std::path::Path) -> i32 {
-    restore_anchor(
-        backup,
-        dest,
-        delta,
-        Some(&backup.parent().unwrap().join("rsia.sqlite3")),
-    )
+    // The live anchor is D/rsia.sqlite3: real backups sit in D/backups/<name>,
+    // copied packages in D/<name>.
+    let parent = backup.parent().unwrap();
+    let root = if parent.ends_with("backups") {
+        parent.parent().unwrap()
+    } else {
+        parent
+    };
+    restore_anchor(backup, dest, delta, Some(&root.join("rsia.sqlite3")))
 }
 
 #[tokio::test]
@@ -1038,8 +1066,19 @@ async fn restore_replays_strict_e16_import_source_revocation_from_current_anchor
         .await
         .unwrap();
     session.commit().await.unwrap();
-    let backup = dir.path().join("e16-backup");
-    store.backup(&backup).await.unwrap();
+    let backup = dir.path().join("backups/e16-backup");
+    store
+        .backup(
+            &ctx("admin", Role::Admin),
+            evo_storage::lifecycle::BackupName::parse(
+                backup.file_name().unwrap().to_str().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     let manifest_bytes = std::fs::read(backup.join("backup-manifest.json")).unwrap();
     let manifest: BackupManifest = serde_json::from_slice(&manifest_bytes).unwrap();
     let base = manifest.watermarks.first().unwrap();
@@ -1255,10 +1294,20 @@ async fn backup_manifest_and_restore_reject_incomplete_old_or_overwrite_cases() 
         1
     );
 
-    let existing = dir.path().join("existing");
+    let existing = dir.path().join("backups/existing");
     std::fs::create_dir(&existing).unwrap();
     assert_eq!(restore(&backup, &existing, &delta), 2);
-    assert!(store.backup(&existing).await.is_err());
+    assert!(
+        store
+            .backup(
+                &ctx("admin", Role::Admin),
+                evo_storage::lifecycle::BackupName::parse("existing").unwrap()
+            )
+            .unwrap()
+            .complete()
+            .await
+            .is_err()
+    );
 
     let broken = dir.path().join("broken");
     copy_dir(&backup, &broken);
@@ -1298,10 +1347,21 @@ async fn backup_manifest_and_restore_reject_incomplete_old_or_overwrite_cases() 
         1
     );
 
-    let blocked_parent = dir.path().join("not-a-directory");
+    std::fs::remove_dir_all(dir.path().join("backups")).unwrap();
+    let blocked_parent = dir.path().join("backups");
     std::fs::write(&blocked_parent, b"x").unwrap();
     let failed_dest = blocked_parent.join("backup");
-    assert!(store.backup(&failed_dest).await.is_err());
+    assert!(
+        store
+            .backup(
+                &ctx("admin", Role::Admin),
+                evo_storage::lifecycle::BackupName::parse("backup").unwrap()
+            )
+            .unwrap()
+            .complete()
+            .await
+            .is_err()
+    );
     assert!(!failed_dest.join("backup-manifest.json").exists());
 }
 
@@ -2190,8 +2250,19 @@ async fn empty_blob_directories_do_not_create_unlisted_backup_members() {
         .delete_blob(&ctx("admin", Role::Admin), &blob)
         .await
         .unwrap();
-    let backup = dir.path().join("empty-blobs-backup");
-    store.backup(&backup).await.unwrap();
+    let backup = dir.path().join("backups/empty-blobs-backup");
+    store
+        .backup(
+            &ctx("admin", Role::Admin),
+            evo_storage::lifecycle::BackupName::parse(
+                backup.file_name().unwrap().to_str().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     let manifest: BackupManifest =
         serde_json::from_slice(&std::fs::read(backup.join("backup-manifest.json")).unwrap())
             .unwrap();

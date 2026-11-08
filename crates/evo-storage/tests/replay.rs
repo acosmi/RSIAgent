@@ -264,8 +264,20 @@ async fn put_trusted_development_source(store: &Store, ctx: &Context, id: &str, 
 }
 
 async fn setup() -> (tempfile::TempDir, Store, Context) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("replay.sqlite3"))
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.path().join("replay.sqlite3"))
+            .unwrap();
+    }
+    let store = Store::open(&dir.path().canonicalize().unwrap().join("replay.sqlite3"))
         .await
         .unwrap();
     let ctx = Context::new("n", "worker", Role::Worker).unwrap();
@@ -810,9 +822,20 @@ async fn hundredth_replay_world_is_admitted_and_sealing_it_is_not_a_new_world() 
 async fn legacy_write_tables_snapshot(
     store: &Store,
 ) -> std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
-    let directory = tempfile::tempdir().unwrap();
-    let backup = directory.path().join("snapshot");
-    store.backup(&backup).await.unwrap();
+    let publication = store
+        .backup(
+            &Context::new("n", "backup-admin", Role::Admin).unwrap(),
+            evo_storage::lifecycle::BackupName::parse(&format!(
+                "snapshot-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
+    let backup = publication.directory();
     let connection = rusqlite::Connection::open_with_flags(
         backup.join("rsia.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,

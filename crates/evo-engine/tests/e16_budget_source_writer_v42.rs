@@ -41,9 +41,23 @@ struct Imported {
 }
 impl Imported {
     async fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .permissions(
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .tempdir()
+            .unwrap();
         let root = dir.path().canonicalize().unwrap();
         let live = root.join("rsia.sqlite3");
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(live.clone())
+                .unwrap();
+        }
         let store = Store::open(&live).await.unwrap();
         let mut s = store.session().await.unwrap();
         s.bump_watermark(&admin(), &hash(b"initial-import-watermark"))
@@ -414,8 +428,16 @@ async fn startup_gate_detects_only_new_ref_drift_with_identical_real_ledger_and_
             .await
             .unwrap();
         assert_eq!(settled.call.actual_cost_micros, Some(9));
-        let backup = f.root.join("backup");
-        f.store.backup(&backup).await.unwrap();
+        let backup = f.root.join("backups/backup");
+        f.store
+            .backup(
+                &admin(),
+                evo_storage::lifecycle::BackupName::parse("backup").unwrap(),
+            )
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
         let raw = std::fs::read(backup.join("backup-manifest.json")).unwrap();
         let manifest: BackupManifest = serde_json::from_slice(&raw).unwrap();
         let delta = f.root.join("delta.json");

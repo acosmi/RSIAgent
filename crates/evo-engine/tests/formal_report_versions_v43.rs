@@ -99,7 +99,7 @@ impl History {
             .unwrap()
             .clone();
         let root = tempfile::tempdir().unwrap();
-        let private = root.path().join("private");
+        let private = root.path().canonicalize().unwrap().join("private");
         fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
         let path = private.join("history.sqlite3");
         let bytes = hex_bytes(original["database_hex"].as_str().unwrap());
@@ -1754,8 +1754,16 @@ async fn restore_retains_judgment_versions_and_spent_facts_without_reopening_exe
     let body = fx.body(&id).await;
     let old_body = fx.body(&fx.ticket_id).await;
     let before = image(&fx.path);
-    let backup = fx.root.path().join("backup");
-    fx.store.backup(&backup).await.unwrap();
+    let backup = fx.path.parent().unwrap().join("backups/backup");
+    fx.store
+        .backup(
+            &fx.admin,
+            evo_storage::lifecycle::BackupName::parse("backup").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
     fx.store.close().await;
     let manifest_raw = fs::read(backup.join("backup-manifest.json")).unwrap();
     let manifest: Value = serde_json::from_slice(&manifest_raw).unwrap();

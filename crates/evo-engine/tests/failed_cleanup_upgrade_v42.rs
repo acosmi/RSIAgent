@@ -202,8 +202,24 @@ async fn generate_legacy_failed_backup_with_real_host_writes_and_cleanup() {
         !destination.exists(),
         "refuse to overwrite a legacy artifact"
     );
-    let temporary = tempfile::tempdir().unwrap();
-    let path = temporary.path().join("rsia.sqlite3");
+    let temporary = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let path = temporary
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join("rsia.sqlite3");
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path.clone())
+            .unwrap();
+    }
     let store = Store::open(&path).await.unwrap();
     let records = new_authorities(&store, DEFAULT_NS).await;
     let failed = drain_old_queue(&store, DEFAULT_NS, begin(&store, DEFAULT_NS).await).await;
@@ -226,7 +242,16 @@ async fn generate_legacy_failed_backup_with_real_host_writes_and_cleanup() {
             serde_json::from_str(row["body"].as_str().unwrap()).unwrap();
         stored.validate().unwrap();
     }
-    store.backup(&destination).await.unwrap();
+    let publication = store
+        .backup(
+            &ctx(DEFAULT_NS, Role::Admin),
+            evo_storage::lifecycle::BackupName::parse("legacy-failed").unwrap(),
+        )
+        .unwrap()
+        .complete()
+        .await
+        .unwrap();
+    std::fs::rename(publication.directory(), &destination).unwrap();
     store.close().await;
     let source_head = Command::new("git")
         .args(["rev-parse", "HEAD"])
