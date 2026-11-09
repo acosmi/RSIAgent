@@ -504,6 +504,171 @@ pub struct UsageCharge {
     pub output_digest: String,
 }
 
+/// Non-persistent classification of one reconcile transaction. The overflow
+/// variant still carries the post-write call record: the charge-preservation
+/// writes are committed by the caller and never rolled back or zeroed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BudgetReconcileOutcome {
+    Applied(BudgetCallRecord),
+    AlreadyFinalized(BudgetCallRecord),
+    PreservedAccountingOverflow(BudgetCallRecord),
+}
+
+/// The safe post-reconciliation call projection. It proves the actual stored
+/// state and amounts without exposing any request/response/transport body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetCallSettlementView {
+    pub billing_scope: String,
+    pub call_id: String,
+    pub state: BudgetCallState,
+    pub dispatch_id: Option<String>,
+    pub provider_request_id: Option<String>,
+    pub usage_record_id: Option<String>,
+    pub output_digest: Option<String>,
+    pub reserved_micros: i64,
+    pub actual_cost_micros: Option<i64>,
+    pub actual_currency: Option<String>,
+    pub actual_pricing_version: Option<String>,
+    pub execution_closed: bool,
+    pub execution_closed_at: Option<i64>,
+    pub execution_close_reason: Option<String>,
+    pub terminal_reason: Option<String>,
+    pub finalized_at: Option<i64>,
+    pub root_stopped: bool,
+    pub root_stop_reason: Option<String>,
+}
+
+impl BudgetCallSettlementView {
+    pub fn new(call: &BudgetCallRecord, root: &RootBudgetRecord) -> Self {
+        Self {
+            billing_scope: call.billing_scope.clone(),
+            call_id: call.call_id.clone(),
+            state: call.state,
+            dispatch_id: call.dispatch_id.clone(),
+            provider_request_id: call.provider_request_id.clone(),
+            usage_record_id: call.usage_record_id.clone(),
+            output_digest: call.output_digest.clone(),
+            reserved_micros: call.reserved_micros,
+            actual_cost_micros: call.actual_cost_micros,
+            actual_currency: call.actual_currency.clone(),
+            actual_pricing_version: call.actual_pricing_version.clone(),
+            execution_closed: call.execution_closed,
+            execution_closed_at: call.execution_closed_at,
+            execution_close_reason: call.execution_close_reason.clone(),
+            terminal_reason: call.terminal_reason.clone(),
+            finalized_at: call.finalized_at,
+            root_stopped: root.stopped,
+            root_stop_reason: root.stop_reason.clone(),
+        }
+    }
+}
+
+pub const BUDGET_OPEN_CALLS_PAGE_SCHEMA: &str = "rsia.budget_open_calls_page.v1";
+pub const BUDGET_LIST_OPEN_MAX_PAGE_SIZE: u16 = 100;
+
+/// One open call in the safe management projection. It carries identifiers,
+/// stage/state, dispatch and money metadata only; never the private request,
+/// response or transport artifact body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetOpenCallView {
+    pub call_id: String,
+    pub namespace: String,
+    pub stage: BudgetStage,
+    pub state: BudgetCallState,
+    pub dispatch_group_id: String,
+    pub dispatch_id: Option<String>,
+    pub provider_request_id: Option<String>,
+    pub usage_record_id: Option<String>,
+    pub output_digest: Option<String>,
+    pub reserved_micros: i64,
+    pub actual_cost_micros: Option<i64>,
+    pub actual_currency: Option<String>,
+    pub actual_pricing_version: Option<String>,
+    pub execution_closed: bool,
+    pub execution_open: bool,
+    pub terminal_reason: Option<String>,
+    pub created_at: i64,
+    pub dispatched_at: Option<i64>,
+    pub finalized_at: Option<i64>,
+}
+
+/// One bounded page of the complete open-call view. `anchor` is the digest of
+/// the whole projected view; a cursor carries it so a changed view is refused
+/// instead of silently splicing two snapshots. `complete` is true only when
+/// the scan proved there is no further open call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetOpenCallsPage {
+    pub schema_version: String,
+    pub billing_scope: String,
+    pub anchor: String,
+    pub page_size: u16,
+    pub entries: Vec<BudgetOpenCallView>,
+    pub next_cursor: Option<String>,
+    pub complete: bool,
+}
+
+/// A non-authoritative continuation position: the caller must still be an
+/// Admin member of the root on every page, and the anchor must match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetListOpenCursor {
+    pub anchor: String,
+    pub after_call_id: String,
+}
+
+pub fn parse_budget_list_open_cursor(value: &str) -> Result<BudgetListOpenCursor> {
+    let mut parts = value.splitn(3, ':');
+    if parts.next() != Some("v1") {
+        return Err(Error::Invalid("invalid budget list cursor".into()));
+    }
+    let anchor = parts
+        .next()
+        .ok_or_else(|| Error::Invalid("invalid budget list cursor".into()))?;
+    validate_digest(anchor, "budget list cursor anchor")?;
+    let after_call_id = parts
+        .next()
+        .ok_or_else(|| Error::Invalid("invalid budget list cursor".into()))?;
+    identifier(after_call_id)?;
+    Ok(BudgetListOpenCursor {
+        anchor: anchor.into(),
+        after_call_id: after_call_id.into(),
+    })
+}
+
+fn open_call_view(call: &BudgetCallRecord) -> Option<BudgetOpenCallView> {
+    let open = match call.state {
+        BudgetCallState::Reserved | BudgetCallState::Dispatched | BudgetCallState::Uncertain => {
+            true
+        }
+        BudgetCallState::Finalized => !call.execution_closed,
+        BudgetCallState::Released | BudgetCallState::Cancelled => false,
+    };
+    open.then(|| BudgetOpenCallView {
+        call_id: call.call_id.clone(),
+        namespace: call.namespace.clone(),
+        stage: call.stage,
+        state: call.state,
+        dispatch_group_id: call.dispatch_group_id.clone(),
+        dispatch_id: call.dispatch_id.clone(),
+        provider_request_id: call.provider_request_id.clone(),
+        usage_record_id: call.usage_record_id.clone(),
+        output_digest: call.output_digest.clone(),
+        reserved_micros: call.reserved_micros,
+        // Unknown amounts stay None; they are never projected as zero.
+        actual_cost_micros: call.actual_cost_micros,
+        actual_currency: call.actual_currency.clone(),
+        actual_pricing_version: call.actual_pricing_version.clone(),
+        execution_closed: call.execution_closed,
+        execution_open: !call.execution_closed,
+        terminal_reason: call.terminal_reason.clone(),
+        created_at: call.created_at,
+        dispatched_at: call.dispatched_at,
+        finalized_at: call.finalized_at,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetArtifact {
@@ -936,83 +1101,11 @@ impl Store {
         ctx: &Context,
         authorization: &RootBudgetAuthorization,
     ) -> Result<RootBudgetRecord> {
-        ctx.require(&[Role::Admin])?;
-        let namespaces = validate_authorization(ctx, authorization)?;
         let mut tx = self.pool.begin().await.map_err(internal)?;
-        if let Some(row) = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
-            .bind(&authorization.billing_scope)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(internal)?
-        {
-            let existing_namespaces =
-                load_namespaces(&mut tx, &authorization.billing_scope).await?;
-            let existing = root_from_row(&row, existing_namespaces)?;
-            if existing.root_budget_id != authorization.root_budget_id
-                || existing.authorizing_namespace != ctx.namespace()
-                || existing.allowed_namespaces != namespaces
-                || existing.currency != authorization.currency
-                || existing.pricing_version != authorization.pricing_version
-                || existing.payment_subject != authorization.payment_subject
-                || existing.authorization_receipt_digest
-                    != authorization.authorization_receipt_digest
-                || existing.per_call_cap_micros != authorization.per_call_cap_micros
-                || existing.total_limit_micros != authorization.total_limit_micros
-            {
-                return Err(Error::Conflict(
-                    "billing_scope_already_bound_to_different_root_or_authorization".into(),
-                ));
-            }
-            tx.commit().await.map_err(internal)?;
-            return Ok(existing);
-        }
-
-        sqlx::query(
-            "INSERT INTO root_budgets(
-               billing_scope,root_budget_id,authorizing_namespace,currency,pricing_version,
-               payment_subject,authorization_receipt_digest,per_call_cap_micros,total_limit_micros,created_at
-             ) VALUES(?,?,?,?,?,?,?,?,?,?)",
-        )
-        .bind(&authorization.billing_scope)
-        .bind(&authorization.root_budget_id)
-        .bind(ctx.namespace())
-        .bind(&authorization.currency)
-        .bind(&authorization.pricing_version)
-        .bind(&authorization.payment_subject)
-        .bind(&authorization.authorization_receipt_digest)
-        .bind(authorization.per_call_cap_micros)
-        .bind(authorization.total_limit_micros)
-        .bind(authorization.created_at)
-        .execute(&mut *tx)
-        .await
-        .map_err(internal)?;
-        for namespace in &namespaces {
-            sqlx::query("INSERT INTO root_budget_namespaces(billing_scope,namespace) VALUES(?,?)")
-                .bind(&authorization.billing_scope)
-                .bind(namespace)
-                .execute(&mut *tx)
-                .await
-                .map_err(internal)?;
-        }
-        insert_event(
-            &mut tx,
-            &authorization.billing_scope,
-            None,
-            "root_authorized",
-            authorization.created_at,
-            json!({
-                "root_budget_id": authorization.root_budget_id,
-                "currency": authorization.currency,
-                "pricing_version": authorization.pricing_version,
-                "payment_subject": authorization.payment_subject,
-                "authorization_receipt_digest": authorization.authorization_receipt_digest,
-                "per_call_cap_micros": authorization.per_call_cap_micros,
-                "total_limit_micros": authorization.total_limit_micros,
-                "allowed_namespaces": namespaces,
-            }),
-        )
-        .await?;
+        authorize_root_budget_in_tx(&mut tx, ctx, authorization).await?;
         tx.commit().await.map_err(internal)?;
+        // The original wrapper commits before this separate Admin read; a
+        // Session writer gets the same record from the one transaction.
         self.root_budget(ctx, &authorization.billing_scope)
             .await?
             .ok_or(Error::Internal)
@@ -2023,39 +2116,20 @@ impl Store {
         charge: &UsageCharge,
         now: i64,
     ) -> Result<BudgetCallRecord> {
-        ctx.require(&[Role::Admin])?;
-        identifier(billing_scope)?;
-        identifier(call_id)?;
-        valid_time(now)?;
-        validate_charge(charge)?;
         let mut tx = self.pool.begin().await.map_err(internal)?;
-        let call = load_call(&mut tx, billing_scope, call_id)
-            .await?
-            .ok_or(Error::NotFound)?;
-        require_call_access(&mut tx, ctx, &call).await?;
-        if call.state == BudgetCallState::Finalized {
-            ensure_same_charge(&call, charge)?;
-            tx.commit().await.map_err(internal)?;
-            return Ok(call);
-        }
-        if !matches!(
-            call.state,
-            BudgetCallState::Dispatched | BudgetCallState::Uncertain
-        ) {
-            return Err(Error::Conflict(
-                "reconcile_requires_dispatched_or_uncertain_call".into(),
-            ));
-        }
-        let accounting_overflow =
-            apply_charge(&mut tx, &call, charge, now, "cost_reconciled").await?;
-        let updated = load_call(&mut tx, billing_scope, call_id)
-            .await?
-            .ok_or(Error::Internal)?;
+        let outcome =
+            reconcile_budget_call_cost_in_tx(&mut tx, ctx, billing_scope, call_id, charge, now)
+                .await?;
         tx.commit().await.map_err(internal)?;
-        if accounting_overflow {
-            return Err(Error::Conflict("cost_accounting_overflow".into()));
+        // The original wrapper committed the preserved overflow facts before
+        // reporting this Conflict; that order is unchanged.
+        match outcome {
+            BudgetReconcileOutcome::Applied(call)
+            | BudgetReconcileOutcome::AlreadyFinalized(call) => Ok(call),
+            BudgetReconcileOutcome::PreservedAccountingOverflow(_) => {
+                Err(Error::Conflict("cost_accounting_overflow".into()))
+            }
         }
-        Ok(updated)
     }
 
     pub async fn close_budget_call_execution(
@@ -2309,6 +2383,155 @@ impl Session {
         billing_scope: &str,
     ) -> Result<Option<RootBudgetRecord>> {
         root_budget_in_tx(&mut self.tx, ctx, billing_scope).await
+    }
+
+    /// Writes the real root authorization in the caller's Session. Nothing is
+    /// committed here: the caller's one transaction also holds the management
+    /// job terminal state.
+    pub async fn authorize_root_budget(
+        &mut self,
+        ctx: &Context,
+        authorization: &RootBudgetAuthorization,
+    ) -> Result<RootBudgetRecord> {
+        authorize_root_budget_in_tx(&mut self.tx, ctx, authorization).await
+    }
+
+    /// Applies one real cost reconciliation in the caller's Session and
+    /// returns its typed outcome. An accounting overflow keeps the committed
+    /// charge-preservation facts in the caller's transaction; it is never
+    /// turned into a rollback, refund or zero amount here.
+    pub async fn reconcile_budget_call_cost(
+        &mut self,
+        ctx: &Context,
+        billing_scope: &str,
+        call_id: &str,
+        charge: &UsageCharge,
+        now: i64,
+    ) -> Result<BudgetReconcileOutcome> {
+        reconcile_budget_call_cost_in_tx(&mut self.tx, ctx, billing_scope, call_id, charge, now)
+            .await
+    }
+
+    /// The complete, bounded, read-only open-call projection of one authorized
+    /// root across namespaces. It scans the whole billing scope in keyset pages
+    /// and never narrows to the caller's namespace or dispatch group. The
+    /// cursor is a position, not authority: every page re-checks the Admin role
+    /// and root membership.
+    pub async fn list_open_budget_calls(
+        &mut self,
+        ctx: &Context,
+        billing_scope: &str,
+        page_size: u16,
+        cursor: Option<&str>,
+    ) -> Result<BudgetOpenCallsPage> {
+        ctx.require(&[Role::Admin])?;
+        identifier(billing_scope)?;
+        if !(1..=BUDGET_LIST_OPEN_MAX_PAGE_SIZE).contains(&page_size) {
+            return Err(Error::Invalid(format!(
+                "budget list page_size must be 1..={BUDGET_LIST_OPEN_MAX_PAGE_SIZE}"
+            )));
+        }
+        let root = root_budget_in_tx(&mut self.tx, ctx, billing_scope)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let cursor = cursor.map(parse_budget_list_open_cursor).transpose()?;
+
+        // Pass 1: the anchor covers the whole projected view in call_id order.
+        let mut anchor = hash(
+            format!(
+                "{}\0{}\0{}\0{}\0{}",
+                BUDGET_OPEN_CALLS_PAGE_SCHEMA,
+                billing_scope,
+                root.stopped,
+                root.spent_micros,
+                root.reserved_micros
+            )
+            .as_bytes(),
+        );
+        let mut after = String::new();
+        loop {
+            let rows = sqlx::query(
+                "SELECT * FROM root_budget_calls WHERE billing_scope=? AND call_id>? ORDER BY call_id LIMIT 1000",
+            )
+            .bind(billing_scope)
+            .bind(&after)
+            .fetch_all(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+            if rows.is_empty() {
+                break;
+            }
+            for row in rows {
+                let call = call_from_row(&row)?;
+                after = call.call_id.clone();
+                if let Some(view) = open_call_view(&call) {
+                    let body = serde_json::to_string(&view).map_err(|_| Error::Internal)?;
+                    anchor = hash(format!("{anchor}\0{body}").as_bytes());
+                }
+            }
+        }
+        if let Some(cursor) = &cursor
+            && cursor.anchor != anchor
+        {
+            return Err(Error::Conflict("budget_list_open_anchor_changed".into()));
+        }
+
+        // Pass 2: collect only the requested page (plus one lookahead entry).
+        let mut after = cursor
+            .as_ref()
+            .map(|cursor| cursor.after_call_id.clone())
+            .unwrap_or_default();
+        let mut entries = Vec::with_capacity(usize::from(page_size) + 1);
+        loop {
+            let rows = sqlx::query(
+                "SELECT * FROM root_budget_calls WHERE billing_scope=? AND call_id>? ORDER BY call_id LIMIT 1000",
+            )
+            .bind(billing_scope)
+            .bind(&after)
+            .fetch_all(&mut *self.tx)
+            .await
+            .map_err(internal)?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut last = None;
+            for row in rows {
+                let call = call_from_row(&row)?;
+                last = Some(call.call_id.clone());
+                if let Some(view) = open_call_view(&call) {
+                    entries.push(view);
+                    if entries.len() > usize::from(page_size) {
+                        break;
+                    }
+                }
+            }
+            if entries.len() > usize::from(page_size) {
+                break;
+            }
+            match last {
+                Some(last) => after = last,
+                None => break,
+            }
+        }
+        let complete = entries.len() <= usize::from(page_size);
+        if !complete {
+            entries.truncate(usize::from(page_size));
+        }
+        let next_cursor = if complete {
+            None
+        } else {
+            let last = entries.last().ok_or(Error::Internal)?;
+            Some(format!("v1:{anchor}:{}", last.call_id))
+        };
+        Ok(BudgetOpenCallsPage {
+            schema_version: BUDGET_OPEN_CALLS_PAGE_SCHEMA.into(),
+            billing_scope: billing_scope.into(),
+            anchor,
+            page_size,
+            entries,
+            next_cursor,
+            complete,
+        })
     }
 
     /// Appends one root stage plan version in the caller's Session. The
@@ -3254,6 +3477,94 @@ fn root_budget_seal_summary(
         sealed_by_actor: actor.into(),
         sealed_at: now,
     }
+}
+
+/// The real root authorization writer, shared by the Store wrapper and the
+/// management Session. It never commits: the caller owns the one transaction.
+async fn authorize_root_budget_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    authorization: &RootBudgetAuthorization,
+) -> Result<RootBudgetRecord> {
+    ctx.require(&[Role::Admin])?;
+    let namespaces = validate_authorization(ctx, authorization)?;
+    if let Some(row) = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
+        .bind(&authorization.billing_scope)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(internal)?
+    {
+        let existing_namespaces = load_namespaces(tx, &authorization.billing_scope).await?;
+        let existing = root_from_row(&row, existing_namespaces)?;
+        if existing.root_budget_id != authorization.root_budget_id
+            || existing.authorizing_namespace != ctx.namespace()
+            || existing.allowed_namespaces != namespaces
+            || existing.currency != authorization.currency
+            || existing.pricing_version != authorization.pricing_version
+            || existing.payment_subject != authorization.payment_subject
+            || existing.authorization_receipt_digest != authorization.authorization_receipt_digest
+            || existing.per_call_cap_micros != authorization.per_call_cap_micros
+            || existing.total_limit_micros != authorization.total_limit_micros
+        {
+            return Err(Error::Conflict(
+                "billing_scope_already_bound_to_different_root_or_authorization".into(),
+            ));
+        }
+        return Ok(existing);
+    }
+
+    sqlx::query(
+        "INSERT INTO root_budgets(
+           billing_scope,root_budget_id,authorizing_namespace,currency,pricing_version,
+           payment_subject,authorization_receipt_digest,per_call_cap_micros,total_limit_micros,created_at
+         ) VALUES(?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&authorization.billing_scope)
+    .bind(&authorization.root_budget_id)
+    .bind(ctx.namespace())
+    .bind(&authorization.currency)
+    .bind(&authorization.pricing_version)
+    .bind(&authorization.payment_subject)
+    .bind(&authorization.authorization_receipt_digest)
+    .bind(authorization.per_call_cap_micros)
+    .bind(authorization.total_limit_micros)
+    .bind(authorization.created_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(internal)?;
+    for namespace in &namespaces {
+        sqlx::query("INSERT INTO root_budget_namespaces(billing_scope,namespace) VALUES(?,?)")
+            .bind(&authorization.billing_scope)
+            .bind(namespace)
+            .execute(&mut **tx)
+            .await
+            .map_err(internal)?;
+    }
+    insert_event(
+        tx,
+        &authorization.billing_scope,
+        None,
+        "root_authorized",
+        authorization.created_at,
+        json!({
+            "root_budget_id": authorization.root_budget_id,
+            "currency": authorization.currency,
+            "pricing_version": authorization.pricing_version,
+            "payment_subject": authorization.payment_subject,
+            "authorization_receipt_digest": authorization.authorization_receipt_digest,
+            "per_call_cap_micros": authorization.per_call_cap_micros,
+            "total_limit_micros": authorization.total_limit_micros,
+            "allowed_namespaces": namespaces,
+        }),
+    )
+    .await?;
+    let row = sqlx::query("SELECT * FROM root_budgets WHERE billing_scope=?")
+        .bind(&authorization.billing_scope)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(internal)?;
+    let namespaces = load_namespaces(tx, &authorization.billing_scope).await?;
+    root_from_row(&row, namespaces)
 }
 
 async fn root_budget_in_tx(
@@ -4884,6 +5195,49 @@ async fn release_reserved(
         json!({"reason": reason, "released_micros": call.reserved_micros}),
     )
     .await
+}
+
+/// The one real cost-reconciliation writer. The caller owns the transaction;
+/// the returned outcome distinguishes an applied charge, an idempotent
+/// finalized replay and the committed overflow-preservation facts.
+async fn reconcile_budget_call_cost_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    ctx: &Context,
+    billing_scope: &str,
+    call_id: &str,
+    charge: &UsageCharge,
+    now: i64,
+) -> Result<BudgetReconcileOutcome> {
+    ctx.require(&[Role::Admin])?;
+    identifier(billing_scope)?;
+    identifier(call_id)?;
+    valid_time(now)?;
+    validate_charge(charge)?;
+    let call = load_call(tx, billing_scope, call_id)
+        .await?
+        .ok_or(Error::NotFound)?;
+    require_call_access(tx, ctx, &call).await?;
+    if call.state == BudgetCallState::Finalized {
+        ensure_same_charge(&call, charge)?;
+        return Ok(BudgetReconcileOutcome::AlreadyFinalized(call));
+    }
+    if !matches!(
+        call.state,
+        BudgetCallState::Dispatched | BudgetCallState::Uncertain
+    ) {
+        return Err(Error::Conflict(
+            "reconcile_requires_dispatched_or_uncertain_call".into(),
+        ));
+    }
+    let accounting_overflow = apply_charge(tx, &call, charge, now, "cost_reconciled").await?;
+    let updated = load_call(tx, billing_scope, call_id)
+        .await?
+        .ok_or(Error::Internal)?;
+    if accounting_overflow {
+        Ok(BudgetReconcileOutcome::PreservedAccountingOverflow(updated))
+    } else {
+        Ok(BudgetReconcileOutcome::Applied(updated))
+    }
 }
 
 async fn apply_charge(

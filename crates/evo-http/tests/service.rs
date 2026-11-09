@@ -9,6 +9,9 @@ use evo_http::{
     AuthIdentity, AuthRegistry, HttpState, TOOL_ROUTE_PATHS, router, typed_route_tool_source,
 };
 use evo_storage::Store;
+use evo_storage::budget::{
+    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
+};
 use evo_storage::replay::{register_replay_pool, seal_replay_world};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -2802,4 +2805,438 @@ async fn http_typed_route_source_is_server_owned_and_keeps_authentication_order(
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
     store.close().await;
+}
+
+const WORKER_TOKEN: &str = "worker-token-0123456789";
+const OTHER_ADMIN_TOKEN: &str = "other-admin-token-0123456789";
+const BUDGET_SCOPE: &str = "scope-http";
+
+fn registry_with_worker() -> AuthRegistry {
+    AuthRegistry::from_plaintext(vec![
+        (
+            AGENT_A_TOKEN.into(),
+            AuthIdentity::new("tenant-a", "agent-a", Role::Agent).unwrap(),
+        ),
+        (
+            ADMIN_TOKEN.into(),
+            AuthIdentity::new("tenant-a", "admin", Role::Admin).unwrap(),
+        ),
+        (
+            HOST_TOKEN.into(),
+            AuthIdentity::new("tenant-a", "gateway-host", Role::Host).unwrap(),
+        ),
+        (
+            EVALUATOR_TOKEN.into(),
+            AuthIdentity::new("tenant-a", "evaluator", Role::Evaluator).unwrap(),
+        ),
+        (
+            WORKER_TOKEN.into(),
+            AuthIdentity::new("tenant-a", "worker", Role::Worker).unwrap(),
+        ),
+    ])
+    .unwrap()
+}
+
+fn registry_with_other_admin() -> AuthRegistry {
+    AuthRegistry::from_plaintext(vec![
+        (
+            ADMIN_TOKEN.into(),
+            AuthIdentity::new("tenant-a", "admin", Role::Admin).unwrap(),
+        ),
+        (
+            EVALUATOR_TOKEN.into(),
+            AuthIdentity::new("tenant-a", "evaluator", Role::Evaluator).unwrap(),
+        ),
+        (
+            OTHER_ADMIN_TOKEN.into(),
+            AuthIdentity::new("tenant-b", "other-admin", Role::Admin).unwrap(),
+        ),
+    ])
+    .unwrap()
+}
+
+fn budget_authorize_body() -> Value {
+    json!({
+        "schema_version":"rsia.management.budget_root_authorize.v1",
+        "request_key":"http-root-authorize",
+        "root_budget_id":"root-http",
+        "billing_scope":BUDGET_SCOPE,
+        "allowed_namespaces":["tenant-a"],
+        "currency":"USD",
+        "pricing_version":"price-v1",
+        "payment_subject":"payer-1",
+        "authorization_receipt_digest":d("receipt"),
+        "per_call_cap_micros":1000,
+        "total_limit_micros":1000
+    })
+}
+
+fn budget_plan_body() -> Value {
+    use evo_core::evaluation::{Money, OptimizationBudgetPlan, RootStageBudgetPlanV1};
+    let mut budget = OptimizationBudgetPlan::unfunded(BUDGET_SCOPE, "payer-1", "USD").unwrap();
+    budget.root_total = Money {
+        currency: "USD".into(),
+        pricing_version: "price-v1".into(),
+        amount: "0.001".into(),
+    };
+    budget.admin_authorization_receipt_digest = Some(d("receipt"));
+    for stage in &mut budget.stages {
+        stage.per_call_limit = Money {
+            currency: "USD".into(),
+            pricing_version: "price-v1".into(),
+            amount: "0".into(),
+        };
+        stage.experiment_total = Money {
+            currency: "USD".into(),
+            pricing_version: "price-v1".into(),
+            amount: "0".into(),
+        };
+    }
+    serde_json::to_value(RootStageBudgetPlanV1::from_optimization_budget(budget)).unwrap()
+}
+
+#[tokio::test]
+async fn budget_operations_require_admin_before_payload_identity_and_json() {
+    let (dir, state) = state(registry_with_worker()).await;
+    let path = dir.path().join("http.sqlite3");
+    let before = management_sql_snapshot(&path);
+    let (base, server) = spawn(state).await;
+    let client = reqwest::Client::new();
+    let operations = [
+        "budget.root.authorize",
+        "budget.stage_plan.bind",
+        "budget.calls.list_open",
+        "budget.call.reconcile",
+    ];
+    for operation in operations {
+        let route = format!("/v1/manage/{operation}");
+        for token in [None, Some("invalid-token-0123456789")] {
+            let response = post(&client, &base, &route, token, json!({"actor":"forged"})).await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{operation}");
+        }
+        // Every non-Admin role is refused before the body is parsed, even a
+        // body that is not JSON or repeats a key.
+        for token in [AGENT_A_TOKEN, HOST_TOKEN, EVALUATOR_TOKEN, WORKER_TOKEN] {
+            let response = raw_post(&client, &base, &route, token, "{").await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{operation}");
+            assert_eq!(
+                response.json::<Value>().await.unwrap(),
+                json!({"error":{"code":"forbidden"}}),
+                "{operation}"
+            );
+            let duplicate = r#"{"schema_version":"first","schema_version":"second"}"#;
+            let response = raw_post(&client, &base, &route, token, duplicate).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{operation}");
+        }
+        // Identity headers are refused by authentication before the Admin gate.
+        let response = client
+            .post(format!("{base}{route}"))
+            .bearer_auth(ADMIN_TOKEN)
+            .header("x-role", "Admin")
+            .body("{")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{operation}");
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":"identity_headers_forbidden"}})
+        );
+        // Admin reaches the strict JSON and body-identity gates.
+        let response = raw_post(&client, &base, &route, ADMIN_TOKEN, "{").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{operation}");
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":"invalid_management_payload"}})
+        );
+        let duplicate = r#"{"schema_version":"first","schema_version":"second"}"#;
+        let response = raw_post(&client, &base, &route, ADMIN_TOKEN, duplicate).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{operation}");
+        let response = post(
+            &client,
+            &base,
+            &route,
+            Some(ADMIN_TOKEN),
+            json!({"role":"Admin"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{operation}");
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":"body_identity_forbidden"}})
+        );
+        // The route's 64 KiB body limit still applies before the handler.
+        let huge = format!(r#"{{"schema_version":"{}"}}"#, "x".repeat(70_000));
+        let response = raw_post(&client, &base, &route, ADMIN_TOKEN, &huge).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "{operation}"
+        );
+    }
+    assert_eq!(management_sql_snapshot(&path), before);
+    server.abort();
+}
+
+#[tokio::test]
+async fn budget_authorize_bind_and_list_pass_real_results_through_http() {
+    let (_dir, state) = state(registry()).await;
+    let (base, server) = spawn(state).await;
+    let client = reqwest::Client::new();
+
+    let authorize = budget_authorize_body();
+    let accepted: Value = post(
+        &client,
+        &base,
+        "/v1/manage/budget.root.authorize",
+        Some(ADMIN_TOKEN),
+        authorize.clone(),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let id = accepted["id"].as_str().unwrap();
+    let completed = wait_job(&client, &base, ADMIN_TOKEN, id).await;
+    assert_eq!(completed["state"], "succeeded", "{completed}");
+    assert_eq!(completed["result"]["result"], "root_authorized");
+    assert_eq!(completed["result"]["root"]["root_budget_id"], "root-http");
+    assert_eq!(completed["result"]["root"]["spent_micros"], 0);
+    assert_eq!(completed["fee_knowledge"]["state"], "known_none");
+    // The same request key and payload is the same job, not a second root.
+    let repeated: Value = post(
+        &client,
+        &base,
+        "/v1/manage/budget.root.authorize",
+        Some(ADMIN_TOKEN),
+        authorize,
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(repeated["id"], id);
+
+    let bind = json!({
+        "schema_version":"rsia.management.budget_stage_plan_bind.v1",
+        "request_key":"http-stage-bind",
+        "billing_scope":BUDGET_SCOPE,
+        "expected_seq":0,
+        "plan":budget_plan_body()
+    });
+    let accepted: Value = post(
+        &client,
+        &base,
+        "/v1/manage/budget.stage_plan.bind",
+        Some(ADMIN_TOKEN),
+        bind,
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let completed = wait_job(
+        &client,
+        &base,
+        ADMIN_TOKEN,
+        accepted["id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(completed["state"], "succeeded", "{completed}");
+    assert_eq!(completed["result"]["result"], "stage_plan_bound");
+    assert_eq!(completed["result"]["binding"]["seq"], 1);
+
+    let accepted: Value = post(
+        &client,
+        &base,
+        "/v1/manage/budget.calls.list_open",
+        Some(ADMIN_TOKEN),
+        json!({
+            "schema_version":"rsia.management.budget_calls_list_open.v1",
+            "request_key":"http-list-open",
+            "billing_scope":BUDGET_SCOPE,
+            "page_size":10
+        }),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let completed = wait_job(
+        &client,
+        &base,
+        ADMIN_TOKEN,
+        accepted["id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(completed["state"], "succeeded", "{completed}");
+    assert_eq!(completed["result"]["result"], "open_calls_listed");
+    assert_eq!(completed["result"]["page"]["complete"], true);
+    assert_eq!(completed["result"]["page"]["entries"], json!([]));
+    assert_eq!(completed["result"]["page"]["next_cursor"], Value::Null);
+    assert_eq!(completed["fee_knowledge"]["state"], "known_none");
+    server.abort();
+}
+
+#[tokio::test]
+async fn budget_reconcile_http_and_non_root_admin_list_denial() {
+    let (_dir, state) = state(registry_with_other_admin()).await;
+    let store = state.service.store().clone();
+    let admin = Context::new("tenant-a", "admin", Role::Admin).unwrap();
+    let worker = Context::new("tenant-a", "worker", Role::Worker).unwrap();
+    store
+        .authorize_root_budget(
+            &admin,
+            &RootBudgetAuthorization {
+                root_budget_id: "root-http".into(),
+                billing_scope: BUDGET_SCOPE.into(),
+                allowed_namespaces: vec!["tenant-a".into()],
+                currency: "USD".into(),
+                pricing_version: "price-v1".into(),
+                payment_subject: "payer-1".into(),
+                authorization_receipt_digest: d("receipt"),
+                per_call_cap_micros: 1000,
+                total_limit_micros: 1000,
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let call = store
+        .reserve_budget_call(
+            &worker,
+            &BudgetCallReservation {
+                billing_scope: BUDGET_SCOPE.into(),
+                call_id: "call-http".into(),
+                dispatch_group_id: "group-http".into(),
+                stage: BudgetStage::Reflection,
+                actual_input_digest: d("input"),
+                request_artifact: None,
+                max_cost_micros: 30,
+                lease_token: "lease-http".into(),
+                lease_until: 102,
+                now: 2,
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .begin_budget_dispatch(
+            &worker,
+            &BudgetCallFence {
+                billing_scope: call.billing_scope.clone(),
+                call_id: call.call_id.clone(),
+                actual_input_digest: call.actual_input_digest.clone(),
+                lease_token: call.lease_token.clone(),
+                lease_epoch: call.lease_epoch,
+                now: 3,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (base, server) = spawn(state).await;
+    let client = reqwest::Client::new();
+    let accepted: Value = post(
+        &client,
+        &base,
+        "/v1/manage/budget.call.reconcile",
+        Some(ADMIN_TOKEN),
+        json!({
+            "schema_version":"rsia.management.budget_call_reconcile.v1",
+            "request_key":"http-reconcile",
+            "billing_scope":BUDGET_SCOPE,
+            "call_id":"call-http",
+            "provider_request_id":"provider-http",
+            "usage_record_id":"usage-http",
+            "output_digest":d("output-http"),
+            "amount_micros":12,
+            "currency":"USD",
+            "pricing_version":"price-v1"
+        }),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let completed = wait_job(
+        &client,
+        &base,
+        ADMIN_TOKEN,
+        accepted["id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(completed["state"], "succeeded", "{completed}");
+    assert_eq!(completed["result"]["result"], "call_reconciled");
+    assert_eq!(completed["result"]["call"]["state"], "finalized");
+    assert_eq!(completed["result"]["call"]["actual_cost_micros"], 12);
+    assert_eq!(completed["result"]["accounting_overflow"], false);
+    // No provider carrier exists, so the result never asserts a verified
+    // supplier reconciliation.
+    assert_eq!(completed["result"]["provider_source_verified"], false);
+    assert_eq!(
+        store
+            .root_budget(&admin, BUDGET_SCOPE)
+            .await
+            .unwrap()
+            .unwrap()
+            .spent_micros,
+        12
+    );
+
+    // The finalized call keeps its execution open and appears in the Admin's
+    // own list; a non-member Admin gets a failed job with no page.
+    let accepted: Value = post(
+        &client,
+        &base,
+        "/v1/manage/budget.calls.list_open",
+        Some(ADMIN_TOKEN),
+        json!({
+            "schema_version":"rsia.management.budget_calls_list_open.v1",
+            "request_key":"http-list-own",
+            "billing_scope":BUDGET_SCOPE,
+            "page_size":10
+        }),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let own = wait_job(
+        &client,
+        &base,
+        ADMIN_TOKEN,
+        accepted["id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(own["result"]["page"]["entries"][0]["call_id"], "call-http");
+    assert_eq!(own["result"]["page"]["entries"][0]["execution_open"], true);
+
+    let accepted: Value = post(
+        &client,
+        &base,
+        "/v1/manage/budget.calls.list_open",
+        Some(OTHER_ADMIN_TOKEN),
+        json!({
+            "schema_version":"rsia.management.budget_calls_list_open.v1",
+            "request_key":"http-list-denied",
+            "billing_scope":BUDGET_SCOPE,
+            "page_size":10
+        }),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    let denied = wait_job(
+        &client,
+        &base,
+        OTHER_ADMIN_TOKEN,
+        accepted["id"].as_str().unwrap(),
+    )
+    .await;
+    assert_eq!(denied["state"], "failed", "{denied}");
+    assert_eq!(denied["error_code"], "not_found");
+    assert_eq!(denied["result"], Value::Null);
+    server.abort();
 }

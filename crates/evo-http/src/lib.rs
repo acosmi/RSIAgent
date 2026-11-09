@@ -370,7 +370,14 @@ async fn management(
     body: Bytes,
 ) -> std::result::Result<Json<Value>, HttpError> {
     let caller = state.auth.authenticate(&headers)?;
-    if operation == "backup.create" {
+    if matches!(
+        operation.as_str(),
+        "backup.create"
+            | "budget.root.authorize"
+            | "budget.stage_plan.bind"
+            | "budget.calls.list_open"
+            | "budget.call.reconcile"
+    ) {
         caller.require(&[Role::Admin])?;
     }
     let body = parse_unique_value(&body, "invalid_management_payload")?;
