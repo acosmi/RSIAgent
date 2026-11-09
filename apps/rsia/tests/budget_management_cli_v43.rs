@@ -12,21 +12,26 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     process::{Command, Output},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 const TOKEN: &str = "budget-cli-fixture-secret-0123456789";
+static NEXT: AtomicU64 = AtomicU64::new(0);
 
 struct Scratch(PathBuf);
 impl Scratch {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
-            "rsia-budget-cli-{}-{}",
+            "rsia-budget-cli-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&root).unwrap();
         std::fs::write(

@@ -1101,6 +1101,10 @@ impl Store {
         ctx: &Context,
         authorization: &RootBudgetAuthorization,
     ) -> Result<RootBudgetRecord> {
+        // The original wrapper validates before it touches the pool; the
+        // Session writer performs the same validation in its own transaction.
+        ctx.require(&[Role::Admin])?;
+        validate_authorization(ctx, authorization)?;
         let mut tx = self.pool.begin().await.map_err(internal)?;
         authorize_root_budget_in_tx(&mut tx, ctx, authorization).await?;
         tx.commit().await.map_err(internal)?;
@@ -2116,6 +2120,13 @@ impl Store {
         charge: &UsageCharge,
         now: i64,
     ) -> Result<BudgetCallRecord> {
+        // Preserve the original validation-before-pool order; the shared
+        // in-tx kernel repeats the same checks for its Session callers.
+        ctx.require(&[Role::Admin])?;
+        identifier(billing_scope)?;
+        identifier(call_id)?;
+        valid_time(now)?;
+        validate_charge(charge)?;
         let mut tx = self.pool.begin().await.map_err(internal)?;
         let outcome =
             reconcile_budget_call_cost_in_tx(&mut tx, ctx, billing_scope, call_id, charge, now)
