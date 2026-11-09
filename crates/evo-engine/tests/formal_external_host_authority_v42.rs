@@ -14,7 +14,7 @@ use evo_core::contract::{
 use evo_core::evaluation::{
     ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec, FormalExperimentPlanV41,
     FormalStatisticalUnit, Money, OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind,
-    Verdict,
+    RootStageBudgetPlanV1, Verdict,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::holdout::{
@@ -42,7 +42,8 @@ use evo_engine::streaming_evaluator::{
     verified_report_view_in_session,
 };
 use evo_storage::budget::{
-    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization, UsageCharge,
+    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
+    RootStagePlanBindRequest, UsageCharge,
 };
 use evo_storage::{Session, Store};
 use serde::Serialize;
@@ -781,7 +782,7 @@ async fn prepare_control_ingress(order: TicketOrder) -> Option<IngressFx> {
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded(BILLING, "payer", "USD").unwrap();
+    let mut budget = OptimizationBudgetPlan::unfunded(BILLING, "fixture-only", "USD").unwrap();
     budget.root_total = money("0.001");
     budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
     for stage in &mut budget.stages {
@@ -912,6 +913,23 @@ async fn prepare_control_ingress(order: TicketOrder) -> Option<IngressFx> {
         host: host.clone(),
         set: set.clone(),
     };
+    {
+        let binding_store = Store::open(&db).await.unwrap();
+        binding_store
+            .bind_root_stage_plan(
+                &admin,
+                &RootStagePlanBindRequest {
+                    billing_scope: current.billing_scope.clone(),
+                    expected_seq: 0,
+                    plan: RootStageBudgetPlanV1::from_optimization_budget(
+                        current.optimization_budget.clone(),
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        binding_store.close().await;
+    }
     register_current_ingress(&ingress, &current).await;
     let store = Store::open(&db).await.unwrap();
     let candidate_bundle = compile(

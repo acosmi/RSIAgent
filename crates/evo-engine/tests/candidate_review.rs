@@ -3,6 +3,54 @@
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
+#[allow(async_fn_in_trait)]
+trait E05Reserve {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord>;
+}
+
+impl E05Reserve for evo_storage::Store {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord> {
+        let ticket_storage_id = format!(
+            "e05-{}",
+            evo_core::fingerprint(&("evaluation_ticket_v2", &request.dispatch_group_id)).unwrap()
+        );
+        let mut session = self.session().await.unwrap();
+        let stored = session
+            .object_row(ctx, "artifact", &ticket_storage_id)
+            .await
+            .unwrap()
+            .expect("the fixture ticket must be persisted before its E05 reservation");
+        let ticket_body: serde_json::Value = serde_json::from_str(&stored.body).unwrap();
+        let witness = evo_storage::budget::StagePlanAttribution::E05Ticket(
+            evo_storage::budget::E05TicketWitness {
+                ticket_kind: "evaluation_ticket_v2".into(),
+                ticket_id: request.dispatch_group_id.clone(),
+                ticket_storage_id,
+                ticket_digest: evo_core::canonical_fingerprint(&ticket_body).unwrap(),
+            },
+        );
+        let result = session
+            .reserve_budget_call_with_stage_plan_typed(ctx, request, &[], &witness)
+            .await
+            .unwrap();
+        match result {
+            Ok(call) => {
+                session.commit().await.unwrap();
+                Ok(call)
+            }
+            Err(refusal) => Err(refusal.into_reservation_error()),
+        }
+    }
+}
+
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, ResolvedBundleV3, SkillPatch,
     SkillSnapshot, compile_bundle,
@@ -10,7 +58,7 @@ use evo_core::contract::{
 use evo_core::evaluation::{
     ControlCondition, ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
     FormalExperimentPlanV41, FormalStatisticalUnit, Money, OptimizationBudgetPlan,
-    OptimizerComparisonContract, ProfileKind,
+    OptimizerComparisonContract, ProfileKind, RootStageBudgetPlanV1,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, SourceSelection, TaskOrigin};
 use evo_core::holdout::{
@@ -53,7 +101,7 @@ use evo_engine::streaming_evaluator::{
 use evo_storage::Store;
 use evo_storage::budget::{
     BudgetCallFence, BudgetCallRef, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
-    UsageCharge,
+    RootStagePlanBindRequest, UsageCharge,
 };
 use evo_storage::lifecycle::{REVOKE_TOMBSTONE_SCHEMA, RevokeTombstone};
 use serde_json::{Value, json};
@@ -1935,7 +1983,7 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
+    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "fixture-only", "USD").unwrap();
     budget.root_total = money("0.001");
     budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
     for stage in &mut budget.stages {
@@ -2017,6 +2065,19 @@ async fn formal_fixture(n: u32, sequential: bool) -> FormalFixture {
         evidence_scope: EvaluationEvidenceScope::ProgramFixture,
         created_at_unix_seconds: 2,
     };
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: control.billing_scope.clone(),
+                expected_seq: 0,
+                plan: RootStageBudgetPlanV1::from_optimization_budget(
+                    control.optimization_budget.clone(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
     IndependentEvaluationControl::register_current_control(&evaluator, &store, control.clone())
         .await
         .unwrap();
@@ -2202,7 +2263,7 @@ async fn formal_execute_output(
     let now = 10 + i64::from(ordinal) * 5;
     fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),

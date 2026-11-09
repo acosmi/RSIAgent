@@ -136,7 +136,9 @@ async fn legacy_and_current_jobs_keep_restore_and_cleanup_protection() {
         .unwrap()
         .parent()
         .unwrap();
-    let dest = dir.path().join("restored");
+    // The restore script rejects symlinked ancestry. macOS tempdirs live below
+    // the /var -> /private/var symlink, so hand it the canonical owned path.
+    let dest = path.parent().unwrap().join("restored");
     let output = std::process::Command::new("python3")
         .arg("-B")
         .arg(root.join("scripts/restore_backup.py"))

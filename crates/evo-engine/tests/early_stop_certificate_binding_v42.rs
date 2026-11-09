@@ -3,13 +3,61 @@
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
+#[allow(async_fn_in_trait)]
+trait E05Reserve {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord>;
+}
+
+impl E05Reserve for evo_storage::Store {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord> {
+        let ticket_storage_id = format!(
+            "e05-{}",
+            evo_core::fingerprint(&("evaluation_ticket_v2", &request.dispatch_group_id)).unwrap()
+        );
+        let mut session = self.session().await.unwrap();
+        let stored = session
+            .object_row(ctx, "artifact", &ticket_storage_id)
+            .await
+            .unwrap()
+            .expect("the fixture ticket must be persisted before its E05 reservation");
+        let ticket_body: serde_json::Value = serde_json::from_str(&stored.body).unwrap();
+        let witness = evo_storage::budget::StagePlanAttribution::E05Ticket(
+            evo_storage::budget::E05TicketWitness {
+                ticket_kind: "evaluation_ticket_v2".into(),
+                ticket_id: request.dispatch_group_id.clone(),
+                ticket_storage_id,
+                ticket_digest: evo_core::canonical_fingerprint(&ticket_body).unwrap(),
+            },
+        );
+        let result = session
+            .reserve_budget_call_with_stage_plan_typed(ctx, request, &[], &witness)
+            .await
+            .unwrap();
+        match result {
+            Ok(call) => {
+                session.commit().await.unwrap();
+                Ok(call)
+            }
+            Err(refusal) => Err(refusal.into_reservation_error()),
+        }
+    }
+}
+
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, SkillPatch, SkillSnapshot,
 };
 use evo_core::evaluation::{
     ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec, FormalExperimentPlanV41,
     FormalStatisticalUnit, Money, OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind,
-    Verdict,
+    RootStageBudgetPlanV1, Verdict,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::holdout::{
@@ -38,7 +86,7 @@ use evo_engine::streaming_evaluator::{
 use evo_storage::Store;
 use evo_storage::budget::{
     BudgetCallFence, BudgetCallReservation, BudgetCallState, BudgetStage, RootBudgetAuthorization,
-    UsageCharge,
+    RootStagePlanBindRequest, UsageCharge,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -261,8 +309,27 @@ print(json.dumps({'control_utf8':case['control_utf8'],'holdout_utf8':case['holdo
     let worker = Context::new(NAMESPACE, "executor", Role::Worker).unwrap();
     let store = Store::open(&db_path).await.unwrap();
     let before = catalog(&db_path);
-    assert_eq!(before, original["catalog"]);
-    assert_eq!(before["tables"].as_array().unwrap().len(), 22);
+    // The archived history predates 0008. Only the three new `root_budget_stage_plan_%`
+    // tables/indexes are absent from that frozen catalog; every pre-0008 row must
+    // still match byte for byte.
+    let filtered = without_root_stage_plan(before.clone());
+    assert_eq!(filtered["tables"], original["catalog"]["tables"]);
+    assert_eq!(filtered["xinfo"], original["catalog"]["xinfo"]);
+    let schema = filtered["schema"].as_array().unwrap();
+    let original_schema = original["catalog"]["schema"].as_array().unwrap();
+    let extra: Vec<_> = schema
+        .iter()
+        .filter(|row| !original_schema.contains(row))
+        .collect();
+    let missing: Vec<_> = original_schema
+        .iter()
+        .filter(|row| !schema.contains(row))
+        .collect();
+    assert!(
+        extra.is_empty() && missing.is_empty(),
+        "extra={extra:?} missing={missing:?}"
+    );
+    assert_eq!(before["tables"].as_array().unwrap().len(), 25);
     let admin = Context::new(NAMESPACE, "admin", Role::Admin).unwrap();
     let mut session = store.session().await.unwrap();
     assert_eq!(
@@ -465,7 +532,8 @@ async fn current_fixture(case: &str, schema: &str, sequential: bool) -> Fixture 
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded(BILLING_SCOPE, "payer", "USD").unwrap();
+    let mut budget =
+        OptimizationBudgetPlan::unfunded(BILLING_SCOPE, "local-software-fixture", "USD").unwrap();
     budget.root_total = money("0.02");
     budget.admin_authorization_receipt_digest = Some(digest("fixture-budget-authorization"));
     for stage in &mut budget.stages {
@@ -540,6 +608,19 @@ async fn current_fixture(case: &str, schema: &str, sequential: bool) -> Fixture 
         created_at_unix_seconds: 2,
     };
     let registered = current_control(&control, sequential);
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: registered.billing_scope.clone(),
+                expected_seq: 0,
+                plan: RootStageBudgetPlanV1::from_optimization_budget(
+                    registered.optimization_budget.clone(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
     IndependentEvaluationControl::register_current_control(&evaluator, &store, registered.clone())
         .await
         .unwrap();
@@ -781,7 +862,7 @@ async fn execute(
     let lease = format!("lease-{ordinal}");
     fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: BILLING_SCOPE.into(),
@@ -1429,6 +1510,46 @@ async fn assert_refused_without_writes(
 
 // Read-only catalog of this fixture's DB, including full schema/xinfo metadata,
 // typed cells, virtual and shadow tables, hidden columns, and every actual row.
+fn without_root_stage_plan(mut catalog: Value) -> Value {
+    let is_stage_plan = |name: &str| {
+        name.starts_with("root_budget_stage_plan_")
+            || name.starts_with("sqlite_autoindex_root_budget_stage_plan_")
+    };
+    for key in ["schema", "xinfo", "tables"] {
+        let name_index = if key == "schema" { 1 } else { 0 };
+        if let Some(rows) = catalog[key].as_array_mut() {
+            rows.retain(|row| {
+                !row.get(name_index)
+                    .and_then(Value::as_str)
+                    .is_some_and(is_stage_plan)
+            });
+        }
+    }
+    // 0008 also appends its own ledger row to an existing table.
+    if let Some(tables) = catalog["tables"].as_array_mut() {
+        for table in tables {
+            if table[0] == "_sqlx_migrations"
+                && let Some(rows) = table[2].as_array_mut()
+            {
+                rows.retain(|row| {
+                    let Some(raw) = row.as_str() else {
+                        return true;
+                    };
+                    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+                        return true;
+                    };
+                    parsed
+                        .get(0)
+                        .and_then(|value| value.get(1))
+                        .and_then(Value::as_i64)
+                        != Some(8)
+                });
+            }
+        }
+    }
+    catalog
+}
+
 fn catalog(path: &Path) -> Value {
     let source = r#"
 import json,sqlite3,sys
@@ -1614,7 +1735,7 @@ async fn start_pending(fixture: &Fixture) -> Pending {
     let call_id = "pending-r59".to_owned();
     fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: BILLING_SCOPE.into(),
@@ -1813,7 +1934,7 @@ async fn legal_out_of_order_first_futility_and_root_stopped_history_read_back() 
     assert_eq!(history.watermark, positive.watermark);
     let blocked = fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: BILLING_SCOPE.into(),

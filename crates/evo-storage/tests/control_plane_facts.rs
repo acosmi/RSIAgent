@@ -179,6 +179,9 @@ async fn facts_cover_watermarks_tombstones_protected_objects_and_root_budget_row
             "root_budget_dispatch_groups",
             "root_budget_events",
             "root_budget_namespaces",
+            "root_budget_stage_plan_bindings",
+            "root_budget_stage_plan_calls",
+            "root_budget_stage_plan_controls",
             "root_budgets"
         ]
     );

@@ -18,7 +18,8 @@ const CONTROL_SCOPE: &str = "ag082-control-scope";
 
 type BudgetSnapshot = BTreeMap<&'static str, Vec<String>>;
 
-// Every column from migration 0005, including nullable call artifacts and event details.
+// Every column from migrations 0005 and 0008, including nullable call
+// artifacts and event details.
 const BUDGET_PROJECTIONS: &[(&str, &str, &str)] = &[
     (
         "root_budgets",
@@ -53,6 +54,27 @@ const BUDGET_PROJECTIONS: &[(&str, &str, &str)] = &[
         "root_budget_events",
         "seq,billing_scope,call_id,event_kind,event_at,details",
         "seq",
+    ),
+    // 0008 adds the append-only root stage plan family. They are part of the
+    // same root budget rollback surface and must stay empty on every failure.
+    (
+        "root_budget_stage_plan_bindings",
+        "billing_scope,seq,plan_schema,plan_digest,plan_body,payer_id,root_total_micros,\
+         currency,pricing_version,authorization_receipt_digest,authorizing_namespace,\
+         bound_by_actor,created_at",
+        "billing_scope,seq",
+    ),
+    (
+        "root_budget_stage_plan_controls",
+        "billing_scope,namespace,control_kind,control_id,control_digest,binding_seq,\
+         plan_digest,created_at",
+        "namespace,control_kind,control_id",
+    ),
+    (
+        "root_budget_stage_plan_calls",
+        "billing_scope,call_id,namespace,stage,binding_seq,plan_digest,\
+         course_producer_ref,created_at",
+        "billing_scope,call_id",
     ),
 ];
 

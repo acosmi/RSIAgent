@@ -1197,7 +1197,7 @@ mod e05_fx {
         IndependentEvaluationControl, ProtectedHoldoutRecordV2 as ProtectedHoldoutRecord,
         ProtectedInputRef, RegisteredEvaluationControlV3 as RegisteredEvaluationControl,
     };
-    use evo_storage::budget::RootBudgetAuthorization;
+    use evo_storage::budget::{RootBudgetAuthorization, RootStagePlanBindRequest};
 
     fn money(amount: &str) -> Money {
         Money {
@@ -1330,7 +1330,8 @@ mod e05_fx {
             }],
         )
         .unwrap();
-        let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
+        let mut budget =
+            OptimizationBudgetPlan::unfunded("billing-1", "fixture-only", "USD").unwrap();
         budget.root_total = money("0.001");
         budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
         for stage in &mut budget.stages {
@@ -1388,6 +1389,20 @@ mod e05_fx {
             evidence_scope: EvaluationEvidenceScope::ProgramFixture,
             created_at_unix_seconds: 2,
         };
+        // A Current control registers only against a real active root stage plan.
+        store
+            .bind_root_stage_plan(
+                &admin,
+                &RootStagePlanBindRequest {
+                    billing_scope: "billing-1".into(),
+                    expected_seq: 0,
+                    plan: evo_core::evaluation::RootStageBudgetPlanV1::from_optimization_budget(
+                        control.optimization_budget.clone(),
+                    ),
+                },
+            )
+            .await
+            .unwrap();
         IndependentEvaluationControl::register_current_control(&evaluator, &store, control.clone())
             .await
             .unwrap();

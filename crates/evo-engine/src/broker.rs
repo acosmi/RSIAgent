@@ -4,8 +4,8 @@
 //! a separately authorized `ModelTransport`; the default transport is disabled.
 
 use crate::model::{
-    ModelExecutionProvenance, ModelExecutionReceipt, ModelPort, ModelRejectionKind, ModelResponse,
-    RejectedDispatch,
+    DevelopmentControlSelector, ModelExecutionProvenance, ModelExecutionReceipt, ModelPort,
+    ModelRejectionKind, ModelResponse, RejectedDispatch,
 };
 use async_trait::async_trait;
 use evo_core::optimization::{ModelRequest, ModelStage};
@@ -15,7 +15,8 @@ use evo_core::{
 use evo_storage::budget::{
     BudgetArtifact, BudgetCallFence, BudgetCallRecord, BudgetCallRefence, BudgetCallReservation,
     BudgetCallState, BudgetDispatchDecision, BudgetExecutionProvenance, BudgetPreDispatchRefusal,
-    BudgetStage, ModelCallSettlementEvidence, RootBudgetRecord, UsageCharge,
+    BudgetStage, E05TicketWitness, ModelCallSettlementEvidence, RootBudgetRecord,
+    StagePlanAttribution, StagePlanControlSelector, StagePlanRefusal, UsageCharge,
 };
 use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
@@ -305,8 +306,27 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                 .ok_or(Error::Budget)?,
             now,
         };
+        // The actual formal task was verified in this Session above. Storage
+        // still re-reads the persisted ticket before admitting TaskExecution on
+        // a bound root; a stage label alone never bypasses the stage gate. The
+        // digest is the canonical digest of that same persisted ticket envelope,
+        // not the task view, so storage can bind the witness to the ticket body.
+        let ticket_witness = StagePlanAttribution::E05Ticket(E05TicketWitness {
+            ticket_kind: crate::streaming_evaluator::TICKET_KIND.into(),
+            ticket_id: request.task.ticket_id.clone(),
+            ticket_storage_id: crate::streaming_evaluator::storage_id(
+                crate::streaming_evaluator::TICKET_KIND,
+                &request.task.ticket_id,
+            )?,
+            ticket_digest: crate::formal_authority::stored_formal_ticket_digest(
+                &mut s,
+                &ctx,
+                &request.task.ticket_id,
+            )
+            .await?,
+        });
         let call = s
-            .reserve_budget_call_with_sources(
+            .reserve_budget_call_with_stage_plan_typed(
                 &ctx,
                 &reservation,
                 &candidate
@@ -314,8 +334,10 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                     .iter()
                     .map(|v| v.id.clone())
                     .collect::<Vec<_>>(),
+                &ticket_witness,
             )
-            .await?;
+            .await?
+            .map_err(BudgetPreDispatchRefusal::into_reservation_error)?;
         s.commit().await?;
         let fence = BudgetCallFence {
             billing_scope: billing.clone(),
@@ -860,6 +882,23 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                 request,
                 &BudgetPreDispatchRefusal::SourceRevoked,
             ))),
+            Err(refusal) if refusal.is_stage_plan() => {
+                // The begin gate judged a still-undispatched reservation. Release
+                // that reservation and write the one refusal event in the same
+                // Session and commit; dropping the Session would only roll back
+                // this transaction while a previously committed Reserved call
+                // stayed reserved forever.
+                self.release_stage_plan_refusal_in_session(
+                    &mut session,
+                    ctx,
+                    fence,
+                    model_stage_budget(request.stage),
+                    &refusal,
+                )
+                .await?;
+                session.commit().await?;
+                Ok(Err(pre_dispatch_refusal(request, &refusal)))
+            }
             Err(refusal) => Ok(Err(self
                 .release_pre_dispatch(session, ctx, request, root, fence, refusal.code())
                 .await?)),
@@ -1051,15 +1090,87 @@ impl<T: ModelTransport> ModelPort for PersistentModelBroker<T> {
         &self,
         bound: crate::model::ReadBoundModelRequest,
     ) -> Result<ModelResponse> {
-        self.dispatch_management_bound(bound, None).await
+        self.dispatch_management_bound(bound, None, None).await
+    }
+
+    async fn dispatch_compiler_bound_with_development_control(
+        &self,
+        bound: crate::model::ReadBoundModelRequest,
+        selector: Option<DevelopmentControlSelector>,
+    ) -> Result<ModelResponse> {
+        self.dispatch_management_bound(bound, None, selector.as_ref())
+            .await
     }
 }
 
 impl<T: ModelTransport> PersistentModelBroker<T> {
+    /// Records the one refusal fact in a fresh Session after the reservation
+    /// Session is dropped. It writes no group, call, amount or caller fact.
+    async fn append_stage_plan_refusal(
+        &self,
+        ctx: &Context,
+        billing_scope: &str,
+        stage: BudgetStage,
+        refusal: &BudgetPreDispatchRefusal,
+    ) -> Result<()> {
+        let BudgetPreDispatchRefusal::StagePlan { kind, .. } = refusal else {
+            return Ok(());
+        };
+        let mut session = self.store.session().await?;
+        session
+            .append_stage_plan_refusal(
+                ctx,
+                &StagePlanRefusal {
+                    billing_scope: billing_scope.into(),
+                    stage,
+                    kind: *kind,
+                },
+            )
+            .await?;
+        session.commit().await?;
+        Ok(())
+    }
+
+    /// Releases this Session's still-undispatched reservation and appends
+    /// exactly one `stage_plan_refused` event in that same Session. The caller
+    /// owns the single commit. A dispatched or uncertain call is never refunded:
+    /// the storage release itself refuses anything but `Reserved`.
+    async fn release_stage_plan_refusal_in_session(
+        &self,
+        session: &mut Session,
+        ctx: &Context,
+        fence: &BudgetCallFence,
+        stage: BudgetStage,
+        refusal: &BudgetPreDispatchRefusal,
+    ) -> Result<()> {
+        let BudgetPreDispatchRefusal::StagePlan { kind, .. } = refusal else {
+            return Ok(());
+        };
+        session
+            .release_undispatched_budget_call(
+                ctx,
+                fence,
+                &format!("{PRE_DISPATCH_REASON_PREFIX}{}", refusal.code()),
+            )
+            .await?;
+        session
+            .append_stage_plan_refusal(
+                ctx,
+                &StagePlanRefusal {
+                    billing_scope: fence.billing_scope.clone(),
+                    stage,
+                    kind: *kind,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn dispatch_management_bound(
         &self,
         bound: crate::model::ReadBoundModelRequest,
         management: Option<&crate::dispatch::ManagementOptimizationClaim>,
+        development_control: Option<&DevelopmentControlSelector>,
     ) -> Result<ModelResponse> {
         bound.validate()?;
         let request = bound.request.clone();
@@ -1191,12 +1302,37 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
             }
             return Err(error);
         }
+        let attribution = match development_control {
+            Some(selector) => StagePlanAttribution::Control(StagePlanControlSelector {
+                control_kind: selector.kind.clone(),
+                namespace: selector.namespace.clone(),
+                control_id: selector.id.clone(),
+            }),
+            None => StagePlanAttribution::Unattributed,
+        };
         let mut call = match session
-            .reserve_budget_call_with_sources_typed(&ctx, &reservation, &source_ids)
+            .reserve_budget_call_with_stage_plan_typed(
+                &ctx,
+                &reservation,
+                &source_ids,
+                &attribution,
+            )
             .await?
         {
             Ok(call) => call,
-            Err(refusal) => return Ok(pre_dispatch_refusal(&request, &refusal)),
+            Err(refusal) => {
+                if refusal.is_stage_plan() {
+                    drop(session);
+                    self.append_stage_plan_refusal(
+                        &ctx,
+                        &reservation.billing_scope,
+                        reservation.stage,
+                        &refusal,
+                    )
+                    .await?;
+                }
+                return Ok(pre_dispatch_refusal(&request, &refusal));
+            }
         };
         if call.state == BudgetCallState::Reserved && now > call.lease_until {
             call = session
@@ -1266,6 +1402,24 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                         &request,
                         &BudgetPreDispatchRefusal::SourceRevoked,
                     ));
+                }
+                Err(refusal) if refusal.is_stage_plan() => {
+                    // The begin gate judged a still-undispatched reservation. This
+                    // Session may hold a reservation made above or an existing
+                    // committed Reserved call returned by the storage early path;
+                    // both are released here, with exactly one refusal event, in
+                    // this same commit. A dispatched or uncertain call never
+                    // reaches this branch and is never refunded.
+                    self.release_stage_plan_refusal_in_session(
+                        &mut session,
+                        &ctx,
+                        &fence,
+                        call.stage,
+                        &refusal,
+                    )
+                    .await?;
+                    session.commit().await?;
+                    return Ok(pre_dispatch_refusal(&request, &refusal));
                 }
                 Err(refusal) => {
                     let released = session
@@ -1396,7 +1550,17 @@ impl<T: ModelTransport> ModelPort for ManagementOptimizationModelPort<T> {
         bound: crate::model::ReadBoundModelRequest,
     ) -> Result<ModelResponse> {
         self.broker
-            .dispatch_management_bound(bound, Some(&self.claim))
+            .dispatch_management_bound(bound, Some(&self.claim), None)
+            .await
+    }
+
+    async fn dispatch_compiler_bound_with_development_control(
+        &self,
+        bound: crate::model::ReadBoundModelRequest,
+        selector: Option<DevelopmentControlSelector>,
+    ) -> Result<ModelResponse> {
+        self.broker
+            .dispatch_management_bound(bound, Some(&self.claim), selector.as_ref())
             .await
     }
 }
@@ -1761,6 +1925,7 @@ fn pre_dispatch_refusal(
         | BudgetPreDispatchRefusal::PerCallCapExceeded
         | BudgetPreDispatchRefusal::RootBudgetExhausted
         | BudgetPreDispatchRefusal::BudgetArithmeticOverflow
+        | BudgetPreDispatchRefusal::StagePlan { .. }
         | BudgetPreDispatchRefusal::ActiveLeaseCapacity { .. } => {
             ModelRejectionKind::BudgetUnavailable
         }
@@ -1862,10 +2027,11 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod pre_dispatch_tests {
     use super::*;
+    use evo_core::evaluation::{Money, OptimizationBudgetPlan, RootStageBudgetPlanV1};
     use evo_core::evidence::Purpose;
     use evo_core::optimization::{ModelInputPart, ModelInputRole, ModelRequestContext};
     use evo_core::skill_edit::EvidenceRef;
-    use evo_storage::budget::RootBudgetAuthorization;
+    use evo_storage::budget::{RootBudgetAuthorization, RootStagePlanBindRequest};
 
     struct GateFixture {
         _dir: tempfile::TempDir,
@@ -2048,6 +2214,140 @@ mod pre_dispatch_tests {
         ) -> Result<TransportCompletion> {
             panic!("the clock refusal must precede provider dispatch")
         }
+    }
+
+    /// The legacy begin entry must release a *committed* Reserved call, not just
+    /// roll back this Session, and it must write the one refusal event in the
+    /// same commit. `GateFixture` has already committed the reservation through
+    /// the real Store API; binding a plan afterwards makes that call's stage
+    /// attribution Unknown at begin.
+    #[tokio::test]
+    async fn legacy_begin_stage_refusal_releases_committed_reserved_and_writes_one_event() {
+        let fixture = GateFixture::new().await;
+        let admin = Context::new("n", "admin", Role::Admin).unwrap();
+        let mut budget = OptimizationBudgetPlan::unfunded("scope", "fixture", "USD").unwrap();
+        budget.root_total = Money {
+            currency: "USD".into(),
+            pricing_version: "price".into(),
+            amount: "0.0001".into(),
+        };
+        budget.admin_authorization_receipt_digest = Some(hash(b"auth"));
+        for stage in &mut budget.stages {
+            stage.per_call_limit = Money {
+                currency: "USD".into(),
+                pricing_version: "price".into(),
+                amount: "0".into(),
+            };
+            stage.experiment_total = Money {
+                currency: "USD".into(),
+                pricing_version: "price".into(),
+                amount: "0".into(),
+            };
+        }
+        // The fixture's pre-committed call holds a 20-micro Merge reservation;
+        // the append must not be refused for allocating below occupied usage.
+        let merge = budget
+            .stages
+            .iter_mut()
+            .find(|stage| stage.stage == evo_core::evaluation::OptimizationStage::Merge)
+            .unwrap();
+        merge.per_call_limit = Money {
+            currency: "USD".into(),
+            pricing_version: "price".into(),
+            amount: "0.00002".into(),
+        };
+        merge.experiment_total = Money {
+            currency: "USD".into(),
+            pricing_version: "price".into(),
+            amount: "0.00002".into(),
+        };
+        budget.validate().unwrap();
+        fixture
+            .broker
+            .store
+            .bind_root_stage_plan(
+                &admin,
+                &RootStagePlanBindRequest {
+                    billing_scope: "scope".into(),
+                    expected_seq: 0,
+                    plan: RootStageBudgetPlanV1::from_optimization_budget(budget),
+                },
+            )
+            .await
+            .unwrap();
+        let before_clock = evo_core::now().unwrap();
+        let mut session = fixture.broker.store.session().await.unwrap();
+        let before = session
+            .root_budget_monetary_snapshot(&admin, "scope")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        assert_eq!(before.root.reserved_micros, 20);
+        assert_eq!(before.calls.len(), 1);
+        assert_eq!(before.calls[0].state, BudgetCallState::Reserved);
+
+        let response = fixture
+            .broker
+            .begin_pre_dispatch(
+                fixture.broker.store.session().await.unwrap(),
+                &fixture.ctx,
+                &fixture.request,
+                &fixture.root,
+                &fixture.fence(10),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+        let after_clock = evo_core::now().unwrap();
+        assert_refusal(
+            &response,
+            ModelRejectionKind::BudgetUnavailable,
+            "stage_plan_unknown",
+        );
+
+        let mut session = fixture.broker.store.session().await.unwrap();
+        let after = session
+            .root_budget_monetary_snapshot(&admin, "scope")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        assert_eq!(after.root.reserved_micros, 0);
+        assert_eq!(after.calls.len(), before.calls.len());
+        assert_eq!(after.dispatch_groups.len(), before.dispatch_groups.len());
+        let call = after
+            .calls
+            .iter()
+            .find(|call| call.call_id == "request")
+            .unwrap();
+        assert_eq!(call.state, BudgetCallState::Released);
+        assert_eq!(
+            call.terminal_reason.as_deref(),
+            Some("broker_pre_dispatch_v1.stage_plan_unknown")
+        );
+        assert_eq!(call.dispatch_id, None);
+        let refusals: Vec<_> = after
+            .ledger_events
+            .iter()
+            .filter(|event| event.event_kind == "stage_plan_refused")
+            .collect();
+        assert_eq!(refusals.len(), 1);
+        let details: serde_json::Value = serde_json::from_str(&refusals[0].details).unwrap();
+        assert_eq!(details["stage"], "merge");
+        assert_eq!(details["reason"], "stage_plan_unknown");
+        assert_eq!(details["binding_seq"], 1);
+        assert!(
+            refusals[0].event_at >= before_clock && refusals[0].event_at <= after_clock,
+            "event_at {} is outside the trusted interval",
+            refusals[0].event_at
+        );
+        assert_ne!(refusals[0].event_at, 10);
+        let released: Vec<_> = after
+            .ledger_events
+            .iter()
+            .filter(|event| event.event_kind == "released")
+            .collect();
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].event_at, 10);
     }
 
     #[tokio::test]

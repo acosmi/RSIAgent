@@ -3,6 +3,54 @@
 // are local deterministic receipts, not provider invocations.
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
+
+#[allow(async_fn_in_trait)]
+trait E05Reserve {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord>;
+}
+
+impl E05Reserve for evo_storage::Store {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord> {
+        let ticket_storage_id = format!(
+            "e05-{}",
+            evo_core::fingerprint(&("evaluation_ticket_v2", &request.dispatch_group_id)).unwrap()
+        );
+        let mut session = self.session().await.unwrap();
+        let stored = session
+            .object_row(ctx, "artifact", &ticket_storage_id)
+            .await
+            .unwrap()
+            .expect("the fixture ticket must be persisted before its E05 reservation");
+        let ticket_body: serde_json::Value = serde_json::from_str(&stored.body).unwrap();
+        let witness = evo_storage::budget::StagePlanAttribution::E05Ticket(
+            evo_storage::budget::E05TicketWitness {
+                ticket_kind: "evaluation_ticket_v2".into(),
+                ticket_id: request.dispatch_group_id.clone(),
+                ticket_storage_id,
+                ticket_digest: evo_core::canonical_fingerprint(&ticket_body).unwrap(),
+            },
+        );
+        let result = session
+            .reserve_budget_call_with_stage_plan_typed(ctx, request, &[], &witness)
+            .await
+            .unwrap();
+        match result {
+            Ok(call) => {
+                session.commit().await.unwrap();
+                Ok(call)
+            }
+            Err(refusal) => Err(refusal.into_reservation_error()),
+        }
+    }
+}
 use evo_core::Strategy;
 use evo_core::contract::{
     CompileParts, HostCapabilities, ImproverPatch, Profile, SkillPatch, SkillSnapshot,
@@ -10,8 +58,8 @@ use evo_core::contract::{
 use evo_core::evaluation::{
     BernsteinReport, ClusterObservation, ControlCondition, ExperimentPlan, FixedOptimizerArm,
     FixedOptimizerSpec, FormalExperimentPlanV41, FormalStatisticalUnit, Money,
-    OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind, Verdict, decide,
-    empirical_bernstein,
+    OptimizationBudgetPlan, OptimizerComparisonContract, ProfileKind, RootStageBudgetPlanV1,
+    Verdict, decide, empirical_bernstein,
 };
 use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::holdout::{
@@ -39,7 +87,8 @@ use evo_engine::streaming_evaluator::{
 };
 use evo_storage::Store;
 use evo_storage::budget::{
-    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization, UsageCharge,
+    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
+    RootStagePlanBindRequest, UsageCharge,
 };
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use serde_json::{Value, json};
@@ -213,7 +262,7 @@ print(json.dumps({'control_utf8':case['control_utf8'],'holdout_utf8':case['holdo
     let worker = Context::new("n", "executor", Role::Worker).unwrap();
     let store = Store::open(&db_path).await.unwrap();
     let initial_catalog = legacy_catalog(&db_path);
-    assert_eq!(initial_catalog["tables"].as_array().unwrap().len(), 22);
+    assert_eq!(initial_catalog["tables"].as_array().unwrap().len(), 25);
     for (id, sha) in metadata["raw_object_sha256"].as_object().unwrap() {
         assert_eq!(&initial_catalog["raw_object_sha256"][id], sha);
     }
@@ -372,7 +421,7 @@ async fn unregistered_fixture(schema: &str, profile: ProfileKind, candidate_cost
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
+    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "fixture-only", "USD").unwrap();
     budget.root_total = money("0.001");
     budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
     for stage in &mut budget.stages {
@@ -670,7 +719,7 @@ async fn unregistered_current_fixture(
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
+    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "fixture-only", "USD").unwrap();
     budget.root_total = money("0.1");
     budget.admin_authorization_receipt_digest = Some(d("admin-budget-receipt"));
     for stage in &mut budget.stages {
@@ -749,6 +798,19 @@ async fn unregistered_current_fixture(
     };
     let current_control = current_control(&control, max_regression);
     let (source, watermark) = prepare_current_source(&store).await;
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: current_control.billing_scope.clone(),
+                expected_seq: 0,
+                plan: RootStageBudgetPlanV1::from_optimization_budget(
+                    current_control.optimization_budget.clone(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
     IndependentEvaluationControl::register_current_control(
         &evaluator,
         &store,
@@ -1011,7 +1073,7 @@ async fn execute_output(
     let now = 10 + i64::from(ordinal) * 5;
     fixture
         .store
-        .reserve_budget_call(
+        .reserve_budget_call_with_e05_ticket(
             &fixture.worker,
             &BudgetCallReservation {
                 billing_scope: "billing-1".into(),
@@ -2969,7 +3031,13 @@ async fn ticket_rechecks_threshold_in_final_transaction() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|table| table[0] != "audit")
+                .filter(|table| {
+                    // Re-registration legitimately replaces its own object rows,
+                    // its audit rows and its root-stage-plan relation; the
+                    // issuer's failed final transaction must leave every other
+                    // table untouched.
+                    table[0] != "audit" && table[0] != "root_budget_stage_plan_controls"
+                })
                 .cloned()
                 .collect(),
         )

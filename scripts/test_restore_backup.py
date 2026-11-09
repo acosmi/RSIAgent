@@ -32,7 +32,7 @@ from scripts import restore_backup as restore
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/restore_backup.py"
 MIGRATIONS = ROOT / "crates/evo-storage/migrations"
-CURRENT = [1, 2, 4, 5, 6, 7]
+CURRENT = [1, 2, 4, 5, 6, 7, 8]
 # The descriptions sqlx 0.8.6 derives from the current file names.
 DESCRIPTIONS = {
     1: "runtime",
@@ -41,6 +41,7 @@ DESCRIPTIONS = {
     5: "root budget",
     6: "revoke cleanup",
     7: "formal parent kind",
+    8: "root stage plan",
 }
 # sqlx-sqlite 0.8.6 `ensure_migrations_table`.
 LEDGER_DDL = """
@@ -331,9 +332,10 @@ class Scenario:
 
 class PrefixRuleTests(unittest.TestCase):
     def test_only_the_current_set_or_a_prefix_through_0005_is_restorable(self):
-        self.assertEqual(restore.missing_migrations([1, 2, 4, 5, 6, 7]), [])
-        self.assertEqual(restore.missing_migrations([1, 2, 4, 5, 6]), [7])
-        self.assertEqual(restore.missing_migrations([1, 2, 4, 5]), [6, 7])
+        self.assertEqual(restore.missing_migrations([1, 2, 4, 5, 6, 7, 8]), [])
+        self.assertEqual(restore.missing_migrations([1, 2, 4, 5, 6, 7]), [8])
+        self.assertEqual(restore.missing_migrations([1, 2, 4, 5, 6]), [7, 8])
+        self.assertEqual(restore.missing_migrations([1, 2, 4, 5]), [6, 7, 8])
         for versions in ([1, 2, 4], [1, 2], [1]):
             with self.assertRaisesRegex(restore.IsolationError, r"^backup predates the root budget ledger \(0005\); protected facts cannot be verified$"):
                 restore.missing_migrations(versions)
@@ -438,7 +440,7 @@ class RestoreTests(unittest.TestCase):
         backup = scenario.backup()
         anchor = scenario.anchor()
         dest, result = scenario.restore(backup, anchor)
-        self.assert_restored(dest, result, 0, "7")
+        self.assert_restored(dest, result, 0, "7,8")
         self.assertEqual(sorted(path.name for path in dest.iterdir()), ["restore.json", "restore.migrations.json", "rsia.sqlite3"])
         record = (dest / "restore.migrations.json").read_text()
         self.assertTrue(record.endswith("\n"))
@@ -447,7 +449,10 @@ class RestoreTests(unittest.TestCase):
             {
                 "schema": "rsia.restore_migrations.v1",
                 "source_versions": [1, 2, 4, 5, 6],
-                "applied": [{"version": 7, "checksum_sha384": hashlib.sha384(migration_file(7).read_bytes()).hexdigest()}],
+                "applied": [
+                    {"version": 7, "checksum_sha384": hashlib.sha384(migration_file(7).read_bytes()).hexdigest()},
+                    {"version": 8, "checksum_sha384": hashlib.sha384(migration_file(8).read_bytes()).hexdigest()},
+                ],
                 "current_versions": CURRENT,
             },
         )
@@ -497,10 +502,11 @@ class RestoreTests(unittest.TestCase):
         }
         delta = scenario.delta(backup, [event], (base_seq + 1, latest_digest))
         dest, result = scenario.restore(backup, anchor, delta=delta)
-        self.assert_restored(dest, result, 1, "6,7")
+        self.assert_restored(dest, result, 1, "6,7,8")
         self.assertEqual(json.loads((dest / "restore.migrations.json").read_text())["applied"], [
             {"version": 6, "checksum_sha384": hashlib.sha384(migration_file(6).read_bytes()).hexdigest()},
             {"version": 7, "checksum_sha384": hashlib.sha384(migration_file(7).read_bytes()).hexdigest()},
+            {"version": 8, "checksum_sha384": hashlib.sha384(migration_file(8).read_bytes()).hexdigest()},
         ])
         con = sqlite3.connect(dest / "rsia.sqlite3")
         self.assertEqual(con.execute("SELECT version FROM _sqlx_migrations ORDER BY version").fetchall(), [(v,) for v in CURRENT])
@@ -592,7 +598,7 @@ class RestoreTests(unittest.TestCase):
         self.assert_isolated(scenario, dest, result, "database migration checksums differ from current code")
         # the same backup against an upgraded anchor is restorable
         dest, result = scenario.restore(backup, scenario.anchor(), "restored-current-anchor")
-        self.assert_restored(dest, result, 0, "7")
+        self.assert_restored(dest, result, 0, "7,8")
 
     def test_a_migration_that_fails_on_the_copy_is_isolated(self):
         scenario = Scenario(self, [1, 2, 4, 5, 6])
@@ -906,7 +912,10 @@ def _rust_current_host_restore_matrix(payload):
     test with independently checked Rust raw constants.
     """
     test=RestoreTests()
-    backup=Path(payload["backup"]);anchor=Path(payload["anchor"])
+    # macOS tempdirs live below the /var -> /private/var symlink. The restore
+    # script deliberately rejects symlinked ancestry, so this bridge resolves
+    # the Rust-owned paths once and passes only canonical components on.
+    backup=Path(payload["backup"]).resolve();anchor=Path(payload["anchor"]).resolve()
     identity=payload["identity"];wire=payload["record_wire"]
     manifest=json.loads((backup/"backup-manifest.json").read_text())
     test.assertTrue(manifest["watermarks"])
@@ -933,7 +942,7 @@ def _rust_current_host_restore_matrix(payload):
         finally:
             con.close()
         test.assertEqual(_host_private_database_image(backup/"rsia.sqlite3"),backup_image)
-        scenario=Scenario.__new__(Scenario);scenario.base=backup.parent
+        scenario=Scenario.__new__(Scenario);scenario.base=backup.parent.resolve()
         dest,result=scenario.restore(backup,anchor,"rust-host-restored")
         test.assert_restored(dest,result,0,"none")
         test.assertEqual(_host_private_database_image(dest/"rsia.sqlite3")[0],backup_image[0])
@@ -1036,7 +1045,7 @@ def _rust_current_host_text_restore_matrix(payload):
     Rust producer/typed serializer in this test run, never a Python auth factory.
     """
     test=RestoreTests()
-    backup=Path(payload["backup"]);anchor=Path(payload["anchor"])
+    backup=Path(payload["backup"]).resolve();anchor=Path(payload["anchor"]).resolve()
     records=payload["records"];faults=payload["faults"]
     test.assertTrue(records);test.assertTrue(faults)
     test.assertEqual(len(records),30);test.assertEqual(len(faults),162)
@@ -1053,7 +1062,7 @@ def _rust_current_host_text_restore_matrix(payload):
                 test.assertEqual(con.execute("SELECT body FROM objects WHERE namespace='name-coverage' AND kind='artifact' AND id=?",(identity,)).fetchone(),(wire,))
         finally:
             con.close()
-        scenario=Scenario.__new__(Scenario);scenario.base=backup.parent
+        scenario=Scenario.__new__(Scenario);scenario.base=backup.parent.resolve()
         dest,result=scenario.restore(backup,anchor,"text-content-restored")
         test.assert_restored(dest,result,0,"none")
         test.assertEqual(_host_private_database_image(dest/"rsia.sqlite3")[0],backup_image[0])
@@ -1140,7 +1149,7 @@ def _rust_current_host_number_admission_matrix(payload):
     test.assertEqual(len(records),2)
     test.assertEqual([(row["field"],row["old_token"],row["new_token"],row["accepted"]) for row in variants],
         [("safe","1","1.0",True),("n","8000000000000004","8000000000000004.0",False)])
-    backup=Path(payload["backup"]);anchor=Path(payload["anchor"])
+    backup=Path(payload["backup"]).resolve();anchor=Path(payload["anchor"]).resolve()
     manifest=json.loads((backup/"backup-manifest.json").read_text())
     test.assertIn("name-coverage",{row["namespace"] for row in manifest["watermarks"]})
     with _host_anchor_read_observer(test,anchor) as (anchor_image,observer):
@@ -1153,7 +1162,7 @@ def _rust_current_host_number_admission_matrix(payload):
                 test.assertEqual(con.execute("SELECT body FROM objects WHERE namespace='name-coverage' AND kind='artifact' AND id=?",(row["id"],)).fetchone(),(row["wire"],))
         finally:
             con.close()
-        scenario=Scenario.__new__(Scenario);scenario.base=backup.parent
+        scenario=Scenario.__new__(Scenario);scenario.base=backup.parent.resolve()
         dest,result=scenario.restore(backup,anchor,"number-content-restored")
         test.assert_restored(dest,result,0,"none")
         test.assertEqual(_host_private_database_image(dest/"rsia.sqlite3")[0],backup_image[0])
@@ -1563,7 +1572,7 @@ raise SystemExit(code)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stderr, "")
         lines = result.stdout.splitlines()
-        self.assertEqual(lines[0], "RESTORE_OK events=0 migrations_applied=7")
+        self.assertEqual(lines[0], "RESTORE_OK events=0 migrations_applied=7,8")
         self.assertEqual(len(lines), 2)
         self.assertTrue(lines[1].startswith("AG157_PY_SQLITE_V1 "))
         observed = json.loads(lines[1].split(" ", 1)[1])
@@ -1583,14 +1592,14 @@ raise SystemExit(code)
     def test_restore_receipt_and_migration_side_record_are_0600(self):
         scenario, backup, anchor = self._healthy([1, 2, 4, 5, 6])
         dest, result = scenario.restore(backup, anchor, "receipts-private")
-        RestoreTests.assert_restored(self, dest, result, 0, "7")
+        RestoreTests.assert_restored(self, dest, result, 0, "7,8")
         receipt = json.loads((dest / "restore.json").read_text())
         side = json.loads((dest / "restore.migrations.json").read_text())
         self.assertEqual(receipt["schema_version"], "rsia.restore_receipt.v2")
         self.assertEqual(side["schema"], "rsia.restore_migrations.v1")
         self.assertEqual(side["source_versions"], [1, 2, 4, 5, 6])
         self.assertEqual(side["current_versions"], CURRENT)
-        self.assertEqual([x["version"] for x in side["applied"]], [7])
+        self.assertEqual([x["version"] for x in side["applied"]], [7, 8])
         self.assertEqual((dest / "restore.json").stat().st_mode & 0o777, 0o600)
         self.assertEqual((dest / "restore.migrations.json").stat().st_mode & 0o777, 0o600)
 
@@ -1608,6 +1617,150 @@ raise SystemExit(code)
         self.assertEqual(_permission_image(backup), backup_before)
         self.assertEqual(_permission_image(anchor.parent), anchor_before)
         self.assertEqual(_permission_image(parent), parent_before)
+
+
+class StagePlanRestoreTests(unittest.TestCase):
+    """AG-141 0008 prefix upgrade and root_budget_stage_plan% restore protection."""
+
+    PLAN_DIGEST = "a" * 64
+    FACT_CHANGED = "consumed query/alpha/dispatch/accounting facts changed; make a fresh backup"
+
+    def _binding_sql(self, seq):
+        return f"""
+INSERT INTO root_budget_stage_plan_bindings(
+ billing_scope,seq,plan_schema,plan_digest,plan_body,payer_id,root_total_micros,
+ currency,pricing_version,authorization_receipt_digest,authorizing_namespace,
+ bound_by_actor,created_at)
+VALUES('scope',{seq},'rsia.root_stage_budget_plan.v1','{self.PLAN_DIGEST}',
+ '{{"schema_version":"rsia.root_stage_budget_plan.v1"}}','payer',1000,'USD','price',
+ 'authorization','legacy-a','admin',{100 + seq});
+"""
+
+    def _control_sql(self, seq):
+        return f"""
+INSERT INTO root_budget_stage_plan_controls(
+ billing_scope,namespace,control_kind,control_id,control_digest,binding_seq,plan_digest,created_at)
+VALUES('scope','legacy-a','control','control-1','{self.PLAN_DIGEST}',{seq},'{self.PLAN_DIGEST}',123);
+"""
+
+    def _call_relation_sql(self, seq):
+        return f"""
+INSERT INTO root_budget_stage_plan_calls(
+ billing_scope,call_id,namespace,stage,binding_seq,plan_digest,course_producer_ref,created_at)
+VALUES('scope','call','legacy-a','optimization',{seq},'{self.PLAN_DIGEST}',NULL,123);
+"""
+
+    def _apply(self, path, sql):
+        con = connect(path)
+        con.executescript(sql)
+        con.close()
+
+    def test_stage_plan_prefix_upgrade_keeps_old_checksums(self):
+        scenario = Scenario(self, [1, 2, 4, 5, 6, 7])
+        backup = scenario.backup()
+        dest, result = scenario.restore(backup, scenario.anchor())
+        RestoreTests.assert_restored(self, dest, result, 0, "8")
+        con = sqlite3.connect(dest / "rsia.sqlite3")
+        rows = dict(
+            (version, bytes(checksum))
+            for version, checksum in con.execute("SELECT version,checksum FROM _sqlx_migrations")
+        )
+        con.close()
+        self.assertEqual(sorted(rows), CURRENT)
+        for version in [1, 2, 4, 5, 6, 7, 8]:
+            self.assertEqual(rows[version], hashlib.sha384(migration_file(version).read_bytes()).digest())
+        side = json.loads((dest / "restore.migrations.json").read_text())
+        self.assertEqual(side["source_versions"], [1, 2, 4, 5, 6, 7])
+        self.assertEqual(side["current_versions"], CURRENT)
+        self.assertEqual([entry["version"] for entry in side["applied"]], [8])
+
+    def test_restore_keeps_binding_sequence_and_full_preimages(self):
+        scenario = Scenario(self, CURRENT)
+        self._apply(
+            scenario.history,
+            self._binding_sql(1)
+            + self._binding_sql(2)
+            + self._control_sql(2)
+            + self._call_relation_sql(2),
+        )
+        backup = scenario.backup()
+        dest, result = scenario.restore(backup, scenario.anchor())
+        RestoreTests.assert_restored(self, dest, result, 0, "none")
+        source = sqlite3.connect(scenario.history)
+        restored = sqlite3.connect(dest / "rsia.sqlite3")
+        for table in (
+            "root_budget_stage_plan_bindings",
+            "root_budget_stage_plan_controls",
+            "root_budget_stage_plan_calls",
+        ):
+            query = f"SELECT * FROM {table} ORDER BY rowid"
+            self.assertEqual(restored.execute(query).fetchall(), source.execute(query).fetchall(), table)
+        source.close()
+        restored.close()
+
+    def test_restore_cannot_rewind_active_stage_plan(self):
+        scenario = Scenario(self, CURRENT)
+        self._apply(scenario.history, self._binding_sql(1))
+        backup = scenario.backup()
+        anchor = scenario.anchor()
+        self._apply(anchor, self._binding_sql(2))
+        dest, result = scenario.restore(backup, anchor)
+        RestoreTests.assert_isolated(self, scenario, dest, result, self.FACT_CHANGED)
+
+    def test_restore_preserves_uncertain_stage_usage(self):
+        scenario = Scenario(self, CURRENT)
+        self._apply(
+            scenario.history,
+            self._binding_sql(1)
+            + self._call_relation_sql(1)
+            + "UPDATE root_budget_calls SET state='uncertain' WHERE billing_scope='scope' AND call_id='call';",
+        )
+        backup = scenario.backup()
+        dest, result = scenario.restore(backup, scenario.anchor())
+        RestoreTests.assert_restored(self, dest, result, 0, "none")
+        con = sqlite3.connect(dest / "rsia.sqlite3")
+        state, reserved, actual = con.execute(
+            "SELECT state,reserved_micros,actual_cost_micros FROM root_budget_calls WHERE billing_scope='scope' AND call_id='call'"
+        ).fetchone()
+        self.assertEqual((state, reserved, actual), ("uncertain", 7, None))
+        self.assertEqual(
+            con.execute("SELECT count(*) FROM root_budget_stage_plan_calls").fetchone(),
+            (1,),
+        )
+        con.close()
+
+    def test_restore_rejects_missing_call_plan_relation(self):
+        scenario = Scenario(self, CURRENT)
+        self._apply(scenario.history, self._binding_sql(1))
+        backup = scenario.backup()
+        anchor = scenario.anchor()
+        self._apply(anchor, self._call_relation_sql(1))
+        dest, result = scenario.restore(backup, anchor)
+        RestoreTests.assert_isolated(self, scenario, dest, result, self.FACT_CHANGED)
+
+    def test_old_backup_without_bindings_stays_unbound(self):
+        scenario = Scenario(self, [1, 2, 4, 5, 6, 7])
+        backup = scenario.backup()
+        dest, result = scenario.restore(backup, scenario.anchor())
+        RestoreTests.assert_restored(self, dest, result, 0, "8")
+        con = sqlite3.connect(dest / "rsia.sqlite3")
+        self.assertEqual(
+            con.execute("SELECT count(*) FROM root_budget_stage_plan_bindings").fetchone(),
+            (0,),
+        )
+        self.assertEqual(
+            con.execute("SELECT count(*) FROM root_budget_stage_plan_controls").fetchone(),
+            (0,),
+        )
+        self.assertEqual(
+            con.execute("SELECT count(*) FROM root_budget_stage_plan_calls").fetchone(),
+            (0,),
+        )
+        self.assertEqual(
+            con.execute("SELECT count(*) FROM _sqlx_migrations WHERE version=8").fetchone(),
+            (1,),
+        )
+        con.close()
 
 if __name__ == "__main__":
     unittest.main()

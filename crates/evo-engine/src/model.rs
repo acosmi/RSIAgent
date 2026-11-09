@@ -199,6 +199,26 @@ pub trait ModelPort: Send + Sync {
             None => Err(Error::Forbidden),
         }
     }
+    /// Internal companion that carries the actual development control only so
+    /// the budget boundary can reload its persisted plan relation. It is not a
+    /// request field and confers no authority by itself; adapters that do not
+    /// override it keep their original behavior.
+    async fn dispatch_compiler_bound_with_development_control(
+        &self,
+        request: ReadBoundModelRequest,
+        _selector: Option<DevelopmentControlSelector>,
+    ) -> Result<ModelResponse> {
+        self.dispatch_compiler_bound(request).await
+    }
+}
+
+/// A read-only pointer to the actual persisted control that produced a
+/// development request. `None` means Unknown, never Outside.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevelopmentControlSelector {
+    pub kind: String,
+    pub namespace: String,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

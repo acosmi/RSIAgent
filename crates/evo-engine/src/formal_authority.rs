@@ -4794,6 +4794,21 @@ pub(crate) async fn verify_formal_task_in_session(
     }
     Ok((candidate, billing))
 }
+/// The canonical digest of the persisted formal ticket envelope, computed from
+/// the same stored body the storage-side E05 witness gate re-reads. The broker
+/// passes this digest in `E05TicketWitness`; storage compares it with its own
+/// canonical digest, so the witness is bound to the actual ticket bytes rather
+/// than to a caller-chosen task value.
+pub(crate) async fn stored_formal_ticket_digest(
+    s: &mut Session,
+    ctx: &Context,
+    ticket_id: &str,
+) -> Result<String> {
+    let storage_id =
+        crate::streaming_evaluator::storage_id(crate::streaming_evaluator::TICKET_KIND, ticket_id)?;
+    let envelope: serde_json::Value = s.need(ctx, "artifact", &storage_id).await?;
+    content_digest(&envelope)
+}
 pub(crate) async fn persist_formal_capture(
     s: &mut Session,
     ctx: &Context,
@@ -6435,7 +6450,7 @@ mod response_bound_tests {
                     allowed_namespaces: vec!["n".into()],
                     currency: "USD".into(),
                     pricing_version: "pricing-v1".into(),
-                    payment_subject: "software-fixture".into(),
+                    payment_subject: "payer".into(),
                     authorization_receipt_digest: hash(b"authorization"),
                     per_call_cap_micros: 100,
                     total_limit_micros: 1000,
@@ -6450,6 +6465,20 @@ mod response_bound_tests {
         // fixture principals do not become external-host execution authority.
         control.evidence_scope =
             crate::streaming_evaluator::EvaluationEvidenceScope::ProgramFixture;
+        // A Current control registers only against a real active root stage plan.
+        store
+            .bind_root_stage_plan(
+                &admin,
+                &evo_storage::budget::RootStagePlanBindRequest {
+                    billing_scope: control.billing_scope.clone(),
+                    expected_seq: 0,
+                    plan: evo_core::evaluation::RootStageBudgetPlanV1::from_optimization_budget(
+                        control.optimization_budget.clone(),
+                    ),
+                },
+            )
+            .await
+            .unwrap();
         let command = FormalOperatorCommand::RegisterControlCurrent {
             control: Box::new(control.clone()),
         };

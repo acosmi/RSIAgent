@@ -5,6 +5,54 @@
 #[path = "support/trusted_compiler_inputs.rs"]
 mod trusted_compiler_inputs;
 
+#[allow(async_fn_in_trait)]
+trait E05Reserve {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord>;
+}
+
+impl E05Reserve for evo_storage::Store {
+    async fn reserve_budget_call_with_e05_ticket(
+        &self,
+        ctx: &evo_core::Context,
+        request: &evo_storage::budget::BudgetCallReservation,
+    ) -> evo_core::Result<evo_storage::budget::BudgetCallRecord> {
+        let ticket_storage_id = format!(
+            "e05-{}",
+            evo_core::fingerprint(&("evaluation_ticket_v2", &request.dispatch_group_id)).unwrap()
+        );
+        let mut session = self.session().await.unwrap();
+        let stored = session
+            .object_row(ctx, "artifact", &ticket_storage_id)
+            .await
+            .unwrap()
+            .expect("the fixture ticket must be persisted before its E05 reservation");
+        let ticket_body: serde_json::Value = serde_json::from_str(&stored.body).unwrap();
+        let witness = evo_storage::budget::StagePlanAttribution::E05Ticket(
+            evo_storage::budget::E05TicketWitness {
+                ticket_kind: "evaluation_ticket_v2".into(),
+                ticket_id: request.dispatch_group_id.clone(),
+                ticket_storage_id,
+                ticket_digest: evo_core::canonical_fingerprint(&ticket_body).unwrap(),
+            },
+        );
+        let result = session
+            .reserve_budget_call_with_stage_plan_typed(ctx, request, &[], &witness)
+            .await
+            .unwrap();
+        match result {
+            Ok(call) => {
+                session.commit().await.unwrap();
+                Ok(call)
+            }
+            Err(refusal) => Err(refusal.into_reservation_error()),
+        }
+    }
+}
+
 use evo_core::evaluation::{
     ControlCondition, ExperimentPlan, FixedOptimizerArm, FixedOptimizerSpec,
     FormalExperimentPlanV41, FormalStatisticalUnit, Money, OptimizationBudgetPlan,
@@ -33,7 +81,8 @@ use evo_engine::streaming_evaluator::{
     IndependentEvaluationControl, read_verified_formal_report_in_session,
 };
 use evo_storage::budget::{
-    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization, UsageCharge,
+    BudgetCallFence, BudgetCallReservation, BudgetStage, RootBudgetAuthorization,
+    RootStagePlanBindRequest, UsageCharge,
 };
 use evo_storage::lifecycle::{
     FORMAL_JUDGMENT_VERSIONS, FormalJudgmentDomain, FormalJudgmentIdStrategy, LifecycleStore,
@@ -561,7 +610,7 @@ async fn current_diagnostic_fixture(n: u32, sequential: bool) -> CurrentDiagnost
         }],
     )
     .unwrap();
-    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "payer", "USD").unwrap();
+    let mut budget = OptimizationBudgetPlan::unfunded("billing-1", "fixture-only", "USD").unwrap();
     budget.root_total = current_money("0.001");
     budget.admin_authorization_receipt_digest = Some(current_digest("admin-budget-receipt"));
     for stage in &mut budget.stages {
@@ -642,6 +691,20 @@ async fn current_diagnostic_fixture(n: u32, sequential: bool) -> CurrentDiagnost
         evidence_scope: EvaluationEvidenceScope::ProgramFixture,
         created_at_unix_seconds: 2,
     };
+    // A Current control registers only against a real active root stage plan.
+    store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: "billing-1".into(),
+                expected_seq: 0,
+                plan: evo_core::evaluation::RootStageBudgetPlanV1::from_optimization_budget(
+                    control.optimization_budget.clone(),
+                ),
+            },
+        )
+        .await
+        .unwrap();
     IndependentEvaluationControl::register_current_control(&evaluator, &store, control.clone())
         .await
         .unwrap();
@@ -1265,7 +1328,7 @@ async fn current_diagnostic_semantics_do_not_grant_promotion_authority() {
                 now: now + 1,
             };
             fx.store
-                .reserve_budget_call(
+                .reserve_budget_call_with_e05_ticket(
                     &worker,
                     &BudgetCallReservation {
                         billing_scope: "billing-1".into(),
@@ -1792,7 +1855,9 @@ async fn restore_retains_judgment_versions_and_spent_facts_without_reopening_exe
     )
     .unwrap();
     drop(file);
-    let restored = fx.root.path().join("restored");
+    // The restore script rejects a symlink in the destination ancestry; the
+    // platform temp directory itself can be a symlink (`/var` -> `/private/var`).
+    let restored = fx.root.path().canonicalize().unwrap().join("restored");
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/restore_backup.py");
     let output = Command::new("python3")
         .arg("-B")
@@ -1809,7 +1874,8 @@ async fn restore_retains_judgment_versions_and_spent_facts_without_reopening_exe
         .unwrap();
     assert!(
         output.status.success(),
-        "actual restore_backup.py rejected the healthy backup"
+        "actual restore_backup.py rejected the healthy backup: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
     let path = restored.join("rsia.sqlite3");
     let store = Store::open(&path).await.unwrap();

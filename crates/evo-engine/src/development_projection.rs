@@ -43,7 +43,8 @@ use evo_storage::budget::{
     BudgetCallState, BudgetExecutionProvenance, BudgetStage,
     REGISTERED_EXECUTION_SETTLEMENT_SCHEMA, ReadRegisteredExecutionSettlement,
     RegisteredExecutionProvenance, RegisteredExecutionSettlement, RegisteredExecutionSettlementV2,
-    RootBudgetRecord, UsageCharge,
+    RootBudgetRecord, RootStagePlanBindRequest, RootStagePlanBinding, StagePlanAttribution,
+    StagePlanControlSelector, StagePlanRefusal, UsageCharge,
 };
 use evo_storage::{PersistentContractState, PersistentContractVersion, Session, Store};
 use serde::{Deserialize, Serialize};
@@ -420,6 +421,66 @@ pub async fn register_config_projection_control(
             "control root budget differs from the persisted billing scope".into(),
         ));
     }
+    register_config_projection_control_in_session(&mut s, ctx, &control).await?;
+    if s.active_root_stage_plan(ctx, &c.billing_scope)
+        .await?
+        .is_some()
+    {
+        s.record_root_stage_plan_control(
+            ctx,
+            &c.billing_scope,
+            CONTROL_KIND,
+            &c.id,
+            &control.digest,
+        )
+        .await?;
+    }
+    s.commit().await?;
+    Ok(control.digest)
+}
+
+/// Binds one Admin-selected root stage plan and registers the config
+/// projection control that references it in one Session.
+pub async fn register_config_projection_control_with_stage_plan(
+    ctx: &Context,
+    store: &Store,
+    record: ConfigProjectionControlV1,
+    bind: &RootStagePlanBindRequest,
+) -> Result<(String, RootStagePlanBinding)> {
+    ctx.require(&[Role::Admin])?;
+    let control = ConfigControl::decode(record)?;
+    let c = &control.record;
+    if c.namespace != ctx.namespace()
+        || ctx.actor() == c.executor_actor
+        || ctx.actor() == c.grader_actor
+        || c.billing_scope != bind.billing_scope
+    {
+        return Err(Error::Forbidden);
+    }
+    let mut s = store.session().await?;
+    let root = s
+        .root_budget(ctx, &c.billing_scope)
+        .await?
+        .ok_or(Error::Budget)?;
+    if root.root_budget_id != c.root_budget_id {
+        return Err(Error::Conflict(
+            "control root budget differs from the persisted billing scope".into(),
+        ));
+    }
+    let binding = s.bind_root_stage_plan(ctx, bind).await?;
+    register_config_projection_control_in_session(&mut s, ctx, &control).await?;
+    s.record_root_stage_plan_control(ctx, &c.billing_scope, CONTROL_KIND, &c.id, &control.digest)
+        .await?;
+    s.commit().await?;
+    Ok((control.digest, binding))
+}
+
+async fn register_config_projection_control_in_session(
+    s: &mut Session,
+    ctx: &Context,
+    control: &ConfigControl,
+) -> Result<()> {
+    let c = &control.record;
     for source in &c.source_ids {
         if s.get::<serde_json::Value>(ctx, "tombstone", source)
             .await?
@@ -427,23 +488,22 @@ pub async fn register_config_projection_control(
         {
             return Err(Error::Forbidden);
         }
-        load_stored_source(&mut s, ctx, source).await?;
+        load_stored_source(s, ctx, source).await?;
     }
-    if let Some(old) = get_record::<serde_json::Value>(&mut s, ctx, CONTROL_KIND, &c.id).await? {
+    if let Some(old) = get_record::<serde_json::Value>(s, ctx, CONTROL_KIND, &c.id).await? {
         if old != serde_json::to_value(c).map_err(|_| Error::Internal)? {
             return Err(Error::Conflict(
                 "development control already registered with different content".into(),
             ));
         }
     } else {
-        let id = put_record(&mut s, ctx, CONTROL_KIND, &c.id, c).await?;
+        let id = put_record(s, ctx, CONTROL_KIND, &c.id, c).await?;
         for source in &c.source_ids {
             s.put_edge(ctx, "artifact", &id, "run", source).await?;
         }
         s.audit(ctx, "development.control.register", &c.id).await?;
     }
-    s.commit().await?;
-    Ok(control.digest)
+    Ok(())
 }
 
 pub async fn load_config_projection_control(
@@ -1309,10 +1369,41 @@ async fn execute_side(
         .budget_call(ctx, &c.record.billing_scope, &call_id)
         .await?
         .is_none();
-    let call = s
-        .reserve_budget_call_with_sources_typed(ctx, &reservation, &c.record.source_ids)
+    let attribution = StagePlanAttribution::Control(StagePlanControlSelector {
+        control_kind: CONTROL_KIND.into(),
+        namespace: ctx.namespace().into(),
+        control_id: c.record.id.clone(),
+    });
+    let call = match s
+        .reserve_budget_call_with_stage_plan_typed(
+            ctx,
+            &reservation,
+            &c.record.source_ids,
+            &attribution,
+        )
         .await?
-        .map_err(evo_storage::budget::BudgetPreDispatchRefusal::into_reservation_error)?;
+    {
+        Ok(call) => call,
+        Err(refusal) => {
+            if let evo_storage::budget::BudgetPreDispatchRefusal::StagePlan { kind, .. } = &refusal
+            {
+                drop(s);
+                let mut events = store.session().await?;
+                events
+                    .append_stage_plan_refusal(
+                        ctx,
+                        &StagePlanRefusal {
+                            billing_scope: reservation.billing_scope.clone(),
+                            stage: reservation.stage,
+                            kind: *kind,
+                        },
+                    )
+                    .await?;
+                events.commit().await?;
+            }
+            return Err(refusal.into_reservation_error());
+        }
+    };
     // Official reserve has checked root, actor, fixed id and this exact artifact.
     require_call_sources(&mut s, ctx, c, &call, new_call).await?;
     s.commit().await?;
@@ -1382,13 +1473,41 @@ async fn execute_side(
         let decision = match s.begin_budget_dispatch_typed(ctx, &fence).await? {
             Ok(decision) => decision,
             Err(refusal) => {
-                if call.state == BudgetCallState::Reserved {
-                    s.release_undispatched_budget_call(
-                        ctx,
-                        &fence,
-                        &format!("development_pre_dispatch_v1.{}", refusal.code()),
-                    )
-                    .await?;
+                if call.state == BudgetCallState::Reserved
+                    && refusal != evo_storage::budget::BudgetPreDispatchRefusal::SourceRevoked
+                {
+                    if refusal.is_stage_plan() {
+                        // Release this undispatched reservation and record the
+                        // single stage refusal in the same Session and commit.
+                        s.release_undispatched_budget_call(
+                            ctx,
+                            &fence,
+                            &format!("development_pre_dispatch_v1.{}", refusal.code()),
+                        )
+                        .await?;
+                        let evo_storage::budget::BudgetPreDispatchRefusal::StagePlan {
+                            kind, ..
+                        } = &refusal
+                        else {
+                            unreachable!("is_stage_plan checked above");
+                        };
+                        s.append_stage_plan_refusal(
+                            ctx,
+                            &StagePlanRefusal {
+                                billing_scope: call.billing_scope.clone(),
+                                stage: call.stage,
+                                kind: *kind,
+                            },
+                        )
+                        .await?;
+                    } else {
+                        s.release_undispatched_budget_call(
+                            ctx,
+                            &fence,
+                            &format!("development_pre_dispatch_v1.{}", refusal.code()),
+                        )
+                        .await?;
+                    }
                 }
                 s.commit().await?;
                 return Err(refusal.into_dispatch_error());
@@ -1739,6 +1858,14 @@ impl ConfigProjectionDevelopmentRunner {
 
 #[async_trait]
 impl DevRunner for ConfigProjectionDevelopmentRunner {
+    fn development_control_selector(&self) -> Option<crate::model::DevelopmentControlSelector> {
+        Some(crate::model::DevelopmentControlSelector {
+            kind: CONTROL_KIND.into(),
+            namespace: self.executor.namespace().into(),
+            id: self.control_id.clone(),
+        })
+    }
+
     async fn run(&self, request: DevelopmentRunRequest) -> Result<DevelopmentRunReport> {
         validate_development_request(&request)?;
         let (c, root) = self.control().await?;

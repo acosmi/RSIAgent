@@ -107,6 +107,26 @@ pub enum CurriculumRuntimeStatus {
     Disabled,
 }
 
+/// The existing §8 twenty-percent course quota, exposed read-only so the budget
+/// report derives the same upper bound instead of copying a second constant.
+pub const CURRICULUM_BUDGET_SHARE_BPS: u16 = 2_000;
+
+/// The course quota upper bound in exact integer micros. This is not a second
+/// budget: course calls are charged from the same ledger and merely capped.
+/// Test-only contract until a real curriculum producer is wired.
+pub fn curriculum_share_limit_micros(root_limit_micros: i64) -> Result<i64> {
+    if root_limit_micros < 0 {
+        return Err(Error::Invalid(
+            "root limit must be nonnegative for the curriculum share".into(),
+        ));
+    }
+    let scaled = i128::from(root_limit_micros)
+        .checked_mul(i128::from(CURRICULUM_BUDGET_SHARE_BPS))
+        .ok_or_else(|| Error::Invalid("curriculum budget arithmetic overflow".into()))?;
+    i64::try_from(scaled / 10_000)
+        .map_err(|_| Error::Invalid("curriculum budget exceeds i64 micros".into()))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CurriculumControlProfileV1 {
@@ -161,7 +181,7 @@ impl CurriculumControlProfileV1 {
             max_abs_mean_gain_micros: 5_000,
             max_gain_variance_micros_squared: 1_000_000_000,
             cooldown_completed_cycles: 3,
-            curriculum_budget_share_bps: 2_000,
+            curriculum_budget_share_bps: CURRICULUM_BUDGET_SHARE_BPS,
             max_concurrent_probe_jobs: 1,
             monetary_limit_micros: 0,
             runtime_status: CurriculumRuntimeStatus::Disabled,
@@ -181,7 +201,7 @@ impl CurriculumControlProfileV1 {
             || self.max_abs_mean_gain_micros != 5_000
             || self.max_gain_variance_micros_squared != 1_000_000_000
             || self.cooldown_completed_cycles != 3
-            || self.curriculum_budget_share_bps != 2_000
+            || self.curriculum_budget_share_bps != CURRICULUM_BUDGET_SHARE_BPS
             || self.max_concurrent_probe_jobs != 1
             || self.monetary_limit_micros != 0
             || self.runtime_status != CurriculumRuntimeStatus::Disabled

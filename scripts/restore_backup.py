@@ -20,7 +20,7 @@ import uuid
 
 BACKUP_SCHEMA = "rsia.backup.v2"
 DELTA_SCHEMA = "rsia.revoke_delta.v1"
-KNOWN_MIGRATIONS = [1, 2, 4, 5, 6, 7]
+KNOWN_MIGRATIONS = [1, 2, 4, 5, 6, 7, 8]
 # A backup may stop at a strict prefix of KNOWN_MIGRATIONS only once it holds the
 # root budget ledger: protected_facts compares the root_budget% tables 0005 creates.
 ROOT_BUDGET_MIGRATION = 5
@@ -658,9 +658,24 @@ def protected_facts(con,namespaces):
             facts.append((ns,kind,id,value))
     # Monetary state and irreversible dispatch counters must also agree.
     tables=[r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'root_budget%'")]
+    # 0008 adds the three root_budget_stage_plan% tables. A consistent backup on a
+    # strict 0005-0007 prefix legitimately has no such tables yet; treat their
+    # absence there as the same empty facts the upgraded anchor has. Once the DB
+    # records 0008, a missing table is a real difference and is not padded.
+    try:
+        has_stage_plan=con.execute("SELECT 1 FROM _sqlx_migrations WHERE version=8").fetchone() is not None
+    except sqlite3.OperationalError:
+        # Synthetic protection-shape tests have no migration ledger.
+        has_stage_plan=True
+    table_facts=[]
+    if tables and not has_stage_plan:
+        for table in ("root_budget_stage_plan_bindings","root_budget_stage_plan_controls","root_budget_stage_plan_calls"):
+            if table not in tables:
+                table_facts.append((table,[]))
     for table in sorted(tables):
         rows=con.execute('SELECT * FROM "'+table+'"').fetchall()
-        facts.append((table,sorted(rows,key=repr)))
+        table_facts.append((table,sorted(rows,key=repr)))
+    facts.extend(sorted(table_facts,key=lambda entry:entry[0]))
     return facts
 
 def verify_delta(path,manifest_raw,base,anchor,backup,database=None):

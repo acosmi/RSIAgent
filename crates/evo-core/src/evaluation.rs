@@ -2255,6 +2255,139 @@ impl OptimizationBudgetPlan {
     }
 }
 
+/// The exact integer-micro form of a canonical `Money` amount. A decimal
+/// remainder below one micro is refused here, never rounded.
+pub fn money_micros(money: &Money, name: &str) -> Result<i64> {
+    let units = canonical_money_units(money, name)?;
+    if units % 100 != 0 {
+        return Err(Error::Invalid(format!(
+            "{name} must be exactly representable in integer micros"
+        )));
+    }
+    i64::try_from(units / 100).map_err(|_| Error::Invalid(format!("{name} exceeds i64 micros")))
+}
+
+pub const ROOT_STAGE_BUDGET_PLAN_SCHEMA: &str = "rsia.root_stage_budget_plan.v1";
+
+/// One of the four ledger stages the first plan version did not carry. `None`
+/// on the plan means the stage was not allocated, which is not zero money.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StageMoneyCaps {
+    pub per_call_limit: Money,
+    pub experiment_total: Money,
+}
+
+/// `rsia.root_stage_budget_plan.v1`: the complete original 11-stage
+/// `OptimizationBudgetPlan` embedded unchanged, plus the four named optional
+/// ledger stages. The original plan bytes and its digest are untouched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootStageBudgetPlanV1 {
+    pub schema_version: String,
+    pub optimization_budget: OptimizationBudgetPlan,
+    pub curriculum: Option<StageMoneyCaps>,
+    pub candidate_generation: Option<StageMoneyCaps>,
+    pub meta_evaluation: Option<StageMoneyCaps>,
+    pub gray_operations: Option<StageMoneyCaps>,
+}
+
+impl RootStageBudgetPlanV1 {
+    pub fn from_optimization_budget(optimization_budget: OptimizationBudgetPlan) -> Self {
+        Self {
+            schema_version: ROOT_STAGE_BUDGET_PLAN_SCHEMA.into(),
+            optimization_budget,
+            curriculum: None,
+            candidate_generation: None,
+            meta_evaluation: None,
+            gray_operations: None,
+        }
+    }
+
+    fn extra_stages(&self) -> [(&'static str, Option<&StageMoneyCaps>); 4] {
+        [
+            ("curriculum", self.curriculum.as_ref()),
+            ("candidate_generation", self.candidate_generation.as_ref()),
+            ("meta_evaluation", self.meta_evaluation.as_ref()),
+            ("gray_operations", self.gray_operations.as_ref()),
+        ]
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != ROOT_STAGE_BUDGET_PLAN_SCHEMA {
+            return Err(Error::Invalid(
+                "unsupported root stage budget plan schema".into(),
+            ));
+        }
+        self.optimization_budget.validate()?;
+        let root = &self.optimization_budget.root_total;
+        let root_micros = money_micros(root, "root_total")?;
+        let mut stage_sum = 0_i64;
+        for stage in &self.optimization_budget.stages {
+            let per_call = money_micros(&stage.per_call_limit, "per_call_limit")?;
+            let total = money_micros(&stage.experiment_total, "experiment_total")?;
+            if per_call < 0 || total < 0 {
+                return Err(Error::Invalid("stage budgets must not be negative".into()));
+            }
+            if stage.per_call_limit.currency != root.currency
+                || stage.experiment_total.currency != root.currency
+                || stage.per_call_limit.pricing_version != root.pricing_version
+                || stage.experiment_total.pricing_version != root.pricing_version
+            {
+                return Err(Error::Invalid(
+                    "all stage budgets must use the root currency and pricing version".into(),
+                ));
+            }
+            if per_call > total || total > root_micros {
+                return Err(Error::Invalid(
+                    "budget ordering must satisfy per_call <= stage_total <= root_total".into(),
+                ));
+            }
+            stage_sum = stage_sum
+                .checked_add(total)
+                .ok_or_else(|| Error::Invalid("stage budget sum overflow".into()))?;
+        }
+        for (name, caps) in self.extra_stages() {
+            let Some(caps) = caps else { continue };
+            let per_call = money_micros(&caps.per_call_limit, name)?;
+            let total = money_micros(&caps.experiment_total, name)?;
+            if per_call < 0 || total < 0 {
+                return Err(Error::Invalid(format!(
+                    "{name} stage budget must not be negative"
+                )));
+            }
+            if caps.per_call_limit.currency != root.currency
+                || caps.experiment_total.currency != root.currency
+                || caps.per_call_limit.pricing_version != root.pricing_version
+                || caps.experiment_total.pricing_version != root.pricing_version
+            {
+                return Err(Error::Invalid(format!(
+                    "{name} must use the root currency and pricing version"
+                )));
+            }
+            if per_call > total || total > root_micros {
+                return Err(Error::Invalid(format!(
+                    "{name} budget ordering must satisfy per_call <= stage_total <= root_total"
+                )));
+            }
+            stage_sum = stage_sum
+                .checked_add(total)
+                .ok_or_else(|| Error::Invalid("stage budget sum overflow".into()))?;
+        }
+        if stage_sum > root_micros {
+            return Err(Error::Invalid(
+                "sum of stage totals exceeds the root budget".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<String> {
+        self.validate()?;
+        fingerprint(self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FixedOptimizerArm {

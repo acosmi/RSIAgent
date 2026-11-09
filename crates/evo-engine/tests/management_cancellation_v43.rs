@@ -38,7 +38,8 @@ use evo_engine::streaming_evaluator::{
     RegisteredEvaluationControlV3,
 };
 use evo_storage::budget::{
-    BudgetCallRecord, BudgetCallState, RootBudgetAuthorization, UsageCharge,
+    BudgetCallRecord, BudgetCallState, RootBudgetAuthorization, RootStagePlanBindRequest,
+    UsageCharge,
 };
 use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
 use evo_storage::{Store, decode_management_job, sqlx};
@@ -377,7 +378,7 @@ async fn cancel_before_first_commit_has_no_business_side_effect() {
                     .root_total
                     .pricing_version
                     .clone(),
-                payment_subject: "fixture-only".into(),
+                payment_subject: control.optimization_budget.payer_id.clone(),
                 authorization_receipt_digest: control
                     .optimization_budget
                     .admin_authorization_receipt_digest
@@ -386,6 +387,20 @@ async fn cancel_before_first_commit_has_no_business_side_effect() {
                 per_call_cap_micros: 100,
                 total_limit_micros: 1000,
                 created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    // A Current control registers only against a real active root stage plan.
+    fx.store
+        .bind_root_stage_plan(
+            &admin,
+            &RootStagePlanBindRequest {
+                billing_scope: control.billing_scope.clone(),
+                expected_seq: 0,
+                plan: evo_core::evaluation::RootStageBudgetPlanV1::from_optimization_budget(
+                    control.optimization_budget.clone(),
+                ),
             },
         )
         .await
