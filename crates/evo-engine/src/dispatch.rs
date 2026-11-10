@@ -66,19 +66,28 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
         "experiment.register" | "evaluation.start" | "evaluation.status" => {
             ctx.require(&[Role::Evaluator])
         }
-        "exploration.start" | "replay.run" | "curriculum.step" | "meta.start"
-        | "optimization.step" | "trace.export" | "backup.create" => ctx.require(&[Role::Admin]),
+        "exploration.start"
+        | "replay.run"
+        | "curriculum.step"
+        | "meta.start"
+        | "optimization.step"
+        | "trace.export"
+        | "backup.create"
+        | "budget.root.authorize"
+        | "budget.stage_plan.bind"
+        | "budget.calls.list_open"
+        | "budget.call.reconcile" => ctx.require(&[Role::Admin]),
         _ => Err(Error::Invalid("management_operation_not_wired".into())),
     }
 }
 
 pub use evo_storage::{
-    ManagementBackupResultV2, ManagementCancelArrival, ManagementDiagnostic, ManagementJob,
-    ManagementJobState, ManagementJobV2, ManagementOptimizationCallProducer,
-    ManagementOptimizationCallRef, ManagementOptimizationProgressV2,
-    ManagementOptimizationResultV2, ManagementOptimizationStageRef, ManagementPartialResultV2,
-    ManagementPendingTerminalState, ManagementResult, ManagementResultV2,
-    ManagementTraceExportResultV2, VersionedManagementJob,
+    ManagementBackupResultV2, ManagementBudgetResultV2, ManagementCancelArrival,
+    ManagementDiagnostic, ManagementJob, ManagementJobState, ManagementJobV2,
+    ManagementOptimizationCallProducer, ManagementOptimizationCallRef,
+    ManagementOptimizationProgressV2, ManagementOptimizationResultV2,
+    ManagementOptimizationStageRef, ManagementPartialResultV2, ManagementPendingTerminalState,
+    ManagementResult, ManagementResultV2, ManagementTraceExportResultV2, VersionedManagementJob,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +232,74 @@ pub struct OptimizationStepManagementRequest {
     pub development_control_id: String,
 }
 
+const BUDGET_ROOT_AUTHORIZE_SCHEMA: &str = "rsia.management.budget_root_authorize.v1";
+const BUDGET_STAGE_PLAN_BIND_SCHEMA: &str = "rsia.management.budget_stage_plan_bind.v1";
+const BUDGET_CALLS_LIST_OPEN_SCHEMA: &str = "rsia.management.budget_calls_list_open.v1";
+const BUDGET_CALL_RECONCILE_SCHEMA: &str = "rsia.management.budget_call_reconcile.v1";
+const BUDGET_LIST_OPEN_DEFAULT_PAGE_SIZE: u16 = 50;
+
+fn default_budget_list_open_page_size() -> u16 {
+    BUDGET_LIST_OPEN_DEFAULT_PAGE_SIZE
+}
+
+/// The complete trusted root authorization minus its timestamp: `created_at`
+/// is always sampled by the service in the writing Session. The body cannot
+/// select an actor, role, namespace, time or lease.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetRootAuthorizeRequest {
+    schema_version: String,
+    request_key: String,
+    root_budget_id: String,
+    billing_scope: String,
+    allowed_namespaces: Vec<String>,
+    currency: String,
+    pricing_version: String,
+    payment_subject: String,
+    authorization_receipt_digest: String,
+    per_call_cap_micros: i64,
+    total_limit_micros: i64,
+}
+
+/// One AG-141 root stage plan version bind. The plan type is the real
+/// `RootStageBudgetPlanV1`; no second plan family is introduced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetStagePlanBindManagementRequest {
+    schema_version: String,
+    request_key: String,
+    billing_scope: String,
+    expected_seq: i64,
+    plan: evo_core::evaluation::RootStageBudgetPlanV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetCallsListOpenRequest {
+    schema_version: String,
+    request_key: String,
+    billing_scope: String,
+    #[serde(default = "default_budget_list_open_page_size")]
+    page_size: u16,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BudgetCallReconcileRequest {
+    schema_version: String,
+    request_key: String,
+    billing_scope: String,
+    call_id: String,
+    provider_request_id: String,
+    usage_record_id: String,
+    output_digest: String,
+    amount_micros: i64,
+    currency: String,
+    pricing_version: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "operation")]
 enum ParsedRequest {
@@ -239,6 +316,10 @@ enum ParsedRequest {
     TraceExportPrepare(Box<TraceExportPrepareRequest>),
     TraceExportPublish(Box<TraceExportPublishRequest>),
     BackupCreate(backup::BackupCreateRequest),
+    BudgetRootAuthorize(Box<BudgetRootAuthorizeRequest>),
+    BudgetStagePlanBind(Box<BudgetStagePlanBindManagementRequest>),
+    BudgetCallsListOpen(Box<BudgetCallsListOpenRequest>),
+    BudgetCallReconcile(Box<BudgetCallReconcileRequest>),
 }
 
 impl<'de> Deserialize<'de> for ParsedRequest {
@@ -266,6 +347,10 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             TraceExportPrepare(Box<TraceExportPrepareRequest>),
             TraceExportPublish(Box<TraceExportPublishRequest>),
             BackupCreate(backup::BackupCreateRequest),
+            BudgetRootAuthorize(Box<BudgetRootAuthorizeRequest>),
+            BudgetStagePlanBind(Box<BudgetStagePlanBindManagementRequest>),
+            BudgetCallsListOpen(Box<BudgetCallsListOpenRequest>),
+            BudgetCallReconcile(Box<BudgetCallReconcileRequest>),
         }
         Ok(
             match serde_json::from_value::<Other>(value).map_err(serde::de::Error::custom)? {
@@ -279,6 +364,10 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::TraceExportPrepare(value) => Self::TraceExportPrepare(value),
                 Other::TraceExportPublish(value) => Self::TraceExportPublish(value),
                 Other::BackupCreate(value) => Self::BackupCreate(value),
+                Other::BudgetRootAuthorize(value) => Self::BudgetRootAuthorize(value),
+                Other::BudgetStagePlanBind(value) => Self::BudgetStagePlanBind(value),
+                Other::BudgetCallsListOpen(value) => Self::BudgetCallsListOpen(value),
+                Other::BudgetCallReconcile(value) => Self::BudgetCallReconcile(value),
             },
         )
     }
@@ -1104,6 +1193,10 @@ impl ParsedRequest {
             Self::TraceExportPrepare(request) => &request.request_key,
             Self::TraceExportPublish(request) => &request.request_key,
             Self::BackupCreate(request) => &request.request_key,
+            Self::BudgetRootAuthorize(request) => &request.request_key,
+            Self::BudgetStagePlanBind(request) => &request.request_key,
+            Self::BudgetCallsListOpen(request) => &request.request_key,
+            Self::BudgetCallReconcile(request) => &request.request_key,
         }
     }
 }
@@ -1323,6 +1416,12 @@ impl JobOutcome {
             Some(ManagementResultV2::Optimization(_)) => false,
             Some(ManagementResultV2::Trace(_)) => true,
             Some(ManagementResultV2::Backup(_)) => true,
+            // A listing writes only its own job/audit row; the other three
+            // budget results are real authorization/accounting commits.
+            Some(ManagementResultV2::Budget(ManagementBudgetResultV2::OpenCallsListed {
+                ..
+            })) => false,
+            Some(ManagementResultV2::Budget(_)) => true,
             Some(ManagementResultV2::Original(
                 ManagementResult::EvaluationStatus { .. }
                 | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -2040,6 +2139,20 @@ async fn execute_request(
         ParsedRequest::BackupCreate(request) => {
             return backup::execute(ctx, store, claimed, request, control).await;
         }
+        ParsedRequest::BudgetRootAuthorize(request) => {
+            return run_budget_root_authorize(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::BudgetStagePlanBind(request) => {
+            return run_budget_stage_plan_bind(ctx, store, claimed.clone(), *request, control)
+                .await;
+        }
+        ParsedRequest::BudgetCallsListOpen(request) => {
+            return run_budget_calls_list_open(ctx, store, claimed.clone(), *request, control)
+                .await;
+        }
+        ParsedRequest::BudgetCallReconcile(request) => {
+            return run_budget_call_reconcile(ctx, store, claimed.clone(), *request, control).await;
+        }
         ParsedRequest::Blocked(_) => {
             control.admit_step()?;
             job.state = ManagementJobState::Blocked;
@@ -2689,6 +2802,304 @@ async fn trace_export_abort_in_session(
     })
 }
 
+/// Four budget management operations: each handler owns one Session from the
+/// live claim fence through the real storage write, the terminal job state and
+/// the audit row, committed together exactly once. A business refusal rolls all
+/// of it back; only the already-terminal job reconciliation records the
+/// refusal.
+async fn run_budget_root_authorize(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: BudgetRootAuthorizeRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    let mut session = store.session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        // The persisted authorization time is the service's trusted clock,
+        // sampled before the first business write; the request never carries it.
+        let created_at = now()?;
+        let authorization = evo_storage::budget::RootBudgetAuthorization {
+            root_budget_id: request.root_budget_id,
+            billing_scope: request.billing_scope,
+            allowed_namespaces: request.allowed_namespaces,
+            currency: request.currency,
+            pricing_version: request.pricing_version,
+            payment_subject: request.payment_subject,
+            authorization_receipt_digest: request.authorization_receipt_digest,
+            per_call_cap_micros: request.per_call_cap_micros,
+            total_limit_micros: request.total_limit_micros,
+            created_at,
+        };
+        let root = session.authorize_root_budget(ctx, &authorization).await?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "root_authorized".into(),
+            result: Some(ManagementResultV2::Budget(
+                ManagementBudgetResultV2::RootAuthorized {
+                    root: Box::new(root),
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    match finished {
+        Ok(outcome) => {
+            session.commit().await?;
+            Ok(ObservedWorkerExit::Completed(outcome))
+        }
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(error) => {
+            execution_outcome(claimed, Err(error)).map(ObservedWorkerExit::BeforeCommitFailed)
+        }
+    }
+}
+
+async fn run_budget_stage_plan_bind(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: BudgetStagePlanBindManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    let mut session = store.session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        let binding = session
+            .bind_root_stage_plan(
+                ctx,
+                &evo_storage::budget::RootStagePlanBindRequest {
+                    billing_scope: request.billing_scope,
+                    expected_seq: request.expected_seq,
+                    plan: request.plan,
+                },
+            )
+            .await?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "stage_plan_bound".into(),
+            result: Some(ManagementResultV2::Budget(
+                ManagementBudgetResultV2::StagePlanBound {
+                    binding: Box::new(binding),
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    match finished {
+        Ok(outcome) => {
+            session.commit().await?;
+            Ok(ObservedWorkerExit::Completed(outcome))
+        }
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(error) => {
+            execution_outcome(claimed, Err(error)).map(ObservedWorkerExit::BeforeCommitFailed)
+        }
+    }
+}
+
+async fn run_budget_calls_list_open(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: BudgetCallsListOpenRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    let mut session = store.session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        // Read-only over budget/call/root/execution facts; the only writes are
+        // this management job and its audit row.
+        let page = session
+            .list_open_budget_calls(
+                ctx,
+                &request.billing_scope,
+                request.page_size,
+                request.cursor.as_deref(),
+            )
+            .await?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "open_calls_listed".into(),
+            result: Some(ManagementResultV2::Budget(
+                ManagementBudgetResultV2::OpenCallsListed {
+                    page: Box::new(page),
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    match finished {
+        Ok(outcome) => {
+            session.commit().await?;
+            Ok(ObservedWorkerExit::Completed(outcome))
+        }
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(error) => {
+            execution_outcome(claimed, Err(error)).map(ObservedWorkerExit::BeforeCommitFailed)
+        }
+    }
+}
+
+/// A persisted charge identity may only be reconciled with the same actual
+/// facts. The finalized case keeps the kernel's own six-field conflict; the
+/// dispatched/uncertain case refuses to overwrite a preserved overflow charge.
+fn ensure_budget_charge_matches_persisted(
+    call: &evo_storage::budget::BudgetCallRecord,
+    charge: &evo_storage::budget::UsageCharge,
+) -> Result<()> {
+    if call.state == evo_storage::budget::BudgetCallState::Finalized {
+        return Ok(());
+    }
+    let same = |stored: Option<&str>, incoming: &str| stored.is_none_or(|value| value == incoming);
+    if !same(
+        call.provider_request_id.as_deref(),
+        &charge.provider_request_id,
+    ) || !same(call.usage_record_id.as_deref(), &charge.usage_record_id)
+        || !same(call.output_digest.as_deref(), &charge.output_digest)
+        || !same(call.actual_currency.as_deref(), &charge.currency)
+        || !same(
+            call.actual_pricing_version.as_deref(),
+            &charge.pricing_version,
+        )
+        || call
+            .actual_cost_micros
+            .is_some_and(|amount| amount != charge.amount_micros)
+    {
+        return Err(Error::Conflict(
+            "reconcile_charge_differs_from_persisted_call".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn run_budget_call_reconcile(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: BudgetCallReconcileRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    let mut session = store.session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        let charge = evo_storage::budget::UsageCharge {
+            amount_micros: request.amount_micros,
+            currency: request.currency,
+            pricing_version: request.pricing_version,
+            provider_request_id: request.provider_request_id,
+            usage_record_id: request.usage_record_id,
+            output_digest: request.output_digest,
+        };
+        let call = session
+            .budget_call(ctx, &request.billing_scope, &request.call_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        ensure_budget_charge_matches_persisted(&call, &charge)?;
+        let reconciled_at = now()?;
+        let outcome = session
+            .reconcile_budget_call_cost(
+                ctx,
+                &request.billing_scope,
+                &request.call_id,
+                &charge,
+                reconciled_at,
+            )
+            .await?;
+        let root = session
+            .root_budget(ctx, &request.billing_scope)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let (state, step, error_code, accounting_overflow, call) = match outcome {
+            evo_storage::budget::BudgetReconcileOutcome::Applied(call) => (
+                ManagementJobState::Succeeded,
+                "call_reconciled",
+                None,
+                false,
+                call,
+            ),
+            evo_storage::budget::BudgetReconcileOutcome::AlreadyFinalized(call) => (
+                ManagementJobState::Succeeded,
+                "call_already_reconciled",
+                None,
+                false,
+                call,
+            ),
+            // The overflow preservation writes are already in this transaction:
+            // the terminal state reports the block while the result keeps the
+            // real uncertain call, amounts and stopped root as committed facts.
+            evo_storage::budget::BudgetReconcileOutcome::PreservedAccountingOverflow(call) => (
+                ManagementJobState::Blocked,
+                "cost_accounting_overflow",
+                Some("cost_accounting_overflow".to_owned()),
+                true,
+                call,
+            ),
+        };
+        let outcome = JobOutcome {
+            state,
+            step: step.into(),
+            result: Some(ManagementResultV2::Budget(
+                ManagementBudgetResultV2::CallReconciled {
+                    call: Box::new(evo_storage::budget::BudgetCallSettlementView::new(
+                        &call, &root,
+                    )),
+                    accounting_overflow,
+                    provider_source_verified: false,
+                },
+            )),
+            error_code,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    match finished {
+        Ok(outcome) => {
+            session.commit().await?;
+            Ok(ObservedWorkerExit::Completed(outcome))
+        }
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(error) => {
+            execution_outcome(claimed, Err(error)).map(ObservedWorkerExit::BeforeCommitFailed)
+        }
+    }
+}
+
 async fn run_replay(
     ctx: &Context,
     store: &Store,
@@ -2831,7 +3242,11 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
         | ParsedRequest::BackupCreate(_)
         | ParsedRequest::ReplayRun(_)
         | ParsedRequest::CurriculumStep(_)
-        | ParsedRequest::ExplorationStart(_) => {
+        | ParsedRequest::ExplorationStart(_)
+        | ParsedRequest::BudgetRootAuthorize(_)
+        | ParsedRequest::BudgetStagePlanBind(_)
+        | ParsedRequest::BudgetCallsListOpen(_)
+        | ParsedRequest::BudgetCallReconcile(_) => {
             ctx.require(&[Role::Admin])?;
         }
         ParsedRequest::TraceExportPrepare(request) => {
@@ -4642,6 +5057,31 @@ async fn consumer_progress(
                 None => Ok(ConsumerProgress::NotCommitted),
             }
         }
+        ParsedRequest::BudgetRootAuthorize(_)
+        | ParsedRequest::BudgetStagePlanBind(_)
+        | ParsedRequest::BudgetCallsListOpen(_)
+        | ParsedRequest::BudgetCallReconcile(_) => {
+            // These handlers write their business effect and the terminal job
+            // state in one transaction. A stored terminal Budget result is
+            // therefore the committed outcome; without one nothing was
+            // committed by this job.
+            let identity = record.identity();
+            let result = record.result();
+            if matches!(
+                identity.state,
+                ManagementJobState::Succeeded | ManagementJobState::Blocked
+            ) && matches!(result, Some(ManagementResultV2::Budget(_)))
+            {
+                Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                    state: identity.state,
+                    step: record.step().into(),
+                    result,
+                    error_code: record.error_code().map(str::to_owned),
+                })))
+            } else {
+                Ok(ConsumerProgress::NotCommitted)
+            }
+        }
         ParsedRequest::OptimizationStep(_) | ParsedRequest::BackupCreate(_) => Err(Error::Internal),
         ParsedRequest::Blocked(request) => {
             if record.identity().operation != "meta.start"
@@ -5348,6 +5788,8 @@ fn stored_result_has_side_effect(result: Option<&ManagementResultV2>) -> bool {
         Some(ManagementResultV2::Optimization(_)) => true,
         Some(ManagementResultV2::Trace(_)) => true,
         Some(ManagementResultV2::Backup(_)) => true,
+        Some(ManagementResultV2::Budget(ManagementBudgetResultV2::OpenCallsListed { .. })) => false,
+        Some(ManagementResultV2::Budget(_)) => true,
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }
             | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -5439,6 +5881,46 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         "backup.create" => {
             ParsedRequest::BackupCreate(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
+        "budget.root.authorize" => match payload["schema_version"].as_str() {
+            Some(BUDGET_ROOT_AUTHORIZE_SCHEMA) => ParsedRequest::BudgetRootAuthorize(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
+        "budget.stage_plan.bind" => match payload["schema_version"].as_str() {
+            Some(BUDGET_STAGE_PLAN_BIND_SCHEMA) => ParsedRequest::BudgetStagePlanBind(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
+        "budget.calls.list_open" => match payload["schema_version"].as_str() {
+            Some(BUDGET_CALLS_LIST_OPEN_SCHEMA) => ParsedRequest::BudgetCallsListOpen(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
+        "budget.call.reconcile" => match payload["schema_version"].as_str() {
+            Some(BUDGET_CALL_RECONCILE_SCHEMA) => ParsedRequest::BudgetCallReconcile(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
@@ -5465,6 +5947,10 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::TraceExportPrepare(request) => &request.schema_version,
         ParsedRequest::TraceExportPublish(request) => &request.schema_version,
         ParsedRequest::BackupCreate(request) => &request.schema_version,
+        ParsedRequest::BudgetRootAuthorize(request) => &request.schema_version,
+        ParsedRequest::BudgetStagePlanBind(request) => &request.schema_version,
+        ParsedRequest::BudgetCallsListOpen(request) => &request.schema_version,
+        ParsedRequest::BudgetCallReconcile(request) => &request.schema_version,
     };
     if actual != &expected {
         return Err(Error::Invalid(
@@ -5599,7 +6085,12 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
                 format!("formal-profile-{}", request.compiler.profile.id),
             ));
         }
-        ParsedRequest::Blocked(_) | ParsedRequest::BackupCreate(_) => {}
+        ParsedRequest::Blocked(_)
+        | ParsedRequest::BackupCreate(_)
+        | ParsedRequest::BudgetRootAuthorize(_)
+        | ParsedRequest::BudgetStagePlanBind(_)
+        | ParsedRequest::BudgetCallsListOpen(_)
+        | ParsedRequest::BudgetCallReconcile(_) => {}
         ParsedRequest::TraceExportPrepare(request) => {
             // The private input depends on every captured source run, so a
             // revoked source redacts the request with the job that holds it.
@@ -5874,6 +6365,20 @@ pub enum ManagementCommittedEffect {
         candidate_digest: String,
         phase: String,
     },
+    BudgetRoot {
+        billing_scope: String,
+        root_budget_id: String,
+    },
+    BudgetBinding {
+        billing_scope: String,
+        binding_seq: i64,
+        plan_digest: String,
+    },
+    BudgetReconciliation {
+        billing_scope: String,
+        call_id: String,
+        accounting_overflow: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6013,6 +6518,33 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
             candidate_digest: candidate_digest.clone(),
             phase: "delivered".into(),
         }],
+        Some(ManagementResultV2::Budget(ManagementBudgetResultV2::RootAuthorized { root })) => {
+            vec![ManagementCommittedEffect::BudgetRoot {
+                billing_scope: root.billing_scope.clone(),
+                root_budget_id: root.root_budget_id.clone(),
+            }]
+        }
+        Some(ManagementResultV2::Budget(ManagementBudgetResultV2::StagePlanBound { binding })) => {
+            vec![ManagementCommittedEffect::BudgetBinding {
+                billing_scope: binding.billing_scope.clone(),
+                binding_seq: binding.seq,
+                plan_digest: binding.plan_digest.clone(),
+            }]
+        }
+        Some(ManagementResultV2::Budget(ManagementBudgetResultV2::CallReconciled {
+            call,
+            accounting_overflow,
+            ..
+        })) => vec![ManagementCommittedEffect::BudgetReconciliation {
+            billing_scope: call.billing_scope.clone(),
+            call_id: call.call_id.clone(),
+            accounting_overflow: *accounting_overflow,
+        }],
+        // The listing commits only its own job and audit row, not a business
+        // fact of the root or its calls.
+        Some(ManagementResultV2::Budget(ManagementBudgetResultV2::OpenCallsListed { .. })) => {
+            Vec::new()
+        }
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }
             | ManagementResult::EvaluationStatusReadV2 { .. },

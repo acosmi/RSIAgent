@@ -507,6 +507,29 @@ pub enum ManagementResultV2 {
     Optimization(ManagementOptimizationResultV2),
     Trace(ManagementTraceExportResultV2),
     Backup(ManagementBackupResultV2),
+    Budget(ManagementBudgetResultV2),
+}
+
+/// Closed management results of the four budget operations. They carry only
+/// persisted records and safe metadata projections; no private request,
+/// response or transport body enters a management job result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementBudgetResultV2 {
+    RootAuthorized {
+        root: Box<budget::RootBudgetRecord>,
+    },
+    StagePlanBound {
+        binding: Box<budget::RootStagePlanBinding>,
+    },
+    OpenCallsListed {
+        page: Box<budget::BudgetOpenCallsPage>,
+    },
+    CallReconciled {
+        call: Box<budget::BudgetCallSettlementView>,
+        accounting_overflow: bool,
+        provider_source_verified: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -900,6 +923,39 @@ pub fn decode_management_job_for_recovery(
     }
 }
 
+fn budget_result_binding_is_valid(job: &ManagementJobV2) -> bool {
+    let Some(ManagementResultV2::Budget(result)) = job.result.as_ref() else {
+        return true;
+    };
+    match result {
+        ManagementBudgetResultV2::RootAuthorized { root } => {
+            job.operation == "budget.root.authorize" && !root.billing_scope.is_empty()
+        }
+        ManagementBudgetResultV2::StagePlanBound { binding } => {
+            job.operation == "budget.stage_plan.bind" && binding.seq > 0
+        }
+        ManagementBudgetResultV2::OpenCallsListed { page } => {
+            job.operation == "budget.calls.list_open"
+                && page.schema_version == budget::BUDGET_OPEN_CALLS_PAGE_SCHEMA
+                && page.entries.len() <= usize::from(page.page_size)
+                && page
+                    .entries
+                    .iter()
+                    .all(|entry| !entry.call_id.is_empty() && !entry.namespace.is_empty())
+                && page.complete == page.next_cursor.is_none()
+                && page
+                    .next_cursor
+                    .as_deref()
+                    .is_none_or(|cursor| budget::parse_budget_list_open_cursor(cursor).is_ok())
+        }
+        ManagementBudgetResultV2::CallReconciled { call, .. } => {
+            job.operation == "budget.call.reconcile"
+                && !call.billing_scope.is_empty()
+                && !call.call_id.is_empty()
+        }
+    }
+}
+
 fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
     let invalid_shape = || Error::Conflict("management_job_invalid_shape".into());
     let schema = value
@@ -928,6 +984,7 @@ fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
                     .is_some_and(|progress| !progress.valid_wire())
                 || (matches!(job.result, Some(ManagementResultV2::Backup(_)))
                     && job.operation != "backup.create")
+                || !budget_result_binding_is_valid(&job)
             {
                 return Err(invalid_shape());
             }

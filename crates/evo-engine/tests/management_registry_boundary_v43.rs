@@ -8,11 +8,12 @@
 //! seven handlers keep their real role guards; and `control.review` never
 //! becomes a management job through `submit`.
 use evo_core::contract::admin_ops;
+use evo_core::evaluation::{OptimizationBudgetPlan, RootStageBudgetPlanV1};
 use evo_core::management_registry::{
     self, ExecutionKind, MANAGEMENT_CATALOG, Plane, REVIEW_OPERATION,
 };
 use evo_core::{Context, Error, Role};
-use evo_engine::dispatch::{ManagementDispatcher, Surface, classify};
+use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState, Surface, classify};
 use evo_storage::Store;
 use serde_json::{Value, json};
 
@@ -98,7 +99,10 @@ fn model_tools_keep_their_surface_and_are_disjoint_from_the_catalog() {
 /// The dispatcher's real guards are untouched: the old seven keep their role
 /// requirements, and every newly registered but unimplemented name —
 /// including the dedicated sync view — fails closed inside `submit` with zero rows
-/// written: no job, no private input, no audit, no call.
+/// written: no job, no private input, no audit, no call. The four budget
+/// operations are wired, so they fail at their own strict DTO boundary rather
+/// than `management_operation_not_wired`; their real consumers are exercised
+/// by `budget_operations_are_wired_to_their_real_handlers` below.
 #[tokio::test]
 async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemented_names() {
     let (dir, store) = store().await;
@@ -159,6 +163,17 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
                 // lacks relative_name, so the strict request DTO refuses it
                 // before any session, with zero writes.
                 ("backup.create", _) => "invalid management payload",
+                // The four budget operations are wired. This boundary payload
+                // only carries schema_version and request_key, so each strict
+                // request DTO refuses it before any session, with zero writes;
+                // their real consumers are covered by the positive control.
+                (
+                    "budget.root.authorize"
+                    | "budget.stage_plan.bind"
+                    | "budget.calls.list_open"
+                    | "budget.call.reconcile",
+                    _,
+                ) => "invalid management payload",
                 (_, ExecutionKind::AsyncJob) => "management_operation_not_wired",
                 _ => "management operation requires dedicated route",
             }),
@@ -566,4 +581,128 @@ async fn unbound_context_stays_forbidden_before_management_classification() {
         }
     }
     assert_eq!(management_sql_snapshot(&path), before);
+}
+
+/// Positive control for the补签 boundary: the four budget names no longer stop
+/// at `management_operation_not_wired`. A real authorization succeeds, a real
+/// listing over it succeeds, and the other two reach their real storage
+/// consumers (and are refused there on this source-less boundary store).
+#[tokio::test]
+async fn budget_operations_are_wired_to_their_real_handlers() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("boundary", "admin", Role::Admin).unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+
+    async fn done(
+        dispatcher: &ManagementDispatcher,
+        admin: &Context,
+        operation: &str,
+        payload: Value,
+    ) -> evo_engine::dispatch::ManagementJobStatusV1 {
+        let queued = dispatcher.submit(admin, operation, payload).await.unwrap();
+        for _ in 0..1_000 {
+            let status = dispatcher
+                .status_view(admin, queued.identity().id)
+                .await
+                .unwrap();
+            if matches!(
+                status.state,
+                ManagementJobState::Succeeded
+                    | ManagementJobState::Failed
+                    | ManagementJobState::Cancelled
+                    | ManagementJobState::Blocked
+            ) {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("{operation} did not finish");
+    }
+
+    let scope = "boundary-budget";
+    let authorized = done(
+        &dispatcher,
+        &admin,
+        "budget.root.authorize",
+        json!({
+            "schema_version":"rsia.management.budget_root_authorize.v1",
+            "request_key":"boundary-authorize",
+            "root_budget_id":"boundary-root",
+            "billing_scope":scope,
+            "allowed_namespaces":["boundary"],
+            "currency":"USD",
+            "pricing_version":"price-v1",
+            "payment_subject":"payer",
+            "authorization_receipt_digest":evo_core::hash(b"receipt"),
+            "per_call_cap_micros":10,
+            "total_limit_micros":100
+        }),
+    )
+    .await;
+    assert_eq!(
+        authorized.state,
+        ManagementJobState::Succeeded,
+        "{authorized:?}"
+    );
+    assert!(store.root_budget(&admin, scope).await.unwrap().is_some());
+
+    let listed = done(
+        &dispatcher,
+        &admin,
+        "budget.calls.list_open",
+        json!({
+            "schema_version":"rsia.management.budget_calls_list_open.v1",
+            "request_key":"boundary-list",
+            "billing_scope":scope,
+            "page_size":10
+        }),
+    )
+    .await;
+    assert_eq!(listed.state, ManagementJobState::Succeeded, "{listed:?}");
+    assert_eq!(listed.step, "open_calls_listed");
+
+    // A valid bind request reaches the real kernel and is refused because this
+    // scope has no root; it is not refused as an unwired operation.
+    let bind_plan = RootStageBudgetPlanV1::from_optimization_budget(
+        OptimizationBudgetPlan::unfunded("boundary-missing", "payer", "USD").unwrap(),
+    );
+    let bind = done(
+        &dispatcher,
+        &admin,
+        "budget.stage_plan.bind",
+        json!({
+            "schema_version":"rsia.management.budget_stage_plan_bind.v1",
+            "request_key":"boundary-bind",
+            "billing_scope":"boundary-missing",
+            "expected_seq":0,
+            "plan":bind_plan
+        }),
+    )
+    .await;
+    assert_eq!(bind.state, ManagementJobState::Failed, "{bind:?}");
+    assert_eq!(bind.error_code.as_deref(), Some("budget_unavailable"));
+
+    // A valid reconcile request reaches the real call reader and reports the
+    // missing call; it is not an unwired refusal either.
+    let reconcile = done(
+        &dispatcher,
+        &admin,
+        "budget.call.reconcile",
+        json!({
+            "schema_version":"rsia.management.budget_call_reconcile.v1",
+            "request_key":"boundary-reconcile",
+            "billing_scope":scope,
+            "call_id":"missing-call",
+            "provider_request_id":"provider",
+            "usage_record_id":"usage",
+            "output_digest":evo_core::hash(b"output"),
+            "amount_micros":1,
+            "currency":"USD",
+            "pricing_version":"price-v1"
+        }),
+    )
+    .await;
+    assert_eq!(reconcile.state, ManagementJobState::Failed, "{reconcile:?}");
+    assert_eq!(reconcile.error_code.as_deref(), Some("not_found"));
+    store.close().await;
 }
