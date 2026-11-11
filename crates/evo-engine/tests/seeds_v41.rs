@@ -14,10 +14,12 @@
 //! - V098: Audit-Traceability
 
 use evo_core::{Context, Error, Role, fingerprint, hash};
-use evo_engine::packages::{E16SourceRef, PersistentPackageStore, StagedAssetState};
+use evo_engine::dispatch::{ManagementDispatcher, ManagementJobState, ManagementResultV2};
+use evo_engine::packages::{E16Envelope, E16SourceRef, PersistentPackageStore, StagedAssetState};
 use evo_engine::seeds::{
-    DiffCategory, E16_CURRENT_SEED_INSTALL_SCHEMA as E16_SEED_INSTALL_SCHEMA,
-    InstallCurrentSeedRequest, PersistentSeedStore, SeedClass, SeedIdentity, SeedInstallRecord,
+    BUILTIN_I0_BYTES, DiffCategory, E16_CURRENT_SEED_INSTALL_SCHEMA as E16_SEED_INSTALL_SCHEMA,
+    E16_SEED_INSTALL_SCHEMA as E16_V1_SEED_INSTALL_SCHEMA, InstallCurrentSeedRequest,
+    PersistentSeedStore, SeedClass, SeedIdentity, SeedInstallPayloadV1, SeedInstallRecord,
     SeedStatus, SeedTriple, SeedUpstream, StagingSession, auto_activate, classify,
     compute_three_way_diff, safe_reset_to_baseline,
 };
@@ -691,4 +693,324 @@ fn f18_pure_seed_reset_rejects_install_records_that_are_not_installed() {
             "safe_reset_to_baseline accepted a {status:?} install record: {result:?}"
         );
     }
+}
+
+// =========================================================================
+// AG-166c install-only: the shared kernel reuses the E16.5 staging cap; the
+// management first copy creates no staging entry.
+// =========================================================================
+#[tokio::test]
+async fn management_seed_install_shares_the_global_capacity_gates() {
+    let (_directory, store, admin, sources) = seed_store().await;
+    // One real update staging plus nineteen explicit safe-B stagings fill the
+    // instance-wide 20-package limit.
+    let mut first = install_request("baseline-install", sources.clone());
+    first.local_bytes = Some(b"baseline seed".to_vec());
+    first.upstream = Some(SeedUpstream {
+        path: "upstream/seed-v2.txt".into(),
+        content_digest: hash(b"upstream v2 seed"),
+        bytes: b"upstream v2 seed".to_vec(),
+    });
+    let installed = PersistentSeedStore::install_current(&admin, &store, first)
+        .await
+        .unwrap();
+    assert!(installed.staged.is_some());
+    for index in 0..19 {
+        PersistentSeedStore::stage_reset_to_baseline(
+            &admin,
+            &store,
+            &installed.install.id,
+            &format!("fill-{index}"),
+            &hash(b"environment"),
+            "compiler-v1",
+        )
+        .await
+        .unwrap();
+    }
+    let usage: evo_engine::capacity::V41CapacityUsage = {
+        let mut session = store.session().await.unwrap();
+        let usage = session
+            .capacity_usage_v41(evo_engine::capacity::unix_now_secs().unwrap())
+            .await
+            .unwrap()
+            .into();
+        session.commit().await.unwrap();
+        usage
+    };
+    assert_eq!(usage.staged_packages, 20);
+
+    // The management builtin first copy creates no staging entry, so it is not
+    // blocked by the full staging counter and does not change it.
+    let i0_digest = store
+        .put_blob_bounded(&admin, BUILTIN_I0_BYTES, 1024 * 1024)
+        .await
+        .unwrap();
+    let input = serde_json::json!({
+        "schema_version": "rsia.management.seed_install_input.v1",
+        "catalog_asset_id": "improver-i0",
+        "source_refs": sources,
+        "environment_digest": hash(b"environment"),
+        "compiler_version": "builtin-i0-v2",
+    });
+    let input_digest = store
+        .put_blob_bounded(&admin, &serde_json::to_vec(&input).unwrap(), 64 * 1024)
+        .await
+        .unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(
+            &admin,
+            "seed.install",
+            serde_json::json!({
+                "schema_version": "rsia.management.seed_install.v1",
+                "request_key": "capacity-first-copy",
+                "install_input_blob_digest": input_digest,
+                "baseline_blob_digest": i0_digest,
+                "local_blob_digest": i0_digest,
+                "upstream_blob_digest": i0_digest,
+            }),
+        )
+        .await
+        .unwrap();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            let status = dispatcher
+                .status_view(&admin, queued.identity().id)
+                .await
+                .unwrap();
+            if matches!(
+                status.state,
+                ManagementJobState::Succeeded
+                    | ManagementJobState::Failed
+                    | ManagementJobState::Cancelled
+                    | ManagementJobState::Blocked
+            ) {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("seed.install reaches a terminal state");
+    assert_eq!(status.state, ManagementJobState::Succeeded, "{status:?}");
+    assert!(matches!(
+        status.result.as_ref(),
+        Some(ManagementResultV2::Seed(_))
+    ));
+    let usage: evo_engine::capacity::V41CapacityUsage = {
+        let mut session = store.session().await.unwrap();
+        let usage = session
+            .capacity_usage_v41(evo_engine::capacity::unix_now_secs().unwrap())
+            .await
+            .unwrap()
+            .into();
+        session.commit().await.unwrap();
+        usage
+    };
+    assert_eq!(usage.staged_packages, 20, "first copy consumes no staging");
+
+    // The same kernel still refuses a 21st staging entry for an update.
+    let mut overflow = install_request("overflow", sources);
+    overflow.baseline_identity = Some(SeedIdentity {
+        publisher: "org.rsia".into(),
+        asset_id: "other-seed".into(),
+        kind: "skill".into(),
+    });
+    overflow.local_identity = overflow.baseline_identity.clone();
+    overflow.local_bytes = Some(b"other baseline".to_vec());
+    overflow.baseline_bytes = Some(b"other baseline".to_vec());
+    overflow.upstream = Some(SeedUpstream {
+        path: "upstream/other.txt".into(),
+        content_digest: hash(b"other upstream"),
+        bytes: b"other upstream".to_vec(),
+    });
+    assert!(matches!(
+        PersistentSeedStore::install_current(&admin, &store, overflow).await,
+        Err(Error::Capacity(detail))
+            if detail.item == evo_core::capacity::CapacityItem::StagingPackage
+                && detail.limit == 20
+    ));
+    assert!(installed.staged.is_some());
+    store.close().await;
+}
+
+// =========================================================================
+// AG-166c: same-key replay keeps the original immutable image and its bytes.
+// =========================================================================
+#[tokio::test]
+async fn management_seed_replay_preserves_original_baseline_and_local_bytes() {
+    let (directory, store, admin, sources) = seed_store().await;
+    let request = install_request("replay-key", sources.clone());
+    let first = PersistentSeedStore::install_current(&admin, &store, request.clone())
+        .await
+        .unwrap();
+    assert_eq!(first.class, SeedClass::BothChanged);
+    let install_id = first.install.id.clone();
+    let mut session = store.session().await.unwrap();
+    let original_body = session
+        .object_row(&admin, "artifact", &install_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .body;
+    session.commit().await.unwrap();
+    let baseline_path = directory
+        .path()
+        .join("blobs")
+        .join(hash(b"n"))
+        .join(&first.install.payload.baseline_blob_digest);
+    let local_path = directory
+        .path()
+        .join("blobs")
+        .join(hash(b"n"))
+        .join(&first.install.payload.local_blob_digest);
+    let baseline_bytes = std::fs::read(&baseline_path).unwrap();
+    let local_bytes = std::fs::read(&local_path).unwrap();
+    assert_eq!(baseline_bytes, b"baseline seed");
+    assert_eq!(local_bytes, b"local seed");
+
+    let replay = PersistentSeedStore::install_current(&admin, &store, request)
+        .await
+        .unwrap();
+    assert_eq!(replay.install.id, install_id);
+    assert_eq!(
+        fingerprint(&replay.install).unwrap(),
+        fingerprint(&first.install).unwrap()
+    );
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session
+            .object_row(&admin, "artifact", &install_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .body,
+        original_body
+    );
+    session.commit().await.unwrap();
+    assert_eq!(std::fs::read(&baseline_path).unwrap(), baseline_bytes);
+    assert_eq!(std::fs::read(&local_path).unwrap(), local_bytes);
+
+    // A new key with the same identity and baseline cannot rewrite the original
+    // baseline/local digests; it only returns the immutable install image.
+    let mut changed = install_request("new-local-key", sources);
+    changed.environment_digest = first.install.payload.environment_digest.clone();
+    let changed = PersistentSeedStore::install_current(&admin, &store, changed)
+        .await
+        .unwrap();
+    assert_eq!(changed.install.id, install_id);
+    assert_eq!(
+        changed.install.payload.baseline_digest,
+        first.install.payload.baseline_digest
+    );
+    assert_eq!(
+        changed.install.payload.local_digest,
+        first.install.payload.local_digest
+    );
+    assert_eq!(std::fs::read(&baseline_path).unwrap(), baseline_bytes);
+    assert_eq!(std::fs::read(&local_path).unwrap(), local_bytes);
+    store.close().await;
+}
+
+// =========================================================================
+// AG-166c: a legacy read confers no Current authority and no management reset.
+// =========================================================================
+#[tokio::test]
+async fn management_legacy_install_read_does_not_authorize_new_reset() {
+    let (_directory, store, admin, sources) = seed_store().await;
+    let baseline = b"legacy baseline";
+    let local = b"legacy local";
+    let baseline_blob = store
+        .put_blob_bounded(&admin, baseline, 1024 * 1024)
+        .await
+        .unwrap();
+    let local_blob = store
+        .put_blob_bounded(&admin, local, 1024 * 1024)
+        .await
+        .unwrap();
+    let envelope = E16Envelope {
+        schema_version: E16_V1_SEED_INSTALL_SCHEMA.into(),
+        id: "e16-seed-install-legacy".into(),
+        namespace: admin.namespace().into(),
+        owner_actor: admin.actor().into(),
+        request_key: "legacy-install".into(),
+        input_digest: hash(b"legacy-input"),
+        created_at: 1,
+        updated_at: 1,
+        source_refs: sources.clone(),
+        revoke_watermark: 1,
+        payload: SeedInstallPayloadV1 {
+            publisher: "org.rsia".into(),
+            asset_id: "legacy-seed".into(),
+            kind: "skill".into(),
+            baseline_blob_digest: baseline_blob,
+            baseline_digest: hash(baseline),
+            local_blob_digest: local_blob,
+            local_digest: hash(local),
+            upstream_blob_digest: None,
+            upstream_digest: None,
+            environment_digest: hash(b"environment"),
+            status: SeedStatus::Installed,
+            quarantine_reason: None,
+        },
+    };
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "artifact", &envelope.id, admin.actor(), &envelope)
+        .await
+        .unwrap();
+    for source in &sources {
+        session
+            .put_edge(&admin, "artifact", &envelope.id, &source.kind, &source.id)
+            .await
+            .unwrap();
+    }
+    session.commit().await.unwrap();
+    let legacy = PersistentSeedStore::read_legacy_install(&admin, &store, &envelope.id)
+        .await
+        .unwrap();
+    assert_eq!(legacy.schema_version, E16_V1_SEED_INSTALL_SCHEMA);
+    assert!(matches!(
+        PersistentSeedStore::read_install(&admin, &store, &envelope.id).await,
+        Err(Error::Conflict(message)) if message == "seed_install_legacy"
+    ));
+    // The management reset stays unwired: a legacy read cannot mint a reset
+    // job, and the stored record is untouched.
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let error = dispatcher
+        .submit(
+            &admin,
+            "seed.reset_stage",
+            serde_json::json!({
+                "schema_version": "rsia.management.seed_reset_stage.v1",
+                "request_key": "legacy-reset",
+                "install_id": envelope.id,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Invalid(message) if message == "management_operation_not_wired"),
+        "{error:?}"
+    );
+    let mut session = store.session().await.unwrap();
+    let body: serde_json::Value = session
+        .need(&admin, "artifact", &envelope.id)
+        .await
+        .unwrap();
+    let jobs: Vec<serde_json::Value> = session.list(&admin, "job").await.unwrap();
+    let staged: Vec<serde_json::Value> = session.list(&admin, "artifact").await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(body, serde_json::to_value(&envelope).unwrap());
+    assert!(jobs.is_empty());
+    let seed_artifacts = staged
+        .iter()
+        .filter(|body| {
+            body["schema_version"]
+                .as_str()
+                .is_some_and(|schema| schema.starts_with("rsia.e16.seed"))
+        })
+        .count();
+    assert_eq!(seed_artifacts, 1, "only the legacy install artifact");
+    store.close().await;
 }
