@@ -508,6 +508,7 @@ pub enum ManagementResultV2 {
     Trace(ManagementTraceExportResultV2),
     Backup(ManagementBackupResultV2),
     Budget(ManagementBudgetResultV2),
+    Import(ManagementImportResultV2),
 }
 
 /// Closed management results of the four budget operations. They carry only
@@ -569,6 +570,77 @@ pub enum ManagementTraceExportResultV2 {
         candidate_digest: String,
         receipt_digest: String,
     },
+}
+
+/// Closed results of the two import management operations. They carry the
+/// registered/frozen identifiers, bounded counters and the import's own fixed
+/// coverage only: never event records, physical roots or the original bytes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementImportResultV2 {
+    ImportRegistered {
+        selection_id: String,
+        selection_digest: String,
+        source_count: u64,
+        statuses: ManagementImportStatusCounts,
+    },
+    ImportCompleted {
+        selection_id: String,
+        result_id: String,
+        result_digest: String,
+        state: ManagementImportResultState,
+        total_events: u64,
+        total_sources: u64,
+        locator_count: u64,
+        event_record_count: u64,
+        native_trace_count: u64,
+        coverage: Box<evo_core::evidence::TraceCoverage>,
+        reader_version: String,
+        normalization_version: String,
+        generation_status: String,
+    },
+}
+
+/// Every persisted source status counted in one bounded, closed carrier.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagementImportStatusCounts {
+    pub prepared: u64,
+    pub ready: u64,
+    pub missing: u64,
+    pub permission_denied: u64,
+    pub source_changed: u64,
+    pub zero_records: u64,
+    pub invalid_file: u64,
+    pub too_large: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementImportResultState {
+    Complete,
+    Partial,
+    Failed,
+}
+
+/// The server-derived location of one namespace-scoped registered blob. The
+/// caller selects only the authenticated namespace (through its `Context`) and
+/// the digest; the root and path are never taken from request data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBlobLocation {
+    pub root: String,
+    pub path: String,
+    pub digest: String,
+}
+
+/// One verified registered blob input: its server-derived location and the
+/// exact bytes whose hash equals `digest`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBlobInput {
+    pub root: String,
+    pub path: String,
+    pub digest: String,
+    pub bytes: Vec<u8>,
 }
 
 /// Only this operation's actual producer references, never amount snapshots.
@@ -1689,6 +1761,88 @@ async fn write_synced_temp(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut file = options.open(path).await.map_err(internal)?;
     file.write_all(bytes).await.map_err(internal)?;
     file.sync_all().await.map_err(internal)
+}
+
+/// The one blob-read admission shared by `read_blob` and the management import
+/// input readers: a lowercase 64-hex digest and the 1..=64MiB byte bound.
+fn validate_blob_read_request(digest: &str, max_bytes: usize) -> Result<()> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::Invalid("invalid lowercase content digest".into()));
+    }
+    if max_bytes == 0 || max_bytes > MAX_BLOB_BYTES {
+        return Err(Error::Invalid(
+            "blob read bound must be 1..=67108864 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read one already-derived blob path under the caller's held blob lock (or
+/// read lock): regular file, single link, bounded non-empty size, stable
+/// identity across open and the exact content digest.
+async fn read_blob_bytes(
+    path: std::path::PathBuf,
+    digest: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    let expected = digest.to_string();
+    let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Error::NotFound
+            } else {
+                internal(error)
+            }
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::Conflict("blob is not a regular file".into()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() != 1 {
+                return Err(Error::Conflict("linked blob is not trusted content".into()));
+            }
+        }
+        if metadata.len() == 0 || metadata.len() > max_bytes as u64 {
+            return Err(Error::Conflict(
+                "blob exceeds the authorized read bound".into(),
+            ));
+        }
+        let file = File::open(&path).map_err(internal)?;
+        let opened = file.metadata().map_err(internal)?;
+        if !opened.is_file() || opened.len() != metadata.len() {
+            return Err(Error::Conflict("blob changed while being opened".into()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if opened.nlink() != 1
+                || opened.dev() != metadata.dev()
+                || opened.ino() != metadata.ino()
+            {
+                return Err(Error::Conflict("blob changed while being opened".into()));
+            }
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(internal)?;
+        if bytes.is_empty() || bytes.len() > max_bytes {
+            return Err(Error::Conflict("blob changed while being read".into()));
+        }
+        Ok(bytes)
+    })
+    .await
+    .map_err(internal)??;
+    if hash(&bytes) != expected {
+        return Err(Error::Conflict("blob content digest mismatch".into()));
+    }
+    Ok(bytes)
 }
 
 async fn verify_blob_file(path: &Path, digest: &str, max_bytes: usize) -> Result<()> {
@@ -3439,77 +3593,66 @@ impl Store {
             evo_core::Role::Host,
             evo_core::Role::Worker,
         ])?;
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(Error::Invalid("invalid lowercase content digest".into()));
-        }
-        if max_bytes == 0 || max_bytes > 64 * 1024 * 1024 {
-            return Err(Error::Invalid(
-                "blob read bound must be 1..=67108864 bytes".into(),
-            ));
-        }
+        validate_blob_read_request(digest, max_bytes)?;
         let _guard = self.blob_lock.read().await;
         let path = self
             .root
             .join("blobs")
             .join(hash(ctx.namespace().as_bytes()))
             .join(digest);
-        let bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-            let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    Error::NotFound
-                } else {
-                    internal(error)
-                }
-            })?;
-            if !metadata.file_type().is_file() {
-                return Err(Error::Conflict("blob is not a regular file".into()));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if metadata.nlink() != 1 {
-                    return Err(Error::Conflict("linked blob is not trusted content".into()));
-                }
-            }
-            if metadata.len() == 0 || metadata.len() > max_bytes as u64 {
-                return Err(Error::Conflict(
-                    "blob exceeds the authorized read bound".into(),
-                ));
-            }
-            let file = File::open(&path).map_err(internal)?;
-            let opened = file.metadata().map_err(internal)?;
-            if !opened.is_file() || opened.len() != metadata.len() {
-                return Err(Error::Conflict("blob changed while being opened".into()));
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                if opened.nlink() != 1
-                    || opened.dev() != metadata.dev()
-                    || opened.ino() != metadata.ino()
-                {
-                    return Err(Error::Conflict("blob changed while being opened".into()));
-                }
-            }
-            let mut bytes = Vec::with_capacity(metadata.len() as usize);
-            file.take(max_bytes as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(internal)?;
-            if bytes.is_empty() || bytes.len() > max_bytes {
-                return Err(Error::Conflict("blob changed while being read".into()));
-            }
-            Ok(bytes)
+        read_blob_bytes(path, digest, max_bytes).await
+    }
+
+    /// Derive the physical namespace blob location for a trusted management
+    /// consumer without reading it. The root and path are the server's own,
+    /// never a caller-supplied directory.
+    pub fn verified_blob_location(
+        &self,
+        ctx: &Context,
+        digest: &str,
+    ) -> Result<VerifiedBlobLocation> {
+        ctx.require(&[
+            evo_core::Role::Admin,
+            evo_core::Role::Host,
+            evo_core::Role::Worker,
+        ])?;
+        validate_blob_read_request(digest, MAX_BLOB_BYTES)?;
+        let root = self
+            .root
+            .join("blobs")
+            .join(hash(ctx.namespace().as_bytes()));
+        let path = root.join(digest);
+        Ok(VerifiedBlobLocation {
+            root: root.to_string_lossy().into_owned(),
+            path: path.to_string_lossy().into_owned(),
+            digest: digest.into(),
         })
-        .await
-        .map_err(internal)??;
-        if hash(&bytes) != digest {
-            return Err(Error::Conflict("blob content digest mismatch".into()));
-        }
-        Ok(bytes)
+    }
+
+    /// Read one registry blob input with the complete regular-file, link,
+    /// size and content-digest checks. Management import registers the exact
+    /// bytes this returns; no request field selects a root or path.
+    pub async fn verified_blob_input(
+        &self,
+        ctx: &Context,
+        digest: &str,
+        max_bytes: usize,
+    ) -> Result<VerifiedBlobInput> {
+        let location = self.verified_blob_location(ctx, digest)?;
+        validate_blob_read_request(digest, max_bytes)?;
+        let _guard = self.blob_lock.read().await;
+        let path = self
+            .root
+            .join("blobs")
+            .join(hash(ctx.namespace().as_bytes()))
+            .join(digest);
+        let bytes = read_blob_bytes(path, digest, max_bytes).await?;
+        Ok(VerifiedBlobInput {
+            root: location.root,
+            path: location.path,
+            digest: location.digest,
+            bytes,
+        })
     }
     pub async fn delete_blob(&self, ctx: &Context, digest: &str) -> Result<()> {
         ctx.require(&[evo_core::Role::Admin])?;
@@ -3590,6 +3733,41 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Re-read the exact bytes of one namespace blob inside the caller's
+    /// publication transaction. The write session already holds the blob
+    /// write lock, so this re-verification waits for no second lock and
+    /// executes no SQL; a missing, replaced, linked or mismatched file rolls
+    /// the caller's transaction back with all its other writes.
+    #[doc(hidden)]
+    pub async fn reverify_blob_input(
+        &self,
+        ctx: &Context,
+        digest: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        ctx.require(&[
+            evo_core::Role::Admin,
+            evo_core::Role::Host,
+            evo_core::Role::Worker,
+        ])?;
+        validate_blob_read_request(digest, max_bytes)?;
+        let root = self
+            .blob_write
+            .as_ref()
+            .ok_or_else(|| {
+                Error::Conflict(
+                    "blob re-verification requires the request publication session".into(),
+                )
+            })?
+            .0
+            .clone();
+        let path = root
+            .join("blobs")
+            .join(hash(ctx.namespace().as_bytes()))
+            .join(digest);
+        read_blob_bytes(path, digest, max_bytes).await
     }
 
     /// Publish inside the request coordinator, without another connection or

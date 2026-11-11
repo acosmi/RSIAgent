@@ -12,7 +12,7 @@ use evo_core::evidence::{
     legacy_import_result_id_v1,
 };
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, now};
-use evo_storage::Store;
+use evo_storage::{ManagementImportStatusCounts, Store, VerifiedBlobInput};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::{
@@ -1944,6 +1944,32 @@ pub struct PersistentImportService {
     operation_lock: Arc<Mutex<()>>,
 }
 
+/// One server-derived management blob source: the strict management wire
+/// supplies only the logical id and reader; the digest selects the
+/// namespace-scoped registered blob whose exact bytes were read outside the
+/// job transaction.
+struct ManagementBlobSource {
+    source_id: String,
+    reader: SourceFormat,
+    input: VerifiedBlobInput,
+}
+
+/// A validated registration plan built outside the job transaction. The
+/// internal v1 request's roots and paths are the server's own blob location,
+/// never request data.
+pub(crate) struct PreparedManagementRegistration {
+    request: ImportRegistrationRequest,
+    sources: Vec<ManagementBlobSource>,
+}
+
+/// A validated execution plan: the live selection, its exact sources and the
+/// v2 result derived from the pinned bytes (or the already stored result).
+pub(crate) struct PreparedManagementExecution {
+    selection: SourceSelectionRecord,
+    sources: Vec<ImportSourceRecord>,
+    result: ImportResultRecord,
+}
+
 impl PersistentImportService {
     pub fn new(store: Store) -> Self {
         Self {
@@ -2456,6 +2482,67 @@ impl PersistentImportService {
             return Err(Error::Conflict("import result identity mismatch".into()));
         }
 
+        let result = self
+            .derive_import_result(ctx, &selection, &source_records)
+            .await?;
+        let mut session = self.store.session().await?;
+        validate_live_import_sources(&mut session, ctx, None, &selection, &source_records).await?;
+        if let Some(existing) = session
+            .get::<ImportResultRecord>(ctx, IMPORT_ARTIFACT_KIND, &result.id)
+            .await?
+        {
+            if fingerprint(&existing)? != fingerprint(&result)? {
+                return Err(Error::Conflict("immutable import result differs".into()));
+            }
+            session.commit().await?;
+            return Ok(existing);
+        }
+        session
+            .put_new_import_result_below_event_capacity(
+                ctx,
+                &result.id,
+                ctx.actor(),
+                &result,
+                result.payload.aggregate_summary.total_events as u64,
+            )
+            .await?;
+        session
+            .put_edge(
+                ctx,
+                IMPORT_ARTIFACT_KIND,
+                &result.id,
+                IMPORT_ARTIFACT_KIND,
+                &selection.id,
+            )
+            .await?;
+        for source in &source_records {
+            session
+                .put_edge(
+                    ctx,
+                    IMPORT_ARTIFACT_KIND,
+                    &result.id,
+                    IMPORT_ARTIFACT_KIND,
+                    &source.id,
+                )
+                .await?;
+        }
+        session
+            .audit(ctx, "e16.import.complete", &result.id)
+            .await?;
+        session.commit().await?;
+        Ok(result)
+    }
+
+    /// The fixed v2 derivation of one live selection from its pinned blob
+    /// bytes. It reads every Ready blob outside any caller transaction and
+    /// never writes; `execute` and the management preflight share it.
+    async fn derive_import_result(
+        &self,
+        ctx: &Context,
+        selection: &SourceSelectionRecord,
+        source_records: &[ImportSourceRecord],
+    ) -> Result<ImportResultRecord> {
+        let result_id = import_result_id_v2(&selection.id, &selection.input_digest)?;
         let mut remaining = MAX_TOTAL_READ_BYTES;
         let mut ready_sources = Vec::new();
         let mut owned_bytes = Vec::new();
@@ -2464,7 +2551,7 @@ impl PersistentImportService {
             files_known: true,
             ..SourceCoverage::default()
         };
-        for source in &source_records {
+        for source in source_records {
             match source.payload.status {
                 ImportSourceReadStatus::Prepared => {
                     return Err(Error::Conflict("import source is still Prepared".into()));
@@ -2570,9 +2657,9 @@ impl PersistentImportService {
         let mut source_refs = vec![ImportTypedRef {
             kind: "source_selection".into(),
             id: selection.id.clone(),
-            content_digest: fingerprint(&selection)?,
+            content_digest: fingerprint(selection)?,
         }];
-        for record in &source_records {
+        for record in source_records {
             source_refs.push(ImportTypedRef {
                 kind: "import_source".into(),
                 id: record.id.clone(),
@@ -2597,55 +2684,393 @@ impl PersistentImportService {
         validate_import_evidence_sources(
             result.payload.evidence_set.as_ref(),
             &result.payload.locators,
-            &selection,
-            &source_records,
+            selection,
+            source_records,
         )?;
-        let mut session = self.store.session().await?;
-        validate_live_import_sources(&mut session, ctx, None, &selection, &source_records).await?;
-        if let Some(existing) = session
-            .get::<ImportResultRecord>(ctx, IMPORT_ARTIFACT_KIND, &result.id)
+        Ok(result)
+    }
+
+    /// Build the server-derived registration plan from strict management
+    /// inputs. Every blob is read and verified outside any job transaction;
+    /// the internal v1 request's roots and paths are the storage's own
+    /// namespace location, never request data.
+    pub(crate) async fn prepare_management_registration(
+        &self,
+        ctx: &Context,
+        request_key: &str,
+        sources: &[(String, String, SourceFormat)],
+    ) -> Result<PreparedManagementRegistration> {
+        ctx.require(&[Role::Admin])?;
+        identifier(request_key)?;
+        if sources.is_empty() || sources.len() > MAX_DISCOVERED_FILES {
+            return Err(Error::Invalid("import requires 1..=200 sources".into()));
+        }
+        let mut seen = BTreeSet::new();
+        let mut remaining = MAX_TOTAL_READ_BYTES;
+        let mut specs = Vec::with_capacity(sources.len());
+        let mut pinned = Vec::with_capacity(sources.len());
+        let mut root: Option<String> = None;
+        for (source_id, digest, reader) in sources {
+            identifier(source_id)?;
+            if !seen.insert(source_id.as_str()) {
+                return Err(Error::Conflict("duplicate import source id".into()));
+            }
+            validate_digest(digest)?;
+            if remaining == 0 {
+                return Err(Error::Invalid("import total exceeds read budget".into()));
+            }
+            let input = self
+                .store
+                .verified_blob_input(ctx, digest, remaining)
+                .await?;
+            match &root {
+                Some(first) if first != &input.root => {
+                    return Err(Error::Conflict(
+                        "management import blobs span multiple namespace roots".into(),
+                    ));
+                }
+                None => root = Some(input.root.clone()),
+                _ => {}
+            }
+            remaining = remaining
+                .checked_sub(input.bytes.len())
+                .ok_or_else(|| Error::Invalid("import total exceeds read budget".into()))?;
+            specs.push(ImportSourceSpec {
+                source_id: source_id.clone(),
+                path: input.path.clone(),
+                reader: *reader,
+                expected_digest: digest.clone(),
+            });
+            pinned.push(ManagementBlobSource {
+                source_id: source_id.clone(),
+                reader: *reader,
+                input,
+            });
+        }
+        let request = ImportRegistrationRequest {
+            schema_version: IMPORT_REGISTRATION_SCHEMA.into(),
+            request_key: request_key.into(),
+            roots: vec![root.ok_or(Error::Internal)?],
+            purpose: Purpose::Inspection,
+            allow_model_excerpts: false,
+            outbound_authorized: false,
+            retention_scope: ImportRetentionScope::LocalPrivate,
+            sources: specs,
+        };
+        validate_registration_request(&request)?;
+        Ok(PreparedManagementRegistration {
+            request,
+            sources: pinned,
+        })
+    }
+
+    /// One transaction end to end: re-verify every pinned blob under the held
+    /// publication lock, converge a cached/existing selection, then write the
+    /// selection, its finalized sources, blob edges, idempotency row and audit
+    /// record. The caller commits this session together with the job's phase,
+    /// terminal state and result.
+    pub(crate) async fn register_in_session(
+        &self,
+        ctx: &Context,
+        session: &mut evo_storage::Session,
+        prepared: &PreparedManagementRegistration,
+    ) -> Result<(SourceSelectionRecord, ManagementImportStatusCounts)> {
+        ctx.require(&[Role::Admin])?;
+        for source in &prepared.sources {
+            let again = session
+                .reverify_blob_input(ctx, &source.input.digest, MAX_TOTAL_READ_BYTES)
+                .await?;
+            if again != source.input.bytes {
+                return Err(Error::Conflict(
+                    "import blob bytes changed before registration".into(),
+                ));
+            }
+        }
+        let request = &prepared.request;
+        if let Some(cached) = session
+            .cached::<SourceSelectionRecord, _>(
+                ctx,
+                "e16.import.register",
+                &request.request_key,
+                request,
+            )
             .await?
         {
-            if fingerprint(&existing)? != fingerprint(&result)? {
+            validate_selection_record(ctx, &cached)?;
+            let (live, sources) = self
+                .load_live_selection_in_session(ctx, session, &cached.id)
+                .await?;
+            return Ok((live, status_counts(&sources)));
+        }
+        let request_digest = fingerprint(request)?;
+        let selection_id = format!("e16sel-{}", &request_digest[..24]);
+        if let Some(existing) = session
+            .get::<SourceSelectionRecord>(ctx, IMPORT_ARTIFACT_KIND, &selection_id)
+            .await?
+        {
+            if existing.input_digest != request_digest || existing.owner_actor != ctx.actor() {
+                return Err(Error::Conflict(
+                    "prepared selection differs or is stale".into(),
+                ));
+            }
+            let (live, sources) = self
+                .load_live_selection_in_session(ctx, session, &selection_id)
+                .await?;
+            return Ok((live, status_counts(&sources)));
+        }
+        let timestamp = now()?;
+        let watermark = current_watermark(session, ctx).await?;
+        let mut records = Vec::with_capacity(prepared.sources.len());
+        for source in &prepared.sources {
+            let id = import_source_id(&selection_id, &source.source_id);
+            let record = ImportEnvelope {
+                schema_version: IMPORT_SOURCE_SCHEMA.into(),
+                id,
+                namespace: ctx.namespace().into(),
+                owner_actor: ctx.actor().into(),
+                request_key: request.request_key.clone(),
+                input_digest: fingerprint(&(
+                    &source.source_id,
+                    &source.input.digest,
+                    source.reader,
+                ))?,
+                created_at: timestamp,
+                updated_at: timestamp,
+                source_refs: vec![ImportTypedRef {
+                    kind: "blob".into(),
+                    id: source.input.digest.clone(),
+                    content_digest: source.input.digest.clone(),
+                }],
+                revoke_watermark: watermark,
+                payload: ImportSourcePayload {
+                    selection_id: selection_id.clone(),
+                    logical_source_id: source.source_id.clone(),
+                    authorized_path: source.input.path.clone(),
+                    reader: source.reader,
+                    reader_version: source.reader.as_label().into(),
+                    raw_digest: source.input.digest.clone(),
+                    observed_digest: None,
+                    raw_blob_digest: source.input.digest.clone(),
+                    blob_published: false,
+                    byte_len: 0,
+                    status: ImportSourceReadStatus::Prepared,
+                    task_origin: TaskOrigin::ImportedHistory,
+                    execution_attestation: ExecutionAttestation::UnverifiedImport,
+                    purpose: request.purpose,
+                },
+            };
+            records.push(self.finalize_source_in_session(
+                ctx,
+                &record,
+                ImportSourceReadStatus::Ready,
+                Some(source.input.digest.clone()),
+                source.input.bytes.len() as u64,
+                true,
+            )?);
+        }
+        let source_refs = source_record_refs(&records)?;
+        let selection = ImportEnvelope {
+            schema_version: SOURCE_SELECTION_SCHEMA.into(),
+            id: selection_id.clone(),
+            namespace: ctx.namespace().into(),
+            owner_actor: ctx.actor().into(),
+            request_key: request.request_key.clone(),
+            input_digest: request_digest.clone(),
+            created_at: timestamp,
+            updated_at: timestamp,
+            source_refs,
+            revoke_watermark: watermark,
+            payload: SourceSelectionPayload {
+                purpose: request.purpose,
+                allow_model_excerpts: request.allow_model_excerpts,
+                outbound_authorized: request.outbound_authorized,
+                retention_scope: request.retention_scope,
+                roots: request.roots.clone(),
+                import_source_ids: records.iter().map(|record| record.id.clone()).collect(),
+            },
+        };
+        // Every id is judged before the first row is written, so a refusal
+        // leaves no half-registered selection behind.
+        session.ensure_revocation_namespace_live(ctx).await?;
+        for record in &records {
+            ensure_import_source_id_is_free(session, ctx, &record.id).await?;
+        }
+        for record in &records {
+            put_new_artifact(session, ctx, record).await?;
+            session
+                .put_edge(
+                    ctx,
+                    IMPORT_ARTIFACT_KIND,
+                    &record.id,
+                    "blob",
+                    &record.payload.raw_blob_digest,
+                )
+                .await?;
+            session
+                .audit(ctx, "e16.import.source.finalize", &record.id)
+                .await?;
+        }
+        put_new_artifact(session, ctx, &selection).await?;
+        for record in &records {
+            session
+                .put_edge(
+                    ctx,
+                    IMPORT_ARTIFACT_KIND,
+                    &selection.id,
+                    IMPORT_ARTIFACT_KIND,
+                    &record.id,
+                )
+                .await?;
+        }
+        session
+            .cache(
+                ctx,
+                "e16.import.register",
+                &request.request_key,
+                request,
+                &selection.id,
+                &selection,
+            )
+            .await?;
+        session
+            .audit(ctx, "e16.import.register", &selection.id)
+            .await?;
+        Ok((selection, status_counts(&records)))
+    }
+
+    /// The final in-memory source shape of one management registration. The
+    /// returned record is validated exactly like a persisted v1 source.
+    fn finalize_source_in_session(
+        &self,
+        ctx: &Context,
+        prepared: &ImportSourceRecord,
+        status: ImportSourceReadStatus,
+        observed_digest: Option<String>,
+        byte_len: u64,
+        blob_published: bool,
+    ) -> Result<ImportSourceRecord> {
+        let mut current = prepared.clone();
+        current.payload.status = status;
+        current.payload.observed_digest = observed_digest;
+        current.payload.byte_len = byte_len;
+        current.payload.blob_published = blob_published;
+        current.updated_at = prepared.created_at;
+        validate_source_record(ctx, &current)?;
+        Ok(current)
+    }
+
+    /// Build the execution plan outside the job transaction: the live
+    /// selection, its exact sources and the stored result or the v2 result
+    /// derived from the pinned blobs.
+    pub(crate) async fn prepare_management_execution(
+        &self,
+        ctx: &Context,
+        selection_id: &str,
+    ) -> Result<PreparedManagementExecution> {
+        ctx.require(&[Role::Admin])?;
+        identifier(selection_id)?;
+        let (selection, source_records) = self.load_live_selection(ctx, selection_id).await?;
+        let result_id = import_result_id_v2(&selection.id, &selection.input_digest)?;
+        let mut session = self.store.session().await?;
+        let result_exists = session
+            .get::<Value>(ctx, IMPORT_ARTIFACT_KIND, &result_id)
+            .await?
+            .is_some();
+        session.commit().await?;
+        let result = if result_exists {
+            let existing = self.load_live_result(ctx, &result_id).await?;
+            if existing.payload.selection_id != selection_id {
+                return Err(Error::Conflict("import result identity mismatch".into()));
+            }
+            existing
+        } else {
+            self.derive_import_result(ctx, &selection, &source_records)
+                .await?
+        };
+        Ok(PreparedManagementExecution {
+            selection,
+            sources: source_records,
+            result,
+        })
+    }
+
+    /// One transaction end to end: reload the live selection and sources,
+    /// re-verify every pinned blob under the held publication lock, then
+    /// return the identical stored result or insert the derived result with
+    /// its edges, event-capacity admission and audit row. The caller commits
+    /// together with the job's terminal state.
+    pub(crate) async fn execute_in_session(
+        &self,
+        ctx: &Context,
+        session: &mut evo_storage::Session,
+        prepared: &PreparedManagementExecution,
+    ) -> Result<ImportResultRecord> {
+        ctx.require(&[Role::Admin])?;
+        let (selection, sources) = self
+            .load_live_selection_in_session(ctx, session, &prepared.selection.id)
+            .await?;
+        if fingerprint(&selection)? != fingerprint(&prepared.selection)?
+            || fingerprint(&sources)? != fingerprint(&prepared.sources)?
+        {
+            return Err(Error::Conflict(
+                "import selection changed before execution".into(),
+            ));
+        }
+        for source in &sources {
+            if source.payload.status != ImportSourceReadStatus::Ready {
+                continue;
+            }
+            let byte_len = usize::try_from(source.payload.byte_len)
+                .map_err(|_| Error::Invalid("invalid import source length".into()))?;
+            let bytes = session
+                .reverify_blob_input(ctx, &source.payload.raw_blob_digest, byte_len)
+                .await?;
+            if bytes.len() != byte_len || hash(&bytes) != source.payload.raw_digest {
+                return Err(Error::Conflict("source_changed".into()));
+            }
+        }
+        if let Some(existing) = session
+            .get::<ImportResultRecord>(ctx, IMPORT_ARTIFACT_KIND, &prepared.result.id)
+            .await?
+        {
+            if fingerprint(&existing)? != fingerprint(&prepared.result)? {
                 return Err(Error::Conflict("immutable import result differs".into()));
             }
-            session.commit().await?;
             return Ok(existing);
         }
         session
             .put_new_import_result_below_event_capacity(
                 ctx,
-                &result.id,
+                &prepared.result.id,
                 ctx.actor(),
-                &result,
-                result.payload.aggregate_summary.total_events as u64,
+                &prepared.result,
+                prepared.result.payload.aggregate_summary.total_events as u64,
             )
             .await?;
         session
             .put_edge(
                 ctx,
                 IMPORT_ARTIFACT_KIND,
-                &result.id,
+                &prepared.result.id,
                 IMPORT_ARTIFACT_KIND,
                 &selection.id,
             )
             .await?;
-        for source in &source_records {
+        for source in &sources {
             session
                 .put_edge(
                     ctx,
                     IMPORT_ARTIFACT_KIND,
-                    &result.id,
+                    &prepared.result.id,
                     IMPORT_ARTIFACT_KIND,
                     &source.id,
                 )
                 .await?;
         }
         session
-            .audit(ctx, "e16.import.complete", &result.id)
+            .audit(ctx, "e16.import.complete", &prepared.result.id)
             .await?;
-        session.commit().await?;
-        Ok(result)
+        Ok(prepared.result.clone())
     }
 
     /// The current (v2) result after its static checks. A v1 result is legacy
@@ -3183,15 +3608,47 @@ impl PersistentImportService {
         selection_id: &str,
     ) -> Result<(SourceSelectionRecord, Vec<ImportSourceRecord>)> {
         let mut session = self.store.session().await?;
+        let result = self
+            .load_live_selection_in_session(ctx, &mut session, selection_id)
+            .await?;
+        session.commit().await?;
+        Ok(result)
+    }
+
+    /// The same live closure read inside a caller-owned transaction, so a
+    /// management writer rechecks it between its first write and commit.
+    async fn load_live_selection_in_session(
+        &self,
+        ctx: &Context,
+        session: &mut evo_storage::Session,
+        selection_id: &str,
+    ) -> Result<(SourceSelectionRecord, Vec<ImportSourceRecord>)> {
         let selection: SourceSelectionRecord = session
             .need(ctx, IMPORT_ARTIFACT_KIND, selection_id)
             .await?;
         validate_selection_record(ctx, &selection)?;
-        let sources = load_and_validate_source_records(&mut session, ctx, &selection).await?;
-        validate_live_import_sources(&mut session, ctx, None, &selection, &sources).await?;
-        session.commit().await?;
+        let sources = load_and_validate_source_records(session, ctx, &selection).await?;
+        validate_live_import_sources(session, ctx, None, &selection, &sources).await?;
         Ok((selection, sources))
     }
+}
+
+/// The bounded status histogram of one selection's persisted sources.
+fn status_counts(sources: &[ImportSourceRecord]) -> ManagementImportStatusCounts {
+    let mut counts = ManagementImportStatusCounts::default();
+    for source in sources {
+        match source.payload.status {
+            ImportSourceReadStatus::Prepared => counts.prepared += 1,
+            ImportSourceReadStatus::Ready => counts.ready += 1,
+            ImportSourceReadStatus::Missing => counts.missing += 1,
+            ImportSourceReadStatus::PermissionDenied => counts.permission_denied += 1,
+            ImportSourceReadStatus::SourceChanged => counts.source_changed += 1,
+            ImportSourceReadStatus::ZeroRecords => counts.zero_records += 1,
+            ImportSourceReadStatus::InvalidFile => counts.invalid_file += 1,
+            ImportSourceReadStatus::TooLarge => counts.too_large += 1,
+        }
+    }
+    counts
 }
 
 struct LocalImportSnapshot {

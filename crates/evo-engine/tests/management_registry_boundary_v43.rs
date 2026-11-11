@@ -100,9 +100,9 @@ fn model_tools_keep_their_surface_and_are_disjoint_from_the_catalog() {
 /// requirements, and every newly registered but unimplemented name —
 /// including the dedicated sync view — fails closed inside `submit` with zero rows
 /// written: no job, no private input, no audit, no call. The four budget
-/// operations are wired, so they fail at their own strict DTO boundary rather
-/// than `management_operation_not_wired`; their real consumers are exercised
-/// by `budget_operations_are_wired_to_their_real_handlers` below.
+/// operations and the two import operations are wired, so they fail at their
+/// own strict DTO boundary rather than `management_operation_not_wired`; their
+/// real consumers are exercised by the positive controls below.
 #[tokio::test]
 async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemented_names() {
     let (dir, store) = store().await;
@@ -174,6 +174,11 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
                     | "budget.call.reconcile",
                     _,
                 ) => "invalid management payload",
+                // import.register/import.execute are wired to their strict
+                // management DTOs: this boundary payload lacks sources or a
+                // selection, so it is refused before any session with zero
+                // writes. Their real consumers are the positive control below.
+                ("import.register" | "import.execute", _) => "invalid management payload",
                 (_, ExecutionKind::AsyncJob) => "management_operation_not_wired",
                 _ => "management operation requires dedicated route",
             }),
@@ -367,6 +372,129 @@ fn exactly_one_registered_operation_is_the_sync_readonly_view() {
     assert_eq!(views.len(), 1);
     assert_eq!(views[0].name, REVIEW_OPERATION);
     assert_eq!(views[0].table_line, 841);
+}
+
+/// Positive control for the imported names: `import.register` and
+/// `import.execute` no longer stop at `management_operation_not_wired`. A real
+/// registered blob produces a real selection and a real v2 result through the
+/// dispatcher.
+#[tokio::test]
+async fn import_operations_are_wired_to_their_real_handlers() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("boundary", "admin", Role::Admin).unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, &evo_core::hash(b"boundary-import-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let bytes = br#"{"role":"user","content":"wired import observation"}"#;
+    let digest = store
+        .put_blob_bounded(&admin, bytes, 1024 * 1024)
+        .await
+        .unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+
+    async fn done(
+        dispatcher: &ManagementDispatcher,
+        admin: &Context,
+        operation: &str,
+        payload: Value,
+    ) -> evo_engine::dispatch::ManagementJobStatusV1 {
+        let queued = dispatcher.submit(admin, operation, payload).await.unwrap();
+        for _ in 0..2_000 {
+            let status = dispatcher
+                .status_view(admin, queued.identity().id)
+                .await
+                .unwrap();
+            if matches!(
+                status.state,
+                ManagementJobState::Succeeded
+                    | ManagementJobState::Failed
+                    | ManagementJobState::Cancelled
+                    | ManagementJobState::Blocked
+            ) {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        panic!("{operation} did not finish");
+    }
+
+    let registered = done(
+        &dispatcher,
+        &admin,
+        "import.register",
+        json!({
+            "schema_version": "rsia.management.import_register.v1",
+            "request_key": "boundary-import-register",
+            "sources": [{
+                "source_id": "boundary-source",
+                "blob_digest": digest,
+                "reader": "claude_fixture",
+            }],
+        }),
+    )
+    .await;
+    assert_eq!(
+        registered.state,
+        ManagementJobState::Succeeded,
+        "{registered:?}"
+    );
+    assert_eq!(registered.step, "import_registered");
+    let selection_id = match registered.result.as_ref() {
+        Some(evo_engine::dispatch::ManagementResultV2::Import(
+            evo_engine::dispatch::ManagementImportResultV2::ImportRegistered {
+                selection_id,
+                source_count,
+                ..
+            },
+        )) => {
+            assert_eq!(*source_count, 1);
+            selection_id.clone()
+        }
+        other => panic!("expected ImportRegistered, got {other:?}"),
+    };
+
+    let executed = done(
+        &dispatcher,
+        &admin,
+        "import.execute",
+        json!({
+            "schema_version": "rsia.management.import_execute.v1",
+            "request_key": "boundary-import-execute",
+            "selection_id": selection_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        executed.state,
+        ManagementJobState::Succeeded,
+        "{executed:?}"
+    );
+    assert_eq!(executed.step, "import_completed");
+    match executed.result.as_ref() {
+        Some(evo_engine::dispatch::ManagementResultV2::Import(
+            evo_engine::dispatch::ManagementImportResultV2::ImportCompleted {
+                total_events,
+                state,
+                generation_status,
+                ..
+            },
+        )) => {
+            assert_eq!(*total_events, 1);
+            assert_eq!(
+                *state,
+                evo_engine::dispatch::ManagementImportResultState::Complete
+            );
+            assert_eq!(
+                generation_status,
+                "blocked_external_generation_conditions_unavailable"
+            );
+        }
+        other => panic!("expected ImportCompleted, got {other:?}"),
+    }
+    store.close().await;
 }
 
 // A read-only SQLite snapshot retains every table, row identity and cell type.

@@ -73,6 +73,8 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
         | "optimization.step"
         | "trace.export"
         | "backup.create"
+        | "import.register"
+        | "import.execute"
         | "budget.root.authorize"
         | "budget.stage_plan.bind"
         | "budget.calls.list_open"
@@ -83,7 +85,8 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
 
 pub use evo_storage::{
     ManagementBackupResultV2, ManagementBudgetResultV2, ManagementCancelArrival,
-    ManagementDiagnostic, ManagementJob, ManagementJobState, ManagementJobV2,
+    ManagementDiagnostic, ManagementImportResultState, ManagementImportResultV2,
+    ManagementImportStatusCounts, ManagementJob, ManagementJobState, ManagementJobV2,
     ManagementOptimizationCallProducer, ManagementOptimizationCallRef,
     ManagementOptimizationProgressV2, ManagementOptimizationResultV2,
     ManagementOptimizationStageRef, ManagementPartialResultV2, ManagementPendingTerminalState,
@@ -300,6 +303,39 @@ struct BudgetCallReconcileRequest {
     pricing_version: String,
 }
 
+const IMPORT_REGISTER_SCHEMA: &str = "rsia.management.import_register.v1";
+const IMPORT_EXECUTE_SCHEMA: &str = "rsia.management.import_execute.v1";
+
+/// One strict `import.register` source: a logical id, the digest of an
+/// existing namespace-scoped registered blob and the pinned reader. Roots,
+/// paths, purpose, retention, outbound flags, roles and owners are not part of
+/// the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportRegisterSource {
+    source_id: String,
+    blob_digest: String,
+    reader: crate::import::SourceFormat,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportRegisterManagementRequest {
+    schema_version: String,
+    request_key: String,
+    sources: Vec<ImportRegisterSource>,
+}
+
+/// `import.execute`: one existing selection of the caller's own namespace.
+/// The result identity is derived from the selection, never sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportExecuteManagementRequest {
+    schema_version: String,
+    request_key: String,
+    selection_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "operation")]
 enum ParsedRequest {
@@ -320,6 +356,8 @@ enum ParsedRequest {
     BudgetStagePlanBind(Box<BudgetStagePlanBindManagementRequest>),
     BudgetCallsListOpen(Box<BudgetCallsListOpenRequest>),
     BudgetCallReconcile(Box<BudgetCallReconcileRequest>),
+    ImportRegister(Box<ImportRegisterManagementRequest>),
+    ImportExecute(Box<ImportExecuteManagementRequest>),
 }
 
 impl<'de> Deserialize<'de> for ParsedRequest {
@@ -351,6 +389,8 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             BudgetStagePlanBind(Box<BudgetStagePlanBindManagementRequest>),
             BudgetCallsListOpen(Box<BudgetCallsListOpenRequest>),
             BudgetCallReconcile(Box<BudgetCallReconcileRequest>),
+            ImportRegister(Box<ImportRegisterManagementRequest>),
+            ImportExecute(Box<ImportExecuteManagementRequest>),
         }
         Ok(
             match serde_json::from_value::<Other>(value).map_err(serde::de::Error::custom)? {
@@ -368,6 +408,8 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::BudgetStagePlanBind(value) => Self::BudgetStagePlanBind(value),
                 Other::BudgetCallsListOpen(value) => Self::BudgetCallsListOpen(value),
                 Other::BudgetCallReconcile(value) => Self::BudgetCallReconcile(value),
+                Other::ImportRegister(value) => Self::ImportRegister(value),
+                Other::ImportExecute(value) => Self::ImportExecute(value),
             },
         )
     }
@@ -1197,6 +1239,8 @@ impl ParsedRequest {
             Self::BudgetStagePlanBind(request) => &request.request_key,
             Self::BudgetCallsListOpen(request) => &request.request_key,
             Self::BudgetCallReconcile(request) => &request.request_key,
+            Self::ImportRegister(request) => &request.request_key,
+            Self::ImportExecute(request) => &request.request_key,
         }
     }
 }
@@ -1422,6 +1466,9 @@ impl JobOutcome {
                 ..
             })) => false,
             Some(ManagementResultV2::Budget(_)) => true,
+            // Import registration commits real selection/source rows; import
+            // execution commits the derived result and its edges.
+            Some(ManagementResultV2::Import(_)) => true,
             Some(ManagementResultV2::Original(
                 ManagementResult::EvaluationStatus { .. }
                 | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -2152,6 +2199,12 @@ async fn execute_request(
         }
         ParsedRequest::BudgetCallReconcile(request) => {
             return run_budget_call_reconcile(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::ImportRegister(request) => {
+            return run_import_register(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::ImportExecute(request) => {
+            return run_import_execute(ctx, store, claimed.clone(), *request, control).await;
         }
         ParsedRequest::Blocked(_) => {
             control.admit_step()?;
@@ -3100,6 +3153,151 @@ async fn run_budget_call_reconcile(
     }
 }
 
+async fn run_import_register(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: ImportRegisterManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    let service = crate::import::PersistentImportService::new(store.clone());
+    let sources: Vec<(String, String, crate::import::SourceFormat)> = request
+        .sources
+        .iter()
+        .map(|source| {
+            (
+                source.source_id.clone(),
+                source.blob_digest.clone(),
+                source.reader,
+            )
+        })
+        .collect();
+    // Blob reads and format checks happen outside the job transaction.
+    let prepared = service
+        .prepare_management_registration(ctx, &request.request_key, &sources)
+        .await?;
+    let mut session = store.registered_blob_write_session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        // The same transaction re-verifies every pinned blob under the held
+        // publication lock and writes the selection, its sources, edges,
+        // idempotency row and audit record.
+        let (selection, statuses) = service
+            .register_in_session(ctx, &mut session, &prepared)
+            .await?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "import_registered".into(),
+            result: Some(ManagementResultV2::Import(
+                ManagementImportResultV2::ImportRegistered {
+                    selection_id: selection.id.clone(),
+                    selection_digest: fingerprint(&selection)?,
+                    source_count: selection.payload.import_source_ids.len() as u64,
+                    statuses,
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    match finished {
+        Ok(outcome) => {
+            session.commit().await?;
+            Ok(ObservedWorkerExit::Completed(outcome))
+        }
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(error) => {
+            execution_outcome(claimed, Err(error)).map(ObservedWorkerExit::BeforeCommitFailed)
+        }
+    }
+}
+
+async fn run_import_execute(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: ImportExecuteManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    let service = crate::import::PersistentImportService::new(store.clone());
+    // The live selection and pinned blobs are read and derived outside the
+    // job transaction.
+    let prepared = service
+        .prepare_management_execution(ctx, &request.selection_id)
+        .await?;
+    let mut session = store.registered_blob_write_session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        // The same transaction rechecks the live closure and watermark,
+        // re-verifies every ready blob and writes the result below the
+        // instance event capacity with the terminal job state.
+        let result = service
+            .execute_in_session(ctx, &mut session, &prepared)
+            .await?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "import_completed".into(),
+            result: Some(ManagementResultV2::Import(
+                ManagementImportResultV2::ImportCompleted {
+                    selection_id: result.payload.selection_id.clone(),
+                    result_id: result.id.clone(),
+                    result_digest: fingerprint(&result)?,
+                    state: import_management_result_state(result.payload.state),
+                    total_events: result.payload.aggregate_summary.total_events as u64,
+                    total_sources: result.payload.aggregate_summary.total_sources as u64,
+                    locator_count: result.payload.locators.len() as u64,
+                    event_record_count: result.payload.event_records.len() as u64,
+                    native_trace_count: result.payload.native_traces.len() as u64,
+                    coverage: Box::new(result.payload.import_coverage.clone()),
+                    reader_version: result.payload.reader_version.clone(),
+                    normalization_version: result.payload.normalization_version.clone(),
+                    generation_status: result.payload.generation_status.clone(),
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    match finished {
+        Ok(outcome) => {
+            session.commit().await?;
+            Ok(ObservedWorkerExit::Completed(outcome))
+        }
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(error) => {
+            execution_outcome(claimed, Err(error)).map(ObservedWorkerExit::BeforeCommitFailed)
+        }
+    }
+}
+
+fn import_management_result_state(
+    state: crate::import::ImportResultState,
+) -> ManagementImportResultState {
+    match state {
+        crate::import::ImportResultState::Complete => ManagementImportResultState::Complete,
+        crate::import::ImportResultState::Partial => ManagementImportResultState::Partial,
+        crate::import::ImportResultState::Failed => ManagementImportResultState::Failed,
+    }
+}
+
 async fn run_replay(
     ctx: &Context,
     store: &Store,
@@ -3249,6 +3447,14 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
         | ParsedRequest::BudgetCallReconcile(_) => {
             ctx.require(&[Role::Admin])?;
         }
+        ParsedRequest::ImportRegister(request) => {
+            ctx.require(&[Role::Admin])?;
+            validate_import_register_request(request)?;
+        }
+        ParsedRequest::ImportExecute(request) => {
+            ctx.require(&[Role::Admin])?;
+            identifier(&request.selection_id)?;
+        }
         ParsedRequest::TraceExportPrepare(request) => {
             ctx.require(&[Role::Admin])?;
             validate_trace_export_prepare_request(request)?;
@@ -3294,6 +3500,24 @@ fn validate_trace_export_prepare_request(request: &TraceExportPrepareRequest) ->
 fn validate_trace_export_publish_request(request: &TraceExportPublishRequest) -> Result<()> {
     trace_export_segment_identifier(&request.export_id)?;
     crate::packages::validate_digest(&request.candidate_digest, "trace export candidate digest")
+}
+
+fn validate_import_register_request(request: &ImportRegisterManagementRequest) -> Result<()> {
+    identifier(&request.request_key)?;
+    if request.sources.is_empty()
+        || request.sources.len() > evo_core::evidence::MAX_DISCOVERED_FILES
+    {
+        return Err(Error::Invalid("import requires 1..=200 sources".into()));
+    }
+    let mut seen = BTreeSet::new();
+    for source in &request.sources {
+        identifier(&source.source_id)?;
+        crate::packages::validate_digest(&source.blob_digest, "import blob digest")?;
+        if !seen.insert(source.source_id.as_str()) {
+            return Err(Error::Conflict("duplicate import source id".into()));
+        }
+    }
+    Ok(())
 }
 
 /// Why a job's private input could not be turned into a request.
@@ -4492,6 +4716,25 @@ async fn consumer_progress(
     if record.identity().operation == "backup.create" {
         return backup::consumer_progress(ctx, store, record).await;
     }
+    if matches!(
+        record.identity().operation,
+        "import.register" | "import.execute"
+    ) {
+        // Each import handler writes every business row, the terminal job state
+        // and the result in one transaction. A non-terminal record therefore
+        // proves no import effect; a terminal one is its own committed outcome.
+        if is_terminal(record.identity().state)
+            && matches!(record.result(), Some(ManagementResultV2::Import(_)))
+        {
+            return Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                state: record.identity().state,
+                step: record.step().into(),
+                result: record.result(),
+                error_code: record.error_code().map(str::to_owned),
+            })));
+        }
+        return Ok(ConsumerProgress::NotCommitted);
+    }
     if let VersionedManagementJob::V2(job) = record
         && job.operation == "experiment.register"
         && job.step == "current_holdout_registered"
@@ -5081,6 +5324,11 @@ async fn consumer_progress(
             } else {
                 Ok(ConsumerProgress::NotCommitted)
             }
+        }
+        // Unreachable: the import short-circuit above owns both operations.
+        // The arms keep this match total without a wildcard.
+        ParsedRequest::ImportRegister(_) | ParsedRequest::ImportExecute(_) => {
+            Ok(ConsumerProgress::NotCommitted)
         }
         ParsedRequest::OptimizationStep(_) | ParsedRequest::BackupCreate(_) => Err(Error::Internal),
         ParsedRequest::Blocked(request) => {
@@ -5677,10 +5925,14 @@ async fn cancel_job_atomic(
     let mut session = store.session().await?;
     let record = load_job_record_in_session(ctx, &mut session, job_id).await?;
     if let VersionedManagementJob::V2(saved) = &record
-        && saved.operation == "backup.create"
         && is_terminal(saved.state)
         && !saved.cancel_requested
-        && matches!(saved.result, Some(ManagementResultV2::Backup(_)))
+        && ((saved.operation == "backup.create"
+            && matches!(saved.result, Some(ManagementResultV2::Backup(_))))
+            || (matches!(
+                saved.operation.as_str(),
+                "import.register" | "import.execute"
+            ) && matches!(saved.result, Some(ManagementResultV2::Import(_)))))
     {
         let mut job = saved.clone();
         now()?;
@@ -5790,6 +6042,7 @@ fn stored_result_has_side_effect(result: Option<&ManagementResultV2>) -> bool {
         Some(ManagementResultV2::Backup(_)) => true,
         Some(ManagementResultV2::Budget(ManagementBudgetResultV2::OpenCallsListed { .. })) => false,
         Some(ManagementResultV2::Budget(_)) => true,
+        Some(ManagementResultV2::Import(_)) => true,
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }
             | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -5921,6 +6174,26 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
                 ));
             }
         },
+        "import.register" => match payload["schema_version"].as_str() {
+            Some(IMPORT_REGISTER_SCHEMA) => ParsedRequest::ImportRegister(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
+        "import.execute" => match payload["schema_version"].as_str() {
+            Some(IMPORT_EXECUTE_SCHEMA) => ParsedRequest::ImportExecute(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
@@ -5951,6 +6224,8 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::BudgetStagePlanBind(request) => &request.schema_version,
         ParsedRequest::BudgetCallsListOpen(request) => &request.schema_version,
         ParsedRequest::BudgetCallReconcile(request) => &request.schema_version,
+        ParsedRequest::ImportRegister(request) => &request.schema_version,
+        ParsedRequest::ImportExecute(request) => &request.schema_version,
     };
     if actual != &expected {
         return Err(Error::Invalid(
@@ -6091,6 +6366,19 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
         | ParsedRequest::BudgetStagePlanBind(_)
         | ParsedRequest::BudgetCallsListOpen(_)
         | ParsedRequest::BudgetCallReconcile(_) => {}
+        ParsedRequest::ImportRegister(request) => {
+            // Every registered blob is a physical input of the future
+            // selection; its digest is content-addressed and carries no
+            // caller-selected path.
+            for source in &request.sources {
+                dependencies.push(("blob".into(), source.blob_digest.clone()));
+            }
+        }
+        ParsedRequest::ImportExecute(request) => {
+            // A revoked selection refuses the execute request before its
+            // first write (and before any blob read).
+            dependencies.push(("artifact".into(), request.selection_id.clone()));
+        }
         ParsedRequest::TraceExportPrepare(request) => {
             // The private input depends on every captured source run, so a
             // revoked source redacts the request with the job that holds it.
@@ -6379,6 +6667,15 @@ pub enum ManagementCommittedEffect {
         call_id: String,
         accounting_overflow: bool,
     },
+    ImportSelection {
+        selection_id: String,
+        selection_digest: String,
+    },
+    ImportResult {
+        selection_id: String,
+        result_id: String,
+        result_digest: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6545,6 +6842,24 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
         Some(ManagementResultV2::Budget(ManagementBudgetResultV2::OpenCallsListed { .. })) => {
             Vec::new()
         }
+        Some(ManagementResultV2::Import(ManagementImportResultV2::ImportRegistered {
+            selection_id,
+            selection_digest,
+            ..
+        })) => vec![ManagementCommittedEffect::ImportSelection {
+            selection_id: selection_id.clone(),
+            selection_digest: selection_digest.clone(),
+        }],
+        Some(ManagementResultV2::Import(ManagementImportResultV2::ImportCompleted {
+            selection_id,
+            result_id,
+            result_digest,
+            ..
+        })) => vec![ManagementCommittedEffect::ImportResult {
+            selection_id: selection_id.clone(),
+            result_id: result_id.clone(),
+            result_digest: result_digest.clone(),
+        }],
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }
             | ManagementResult::EvaluationStatusReadV2 { .. },
