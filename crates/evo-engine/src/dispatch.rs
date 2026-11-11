@@ -75,6 +75,12 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
         | "backup.create"
         | "import.register"
         | "import.execute"
+        | "asset.stage"
+        | "asset.abort"
+        | "asset.handoff"
+        | "export.prepare"
+        | "export.complete"
+        | "export.abort"
         | "budget.root.authorize"
         | "budget.stage_plan.bind"
         | "budget.calls.list_open"
@@ -84,13 +90,14 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
 }
 
 pub use evo_storage::{
-    ManagementBackupResultV2, ManagementBudgetResultV2, ManagementCancelArrival,
-    ManagementDiagnostic, ManagementImportResultState, ManagementImportResultV2,
-    ManagementImportStatusCounts, ManagementJob, ManagementJobState, ManagementJobV2,
-    ManagementOptimizationCallProducer, ManagementOptimizationCallRef,
-    ManagementOptimizationProgressV2, ManagementOptimizationResultV2,
-    ManagementOptimizationStageRef, ManagementPartialResultV2, ManagementPendingTerminalState,
-    ManagementResult, ManagementResultV2, ManagementTraceExportResultV2, VersionedManagementJob,
+    ManagementAssetExportResultV2, ManagementAssetExportState, ManagementBackupResultV2,
+    ManagementBudgetResultV2, ManagementCancelArrival, ManagementDiagnostic,
+    ManagementImportResultState, ManagementImportResultV2, ManagementImportStatusCounts,
+    ManagementJob, ManagementJobState, ManagementJobV2, ManagementOptimizationCallProducer,
+    ManagementOptimizationCallRef, ManagementOptimizationProgressV2,
+    ManagementOptimizationResultV2, ManagementOptimizationStageRef, ManagementPartialResultV2,
+    ManagementPendingTerminalState, ManagementResult, ManagementResultV2,
+    ManagementTraceExportResultV2, VersionedManagementJob,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,6 +343,62 @@ struct ImportExecuteManagementRequest {
     selection_id: String,
 }
 
+const ASSET_STAGE_SCHEMA: &str = "rsia.management.asset_stage.v1";
+const ASSET_ABORT_SCHEMA: &str = "rsia.management.asset_abort.v1";
+const ASSET_HANDOFF_SCHEMA: &str = "rsia.management.asset_handoff.v1";
+const EXPORT_PREPARE_SCHEMA: &str = "rsia.management.export_prepare.v1";
+const EXPORT_COMPLETE_SCHEMA: &str = "rsia.management.export_complete.v1";
+const EXPORT_ABORT_SCHEMA: &str = "rsia.management.export_abort.v1";
+
+/// `asset.stage`: the digest of one existing namespace-scoped controlled blob
+/// holding the strict `rsia.management.asset_stage_input.v1` projection. No
+/// physical root, destination, role, owner or authority boolean is accepted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssetStageManagementRequest {
+    schema_version: String,
+    request_key: String,
+    input_blob_digest: String,
+}
+
+/// `asset.abort`: one existing staged asset of the caller's namespace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssetAbortManagementRequest {
+    schema_version: String,
+    request_key: String,
+    staged_asset_id: String,
+}
+
+/// `asset.handoff`: one staged asset and one existing Current candidate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssetHandoffManagementRequest {
+    schema_version: String,
+    request_key: String,
+    staged_asset_id: String,
+    candidate_id: String,
+}
+
+/// `export.prepare`: the staged asset whose local projection is frozen. The
+/// destination is always the server's fixed `local_namespace`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportPrepareManagementRequest {
+    schema_version: String,
+    request_key: String,
+    staged_asset_id: String,
+}
+
+/// `export.complete` and `export.abort`: one existing v2 export attempt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExportAttemptManagementRequest {
+    schema_version: String,
+    request_key: String,
+    export_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case", tag = "operation")]
 enum ParsedRequest {
@@ -358,6 +421,12 @@ enum ParsedRequest {
     BudgetCallReconcile(Box<BudgetCallReconcileRequest>),
     ImportRegister(Box<ImportRegisterManagementRequest>),
     ImportExecute(Box<ImportExecuteManagementRequest>),
+    AssetStage(Box<AssetStageManagementRequest>),
+    AssetAbort(Box<AssetAbortManagementRequest>),
+    AssetHandoff(Box<AssetHandoffManagementRequest>),
+    ExportPrepare(Box<ExportPrepareManagementRequest>),
+    ExportComplete(Box<ExportAttemptManagementRequest>),
+    ExportAbort(Box<ExportAttemptManagementRequest>),
 }
 
 impl<'de> Deserialize<'de> for ParsedRequest {
@@ -391,6 +460,12 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             BudgetCallReconcile(Box<BudgetCallReconcileRequest>),
             ImportRegister(Box<ImportRegisterManagementRequest>),
             ImportExecute(Box<ImportExecuteManagementRequest>),
+            AssetStage(Box<AssetStageManagementRequest>),
+            AssetAbort(Box<AssetAbortManagementRequest>),
+            AssetHandoff(Box<AssetHandoffManagementRequest>),
+            ExportPrepare(Box<ExportPrepareManagementRequest>),
+            ExportComplete(Box<ExportAttemptManagementRequest>),
+            ExportAbort(Box<ExportAttemptManagementRequest>),
         }
         Ok(
             match serde_json::from_value::<Other>(value).map_err(serde::de::Error::custom)? {
@@ -410,6 +485,12 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::BudgetCallReconcile(value) => Self::BudgetCallReconcile(value),
                 Other::ImportRegister(value) => Self::ImportRegister(value),
                 Other::ImportExecute(value) => Self::ImportExecute(value),
+                Other::AssetStage(value) => Self::AssetStage(value),
+                Other::AssetAbort(value) => Self::AssetAbort(value),
+                Other::AssetHandoff(value) => Self::AssetHandoff(value),
+                Other::ExportPrepare(value) => Self::ExportPrepare(value),
+                Other::ExportComplete(value) => Self::ExportComplete(value),
+                Other::ExportAbort(value) => Self::ExportAbort(value),
             },
         )
     }
@@ -1241,6 +1322,12 @@ impl ParsedRequest {
             Self::BudgetCallReconcile(request) => &request.request_key,
             Self::ImportRegister(request) => &request.request_key,
             Self::ImportExecute(request) => &request.request_key,
+            Self::AssetStage(request) => &request.request_key,
+            Self::AssetAbort(request) => &request.request_key,
+            Self::AssetHandoff(request) => &request.request_key,
+            Self::ExportPrepare(request) => &request.request_key,
+            Self::ExportComplete(request) => &request.request_key,
+            Self::ExportAbort(request) => &request.request_key,
         }
     }
 }
@@ -1469,6 +1556,9 @@ impl JobOutcome {
             // Import registration commits real selection/source rows; import
             // execution commits the derived result and its edges.
             Some(ManagementResultV2::Import(_)) => true,
+            // Staged/aborted/handed-off assets and prepared/completed/aborted
+            // local exports all commit real business rows.
+            Some(ManagementResultV2::AssetExport(_)) => true,
             Some(ManagementResultV2::Original(
                 ManagementResult::EvaluationStatus { .. }
                 | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -2205,6 +2295,24 @@ async fn execute_request(
         }
         ParsedRequest::ImportExecute(request) => {
             return run_import_execute(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::AssetStage(request) => {
+            return run_asset_stage(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::AssetAbort(request) => {
+            return run_asset_abort(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::AssetHandoff(request) => {
+            return run_asset_handoff(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::ExportPrepare(request) => {
+            return run_export_prepare(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::ExportComplete(request) => {
+            return run_export_complete(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::ExportAbort(request) => {
+            return run_export_abort(ctx, store, claimed.clone(), *request, control).await;
         }
         ParsedRequest::Blocked(_) => {
             control.admit_step()?;
@@ -3288,6 +3396,430 @@ async fn run_import_execute(
     }
 }
 
+fn asset_export_result_state(
+    state: crate::packages::StagedAssetState,
+) -> ManagementAssetExportState {
+    match state {
+        crate::packages::StagedAssetState::Staged => ManagementAssetExportState::Staged,
+        crate::packages::StagedAssetState::Quarantined => ManagementAssetExportState::Quarantined,
+        crate::packages::StagedAssetState::Aborted
+        | crate::packages::StagedAssetState::Prepared
+        | crate::packages::StagedAssetState::Failed => ManagementAssetExportState::Aborted,
+    }
+}
+
+fn staged_result(
+    staged: &crate::packages::E16Envelope<crate::packages::StagedAssetPayload>,
+) -> ManagementAssetExportResultV2 {
+    ManagementAssetExportResultV2::AssetStaged {
+        staged_asset_id: staged.id.clone(),
+        manifest_digest: staged.payload.manifest_digest.clone(),
+        content_blob_digest: staged.payload.content_blob_digest.clone(),
+        content_bytes: staged.payload.content_bytes,
+        state: asset_export_result_state(staged.payload.state),
+    }
+}
+
+fn export_completed_outcome(completion: &crate::packages::ExportCompletion) -> Result<JobOutcome> {
+    let delivery_audit_id = completion.audit.id.clone();
+    Ok(JobOutcome {
+        state: ManagementJobState::Succeeded,
+        step: "export_completed".into(),
+        result: Some(ManagementResultV2::AssetExport(
+            ManagementAssetExportResultV2::ExportCompleted {
+                export_id: completion.attempt.id.clone(),
+                staged_asset_id: completion.attempt.payload.staged_asset_id.clone(),
+                package_tree_digest: completion.receipt.package_tree_digest.clone(),
+                delivered_bytes: completion.receipt.delivered_bytes,
+                receipt_digest: completion.receipt.completion_receipt_digest.clone(),
+                delivery_audit_id,
+            },
+        )),
+        error_code: None,
+    })
+}
+
+async fn commit_management_outcome(
+    session: Session,
+    claimed: ManagementJobV2,
+    finished: Result<JobOutcome>,
+) -> Result<ObservedWorkerExit> {
+    match finished {
+        Ok(outcome) => {
+            session.commit().await?;
+            Ok(ObservedWorkerExit::Completed(outcome))
+        }
+        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(error) => {
+            execution_outcome(claimed, Err(error)).map(ObservedWorkerExit::BeforeCommitFailed)
+        }
+    }
+}
+
+async fn run_asset_stage(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: AssetStageManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    // The controlled input blob is read and the whole projection is decoded,
+    // validated and hashed outside the job transaction.
+    let input = store
+        .verified_blob_input(
+            ctx,
+            &request.input_blob_digest,
+            crate::packages::MAX_PERSISTENT_PROJECTION,
+        )
+        .await?;
+    let (stage_request, projection) =
+        crate::packages::decode_asset_stage_input(&input.bytes, &request.request_key)?;
+    let mut session = store.registered_blob_write_session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        // The same transaction re-checks watermark, sources, dependencies,
+        // capacity and the existing key image, then publishes the projection
+        // blob and writes the finalized staged asset.
+        let staged = crate::packages::PersistentPackageStore::stage_package_in_session(
+            ctx,
+            &mut session,
+            &stage_request,
+            &projection,
+        )
+        .await?;
+        if !matches!(
+            staged.payload.state,
+            crate::packages::StagedAssetState::Staged
+                | crate::packages::StagedAssetState::Quarantined
+        ) {
+            return Err(Error::Conflict("staged asset is terminal".into()));
+        }
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "asset_staged".into(),
+            result: Some(ManagementResultV2::AssetExport(staged_result(&staged))),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
+async fn run_asset_abort(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: AssetAbortManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    let mut session = store.session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        let staged = crate::packages::PersistentPackageStore::abort_staged_in_session(
+            ctx,
+            &mut session,
+            &request.staged_asset_id,
+        )
+        .await?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "asset_aborted".into(),
+            result: Some(ManagementResultV2::AssetExport(
+                ManagementAssetExportResultV2::AssetAborted {
+                    staged_asset_id: staged.id.clone(),
+                    state: ManagementAssetExportState::Aborted,
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
+async fn run_asset_handoff(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: AssetHandoffManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    let staged =
+        crate::packages::PersistentPackageStore::read_staged(ctx, store, &request.staged_asset_id)
+            .await?;
+    if staged.owner_actor != ctx.actor()
+        || staged.payload.state != crate::packages::StagedAssetState::Staged
+    {
+        return Err(Error::Forbidden);
+    }
+    if staged.payload.package_schema_version != crate::packages::PACKAGE_SCHEMA_V1 {
+        return Err(Error::Invalid(
+            "candidate handoff requires a validated package projection".into(),
+        ));
+    }
+    if staged.payload.candidate_material.is_none() {
+        return Err(Error::Invalid(
+            "staged asset has no candidate material binding".into(),
+        ));
+    }
+    if staged.payload.package_kind != "skill" {
+        return Err(Error::Invalid(
+            "candidate handoff only supports skill packages".into(),
+        ));
+    }
+    let projection = crate::packages::load_staged_projection(ctx, store, &staged).await?;
+    let mut session = store.session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        // The same transaction re-reads the staged asset, the Current
+        // candidate and the whole material/source closure, then writes only
+        // the candidate ref, edge and audit record.
+        let handed = crate::packages::PersistentPackageStore::handoff_in_session(
+            ctx,
+            &mut session,
+            &staged,
+            &request.candidate_id,
+            &projection,
+        )
+        .await?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "asset_handed_off".into(),
+            result: Some(ManagementResultV2::AssetExport(
+                ManagementAssetExportResultV2::AssetHandedOff {
+                    staged_asset_id: handed.id.clone(),
+                    candidate_id: request.candidate_id.clone(),
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
+async fn run_export_prepare(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: ExportPrepareManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    let staged =
+        crate::packages::PersistentPackageStore::read_staged(ctx, store, &request.staged_asset_id)
+            .await?;
+    if staged.owner_actor != ctx.actor()
+        || staged.payload.state != crate::packages::StagedAssetState::Staged
+    {
+        return Err(Error::Forbidden);
+    }
+    if staged.payload.package_schema_version != crate::packages::PACKAGE_SCHEMA_V1 {
+        return Err(Error::Invalid(
+            "only validated package projections can be exported".into(),
+        ));
+    }
+    let projection = crate::packages::load_staged_projection(ctx, store, &staged).await?;
+    let files = crate::packages::local_export_files(&projection)?;
+    let (package_tree_digest, delivered_bytes) = evo_storage::local_export_tree_digest(&files)?;
+    let mut session = store.session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        // The fixed local destination, the staged watermark/source closure
+        // and one replayable intent per request key commit with the job.
+        let attempt = crate::packages::PersistentPackageStore::prepare_export_in_session(
+            ctx,
+            &mut session,
+            &request.request_key,
+            &staged,
+            &files,
+            &package_tree_digest,
+            delivered_bytes,
+            None,
+        )
+        .await?;
+        if attempt.payload.state != crate::packages::ExportAttemptState::Prepared {
+            return Err(Error::Conflict("export attempt is not prepared".into()));
+        }
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "export_prepared".into(),
+            result: Some(ManagementResultV2::AssetExport(
+                ManagementAssetExportResultV2::ExportPrepared {
+                    export_id: attempt.id.clone(),
+                    staged_asset_id: attempt.payload.staged_asset_id.clone(),
+                    package_tree_digest: attempt.payload.package_tree_digest.clone(),
+                    delivered_bytes: attempt.payload.delivered_bytes,
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
+async fn run_export_complete(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: ExportAttemptManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    // All blob and directory reads, the tree derivation and the dependency
+    // preflight happen before the job transaction.
+    match crate::packages::PersistentPackageStore::prepare_export_completion(
+        ctx,
+        store,
+        &request.export_id,
+    )
+    .await?
+    {
+        crate::packages::ExportCompletionPreparation::Completed(_, completion) => {
+            let mut session = store.session().await?;
+            let finished = async {
+                let mut current =
+                    begin_management_step(ctx, &mut session, &claimed, control).await?;
+                let outcome = export_completed_outcome(&completion)?;
+                apply_completed_outcome(&mut current, &outcome)?;
+                session
+                    .put(ctx, "job", &current.id, ctx.actor(), &current)
+                    .await?;
+                session
+                    .audit(ctx, "management.job.finish", &current.id)
+                    .await?;
+                Ok::<JobOutcome, Error>(outcome)
+            }
+            .await;
+            commit_management_outcome(session, claimed, finished).await
+        }
+        crate::packages::ExportCompletionPreparation::Ready(prepared) => {
+            let mut session = store.registered_blob_write_session().await?;
+            let finished = async {
+                let mut current =
+                    begin_management_step(ctx, &mut session, &claimed, control).await?;
+                let completion = {
+                    let lease = current.lease_token.clone().ok_or(Error::Internal)?;
+                    let fence = evo_storage::ManagementJobFence {
+                        job_id: &current.id,
+                        operation: "export.complete",
+                        generation: current.generation,
+                        lease_token: &lease,
+                    };
+                    crate::packages::PersistentPackageStore::complete_export_in_session(
+                        ctx,
+                        store,
+                        &mut session,
+                        &request.export_id,
+                        &prepared,
+                        Some(&fence),
+                    )
+                    .await?
+                };
+                let outcome = export_completed_outcome(&completion)?;
+                apply_completed_outcome(&mut current, &outcome)?;
+                session
+                    .put(ctx, "job", &current.id, ctx.actor(), &current)
+                    .await?;
+                session
+                    .audit(ctx, "management.job.finish", &current.id)
+                    .await?;
+                Ok::<JobOutcome, Error>(outcome)
+            }
+            .await;
+            commit_management_outcome(session, claimed, finished).await
+        }
+    }
+}
+
+async fn run_export_abort(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: ExportAttemptManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    let mut session = store.registered_blob_write_session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        {
+            let lease = current.lease_token.clone().ok_or(Error::Internal)?;
+            let fence = evo_storage::ManagementJobFence {
+                job_id: &current.id,
+                operation: "export.abort",
+                generation: current.generation,
+                lease_token: &lease,
+            };
+            crate::packages::PersistentPackageStore::abort_export_in_session(
+                ctx,
+                store,
+                &mut session,
+                &request.export_id,
+                Some(&fence),
+            )
+            .await?;
+        }
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "export_aborted".into(),
+            result: Some(ManagementResultV2::AssetExport(
+                ManagementAssetExportResultV2::ExportAborted {
+                    export_id: request.export_id.clone(),
+                    state: ManagementAssetExportState::Aborted,
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
 fn import_management_result_state(
     state: crate::import::ImportResultState,
 ) -> ManagementImportResultState {
@@ -3454,6 +3986,28 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
         ParsedRequest::ImportExecute(request) => {
             ctx.require(&[Role::Admin])?;
             identifier(&request.selection_id)?;
+        }
+        ParsedRequest::AssetStage(request) => {
+            ctx.require(&[Role::Admin])?;
+            identifier(&request.request_key)?;
+            crate::packages::validate_digest(&request.input_blob_digest, "asset stage input blob")?;
+        }
+        ParsedRequest::AssetAbort(request) => {
+            ctx.require(&[Role::Admin])?;
+            identifier(&request.staged_asset_id)?;
+        }
+        ParsedRequest::AssetHandoff(request) => {
+            ctx.require(&[Role::Admin])?;
+            identifier(&request.staged_asset_id)?;
+            identifier(&request.candidate_id)?;
+        }
+        ParsedRequest::ExportPrepare(request) => {
+            ctx.require(&[Role::Admin])?;
+            identifier(&request.staged_asset_id)?;
+        }
+        ParsedRequest::ExportComplete(request) | ParsedRequest::ExportAbort(request) => {
+            ctx.require(&[Role::Admin])?;
+            identifier(&request.export_id)?;
         }
         ParsedRequest::TraceExportPrepare(request) => {
             ctx.require(&[Role::Admin])?;
@@ -4735,6 +5289,41 @@ async fn consumer_progress(
         }
         return Ok(ConsumerProgress::NotCommitted);
     }
+    if matches!(
+        record.identity().operation,
+        "asset.stage" | "asset.abort" | "asset.handoff" | "export.prepare" | "export.abort"
+    ) {
+        // Each of these handlers writes every business row and the terminal job
+        // state in one transaction. A non-terminal record proves no effect; a
+        // terminal one with its bound result is its own committed outcome.
+        if is_terminal(record.identity().state)
+            && matches!(record.result(), Some(ManagementResultV2::AssetExport(_)))
+        {
+            return Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                state: record.identity().state,
+                step: record.step().into(),
+                result: record.result(),
+                error_code: record.error_code().map(str::to_owned),
+            })));
+        }
+        return Ok(ConsumerProgress::NotCommitted);
+    }
+    if record.identity().operation == "export.complete"
+        && is_terminal(record.identity().state)
+        && matches!(
+            record.result(),
+            Some(ManagementResultV2::AssetExport(
+                ManagementAssetExportResultV2::ExportCompleted { .. }
+            ))
+        )
+    {
+        return Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+            state: record.identity().state,
+            step: record.step().into(),
+            result: record.result(),
+            error_code: record.error_code().map(str::to_owned),
+        })));
+    }
     if let VersionedManagementJob::V2(job) = record
         && job.operation == "experiment.register"
         && job.step == "current_holdout_registered"
@@ -5330,6 +5919,38 @@ async fn consumer_progress(
         ParsedRequest::ImportRegister(_) | ParsedRequest::ImportExecute(_) => {
             Ok(ConsumerProgress::NotCommitted)
         }
+        // Unreachable: the asset/export short-circuits above own these five.
+        ParsedRequest::AssetStage(_)
+        | ParsedRequest::AssetAbort(_)
+        | ParsedRequest::AssetHandoff(_)
+        | ParsedRequest::ExportPrepare(_)
+        | ParsedRequest::ExportAbort(_) => Ok(ConsumerProgress::NotCommitted),
+        ParsedRequest::ExportComplete(request) => {
+            // A published tree whose SQL completion did not commit is an
+            // exact-effect question, never an empty-failure guess: only the
+            // full attempt/input/source/watermark/tree/bytes/dependency and
+            // actual-directory agreement completes; a differing tree that
+            // exists stays Unknown (Draining); an absent tree proves no
+            // delivery.
+            match crate::packages::PersistentPackageStore::inspect_export_completion_recovery(
+                ctx,
+                store,
+                &request.export_id,
+            )
+            .await?
+            {
+                crate::packages::ExportCompletionInspection::Completed(_, completion) => Ok(
+                    ConsumerProgress::Committed(Box::new(export_completed_outcome(&completion)?)),
+                ),
+                crate::packages::ExportCompletionInspection::Ready(_)
+                | crate::packages::ExportCompletionInspection::PublishedUnverified => {
+                    Ok(ConsumerProgress::Unknown)
+                }
+                crate::packages::ExportCompletionInspection::NotPublished => {
+                    Ok(ConsumerProgress::NotCommitted)
+                }
+            }
+        }
         ParsedRequest::OptimizationStep(_) | ParsedRequest::BackupCreate(_) => Err(Error::Internal),
         ParsedRequest::Blocked(request) => {
             if record.identity().operation != "meta.start"
@@ -5576,6 +6197,132 @@ impl ManagementDispatcher {
 }
 
 impl ManagementDispatcher {
+    /// Own the `export.complete` crash reconciliation. `Some` means this path
+    /// decided the job (recovered, already completed, or an unverified tree
+    /// kept Draining); `None` means the formal tree is absent and the generic
+    /// NotCommitted path answers honestly.
+    async fn finish_export_complete(
+        &self,
+        ctx: &Context,
+        claimed: &ManagementJobV2,
+        _observed: &ObservedWorkerExit,
+    ) -> Result<Option<ManagementJobState>> {
+        let request = match load_private_request(ctx, &self.store, claimed).await {
+            Ok(ParsedRequest::ExportComplete(request)) => request,
+            Ok(_) => {
+                return Err(Error::Conflict(
+                    "export completion job input differs".into(),
+                ));
+            }
+            Err(_) => return Ok(None),
+        };
+        let inspection =
+            crate::packages::PersistentPackageStore::inspect_export_completion_recovery(
+                ctx,
+                &self.store,
+                &request.export_id,
+            )
+            .await;
+        let inspection = match inspection {
+            Ok(inspection) => inspection,
+            Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
+            // The stored attempt or its closure cannot be read as the exact
+            // preimage. Without a proven absent tree this is uncertainty, not
+            // a zero-effect failure.
+            Err(_) => {
+                return self
+                    .mark_export_complete_draining(ctx, claimed)
+                    .await
+                    .map(Some);
+            }
+        };
+        match inspection {
+            crate::packages::ExportCompletionInspection::NotPublished => Ok(None),
+            crate::packages::ExportCompletionInspection::PublishedUnverified => self
+                .mark_export_complete_draining(ctx, claimed)
+                .await
+                .map(Some),
+            crate::packages::ExportCompletionInspection::Ready(_)
+            | crate::packages::ExportCompletionInspection::Completed(_, _) => self
+                .recover_export_complete(ctx, claimed, &request.export_id, &inspection)
+                .await
+                .map(Some),
+        }
+    }
+
+    async fn mark_export_complete_draining(
+        &self,
+        ctx: &Context,
+        claimed: &ManagementJobV2,
+    ) -> Result<ManagementJobState> {
+        let mut session = self.store.session().await?;
+        let record = load_job_record_in_session(ctx, &mut session, &claimed.id).await?;
+        if is_terminal(record.identity().state) {
+            let state = record.identity().state;
+            session.commit().await?;
+            return Ok(state);
+        }
+        let mut current = record.into_unfinished_v2()?;
+        if !same_claim_fields(&current, claimed) {
+            return Err(Error::Conflict("management job lease fence changed".into()));
+        }
+        if current.state != ManagementJobState::Draining {
+            current.state = ManagementJobState::Draining;
+            now()?;
+            session
+                .put(ctx, "job", &current.id, ctx.actor(), &current)
+                .await?;
+            session
+                .audit(ctx, "management.job.draining", &current.id)
+                .await?;
+        }
+        session.commit().await?;
+        Ok(ManagementJobState::Draining)
+    }
+
+    async fn recover_export_complete(
+        &self,
+        ctx: &Context,
+        claimed: &ManagementJobV2,
+        export_id: &str,
+        inspection: &crate::packages::ExportCompletionInspection,
+    ) -> Result<ManagementJobState> {
+        let mut session = self.store.registered_blob_write_session().await?;
+        let record = load_job_record_in_session(ctx, &mut session, &claimed.id).await?;
+        if is_terminal(record.identity().state) {
+            let state = record.identity().state;
+            session.commit().await?;
+            return Ok(state);
+        }
+        let mut current = record.into_unfinished_v2()?;
+        if !same_claim_fields(&current, claimed) {
+            return Err(Error::Conflict("management job lease fence changed".into()));
+        }
+        // Only the SQL completion is written in this transaction; the published
+        // tree is verified, never staged, renamed or rewritten.
+        let completion =
+            crate::packages::PersistentPackageStore::recover_export_completion_in_session(
+                ctx,
+                &self.store,
+                &mut session,
+                export_id,
+                inspection,
+            )
+            .await?;
+        let outcome = export_completed_outcome(&completion)?;
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        session.commit().await?;
+        Ok(ManagementJobState::Succeeded)
+    }
+}
+
+impl ManagementDispatcher {
     async fn finish_observed_worker(
         &self,
         ctx: &Context,
@@ -5593,6 +6340,16 @@ impl ManagementDispatcher {
             // This entry owns a real exit/startup witness. Budget work happens
             // outside the subsequent management writer transaction.
             self.optimization_budget_actions(ctx, &claimed.id).await?;
+        }
+        if claimed.operation == "export.complete"
+            && !matches!(
+                observed,
+                ObservedWorkerExit::Completed(outcome)
+                    if outcome.state != ManagementJobState::Failed
+            )
+            && let Some(state) = self.finish_export_complete(ctx, claimed, observed).await?
+        {
+            return Ok(state);
         }
         if let ObservedWorkerExit::Completed(outcome) = observed
             && outcome.state != ManagementJobState::Failed
@@ -5932,7 +6689,16 @@ async fn cancel_job_atomic(
             || (matches!(
                 saved.operation.as_str(),
                 "import.register" | "import.execute"
-            ) && matches!(saved.result, Some(ManagementResultV2::Import(_)))))
+            ) && matches!(saved.result, Some(ManagementResultV2::Import(_))))
+            || (matches!(
+                saved.operation.as_str(),
+                "asset.stage"
+                    | "asset.abort"
+                    | "asset.handoff"
+                    | "export.prepare"
+                    | "export.complete"
+                    | "export.abort"
+            ) && matches!(saved.result, Some(ManagementResultV2::AssetExport(_)))))
     {
         let mut job = saved.clone();
         now()?;
@@ -6043,6 +6809,7 @@ fn stored_result_has_side_effect(result: Option<&ManagementResultV2>) -> bool {
         Some(ManagementResultV2::Budget(ManagementBudgetResultV2::OpenCallsListed { .. })) => false,
         Some(ManagementResultV2::Budget(_)) => true,
         Some(ManagementResultV2::Import(_)) => true,
+        Some(ManagementResultV2::AssetExport(_)) => true,
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }
             | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -6194,6 +6961,66 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
                 ));
             }
         },
+        "asset.stage" => match payload["schema_version"].as_str() {
+            Some(ASSET_STAGE_SCHEMA) => ParsedRequest::AssetStage(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
+        "asset.abort" => match payload["schema_version"].as_str() {
+            Some(ASSET_ABORT_SCHEMA) => ParsedRequest::AssetAbort(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
+        "asset.handoff" => match payload["schema_version"].as_str() {
+            Some(ASSET_HANDOFF_SCHEMA) => ParsedRequest::AssetHandoff(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
+        "export.prepare" => match payload["schema_version"].as_str() {
+            Some(EXPORT_PREPARE_SCHEMA) => ParsedRequest::ExportPrepare(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
+        "export.complete" => match payload["schema_version"].as_str() {
+            Some(EXPORT_COMPLETE_SCHEMA) => ParsedRequest::ExportComplete(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
+        "export.abort" => match payload["schema_version"].as_str() {
+            Some(EXPORT_ABORT_SCHEMA) => ParsedRequest::ExportAbort(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
@@ -6226,6 +7053,12 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::BudgetCallReconcile(request) => &request.schema_version,
         ParsedRequest::ImportRegister(request) => &request.schema_version,
         ParsedRequest::ImportExecute(request) => &request.schema_version,
+        ParsedRequest::AssetStage(request) => &request.schema_version,
+        ParsedRequest::AssetAbort(request) => &request.schema_version,
+        ParsedRequest::AssetHandoff(request) => &request.schema_version,
+        ParsedRequest::ExportPrepare(request) => &request.schema_version,
+        ParsedRequest::ExportComplete(request) => &request.schema_version,
+        ParsedRequest::ExportAbort(request) => &request.schema_version,
     };
     if actual != &expected {
         return Err(Error::Invalid(
@@ -6378,6 +7211,24 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             // A revoked selection refuses the execute request before its
             // first write (and before any blob read).
             dependencies.push(("artifact".into(), request.selection_id.clone()));
+        }
+        ParsedRequest::AssetStage(request) => {
+            // The transient input blob is a physical input of the future
+            // staged asset; its digest is content-addressed, not a path.
+            dependencies.push(("blob".into(), request.input_blob_digest.clone()));
+        }
+        // Abort is closure: it must remain possible after a source revocation
+        // and never opens a new use of the cancelled material.
+        ParsedRequest::AssetAbort(_) | ParsedRequest::ExportAbort(_) => {}
+        ParsedRequest::AssetHandoff(request) => {
+            dependencies.push(("artifact".into(), request.staged_asset_id.clone()));
+            dependencies.push(("artifact".into(), request.candidate_id.clone()));
+        }
+        ParsedRequest::ExportPrepare(request) => {
+            dependencies.push(("artifact".into(), request.staged_asset_id.clone()));
+        }
+        ParsedRequest::ExportComplete(request) => {
+            dependencies.push(("artifact".into(), request.export_id.clone()));
         }
         ParsedRequest::TraceExportPrepare(request) => {
             // The private input depends on every captured source run, so a
@@ -6676,6 +7527,30 @@ pub enum ManagementCommittedEffect {
         result_id: String,
         result_digest: String,
     },
+    AssetStaged {
+        staged_asset_id: String,
+        manifest_digest: String,
+        content_blob_digest: String,
+    },
+    AssetAborted {
+        staged_asset_id: String,
+    },
+    AssetHandedOff {
+        staged_asset_id: String,
+        candidate_id: String,
+    },
+    ExportPrepared {
+        export_id: String,
+        package_tree_digest: String,
+    },
+    ExportCompleted {
+        export_id: String,
+        receipt_digest: String,
+        delivery_audit_id: String,
+    },
+    ExportAborted {
+        export_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -6859,6 +7734,53 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
             selection_id: selection_id.clone(),
             result_id: result_id.clone(),
             result_digest: result_digest.clone(),
+        }],
+        Some(ManagementResultV2::AssetExport(ManagementAssetExportResultV2::AssetStaged {
+            staged_asset_id,
+            manifest_digest,
+            content_blob_digest,
+            ..
+        })) => vec![ManagementCommittedEffect::AssetStaged {
+            staged_asset_id: staged_asset_id.clone(),
+            manifest_digest: manifest_digest.clone(),
+            content_blob_digest: content_blob_digest.clone(),
+        }],
+        Some(ManagementResultV2::AssetExport(ManagementAssetExportResultV2::AssetAborted {
+            staged_asset_id,
+            ..
+        })) => vec![ManagementCommittedEffect::AssetAborted {
+            staged_asset_id: staged_asset_id.clone(),
+        }],
+        Some(ManagementResultV2::AssetExport(ManagementAssetExportResultV2::AssetHandedOff {
+            staged_asset_id,
+            candidate_id,
+        })) => vec![ManagementCommittedEffect::AssetHandedOff {
+            staged_asset_id: staged_asset_id.clone(),
+            candidate_id: candidate_id.clone(),
+        }],
+        Some(ManagementResultV2::AssetExport(ManagementAssetExportResultV2::ExportPrepared {
+            export_id,
+            package_tree_digest,
+            ..
+        })) => vec![ManagementCommittedEffect::ExportPrepared {
+            export_id: export_id.clone(),
+            package_tree_digest: package_tree_digest.clone(),
+        }],
+        Some(ManagementResultV2::AssetExport(ManagementAssetExportResultV2::ExportCompleted {
+            export_id,
+            receipt_digest,
+            delivery_audit_id,
+            ..
+        })) => vec![ManagementCommittedEffect::ExportCompleted {
+            export_id: export_id.clone(),
+            receipt_digest: receipt_digest.clone(),
+            delivery_audit_id: delivery_audit_id.clone(),
+        }],
+        Some(ManagementResultV2::AssetExport(ManagementAssetExportResultV2::ExportAborted {
+            export_id,
+            ..
+        })) => vec![ManagementCommittedEffect::ExportAborted {
+            export_id: export_id.clone(),
         }],
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }

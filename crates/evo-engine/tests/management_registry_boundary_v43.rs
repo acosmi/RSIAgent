@@ -179,6 +179,20 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
                 // selection, so it is refused before any session with zero
                 // writes. Their real consumers are the positive control below.
                 ("import.register" | "import.execute", _) => "invalid management payload",
+                // The six asset/local-export operations are wired to their
+                // strict management DTOs: this boundary payload lacks the
+                // input digest or stored id, so it is refused before any
+                // session with zero writes. Their real consumers are covered
+                // by the dedicated asset/export management controls.
+                (
+                    "asset.stage"
+                    | "asset.abort"
+                    | "asset.handoff"
+                    | "export.prepare"
+                    | "export.complete"
+                    | "export.abort",
+                    _,
+                ) => "invalid management payload",
                 (_, ExecutionKind::AsyncJob) => "management_operation_not_wired",
                 _ => "management operation requires dedicated route",
             }),

@@ -981,7 +981,7 @@ fn f20_local_export_member_paths_are_validated_on_the_raw_string() {
 
 fn q03_export_sql(path: &std::path::Path, sql: &str) {
     let output = std::process::Command::new("python3").arg("-c")
-        .arg("import sqlite3,sys\nc=sqlite3.connect(sys.argv[1]);c.executescript(sys.argv[2]);c.close()")
+        .arg("import sqlite3,sys\nc=sqlite3.connect(sys.argv[1], timeout=30);c.executescript(sys.argv[2]);c.close()")
         .arg(path).arg(sql).output().unwrap();
     assert!(
         output.status.success(),
@@ -1157,4 +1157,509 @@ async fn q03_completed_export_verification_is_kind_exact_and_read_only() {
         receipt
     );
     assert_eq!(q03_export_snapshot(&path), before);
+}
+
+// ---------------------------------------------------------------------------
+// AG-166b management in-session publication/recovery controls
+// ---------------------------------------------------------------------------
+
+fn sqlite(path: &std::path::Path, script: &str) {
+    let output = std::process::Command::new("python3")
+        .args(["-B", "-c", script])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn seed_running_job(
+    store: &Store,
+    ctx: &Context,
+    job_id: &str,
+    operation: &str,
+    generation: u64,
+    lease: &str,
+) {
+    let job = evo_storage::ManagementJobV2 {
+        id: job_id.into(),
+        schema_version: "rsia.management_job.v2".into(),
+        operation: operation.into(),
+        request_key: "management-fence-key".into(),
+        payload_digest: hash(b"management-fence-payload"),
+        owner_actor: ctx.actor().into(),
+        owner_role: Role::Admin,
+        state: evo_storage::ManagementJobState::Running,
+        step: "claimed".into(),
+        private_input_ref: "management-input-fence".into(),
+        result: None,
+        error_code: None,
+        cancel_requested: false,
+        lease_token: Some(lease.into()),
+        lease_until: evo_core::now().unwrap() + 60,
+        generation,
+        diagnostics: Vec::new(),
+        created_at: evo_core::now().unwrap(),
+        cancel_arrival: None,
+        pending_terminal_state: None,
+        optimization: None,
+        backup: None,
+    };
+    let mut session = store.session().await.unwrap();
+    session
+        .put(ctx, "job", job_id, ctx.actor(), &job)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+}
+
+async fn publish_in_session(
+    store: &Store,
+    ctx: &Context,
+    export_id: &str,
+    files: &[LocalExportFile],
+    completed: &Value,
+    audit: &Value,
+    fence: Option<&evo_storage::ManagementJobFence<'_>>,
+) -> evo_core::Result<evo_storage::LocalExportReceipt> {
+    let plan = store
+        .snapshot_local_export_dependencies(ctx, export_id)
+        .await?;
+    let dependencies = store
+        .prevalidate_local_export_dependency_blobs(ctx, plan)
+        .await?;
+    let mut session = store.registered_blob_write_session().await?;
+    let receipt = store
+        .publish_registered_local_export_in_session(
+            ctx,
+            &mut session,
+            export_id,
+            files,
+            completed,
+            audit,
+            &dependencies,
+            fence,
+        )
+        .await?;
+    session.commit().await?;
+    Ok(receipt)
+}
+
+/// The narrow physical claim fence is judged before the first DML/FS effect.
+#[tokio::test]
+async fn local_export_checks_management_fence_before_publish() {
+    let (directory, store, admin, export_id, files, completed, audit) = prepared_fixture().await;
+    let lease = hash(b"real-lease");
+    seed_running_job(
+        &store,
+        &admin,
+        "management-job-fence",
+        "export.complete",
+        1,
+        &lease,
+    )
+    .await;
+    let stale = evo_storage::ManagementJobFence {
+        job_id: "management-job-fence",
+        operation: "export.complete",
+        generation: 0,
+        lease_token: &lease,
+    };
+    let denied = publish_in_session(
+        &store,
+        &admin,
+        &export_id,
+        &files,
+        &completed,
+        &audit,
+        Some(&stale),
+    )
+    .await;
+    assert!(matches!(denied, Err(Error::Conflict(_))), "{denied:?}");
+    assert!(
+        !tokio::fs::try_exists(store.local_export_directory(&admin, &export_id).unwrap())
+            .await
+            .unwrap(),
+        "no filesystem effect before the fence"
+    );
+    let stale_lease = evo_storage::ManagementJobFence {
+        job_id: "management-job-fence",
+        operation: "export.complete",
+        generation: 1,
+        lease_token: "other-lease",
+    };
+    assert!(matches!(
+        publish_in_session(
+            &store,
+            &admin,
+            &export_id,
+            &files,
+            &completed,
+            &audit,
+            Some(&stale_lease)
+        )
+        .await,
+        Err(Error::Conflict(_))
+    ));
+    let current = evo_storage::ManagementJobFence {
+        job_id: "management-job-fence",
+        operation: "export.complete",
+        generation: 1,
+        lease_token: &lease,
+    };
+    let receipt = publish_in_session(
+        &store,
+        &admin,
+        &export_id,
+        &files,
+        &completed,
+        &audit,
+        Some(&current),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        receipt.local_export_ref,
+        completed["payload"]["local_export_ref"].as_str().unwrap()
+    );
+    assert!(
+        tokio::fs::try_exists(store.local_export_directory(&admin, &export_id).unwrap())
+            .await
+            .unwrap()
+    );
+    let _ = directory;
+    store.close().await;
+}
+
+/// A commit failure after the rename keeps the published tree; the recovery
+/// entry verifies it and adds only the missing SQL completion.
+#[tokio::test]
+async fn local_export_job_cas_failure_preserves_published_tree_for_recovery() {
+    let (directory, store, admin, export_id, files, completed, audit) = prepared_fixture().await;
+    let path = directory.path().join("local-export.sqlite3");
+    sqlite(
+        &path,
+        "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1], timeout=30)\nc.execute(\"CREATE TRIGGER stop_audit BEFORE INSERT ON objects WHEN NEW.id='delivery-audit-1' BEGIN SELECT RAISE(ABORT,'injected-audit-stop'); END\")\nc.commit()\nprint('ok')",
+    );
+    let failed =
+        publish_in_session(&store, &admin, &export_id, &files, &completed, &audit, None).await;
+    assert!(matches!(failed, Err(Error::Internal)), "{failed:?}");
+    let mut session = store.session().await.unwrap();
+    let attempt: Value = session.need(&admin, "artifact", &export_id).await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(attempt["payload"]["state"], "prepared");
+    let export_dir = store.local_export_directory(&admin, &export_id).unwrap();
+    assert!(tokio::fs::try_exists(&export_dir).await.unwrap());
+    sqlite(
+        &path,
+        "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1], timeout=30)\nc.execute('DROP TRIGGER stop_audit')\nc.commit()\nprint('ok')",
+    );
+    let plan = store
+        .snapshot_local_export_dependencies(&admin, &export_id)
+        .await
+        .unwrap();
+    let dependencies = store
+        .prevalidate_local_export_dependency_blobs(&admin, plan)
+        .await
+        .unwrap();
+    let mut session = store.registered_blob_write_session().await.unwrap();
+    let receipt = store
+        .recover_registered_local_export_in_session(
+            &admin,
+            &mut session,
+            &export_id,
+            &files,
+            &completed,
+            &audit,
+            &dependencies,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(
+        receipt.completion_receipt_digest,
+        completed["payload"]["completion_receipt_digest"]
+            .as_str()
+            .unwrap()
+    );
+    let mut session = store.session().await.unwrap();
+    let attempt: Value = session.need(&admin, "artifact", &export_id).await.unwrap();
+    let audit_row: Value = session
+        .need(&admin, "artifact", "delivery-audit-1")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(attempt["payload"]["state"], "completed");
+    assert_eq!(audit_row["schema_version"], "rsia.e16.delivery_audit.v2");
+    store.close().await;
+}
+
+/// The job terminal state and the delivery facts share one commit: a failure
+/// on the job write leaves no attempt/audit completion while the tree stays.
+#[tokio::test]
+async fn local_export_job_terminal_and_delivery_facts_commit_together() {
+    let (directory, store, admin, export_id, files, completed, audit) = prepared_fixture().await;
+    let path = directory.path().join("local-export.sqlite3");
+    seed_running_job(
+        &store,
+        &admin,
+        "management-job-cas",
+        "export.complete",
+        1,
+        &hash(b"cas-lease"),
+    )
+    .await;
+    sqlite(
+        &path,
+        "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1], timeout=30)\nc.execute(\"CREATE TRIGGER stop_job BEFORE INSERT ON objects WHEN NEW.id='management-job-cas' BEGIN SELECT RAISE(ABORT,'injected-job-stop'); END\")\nc.commit()\nprint('ok')",
+    );
+    let plan = store
+        .snapshot_local_export_dependencies(&admin, &export_id)
+        .await
+        .unwrap();
+    let dependencies = store
+        .prevalidate_local_export_dependency_blobs(&admin, plan)
+        .await
+        .unwrap();
+    let mut session = store.registered_blob_write_session().await.unwrap();
+    store
+        .publish_registered_local_export_in_session(
+            &admin,
+            &mut session,
+            &export_id,
+            &files,
+            &completed,
+            &audit,
+            &dependencies,
+            None,
+        )
+        .await
+        .unwrap();
+    let job: Value = session
+        .need(&admin, "job", "management-job-cas")
+        .await
+        .unwrap();
+    let mut job_value = job;
+    job_value["state"] = json!("succeeded");
+    assert!(
+        session
+            .put(
+                &admin,
+                "job",
+                "management-job-cas",
+                admin.actor(),
+                &job_value
+            )
+            .await
+            .is_err(),
+        "the injected job write fails"
+    );
+    drop(session);
+    let mut session = store.session().await.unwrap();
+    let attempt: Value = session.need(&admin, "artifact", &export_id).await.unwrap();
+    let audits: Vec<Value> = session.list(&admin, "artifact").await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(attempt["payload"]["state"], "prepared");
+    assert!(
+        audits
+            .iter()
+            .all(|value| value["schema_version"] != "rsia.e16.delivery_audit.v2"),
+        "no delivery fact survives the failed joint commit"
+    );
+    assert!(
+        tokio::fs::try_exists(store.local_export_directory(&admin, &export_id).unwrap())
+            .await
+            .unwrap(),
+        "the published tree stays for exact recovery"
+    );
+    sqlite(
+        &path,
+        "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1], timeout=30)\nc.execute('DROP TRIGGER stop_job')\nc.commit()\nprint('ok')",
+    );
+    store.close().await;
+}
+
+/// Another owner cannot abort or delete a published delivery; the owner's own
+/// abort keeps the original "must be recovered" refusal.
+#[tokio::test]
+async fn local_export_old_owner_cannot_abort_new_owner_delivery() {
+    let (_directory, store, admin, export_id, files, completed, audit) = prepared_fixture().await;
+    let other = Context::new("tenant", "admin-two", Role::Admin).unwrap();
+    let plan = store
+        .snapshot_local_export_dependencies(&admin, &export_id)
+        .await
+        .unwrap();
+    let dependencies = store
+        .prevalidate_local_export_dependency_blobs(&admin, plan)
+        .await
+        .unwrap();
+    let mut session = store.registered_blob_write_session().await.unwrap();
+    store
+        .publish_registered_local_export_in_session(
+            &admin,
+            &mut session,
+            &export_id,
+            &files,
+            &completed,
+            &audit,
+            &dependencies,
+            None,
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let export_dir = store.local_export_directory(&admin, &export_id).unwrap();
+    let before = std::fs::read(export_dir.join("manifest.json")).unwrap();
+    let aborted = json!({
+        "schema_version": "rsia.e16.export_attempt.v2",
+        "id": export_id,
+        "namespace": admin.namespace(),
+        "owner_actor": other.actor(),
+        "request_key": "other-abort",
+        "input_digest": hash(b"other"),
+        "created_at": 1,
+        "updated_at": 1,
+        "source_refs": [],
+        "revoke_watermark": 1,
+        "payload": {"state": "aborted"}
+    });
+    assert!(matches!(
+        store
+            .abort_registered_local_export(&other, &export_id, &aborted)
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    let owner_abort = json!({
+        "schema_version": "rsia.e16.export_attempt.v2",
+        "id": export_id,
+        "namespace": admin.namespace(),
+        "owner_actor": admin.actor(),
+        "request_key": "owner-abort",
+        "input_digest": hash(b"owner"),
+        "created_at": 1,
+        "updated_at": 1,
+        "source_refs": [],
+        "revoke_watermark": 1,
+        "payload": {"state": "aborted"}
+    });
+    assert!(matches!(
+        store
+            .abort_registered_local_export(&admin, &export_id, &owner_abort)
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(
+        std::fs::read(export_dir.join("manifest.json")).unwrap(),
+        before
+    );
+    let mut session = store.session().await.unwrap();
+    let attempt: Value = session.need(&admin, "artifact", &export_id).await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(attempt["payload"]["state"], "completed");
+    store.close().await;
+}
+
+/// Recovery requires the exact attempt, source closure and actual tree: any
+/// mismatch leaves the Prepared attempt and writes no completion.
+#[tokio::test]
+async fn local_export_recovery_requires_exact_attempt_and_source_snapshot() {
+    let (directory, store, admin, export_id, files, completed, audit) = prepared_fixture().await;
+    let path = directory.path().join("local-export.sqlite3");
+    sqlite(
+        &path,
+        "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1], timeout=30)\nc.execute(\"CREATE TRIGGER stop_audit BEFORE INSERT ON objects WHEN NEW.id='delivery-audit-1' BEGIN SELECT RAISE(ABORT,'injected-audit-stop'); END\")\nc.commit()\nprint('ok')",
+    );
+    assert!(
+        publish_in_session(&store, &admin, &export_id, &files, &completed, &audit, None)
+            .await
+            .is_err()
+    );
+    sqlite(
+        &path,
+        "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1], timeout=30)\nc.execute('DROP TRIGGER stop_audit')\nc.commit()\nprint('ok')",
+    );
+    let plan = store
+        .snapshot_local_export_dependencies(&admin, &export_id)
+        .await
+        .unwrap();
+    let dependencies = store
+        .prevalidate_local_export_dependency_blobs(&admin, plan)
+        .await
+        .unwrap();
+
+    let mut tampered_attempt = completed.clone();
+    tampered_attempt["input_digest"] = json!(hash(b"tampered"));
+    let mut session = store.registered_blob_write_session().await.unwrap();
+    assert!(matches!(
+        store
+            .recover_registered_local_export_in_session(
+                &admin,
+                &mut session,
+                &export_id,
+                &files,
+                &tampered_attempt,
+                &audit,
+                &dependencies,
+            )
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    drop(session);
+
+    let mut tampered_files = files.clone();
+    tampered_files[1].bytes = b"different member".to_vec();
+    let mut session = store.registered_blob_write_session().await.unwrap();
+    assert!(matches!(
+        store
+            .recover_registered_local_export_in_session(
+                &admin,
+                &mut session,
+                &export_id,
+                &tampered_files,
+                &completed,
+                &audit,
+                &dependencies,
+            )
+            .await,
+        Err(Error::Conflict(_))
+    ));
+    drop(session);
+
+    let mut session = store.session().await.unwrap();
+    session
+        .delete(&admin, "artifact", "source-1")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let mut session = store.registered_blob_write_session().await.unwrap();
+    assert!(
+        store
+            .recover_registered_local_export_in_session(
+                &admin,
+                &mut session,
+                &export_id,
+                &files,
+                &completed,
+                &audit,
+                &dependencies,
+            )
+            .await
+            .is_err(),
+        "a missing source snapshot blocks recovery"
+    );
+    drop(session);
+    let mut session = store.session().await.unwrap();
+    let attempt: Value = session.need(&admin, "artifact", &export_id).await.unwrap();
+    let audits: Vec<Value> = session.list(&admin, "artifact").await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(attempt["payload"]["state"], "prepared");
+    assert!(
+        audits
+            .iter()
+            .all(|value| value["schema_version"] != "rsia.e16.delivery_audit.v2")
+    );
+    store.close().await;
 }
