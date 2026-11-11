@@ -1056,6 +1056,20 @@ fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
                     .is_some_and(|progress| !progress.valid_wire())
                 || (matches!(job.result, Some(ManagementResultV2::Backup(_)))
                     && job.operation != "backup.create")
+                || (matches!(
+                    job.result,
+                    Some(ManagementResultV2::Import(
+                        ManagementImportResultV2::ImportRegistered { .. }
+                    ))
+                ) && job.operation != "import.register")
+                || (matches!(
+                    job.result,
+                    Some(ManagementResultV2::Import(
+                        ManagementImportResultV2::ImportCompleted { .. }
+                    ))
+                ) && job.operation != "import.execute")
+                || (matches!(job.result, Some(ManagementResultV2::Import(_)))
+                    && !matches!(job.operation.as_str(), "import.register" | "import.execute"))
                 || !budget_result_binding_is_valid(&job)
             {
                 return Err(invalid_shape());

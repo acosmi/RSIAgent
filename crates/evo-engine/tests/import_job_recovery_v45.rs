@@ -11,7 +11,7 @@ use evo_engine::dispatch::{
     ManagementJobV2, ManagementResultV2,
 };
 use evo_engine::import::PersistentImportService;
-use evo_storage::Store;
+use evo_storage::{Store, decode_management_job};
 use serde_json::{Value, json};
 
 const CLAUDE: &[u8] = include_bytes!("../../../fixtures/imports/claude.fixture.jsonl");
@@ -153,9 +153,9 @@ fn sqlite(path: &std::path::Path, script: &str) {
     );
 }
 
-/// A real accepted-but-never-claimed job row is the deterministic fixture for
-/// cancellation before any claim; it is exactly the queued shape `submit`
-/// writes, with the same stable ids.
+/// A queued job-row fixture for cancellation before any claim. It carries the
+/// stable ids `submit` derives but omits the private input and idempotency
+/// rows, which the cancellation path does not read.
 async fn accepted_register_job(store: &Store, ctx: &Context, key: &str) -> String {
     let owner = ctx.actor();
     let namespace = ctx.namespace();
@@ -334,10 +334,11 @@ async fn import_restart_reconciles_terminal_jobs_without_client_path_reads() {
 }
 
 /// Two dispatchers racing on one request key produce one job, one selection
-/// and one result; a later stale submit observes the same terminal job and
-/// lease generation instead of claiming it again.
+/// and one result; a later submit observes the same terminal job and lease
+/// generation instead of claiming it again. True stale-lease fencing is
+/// enforced by `begin_management_step` and is not re-simulated here.
 #[tokio::test]
-async fn import_two_workers_and_old_lease_have_one_result() {
+async fn import_two_workers_converge_and_terminal_replay_is_stable() {
     let (_dir, store) = store().await;
     let ctx = admin();
     bump(&store, &ctx, "workers-watermark").await;
@@ -684,4 +685,59 @@ fn register_payload_with_source(key: &str, digest: &str, source_id: &str, reader
             "reader": reader,
         }],
     })
+}
+
+/// A persisted import result is valid only under its own physical operation:
+/// `import.register` owns `ImportRegistered`, `import.execute` owns
+/// `ImportCompleted`, and no other operation may carry either.
+#[test]
+fn import_results_are_bound_to_their_physical_operation() {
+    let registered = json!({
+        "result": "import_registered",
+        "selection_id": "e16sel-bound",
+        "selection_digest": "a".repeat(64),
+        "source_count": 1,
+        "statuses": {
+            "prepared": 0,
+            "ready": 1,
+            "missing": 0,
+            "permission_denied": 0,
+            "source_changed": 0,
+            "zero_records": 0,
+            "invalid_file": 0,
+            "too_large": 0
+        }
+    });
+    let job = |operation: &str, result: Value| {
+        json!({
+            "id": "management-job-binding",
+            "schema_version": "rsia.management_job.v2",
+            "operation": operation,
+            "request_key": "binding-key",
+            "payload_digest": "b".repeat(64),
+            "owner_actor": "admin",
+            "owner_role": "admin",
+            "state": "succeeded",
+            "step": "finished",
+            "private_input_ref": "management-input-binding",
+            "result": result,
+            "error_code": null,
+            "cancel_requested": false,
+            "lease_token": null,
+            "lease_until": 0,
+            "generation": 1,
+            "diagnostics": [],
+            "created_at": 1
+        })
+    };
+    let encoded = |value: &Value| serde_json::to_string(value).unwrap();
+    decode_management_job(&encoded(&job("import.register", registered.clone()))).unwrap();
+    for operation in ["import.execute", "meta.start"] {
+        let error =
+            decode_management_job(&encoded(&job(operation, registered.clone()))).unwrap_err();
+        assert!(
+            matches!(error, evo_core::Error::Conflict(ref reason) if reason == "management_job_invalid_shape"),
+            "{operation}: {error:?}"
+        );
+    }
 }

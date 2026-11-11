@@ -9,6 +9,7 @@
 //! fails closed instead of faking one.
 use evo_core::evidence::Purpose;
 use evo_core::{Context, Error, Role, fingerprint, hash};
+use evo_engine::dependency_integrity::{InspectionBudget, IssueCode, inspect_e16_content_edges};
 use evo_engine::dispatch::{
     ManagementDispatcher, ManagementImportResultState, ManagementImportResultV2,
     ManagementJobState, ManagementJobStatusV1, ManagementResultV2,
@@ -782,4 +783,55 @@ con.close()
     );
     assert!(!result.stdout.is_empty());
     result.stdout
+}
+
+/// Managed sources persist the same identity formula as the legacy register.
+/// The existing E16 dependency inspection re-derives it from
+/// `source_spec(source) + raw_digest`; a different tuple would mark every
+/// managed source `InputDigestMismatch` and leave the selection uncheckable.
+#[tokio::test]
+async fn import_managed_sources_match_the_legacy_input_digest_contract() {
+    let (_dir, store) = store().await;
+    let admin = admin();
+    bump(&store, &admin, "digest-contract-watermark").await;
+    let digest = put_blob(&store, &admin, CLAUDE).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let status = done(
+        &dispatcher,
+        &admin,
+        "import.register",
+        register_payload(
+            "digest-contract",
+            &[("source-digest", &digest, "claude_fixture")],
+        ),
+    )
+    .await;
+    assert_eq!(status.state, ManagementJobState::Succeeded, "{status:?}");
+    let (selection_id, _, _) = registered(&status);
+
+    let report =
+        inspect_e16_content_edges(&admin, &store, selection_id, InspectionBudget::default())
+            .await
+            .unwrap();
+    for object in &report.objects {
+        assert!(
+            object.issues.iter().all(|issue| !matches!(
+                issue.code,
+                IssueCode::InputDigestMismatch | IssueCode::AuthorityNotCheckable
+            )),
+            "{} has blocking issues: {:?}",
+            object.id,
+            object.issues
+        );
+    }
+    let selection = report
+        .objects
+        .iter()
+        .find(|object| object.id == selection_id)
+        .expect("selection inspected");
+    assert!(
+        selection.declarations_checked,
+        "managed selection was not checked: {selection:?}"
+    );
+    store.close().await;
 }

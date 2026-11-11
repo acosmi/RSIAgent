@@ -2829,10 +2829,18 @@ impl PersistentImportService {
                 namespace: ctx.namespace().into(),
                 owner_actor: ctx.actor().into(),
                 request_key: request.request_key.clone(),
+                // The persisted identity must match the legacy register
+                // formula exactly: `dependency_integrity` recomputes it from
+                // `source_spec(source)` and `raw_digest`, so a different
+                // tuple here would make every managed source uncheckable.
                 input_digest: fingerprint(&(
-                    &source.source_id,
-                    &source.input.digest,
-                    source.reader,
+                    ImportSourceSpec {
+                        source_id: source.source_id.clone(),
+                        path: source.input.path.clone(),
+                        reader: source.reader,
+                        expected_digest: source.input.digest.clone(),
+                    },
+                    source.input.digest.as_str(),
                 ))?,
                 created_at: timestamp,
                 updated_at: timestamp,

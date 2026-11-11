@@ -155,11 +155,12 @@ async fn import_blob_preflight_holds_no_sql_transaction() {
     store.close().await;
 }
 
-/// The event capacity is deployment wide. At the limit a new result is
-/// refused, while the same already-stored result identity is still readable
-/// and never re-counted: the handler returns it before the bounded writer.
+/// The event capacity primitive is deployment wide. At the limit a new result
+/// is refused, while an already-stored result identity is still readable and
+/// never re-counted. This exercises the storage primitive; the handler's
+/// existing-first ordering is reviewed separately.
 #[tokio::test]
-async fn import_capacity_is_global_and_same_request_at_limit_is_idempotent() {
+async fn import_event_capacity_primitive_counts_globally_and_replays_idempotently() {
     let (_dir, store) = store().await;
     let first = admin("tenant-capacity-a");
     let second = admin("tenant-capacity-b");
