@@ -1134,7 +1134,7 @@ pub struct Store {
     /// Per-namespace verified audit prefix. A witness read verifies only the
     /// rows appended after this prefix instead of re-hashing the whole chain;
     /// see `verified_audit_selection`.
-    audit_chain: Arc<std::sync::Mutex<std::collections::BTreeMap<String, AuditWalkState>>>,
+    audit_chain: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Arc<AuditWalkState>>>>,
 }
 
 /// A physical object row from the caller's current transaction. This is a
@@ -1151,18 +1151,21 @@ pub struct ObjectRowSnapshot {
 pub struct Session {
     tx: Transaction<'static, Sqlite>,
     blob_write: Option<(PathBuf, OwnedRwLockWriteGuard<()>)>,
-    audit_chain: Arc<std::sync::Mutex<std::collections::BTreeMap<String, AuditWalkState>>>,
+    audit_chain: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Arc<AuditWalkState>>>>,
 }
 
 /// One verified, append-only audit prefix of one namespace. `count`/`watermark`
-/// pin the SQLite snapshot the prefix covers; `digest` is the last verified
-/// link. `witnesses` keeps the latest entity per `(role, operation)`, which is
-/// the only thing a role witness answer depends on.
+/// identify the SQLite snapshot the prefix covers; `digest` is the last
+/// verified link and `previous` is that row's `previous_hash`, so the guard
+/// re-checks both halves of the tail without re-hashing the prefix.
+/// `witnesses` keeps the latest entity per `(role, operation)`, which is the
+/// only thing a role witness answer depends on.
 #[derive(Clone, Default)]
 struct AuditWalkState {
     count: i64,
     watermark: i64,
     digest: String,
+    previous: String,
     witnesses: std::collections::BTreeMap<(u8, String), String>,
 }
 
@@ -4276,21 +4279,30 @@ impl Session {
                 let link_is_current = if state.watermark == 0 {
                     true
                 } else {
-                    let digest: Option<String> =
-                        sqlx::query_scalar("SELECT digest FROM audit WHERE namespace=? AND seq=?")
-                            .bind(ctx.namespace())
-                            .bind(state.watermark)
-                            .fetch_optional(&mut *self.tx)
-                            .await
-                            .map_err(internal)?;
-                    digest.as_deref() == Some(state.digest.as_str())
+                    // Recompute the tail row itself: the cached digest already
+                    // binds its `previous_hash` and payload, so this rejects a
+                    // changed link or payload without re-hashing the prefix.
+                    // Oversized tails fall through to the full walk.
+                    let tail: Option<(String, i64, String)> = sqlx::query_as(
+                        "SELECT previous_hash,length(CAST(payload AS BLOB)),payload FROM audit WHERE namespace=? AND seq=?",
+                    )
+                    .bind(ctx.namespace())
+                    .bind(state.watermark)
+                    .fetch_optional(&mut *self.tx)
+                    .await
+                    .map_err(internal)?;
+                    tail.is_some_and(|(previous, payload_bytes, payload)| {
+                        previous == state.previous
+                            && payload_bytes <= 64 * 1024
+                            && hash(format!("{previous}\n{payload}").as_bytes()) == state.digest
+                    })
                 };
                 link_is_current.then_some(state)
             }
             _ => None,
         };
         let (state, facts) = match self
-            .walk_audit(ctx, count, watermark, start.as_ref(), &subject)
+            .walk_audit(ctx, count, watermark, start.as_deref(), &subject)
             .await
         {
             Ok(value) => value,
@@ -4317,7 +4329,7 @@ impl Session {
             self.audit_chain
                 .lock()
                 .map_err(|_| Error::Internal)?
-                .insert(ctx.namespace().to_owned(), state);
+                .insert(ctx.namespace().to_owned(), Arc::new(state));
         }
         Ok((matched, facts))
     }
@@ -4366,6 +4378,9 @@ impl Session {
         let mut scanned = start.map(|state| state.count).unwrap_or(0);
         let mut after = start.map(|state| state.watermark).unwrap_or(0);
         let mut previous = start.map(|state| state.digest.clone()).unwrap_or_default();
+        let mut tail_previous = start
+            .map(|state| state.previous.clone())
+            .unwrap_or_default();
         let mut witnesses = start
             .map(|state| state.witnesses.clone())
             .unwrap_or_default();
@@ -4520,6 +4535,7 @@ impl Session {
                         payload.entity.into_owned(),
                     ));
                 }
+                tail_previous = prev;
                 previous = digest;
                 after = sequence;
                 scanned = scanned.checked_add(1).ok_or_else(invalid_chain)?;
@@ -4533,6 +4549,7 @@ impl Session {
                 count,
                 watermark,
                 digest: previous,
+                previous: tail_previous,
                 witnesses,
             },
             service_facts,
