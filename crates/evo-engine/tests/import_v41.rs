@@ -4,9 +4,9 @@
 
 use evo_core::contract::SkillSnapshot;
 use evo_core::evidence::{
-    EvidenceLocator, ExecutionAttestation, ModelEvidenceRequest, Pattern, Purpose, RouteClass,
-    RouteStatus, SourceSelection, TaskOrigin, assert_authorized_path,
-    invalidate_jobs_if_source_revoked, route,
+    EvidenceLocator, ExecutionAttestation, LEGACY_IMPORT_RESULT_SCHEMA_V1, ModelEvidenceRequest,
+    Pattern, Purpose, RouteClass, RouteStatus, SourceSelection, TaskOrigin, assert_authorized_path,
+    invalidate_jobs_if_source_revoked, legacy_import_result_id_v1, route,
 };
 use evo_core::hash;
 use evo_core::skill_edit::{
@@ -17,10 +17,11 @@ use evo_core::skill_edit::{
 use evo_core::{Context, Error, Role};
 use evo_engine::evidence::read_persisted_imported_evidence;
 use evo_engine::import::{
-    IMPORT_REGISTRATION_SCHEMA, ImportForensicLimits, ImportRegistrationRequest, ImportResultState,
-    ImportRetentionScope, ImportSourceSpec, PersistentImportService, SourceFormat, detect_format,
-    detect_format_from_bytes, extract_cluster_id, ingest_imported_sources, parse_fixture,
-    tool_result_is_not_preference,
+    IMPORT_REGISTRATION_SCHEMA, ImportEnvelope, ImportForensicLimits, ImportRegistrationRequest,
+    ImportResultPayload, ImportResultReadState, ImportResultState, ImportRetentionScope,
+    ImportSourceSpec, LegacyImportResultPayloadV1, PersistentImportService, SourceFormat,
+    detect_format, detect_format_from_bytes, extract_cluster_id, ingest_imported_sources,
+    parse_fixture, tool_result_is_not_preference,
 };
 use evo_storage::Store;
 use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
@@ -1605,4 +1606,381 @@ fn f16_tool_output_is_never_preference_for_any_role_and_missing_content_fails_cl
         )
         .is_ok()
     );
+}
+
+// =========================================================================
+// AG-166a: the blob management path reuses the same pinned readers and v2
+// derivation; legacy v1 bytes stay readable without becoming Current; a
+// Current result keeps UnverifiedImport and failure coverage.
+// =========================================================================
+const MANAGEMENT_CLAUDE: &[u8] = include_bytes!("../../../fixtures/imports/claude.fixture.jsonl");
+/// The reader's locator covers the JSON event without the file's trailing
+/// newline.
+const MANAGEMENT_CLAUDE_EVENT: &[u8] = b"{\"role\":\"user\",\"content\":\"hello\"}";
+
+async fn register_and_execute_files(
+    store: &Store,
+    admin: &Context,
+    directory: &std::path::Path,
+    key: &str,
+    sources: &[(&str, &std::path::Path, &[u8])],
+) -> (
+    evo_engine::import::SourceSelectionRecord,
+    evo_engine::import::ImportResultRecord,
+) {
+    let service = PersistentImportService::new(store.clone());
+    let selection = service
+        .register(
+            admin,
+            ImportRegistrationRequest {
+                schema_version: IMPORT_REGISTRATION_SCHEMA.into(),
+                request_key: key.into(),
+                roots: vec![directory.to_string_lossy().into_owned()],
+                purpose: Purpose::Development,
+                allow_model_excerpts: false,
+                outbound_authorized: false,
+                retention_scope: ImportRetentionScope::LocalPrivate,
+                sources: sources
+                    .iter()
+                    .map(|(source_id, path, bytes)| ImportSourceSpec {
+                        source_id: (*source_id).into(),
+                        path: path.to_string_lossy().into_owned(),
+                        reader: SourceFormat::ClaudeFixture,
+                        expected_digest: hash(bytes),
+                    })
+                    .collect(),
+            },
+        )
+        .await
+        .unwrap();
+    let result = service.execute(admin, &selection.id).await.unwrap();
+    (selection, result)
+}
+
+async fn management_terminal(
+    dispatcher: &evo_engine::dispatch::ManagementDispatcher,
+    admin: &Context,
+    job_id: &str,
+) -> evo_engine::dispatch::ManagementJobStatusV1 {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let status = dispatcher.status_view(admin, job_id).await.unwrap();
+            if matches!(
+                status.state,
+                evo_engine::dispatch::ManagementJobState::Succeeded
+                    | evo_engine::dispatch::ManagementJobState::Failed
+                    | evo_engine::dispatch::ManagementJobState::Cancelled
+                    | evo_engine::dispatch::ManagementJobState::Blocked
+            ) {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("management import job reaches a terminal state")
+}
+
+fn event_shape(
+    payload: &ImportResultPayload,
+) -> Vec<(usize, usize, usize, String, String, String)> {
+    payload
+        .event_records
+        .iter()
+        .map(|event| {
+            (
+                event.event_index,
+                event.byte_start,
+                event.byte_end,
+                event.raw_fragment_digest.clone(),
+                event.normalized_content_digest.clone(),
+                event.role.clone(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn management_blob_import_matches_same_pinned_reader_normalization() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("same.jsonl");
+    tokio::fs::write(&file, MANAGEMENT_CLAUDE).await.unwrap();
+    let store = Store::open(&directory.path().join("management-match.sqlite3"))
+        .await
+        .unwrap();
+    let admin = Context::new("tenant", "admin", Role::Admin).unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, &hash(b"management-match-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let (_, file_result) = register_and_execute_files(
+        &store,
+        &admin,
+        directory.path(),
+        "management-match-file",
+        &[("same-source", &file, MANAGEMENT_CLAUDE)],
+    )
+    .await;
+
+    let digest = store
+        .put_blob_bounded(&admin, MANAGEMENT_CLAUDE, 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    let dispatcher =
+        evo_engine::dispatch::ManagementDispatcher::new(store.clone(), vec![admin.clone()])
+            .unwrap();
+    let registered = dispatcher
+        .submit(
+            &admin,
+            "import.register",
+            serde_json::json!({
+                "schema_version": "rsia.management.import_register.v1",
+                "request_key": "management-match-blob",
+                "sources": [{
+                    "source_id": "same-source",
+                    "blob_digest": digest,
+                    "reader": "claude_fixture",
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+    let registered = management_terminal(&dispatcher, &admin, registered.identity().id).await;
+    assert_eq!(
+        registered.state,
+        evo_engine::dispatch::ManagementJobState::Succeeded
+    );
+    let selection_id = match registered.result.as_ref() {
+        Some(evo_engine::dispatch::ManagementResultV2::Import(
+            evo_engine::dispatch::ManagementImportResultV2::ImportRegistered {
+                selection_id, ..
+            },
+        )) => selection_id.clone(),
+        other => panic!("expected ImportRegistered, got {other:?}"),
+    };
+    let executed = dispatcher
+        .submit(
+            &admin,
+            "import.execute",
+            serde_json::json!({
+                "schema_version": "rsia.management.import_execute.v1",
+                "request_key": "management-match-blob-execute",
+                "selection_id": selection_id,
+            }),
+        )
+        .await
+        .unwrap();
+    let executed = management_terminal(&dispatcher, &admin, executed.identity().id).await;
+    let result_id = match executed.result.as_ref() {
+        Some(evo_engine::dispatch::ManagementResultV2::Import(
+            evo_engine::dispatch::ManagementImportResultV2::ImportCompleted { result_id, .. },
+        )) => result_id.clone(),
+        other => panic!("expected ImportCompleted, got {other:?}"),
+    };
+    let service = PersistentImportService::new(store.clone());
+    let blob_result = service.load_live_result(&admin, &result_id).await.unwrap();
+
+    assert_eq!(file_result.payload.state, blob_result.payload.state);
+    assert_eq!(
+        file_result.payload.reader_version,
+        blob_result.payload.reader_version
+    );
+    assert_eq!(
+        file_result.payload.normalization_version,
+        blob_result.payload.normalization_version
+    );
+    assert_eq!(
+        file_result.payload.generation_status,
+        blob_result.payload.generation_status
+    );
+    assert_eq!(
+        serde_json::to_value(&file_result.payload.aggregate_summary).unwrap(),
+        serde_json::to_value(&blob_result.payload.aggregate_summary).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&file_result.payload.import_coverage).unwrap(),
+        serde_json::to_value(&blob_result.payload.import_coverage).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&file_result.payload.native_traces).unwrap(),
+        serde_json::to_value(&blob_result.payload.native_traces).unwrap()
+    );
+    assert_eq!(
+        event_shape(&file_result.payload),
+        event_shape(&blob_result.payload),
+        "the pinned reader and normalization produce the same events"
+    );
+    assert_eq!(
+        file_result.payload.locators.len(),
+        blob_result.payload.locators.len()
+    );
+    store.close().await;
+}
+
+#[tokio::test]
+async fn legacy_import_bytes_stay_readable_without_current_material_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("legacy.jsonl");
+    tokio::fs::write(&file, MANAGEMENT_CLAUDE).await.unwrap();
+    let store = Store::open(&directory.path().join("legacy-read.sqlite3"))
+        .await
+        .unwrap();
+    let admin = Context::new("tenant", "admin", Role::Admin).unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, &hash(b"legacy-read-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let (selection, current) = register_and_execute_files(
+        &store,
+        &admin,
+        directory.path(),
+        "legacy-read",
+        &[("legacy-source", &file, MANAGEMENT_CLAUDE)],
+    )
+    .await;
+    let legacy_id = legacy_import_result_id_v1(&selection.id);
+    let legacy = ImportEnvelope {
+        schema_version: LEGACY_IMPORT_RESULT_SCHEMA_V1.into(),
+        id: legacy_id.clone(),
+        namespace: "tenant".into(),
+        owner_actor: "admin".into(),
+        request_key: current.request_key.clone(),
+        input_digest: current.input_digest.clone(),
+        created_at: current.created_at,
+        updated_at: current.updated_at,
+        source_refs: current.source_refs.clone(),
+        revoke_watermark: current.revoke_watermark,
+        payload: LegacyImportResultPayloadV1 {
+            selection_id: current.payload.selection_id.clone(),
+            state: current.payload.state,
+            evidence_set: current.payload.evidence_set.clone(),
+            aggregate_summary: current.payload.aggregate_summary.clone(),
+            locators: current.payload.locators.clone(),
+            event_records: current.payload.event_records.clone(),
+            generation_status: current.payload.generation_status.clone(),
+        },
+    };
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&admin, "artifact", &legacy_id, admin.actor(), &legacy)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+
+    let service = PersistentImportService::new(store.clone());
+    let view = service
+        .read_result_version(&admin, &legacy_id)
+        .await
+        .unwrap();
+    assert_eq!(view.schema_version, LEGACY_IMPORT_RESULT_SCHEMA_V1);
+    assert_eq!(view.state, ImportResultReadState::Legacy);
+    assert_eq!(view.selection_id, selection.id);
+    assert_eq!(view.legacy_v1_id, legacy_id);
+    assert_ne!(view.current_v2_id, legacy_id);
+    assert!(matches!(
+        service.load_live_result(&admin, &legacy_id).await,
+        Err(Error::Conflict(message)) if message == "import_result_legacy"
+    ));
+    // The legacy event fragment stays readable from its own raw bytes, without
+    // the v1 record becoming an input to a current derivation.
+    let fragment = service
+        .read_event_fragment(
+            &admin,
+            &legacy_id,
+            &selection.payload.import_source_ids[0],
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(fragment, MANAGEMENT_CLAUDE_EVENT);
+    assert!(
+        service
+            .read_event_fragment(&agent(), &legacy_id, "source", 0)
+            .await
+            .is_err()
+    );
+    store.close().await;
+}
+
+fn agent() -> Context {
+    Context::new("tenant", "agent", Role::Agent).unwrap()
+}
+
+#[tokio::test]
+async fn current_import_result_keeps_unverified_provenance_and_failure_coverage() {
+    let directory = tempfile::tempdir().unwrap();
+    let valid = directory.path().join("valid.jsonl");
+    let broken = directory.path().join("broken.jsonl");
+    tokio::fs::write(&valid, MANAGEMENT_CLAUDE).await.unwrap();
+    tokio::fs::write(&broken, b"{broken-json").await.unwrap();
+    let store = Store::open(&directory.path().join("failure-coverage.sqlite3"))
+        .await
+        .unwrap();
+    let admin = Context::new("tenant", "admin", Role::Admin).unwrap();
+    let mut session = store.session().await.unwrap();
+    session
+        .bump_watermark(&admin, &hash(b"failure-coverage-watermark"))
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let (selection, result) = register_and_execute_files(
+        &store,
+        &admin,
+        directory.path(),
+        "failure-coverage",
+        &[
+            ("valid-source", &valid, MANAGEMENT_CLAUDE),
+            ("broken-source", &broken, b"{broken-json"),
+        ],
+    )
+    .await;
+    assert_eq!(result.payload.state, ImportResultState::Partial);
+    assert_eq!(result.payload.aggregate_summary.coverage.parsed_ok, 1);
+    assert_eq!(result.payload.aggregate_summary.coverage.parsed_fail, 1);
+    assert!(!result.payload.import_coverage.complete());
+    assert_eq!(
+        result.payload.generation_status,
+        "blocked_external_generation_conditions_unavailable"
+    );
+    let evidence = result.payload.evidence_set.as_ref().unwrap();
+    assert_eq!(evidence.members.len(), 1, "only the readable source binds");
+    assert_eq!(
+        evidence.members[0].source_id,
+        selection.payload.import_source_ids[0]
+    );
+    for member in &evidence.members {
+        assert_eq!(member.task_origin, TaskOrigin::ImportedHistory);
+        assert_eq!(
+            member.execution_attestation,
+            ExecutionAttestation::UnverifiedImport
+        );
+        assert_eq!(member.purpose, Purpose::Development);
+    }
+    let service = PersistentImportService::new(store.clone());
+    let view = service
+        .read_result_version(&admin, &result.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        view.schema_version,
+        evo_core::evidence::IMPORT_RESULT_SCHEMA_V2
+    );
+    assert_eq!(view.state, ImportResultReadState::CurrentVerified);
+    assert_eq!(
+        service
+            .read_event_fragment(
+                &admin,
+                &result.id,
+                &selection.payload.import_source_ids[0],
+                0,
+            )
+            .await
+            .unwrap(),
+        MANAGEMENT_CLAUDE_EVENT
+    );
+    store.close().await;
 }
