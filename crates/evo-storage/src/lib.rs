@@ -1131,6 +1131,10 @@ pub struct Store {
     root: PathBuf,
     blob_lock: Arc<RwLock<()>>,
     inflight_prepare: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-namespace verified audit prefix. A witness read verifies only the
+    /// rows appended after this prefix instead of re-hashing the whole chain;
+    /// see `verified_audit_selection`.
+    audit_chain: Arc<std::sync::Mutex<std::collections::BTreeMap<String, AuditWalkState>>>,
 }
 
 /// A physical object row from the caller's current transaction. This is a
@@ -1147,6 +1151,29 @@ pub struct ObjectRowSnapshot {
 pub struct Session {
     tx: Transaction<'static, Sqlite>,
     blob_write: Option<(PathBuf, OwnedRwLockWriteGuard<()>)>,
+    audit_chain: Arc<std::sync::Mutex<std::collections::BTreeMap<String, AuditWalkState>>>,
+}
+
+/// One verified, append-only audit prefix of one namespace. `count`/`watermark`
+/// pin the SQLite snapshot the prefix covers; `digest` is the last verified
+/// link. `witnesses` keeps the latest entity per `(role, operation)`, which is
+/// the only thing a role witness answer depends on.
+#[derive(Clone, Default)]
+struct AuditWalkState {
+    count: i64,
+    watermark: i64,
+    digest: String,
+    witnesses: std::collections::BTreeMap<(u8, String), String>,
+}
+
+fn role_cache_key(role: Role) -> u8 {
+    match role {
+        Role::Agent => 0,
+        Role::Host => 1,
+        Role::Evaluator => 2,
+        Role::Admin => 3,
+        Role::Worker => 4,
+    }
 }
 
 /// Schema of the tombstone the revocation cleanup leaves in place of an artifact
@@ -2611,12 +2638,14 @@ impl Store {
             root,
             blob_lock: Arc::new(RwLock::new(())),
             inflight_prepare: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            audit_chain: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
         })
     }
     pub async fn session(&self) -> Result<Session> {
         Ok(Session {
             tx: self.pool.begin().await.map_err(internal)?,
             blob_write: None,
+            audit_chain: self.audit_chain.clone(),
         })
     }
 
@@ -2632,6 +2661,7 @@ impl Store {
                 .await
                 .map_err(internal)?,
             blob_write: Some((self.root.clone(), guard)),
+            audit_chain: self.audit_chain.clone(),
         })
     }
     pub async fn close(&self) {
@@ -4229,6 +4259,99 @@ impl Session {
         ctx: &Context,
         subject: AuditReadSubject<'_>,
     ) -> Result<(bool, Vec<(String, ServiceSuccessFactV1)>)> {
+        // A finite snapshot, not a new audit-history capacity. Legitimate
+        // histories may exceed the 10000 business-event collection bound.
+        let (count, watermark) = self.audit_snapshot(ctx).await?;
+        // A role witness is answered by the latest matching row. The verified
+        // prefix makes that answer: only rows appended after it are hashed
+        // again, and a stale or rolled-back prefix falls back to a full walk.
+        let cached = if matches!(&subject, AuditReadSubject::RoleWitness { .. }) {
+            let guard = self.audit_chain.lock().map_err(|_| Error::Internal)?;
+            guard.get(ctx.namespace()).cloned()
+        } else {
+            None
+        };
+        let start = match cached {
+            Some(state) if state.count <= count && state.watermark <= watermark => {
+                let link_is_current = if state.watermark == 0 {
+                    true
+                } else {
+                    let digest: Option<String> = sqlx::query_scalar(
+                        "SELECT digest FROM audit WHERE namespace=? AND seq=?",
+                    )
+                    .bind(ctx.namespace())
+                    .bind(state.watermark)
+                    .fetch_optional(&mut *self.tx)
+                    .await
+                    .map_err(internal)?;
+                    digest.as_deref() == Some(state.digest.as_str())
+                };
+                link_is_current.then_some(state)
+            }
+            _ => None,
+        };
+        let (state, facts) = match self
+            .walk_audit(ctx, count, watermark, start.as_ref(), &subject)
+            .await
+        {
+            Ok(value) => value,
+            // An incremental prefix may have been truncated or replaced. The
+            // full walk re-checks every link and yields the same judgement.
+            Err(_) if start.is_some() => {
+                self.walk_audit(ctx, count, watermark, None, &subject).await?
+            }
+            Err(error) => return Err(error),
+        };
+        let matched = match &subject {
+            AuditReadSubject::RoleWitness {
+                role,
+                operation,
+                entity,
+            } => state
+                .witnesses
+                .get(&(role_cache_key(*role), (*operation).to_owned()))
+                .is_some_and(|value| value == entity),
+            AuditReadSubject::ServiceFacts { .. } => false,
+        };
+        if matches!(&subject, AuditReadSubject::RoleWitness { .. }) {
+            self.audit_chain
+                .lock()
+                .map_err(|_| Error::Internal)?
+                .insert(ctx.namespace().to_owned(), state);
+        }
+        Ok((matched, facts))
+    }
+
+    async fn audit_snapshot(&mut self, ctx: &Context) -> Result<(i64, i64)> {
+        let snapshot = sqlx::query(
+            "SELECT COUNT(*) AS row_count,COALESCE(MAX(seq),0) AS watermark FROM audit WHERE namespace=?",
+        )
+        .bind(ctx.namespace())
+        .fetch_one(&mut *self.tx)
+        .await
+        .map_err(internal)?;
+        let count: i64 = snapshot.try_get("row_count").map_err(internal)?;
+        let watermark: i64 = snapshot.try_get("watermark").map_err(internal)?;
+        if count < 0 || watermark < 0 {
+            return Err(Error::Conflict(
+                "audit chain or payload mismatch".into(),
+            ));
+        }
+        Ok((count, watermark))
+    }
+
+    /// Verifies the chain from `start` (already verified) to `watermark` and
+    /// returns the extended prefix plus the requested service facts. Every row
+    /// it reads is hashed and decoded; an incremental prefix is trusted only
+    /// for its own covered rows.
+    async fn walk_audit(
+        &mut self,
+        ctx: &Context,
+        count: i64,
+        watermark: i64,
+        start: Option<&AuditWalkState>,
+        subject: &AuditReadSubject<'_>,
+    ) -> Result<(AuditWalkState, Vec<(String, ServiceSuccessFactV1)>)> {
         #[derive(serde::Deserialize)]
         #[serde(deny_unknown_fields)]
         struct AuditPayload<'a> {
@@ -4242,24 +4365,10 @@ impl Session {
             timestamp: i64,
         }
         let invalid_chain = || Error::Conflict("audit chain or payload mismatch".into());
-        // A finite snapshot, not a new audit-history capacity. Legitimate
-        // histories may exceed the 10000 business-event collection bound.
-        let snapshot = sqlx::query(
-            "SELECT COUNT(*) AS row_count,COALESCE(MAX(seq),0) AS watermark FROM audit WHERE namespace=?",
-        )
-        .bind(ctx.namespace())
-        .fetch_one(&mut *self.tx)
-        .await
-        .map_err(internal)?;
-        let count: i64 = snapshot.try_get("row_count").map_err(internal)?;
-        let watermark: i64 = snapshot.try_get("watermark").map_err(internal)?;
-        if count < 0 || watermark < 0 {
-            return Err(invalid_chain());
-        }
-        let mut scanned = 0_i64;
-        let mut after = 0_i64;
-        let mut previous = String::new();
-        let mut latest_matches = false;
+        let mut scanned = start.map(|state| state.count).unwrap_or(0);
+        let mut after = start.map(|state| state.watermark).unwrap_or(0);
+        let mut previous = start.map(|state| state.digest.clone()).unwrap_or_default();
+        let mut witnesses = start.map(|state| state.witnesses.clone()).unwrap_or_default();
         let mut service_facts = Vec::new();
         let mut previous_row: Option<(i64, String, evo_core::Role, String, String, String)> = None;
         loop {
@@ -4351,15 +4460,15 @@ impl Session {
                 if payload.timestamp < 0 || identifier(payload.actor.as_ref()).is_err() {
                     return Err(invalid_chain());
                 }
-                match &subject {
-                    AuditReadSubject::RoleWitness {
-                        role,
-                        operation,
-                        entity,
-                    } => {
-                        if payload.role == *role && payload.operation.as_ref() == *operation {
-                            latest_matches = payload.entity.as_ref() == *entity;
-                        }
+                match subject {
+                    AuditReadSubject::RoleWitness { .. } => {
+                        witnesses.insert(
+                            (
+                                role_cache_key(payload.role),
+                                payload.operation.as_ref().to_owned(),
+                            ),
+                            payload.entity.as_ref().to_owned(),
+                        );
                     }
                     AuditReadSubject::ServiceFacts { run_id }
                         if payload.operation == "service.success_fact.v1" =>
@@ -4401,7 +4510,7 @@ impl Session {
                     }
                     AuditReadSubject::ServiceFacts { .. } => {}
                 }
-                if matches!(&subject, AuditReadSubject::ServiceFacts { .. }) {
+                if matches!(subject, AuditReadSubject::ServiceFacts { .. }) {
                     previous_row = Some((
                         sequence,
                         digest.clone(),
@@ -4419,7 +4528,15 @@ impl Session {
         if scanned != count || after != watermark {
             return Err(invalid_chain());
         }
-        Ok((latest_matches, service_facts))
+        Ok((
+            AuditWalkState {
+                count,
+                watermark,
+                digest: previous,
+                witnesses,
+            },
+            service_facts,
+        ))
     }
 
     pub async fn audit(&mut self, ctx: &Context, operation: &str, entity: &str) -> Result<()> {
