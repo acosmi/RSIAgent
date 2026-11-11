@@ -23,6 +23,10 @@ use evo_core::evidence::{ExecutionAttestation, Purpose, TaskOrigin};
 use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::{Context, Error, Role, Strategy, fingerprint, hash};
 use evo_engine::capacity::MAX_STAGED_PACKAGES;
+use evo_engine::dispatch::{
+    ManagementAssetExportResultV2, ManagementDispatcher, ManagementJobState, ManagementJobStatusV1,
+    ManagementResultV2,
+};
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::packages::{
     AssetPackageManifest, CandidateMaterialBinding, CandidateStrategyAuthority,
@@ -2692,4 +2696,346 @@ async fn current_handoff_binds_real_candidate_and_does_not_grant_release() {
             store.close().await;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// AG-166b management asset/export controls
+// ---------------------------------------------------------------------------
+
+fn managed_stage_input_bytes(
+    manifest: &AssetPackageManifest,
+    files: &BTreeMap<String, Vec<u8>>,
+    sources: &[E16SourceRef],
+    upstream: Option<String>,
+) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": "rsia.management.asset_stage_input.v1",
+        "manifest": manifest,
+        "files": files
+            .iter()
+            .map(|(path, bytes)| (path.clone(), String::from_utf8(bytes.clone()).unwrap()))
+            .collect::<BTreeMap<_, _>>(),
+        "source_refs": sources,
+        "baseline_digest": hash(b"baseline"),
+        "local_digest": hash(b"local"),
+        "upstream_digest": upstream,
+        "environment_digest": hash(b"environment"),
+        "compiler_version": "compiler-v1",
+        "candidate_material": null,
+    }))
+    .unwrap()
+}
+
+async fn management_terminal(
+    dispatcher: &ManagementDispatcher,
+    admin: &Context,
+    job_id: &str,
+) -> ManagementJobStatusV1 {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let status = dispatcher.status_view(admin, job_id).await.unwrap();
+            if matches!(
+                status.state,
+                ManagementJobState::Succeeded
+                    | ManagementJobState::Failed
+                    | ManagementJobState::Cancelled
+                    | ManagementJobState::Blocked
+            ) {
+                return status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+async fn management_done(
+    dispatcher: &ManagementDispatcher,
+    admin: &Context,
+    operation: &str,
+    payload: serde_json::Value,
+) -> ManagementJobStatusV1 {
+    let queued = dispatcher.submit(admin, operation, payload).await.unwrap();
+    management_terminal(dispatcher, admin, queued.identity().id).await
+}
+
+/// The management stage derives exactly the same manifest digest, members and
+/// projection bytes as the original direct stage.
+#[tokio::test]
+async fn management_projection_matches_original_manifest_and_members() {
+    let (_dir, store, admin, sources) = persistent_store().await;
+    let files = valid_files();
+    let manifest = manifest_for_files("managed_equivalence", &files);
+    let input = managed_stage_input_bytes(&manifest, &files, &sources, Some(hash(b"upstream")));
+    let digest = store
+        .put_blob_bounded(&admin, &input, 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let status = management_done(
+        &dispatcher,
+        &admin,
+        "asset.stage",
+        serde_json::json!({
+            "schema_version": "rsia.management.asset_stage.v1",
+            "request_key": "managed-equivalence",
+            "input_blob_digest": digest,
+        }),
+    )
+    .await;
+    assert_eq!(status.state, ManagementJobState::Succeeded, "{status:?}");
+    let (managed_id, managed_manifest, managed_blob, managed_bytes) = match status.result.as_ref() {
+        Some(ManagementResultV2::AssetExport(ManagementAssetExportResultV2::AssetStaged {
+            staged_asset_id,
+            manifest_digest,
+            content_blob_digest,
+            content_bytes,
+            ..
+        })) => (
+            staged_asset_id.clone(),
+            manifest_digest.clone(),
+            content_blob_digest.clone(),
+            *content_bytes,
+        ),
+        other => panic!("{other:?}"),
+    };
+    let direct = PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request("direct-equivalence", manifest, files.clone(), sources),
+    )
+    .await
+    .unwrap();
+    assert_ne!(managed_id, direct.id);
+    assert_eq!(managed_manifest, direct.payload.manifest_digest);
+    assert_eq!(managed_blob, direct.payload.content_blob_digest);
+    assert_eq!(managed_bytes, direct.payload.content_bytes);
+    assert_eq!(
+        store
+            .read_blob(&admin, &managed_blob, 10 * 1024 * 1024)
+            .await
+            .unwrap(),
+        store
+            .read_blob(
+                &admin,
+                &direct.payload.content_blob_digest,
+                10 * 1024 * 1024
+            )
+            .await
+            .unwrap()
+    );
+    let mut session = store.session().await.unwrap();
+    let managed: E16Envelope<StagedAssetPayload> =
+        session.need(&admin, "artifact", &managed_id).await.unwrap();
+    let direct_wire: E16Envelope<StagedAssetPayload> =
+        session.need(&admin, "artifact", &direct.id).await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(
+        managed.payload.manifest_digest,
+        direct_wire.payload.manifest_digest
+    );
+    assert_eq!(
+        managed.payload.content_blob_digest,
+        direct_wire.payload.content_blob_digest
+    );
+    assert_eq!(
+        managed.payload.content_bytes,
+        direct_wire.payload.content_bytes
+    );
+    assert_eq!(managed.source_refs, direct_wire.source_refs);
+    store.close().await;
+}
+
+/// A reused management key with a different controlled input conflicts at
+/// acceptance and leaves the original staged image untouched.
+#[tokio::test]
+async fn management_key_conflict_preserves_original_payload() {
+    let (_dir, store, admin, sources) = persistent_store().await;
+    let files = valid_files();
+    let manifest = manifest_for_files("managed_conflict", &files);
+    let first_input =
+        managed_stage_input_bytes(&manifest, &files, &sources, Some(hash(b"upstream")));
+    let first_digest = store
+        .put_blob_bounded(&admin, &first_input, 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    let other_manifest = manifest_for_files("managed_conflict_other", &files);
+    let second_input =
+        managed_stage_input_bytes(&other_manifest, &files, &sources, Some(hash(b"upstream")));
+    let second_digest = store
+        .put_blob_bounded(&admin, &second_input, 64 * 1024 * 1024)
+        .await
+        .unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let status = management_done(
+        &dispatcher,
+        &admin,
+        "asset.stage",
+        serde_json::json!({
+            "schema_version": "rsia.management.asset_stage.v1",
+            "request_key": "managed-conflict",
+            "input_blob_digest": first_digest,
+        }),
+    )
+    .await;
+    assert_eq!(status.state, ManagementJobState::Succeeded);
+    let staged_id = match status.result.as_ref() {
+        Some(ManagementResultV2::AssetExport(ManagementAssetExportResultV2::AssetStaged {
+            staged_asset_id,
+            ..
+        })) => staged_asset_id.clone(),
+        other => panic!("{other:?}"),
+    };
+    let mut session = store.session().await.unwrap();
+    let before: serde_json::Value = session.need(&admin, "artifact", &staged_id).await.unwrap();
+    session.commit().await.unwrap();
+    let error = dispatcher
+        .submit(
+            &admin,
+            "asset.stage",
+            serde_json::json!({
+                "schema_version": "rsia.management.asset_stage.v1",
+                "request_key": "managed-conflict",
+                "input_blob_digest": second_digest,
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Conflict(message)
+            if message == "idempotency key reused with different content"),
+        "{error:?}"
+    );
+    let mut session = store.session().await.unwrap();
+    let after: serde_json::Value = session.need(&admin, "artifact", &staged_id).await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(before, after);
+    store.close().await;
+}
+
+/// The management export path has no budget reference and invents no zero
+/// cost, fee or refund fact.
+#[tokio::test]
+async fn management_export_does_not_invent_zero_or_refund_unknown_cost() {
+    let (_dir, store, admin, sources) = persistent_store().await;
+    let staged = PersistentPackageStore::stage_package(
+        &admin,
+        &store,
+        persistent_stage_request(
+            "managed-cost-staged",
+            manifest_for_files("managed_cost", &valid_files()),
+            valid_files(),
+            sources,
+        ),
+    )
+    .await
+    .unwrap();
+    let attempt = PersistentPackageStore::prepare_export(
+        &admin,
+        &store,
+        "managed-cost-attempt",
+        &staged.id,
+        "local_namespace",
+        None,
+    )
+    .await
+    .unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    let status = management_done(
+        &dispatcher,
+        &admin,
+        "export.complete",
+        serde_json::json!({
+            "schema_version": "rsia.management.export_complete.v1",
+            "request_key": "managed-cost-complete",
+            "export_id": attempt.id,
+        }),
+    )
+    .await;
+    assert_eq!(status.state, ManagementJobState::Succeeded, "{status:?}");
+    let mut session = store.session().await.unwrap();
+    let completed: serde_json::Value = session.need(&admin, "artifact", &attempt.id).await.unwrap();
+    let artifacts: Vec<serde_json::Value> = session.list(&admin, "artifact").await.unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(completed["payload"]["budget_ref"], serde_json::Value::Null);
+    let result_wire = serde_json::to_string(&status.result).unwrap();
+    for forbidden in ["fee", "cost", "refund", "amount", "zero"] {
+        assert!(
+            !result_wire.contains(forbidden),
+            "result invents {forbidden}: {result_wire}"
+        );
+    }
+    assert!(
+        artifacts.iter().all(|value| !value["schema_version"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("budget")),
+        "no budget artifact is created by the asset/export path"
+    );
+    store.close().await;
+}
+
+/// A legacy v1 export attempt is read-only history: completion and abort stay
+/// exact refusals and open no new delivery.
+#[tokio::test]
+async fn management_legacy_export_read_does_not_open_new_delivery() {
+    let (_dir, store, admin, _sources) = persistent_store().await;
+    let legacy_id = "legacy-export-attempt";
+    let mut session = store.session().await.unwrap();
+    session
+        .put(
+            &admin,
+            "artifact",
+            legacy_id,
+            admin.actor(),
+            &serde_json::json!({
+                "schema_version": "rsia.e16.export_attempt.v1",
+                "id": legacy_id,
+            }),
+        )
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
+    for (operation, payload) in [
+        (
+            "export.complete",
+            serde_json::json!({
+                "schema_version": "rsia.management.export_complete.v1",
+                "request_key": "legacy-complete",
+                "export_id": legacy_id,
+            }),
+        ),
+        (
+            "export.abort",
+            serde_json::json!({
+                "schema_version": "rsia.management.export_abort.v1",
+                "request_key": "legacy-abort",
+                "export_id": legacy_id,
+            }),
+        ),
+    ] {
+        let status = management_done(&dispatcher, &admin, operation, payload).await;
+        assert_eq!(
+            status.state,
+            ManagementJobState::Failed,
+            "{operation}: {status:?}"
+        );
+        assert_eq!(status.error_code.as_deref(), Some("invalid_input"));
+    }
+    assert!(
+        !tokio::fs::try_exists(store.local_export_directory(&admin, legacy_id).unwrap())
+            .await
+            .unwrap()
+    );
+    let mut session = store.session().await.unwrap();
+    let artifacts: Vec<serde_json::Value> = session.list(&admin, "artifact").await.unwrap();
+    session.commit().await.unwrap();
+    assert!(
+        artifacts
+            .iter()
+            .all(|value| value["schema_version"] != "rsia.e16.delivery_audit.v2")
+    );
+    store.close().await;
 }

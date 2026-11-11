@@ -1036,6 +1036,29 @@ pub const E16_EXPORT_ATTEMPT_SCHEMA: &str = "rsia.e16.export_attempt.v2";
 pub const E16_DELIVERY_AUDIT_SCHEMA: &str = "rsia.e16.delivery_audit.v2";
 pub const LOCAL_EXPORT_DESTINATION: &str = "local_namespace";
 pub const LOCAL_EXPORT_KIND: &str = "local_directory_v1";
+/// The transient, namespace-scoped controlled blob that carries one
+/// `asset.stage` input. It is never registered as a persistent object.
+pub const ASSET_STAGE_INPUT_SCHEMA: &str = "rsia.management.asset_stage_input.v1";
+
+/// One strict `asset.stage` input: the full manifest, UTF-8 members, source
+/// refs, frozen watermarks and optional candidate material. Physical roots,
+/// destinations, roles, owners and authority booleans are not part of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssetStageInput {
+    schema_version: String,
+    manifest: AssetPackageManifest,
+    files: BTreeMap<String, String>,
+    source_refs: Vec<E16SourceRef>,
+    baseline_digest: String,
+    local_digest: String,
+    #[serde(default)]
+    upstream_digest: Option<String>,
+    environment_digest: String,
+    compiler_version: String,
+    #[serde(default)]
+    candidate_material: Option<CandidateMaterialBinding>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1179,7 +1202,7 @@ pub struct DeliveryAuditPayload {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PackageProjection {
+pub(crate) struct PackageProjection {
     manifest: AssetPackageManifest,
     files: BTreeMap<String, String>,
 }
@@ -1253,7 +1276,7 @@ fn decode_package_projection(bytes: &[u8]) -> Result<PackageProjection> {
     Ok(projection)
 }
 
-fn local_export_files(projection: &PackageProjection) -> Result<Vec<LocalExportFile>> {
+pub(crate) fn local_export_files(projection: &PackageProjection) -> Result<Vec<LocalExportFile>> {
     validate_manifest(&projection.manifest)?;
     if projection.files.contains_key("manifest.json") {
         return Err(Error::Invalid(
@@ -1285,6 +1308,70 @@ fn local_export_files(projection: &PackageProjection) -> Result<Vec<LocalExportF
     }
     local_export_tree_digest(&files)?;
     Ok(files)
+}
+
+/// Read one staged asset's projection blob with the payload-bound digest and
+/// byte count, then decode and canonically validate it. All filesystem reads
+/// happen outside any caller transaction.
+pub(crate) async fn load_staged_projection(
+    ctx: &Context,
+    store: &Store,
+    staged: &E16Envelope<StagedAssetPayload>,
+) -> Result<PackageProjection> {
+    let bytes = store
+        .read_blob(
+            ctx,
+            &staged.payload.content_blob_digest,
+            MAX_PERSISTENT_PROJECTION,
+        )
+        .await?;
+    if hash(&bytes) != staged.payload.content_blob_digest
+        || bytes.len() as u64 != staged.payload.content_bytes
+    {
+        return Err(Error::Conflict("staged asset blob differs".into()));
+    }
+    let projection = decode_package_projection(&bytes)?;
+    if fingerprint(&projection.manifest)? != staged.payload.manifest_digest {
+        return Err(Error::Conflict(
+            "staged manifest differs from registered digest".into(),
+        ));
+    }
+    Ok(projection)
+}
+
+/// Everything one Prepared local export needs outside the job transaction:
+/// the exact frozen files, the pinned dependency identities, the Prepared
+/// attempt and its deterministic receipt.
+pub(crate) struct PreparedExportCompletion {
+    pub(crate) files: Vec<LocalExportFile>,
+    pub(crate) dependencies: evo_storage::LocalExportDependencySnapshot,
+    pub(crate) attempt: E16Envelope<ExportAttemptPayload>,
+    pub(crate) receipt: LocalExportReceipt,
+}
+
+/// The completed attempt, its delivery audit and the local receipt the exact
+/// published tree earned.
+pub(crate) struct ExportCompletion {
+    pub(crate) attempt: E16Envelope<ExportAttemptPayload>,
+    pub(crate) audit: E16Envelope<DeliveryAuditPayload>,
+    pub(crate) receipt: LocalExportReceipt,
+}
+
+pub(crate) enum ExportCompletionPreparation {
+    Ready(Box<PreparedExportCompletion>),
+    Completed(Box<PreparedExportCompletion>, Box<ExportCompletion>),
+}
+
+/// The read-only recovery verdict of one `export.complete` job. It never
+/// invents a delivery: `NotPublished` proves the formal tree is absent,
+/// `PublishedUnverified` proves a tree exists but one identity does not match,
+/// `Ready` proves a Prepared attempt whose published tree is exactly the
+/// frozen completion, and `Completed` names an already completed delivery.
+pub(crate) enum ExportCompletionInspection {
+    NotPublished,
+    PublishedUnverified,
+    Ready(Box<PreparedExportCompletion>),
+    Completed(Box<PreparedExportCompletion>, Box<ExportCompletion>),
 }
 
 fn validate_candidate_material(
@@ -1332,6 +1419,80 @@ fn validate_candidate_material(
         }
     }
     Ok((skill, strategy))
+}
+
+/// Decode and fully validate one transient `asset.stage` input blob. All
+/// package safety, privacy, member and candidate material gates run here,
+/// outside any database transaction. The returned request carries no caller
+/// path, root, role, owner, namespace or authority boolean.
+pub(crate) fn decode_asset_stage_input(
+    bytes: &[u8],
+    request_key: &str,
+) -> Result<(StagePackageRequest, Vec<u8>)> {
+    if bytes.is_empty() || bytes.len() > MAX_PERSISTENT_PROJECTION {
+        return Err(Error::Invalid("invalid asset stage input size".into()));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Error::Invalid("asset stage input is not UTF-8".into()))?;
+    let value = evo_storage::lifecycle::parse_strict_json(text)?;
+    let input: AssetStageInput = serde_json::from_value(value)
+        .map_err(|_| Error::Invalid("invalid asset stage input".into()))?;
+    if input.schema_version != ASSET_STAGE_INPUT_SCHEMA {
+        return Err(Error::Invalid(
+            "unsupported asset stage input schema".into(),
+        ));
+    }
+    identifier(request_key)?;
+    validate_digest(&input.baseline_digest, "baseline_digest")?;
+    validate_digest(&input.local_digest, "local_digest")?;
+    if let Some(upstream) = &input.upstream_digest {
+        validate_digest(upstream, "upstream_digest")?;
+    }
+    validate_digest(&input.environment_digest, "environment_digest")?;
+    identifier(&input.compiler_version)?;
+    let sources = canonical_sources(input.source_refs)?;
+    let files = input
+        .files
+        .into_iter()
+        .map(|(path, content)| (path, content.into_bytes()))
+        .collect::<BTreeMap<_, _>>();
+    let projection = build_package_projection(&input.manifest, &files)?;
+    if let Some(binding) = &input.candidate_material {
+        validate_candidate_material(&input.manifest, &files, binding)?;
+    }
+    Ok((
+        StagePackageRequest {
+            request_key: request_key.into(),
+            manifest: input.manifest,
+            files,
+            source_refs: sources,
+            baseline_digest: input.baseline_digest,
+            local_digest: input.local_digest,
+            upstream_digest: input.upstream_digest,
+            environment_digest: input.environment_digest,
+            compiler_version: input.compiler_version,
+            candidate_material: input.candidate_material,
+        },
+        projection,
+    ))
+}
+
+fn stage_input_digest(
+    request: &StagePackageRequest,
+    projection: &[u8],
+    sources: &[E16SourceRef],
+) -> Result<String> {
+    fingerprint(&(
+        &request.manifest,
+        hash(projection),
+        sources,
+        request.baseline_digest.as_str(),
+        request.local_digest.as_str(),
+        request.upstream_digest.as_deref(),
+        request.environment_digest.as_str(),
+        request.compiler_version.as_str(),
+        &request.candidate_material,
+    ))
 }
 
 pub(crate) fn e16_storage_id(
@@ -1473,31 +1634,40 @@ impl PersistentPackageStore {
         validate_digest(&request.environment_digest, "environment_digest")?;
         identifier(&request.compiler_version)?;
         let projection = build_package_projection(&request.manifest, &request.files)?;
-        let projection_digest = hash(&projection);
         if let Some(binding) = &request.candidate_material {
             validate_candidate_material(&request.manifest, &request.files, binding)?;
         }
-        let sources = canonical_sources(request.source_refs)?;
+        canonical_sources(request.source_refs.clone())?;
+        let mut session = store.registered_blob_write_session().await?;
+        let envelope =
+            Self::stage_package_in_session(ctx, &mut session, &request, &projection).await?;
+        session.commit().await?;
+        Self::read_staged(ctx, store, &envelope.id).await
+    }
+
+    /// The staging kernel in the caller's request publication transaction.
+    /// Everything after the decoded projection is re-checked here: watermark,
+    /// sources, manifest dependencies, the existing key image, capacity, blob
+    /// publication and the final state, all with the frozen input digest.
+    pub(crate) async fn stage_package_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        request: &StagePackageRequest,
+        projection: &[u8],
+    ) -> Result<E16Envelope<StagedAssetPayload>> {
+        ctx.require(&[Role::Admin])?;
+        identifier(&request.request_key)?;
+        let projection_digest = hash(projection);
+        let sources = canonical_sources(request.source_refs.clone())?;
+        let input_digest = stage_input_digest(request, projection, &sources)?;
         let id = e16_storage_id(
             "staged-asset",
             ctx.namespace(),
             ctx.actor(),
             &request.request_key,
         )?;
-        let input_digest = fingerprint(&(
-            &request.manifest,
-            projection_digest.as_str(),
-            &sources,
-            request.baseline_digest.as_str(),
-            request.local_digest.as_str(),
-            request.upstream_digest.as_deref(),
-            request.environment_digest.as_str(),
-            request.compiler_version.as_str(),
-            &request.candidate_material,
-        ))?;
-        let mut session = store.registered_blob_write_session().await?;
-        let watermark = current_watermark(&mut session, ctx).await?;
-        verify_sources(&mut session, ctx, &sources).await?;
+        let watermark = current_watermark(session, ctx).await?;
+        verify_sources(session, ctx, &sources).await?;
         let mut quarantine = None;
         let mut dependency_refs = Vec::new();
         for dependency in &request.manifest.dependencies {
@@ -1524,8 +1694,8 @@ impl PersistentPackageStore {
         let all_sources = canonical_sources(all_sources)?;
         // Judge resolved manifest content and request sources together, including
         // their joint closure bound, before either an existing lookup or any write.
-        verify_sources(&mut session, ctx, &all_sources).await?;
-        if judge_dependency(ctx, &mut session, "artifact", &id)
+        verify_sources(session, ctx, &all_sources).await?;
+        if judge_dependency(ctx, session, "artifact", &id)
             .await?
             .is_some()
         {
@@ -1555,10 +1725,9 @@ impl PersistentPackageStore {
                     "staged asset request key or frozen inputs changed".into(),
                 ));
             }
-            verify_sources(&mut session, ctx, &existing.source_refs).await?;
+            verify_sources(session, ctx, &existing.source_refs).await?;
             if existing.payload.state != StagedAssetState::Prepared {
-                session.commit().await?;
-                return Self::read_staged(ctx, store, &existing.id).await;
+                return Ok(existing);
             }
         } else {
             // E16.5: a new staged asset is a new derivation. Measure and refuse
@@ -1578,7 +1747,7 @@ impl PersistentPackageStore {
                 id: id.clone(),
                 namespace: ctx.namespace().into(),
                 owner_actor: ctx.actor().into(),
-                request_key: request.request_key,
+                request_key: request.request_key.clone(),
                 input_digest: input_digest.clone(),
                 created_at: timestamp,
                 updated_at: timestamp,
@@ -1591,19 +1760,19 @@ impl PersistentPackageStore {
                     manifest_digest: fingerprint(&request.manifest)?,
                     content_blob_digest: projection_digest.clone(),
                     content_bytes: projection.len() as u64,
-                    baseline_digest: request.baseline_digest,
-                    local_digest: request.local_digest,
-                    upstream_digest: request.upstream_digest,
-                    environment_digest: request.environment_digest,
-                    package_schema_version: request.manifest.schema_version,
-                    compiler_version: request.compiler_version,
+                    baseline_digest: request.baseline_digest.clone(),
+                    local_digest: request.local_digest.clone(),
+                    upstream_digest: request.upstream_digest.clone(),
+                    environment_digest: request.environment_digest.clone(),
+                    package_schema_version: request.manifest.schema_version.clone(),
+                    compiler_version: request.compiler_version.clone(),
                     state: StagedAssetState::Prepared,
                     quarantine_reason: quarantine.clone(),
-                    candidate_material: request.candidate_material,
+                    candidate_material: request.candidate_material.clone(),
                     candidate_ref: None,
                 },
             };
-            put_envelope(&mut session, ctx, &envelope).await?;
+            put_envelope(session, ctx, &envelope).await?;
             session
                 .audit(ctx, "e16.staged_asset.prepare", &envelope.id)
                 .await?;
@@ -1614,7 +1783,7 @@ impl PersistentPackageStore {
                 &id,
                 E16_STAGED_ASSET_SCHEMA,
                 "content_blob_digest",
-                &projection,
+                projection,
                 MAX_PERSISTENT_PROJECTION,
             )
             .await?;
@@ -1629,7 +1798,7 @@ impl PersistentPackageStore {
             || current.input_digest != input_digest
             || current.payload.state != StagedAssetState::Prepared
             || current.payload.content_blob_digest != projection_digest
-            || current.revoke_watermark != current_watermark(&mut session, ctx).await?
+            || current.revoke_watermark != current_watermark(session, ctx).await?
         {
             return Err(Error::Conflict(
                 "staged asset changed before blob finalization".into(),
@@ -1641,12 +1810,11 @@ impl PersistentPackageStore {
             StagedAssetState::Staged
         };
         current.updated_at = now()?;
-        put_envelope(&mut session, ctx, &current).await?;
+        put_envelope(session, ctx, &current).await?;
         session
             .audit(ctx, "e16.staged_asset.finalize", &current.id)
             .await?;
-        session.commit().await?;
-        Self::read_staged(ctx, store, &id).await
+        Ok(current)
     }
 
     pub async fn read_staged(
@@ -1724,13 +1892,25 @@ impl PersistentPackageStore {
     ) -> Result<E16Envelope<StagedAssetPayload>> {
         ctx.require(&[Role::Admin])?;
         let mut session = store.session().await?;
+        let envelope = Self::abort_staged_in_session(ctx, &mut session, id).await?;
+        session.commit().await?;
+        Ok(envelope)
+    }
+
+    /// Abort one staged asset in the caller's transaction. Closure is allowed
+    /// after a source revocation: it reads no source and writes no blob.
+    pub(crate) async fn abort_staged_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        id: &str,
+    ) -> Result<E16Envelope<StagedAssetPayload>> {
+        ctx.require(&[Role::Admin])?;
         let mut envelope: E16Envelope<StagedAssetPayload> =
             session.need(ctx, "artifact", id).await?;
         if envelope.owner_actor != ctx.actor() {
             return Err(Error::Forbidden);
         }
         if envelope.payload.state == StagedAssetState::Aborted {
-            session.commit().await?;
             return Ok(envelope);
         }
         if !matches!(
@@ -1741,9 +1921,8 @@ impl PersistentPackageStore {
         }
         envelope.payload.state = StagedAssetState::Aborted;
         envelope.updated_at = now()?;
-        put_envelope(&mut session, ctx, &envelope).await?;
+        put_envelope(session, ctx, &envelope).await?;
         session.audit(ctx, "e16.staged_asset.abort", id).await?;
-        session.commit().await?;
         Ok(envelope)
     }
 
@@ -1768,9 +1947,11 @@ impl PersistentPackageStore {
                 "candidate handoff requires a validated package projection".into(),
             ));
         }
-        let binding = staged.payload.candidate_material.as_ref().ok_or_else(|| {
-            Error::Invalid("staged asset has no candidate material binding".into())
-        })?;
+        if staged.payload.candidate_material.is_none() {
+            return Err(Error::Invalid(
+                "staged asset has no candidate material binding".into(),
+            ));
+        }
         if staged.payload.package_kind != "skill" {
             return Err(Error::Invalid(
                 "candidate handoff only supports skill packages".into(),
@@ -1784,6 +1965,29 @@ impl PersistentPackageStore {
             )
             .await?;
         let projection = decode_package_projection(&bytes)?;
+        let mut session = store.session().await?;
+        let current =
+            Self::handoff_in_session(ctx, &mut session, &staged, candidate_id, &projection).await?;
+        session.commit().await?;
+        Ok(current)
+    }
+
+    /// Bind one existing staged asset to an existing Current release candidate
+    /// in the caller's transaction. It writes the candidate ref, the edge and
+    /// the audit record only: no approval, no Active pointer, no new candidate.
+    pub(crate) async fn handoff_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        staged: &E16Envelope<StagedAssetPayload>,
+        candidate_id: &str,
+        projection: &PackageProjection,
+    ) -> Result<E16Envelope<StagedAssetPayload>> {
+        ctx.require(&[Role::Admin])?;
+        identifier(&staged.id)?;
+        identifier(candidate_id)?;
+        let binding = staged.payload.candidate_material.as_ref().ok_or_else(|| {
+            Error::Invalid("staged asset has no candidate material binding".into())
+        })?;
         let material_files = projection
             .files
             .iter()
@@ -1792,10 +1996,9 @@ impl PersistentPackageStore {
         let (staged_skill, staged_strategy) =
             validate_candidate_material(&projection.manifest, &material_files, binding)?;
 
-        let mut session = store.session().await?;
         let mut current_staged: E16Envelope<StagedAssetPayload> =
-            session.need(ctx, "artifact", staged_asset_id).await?;
-        if fingerprint(&current_staged)? != fingerprint(&staged)?
+            session.need(ctx, "artifact", &staged.id).await?;
+        if fingerprint(&current_staged)? != fingerprint(staged)?
             || current_staged.schema_version != E16_STAGED_ASSET_SCHEMA
             || current_staged.namespace != ctx.namespace()
             || current_staged.owner_actor != ctx.actor()
@@ -1803,19 +2006,18 @@ impl PersistentPackageStore {
         {
             return Err(Error::Forbidden);
         }
-        let watermark = current_watermark(&mut session, ctx).await?;
+        let watermark = current_watermark(session, ctx).await?;
         if current_staged.revoke_watermark != watermark {
             return Err(Error::Conflict(
                 "staged asset watermark changed before candidate handoff".into(),
             ));
         }
-        verify_sources(&mut session, ctx, &current_staged.source_refs).await?;
+        verify_sources(session, ctx, &current_staged.source_refs).await?;
 
         let candidate: crate::release_store::ReadCandidate =
             session.need(ctx, "artifact", candidate_id).await?;
         candidate.current()?;
-        crate::release_store::validate_read_candidate_in_session(&mut session, ctx, &candidate)
-            .await?;
+        crate::release_store::validate_read_candidate_in_session(session, ctx, &candidate).await?;
         if candidate.schema_version != crate::release_store::RELEASE_CANDIDATE_SCHEMA_V2
             || candidate.id != candidate_id
             || candidate.environment_digest != current_staged.payload.environment_digest
@@ -1828,7 +2030,7 @@ impl PersistentPackageStore {
         }
         candidate.bundle.validate_identity()?;
         let authenticated = crate::compiler::verify_current_bundle_in_session(
-            &mut session,
+            session,
             ctx,
             &candidate.bundle_digest,
             &candidate.environment_digest,
@@ -1887,9 +2089,9 @@ impl PersistentPackageStore {
             .iter()
             .map(|source| source.id.clone())
             .collect::<Vec<_>>();
-        validate_stored_sources(&mut session, ctx, &candidate_source_ids, watermark).await?;
+        validate_stored_sources(session, ctx, &candidate_source_ids, watermark).await?;
         for source in &candidate.sources {
-            let authority = load_stored_source(&mut session, ctx, &source.id).await?;
+            let authority = load_stored_source(session, ctx, &source.id).await?;
             if authority.trace.source_digest != source.content_digest {
                 return Err(Error::Conflict(
                     "release candidate source digest changed".into(),
@@ -1899,7 +2101,6 @@ impl PersistentPackageStore {
 
         match current_staged.payload.candidate_ref.as_deref() {
             Some(existing) if existing == candidate_id => {
-                session.commit().await?;
                 return Ok(current_staged);
             }
             Some(_) => {
@@ -1911,7 +2112,7 @@ impl PersistentPackageStore {
         }
         current_staged.payload.candidate_ref = Some(candidate_id.into());
         current_staged.updated_at = now()?;
-        put_envelope(&mut session, ctx, &current_staged).await?;
+        put_envelope(session, ctx, &current_staged).await?;
         session
             .put_edge(
                 ctx,
@@ -1928,7 +2129,6 @@ impl PersistentPackageStore {
                 &current_staged.id,
             )
             .await?;
-        session.commit().await?;
         Ok(current_staged)
     }
 
@@ -1969,7 +2169,6 @@ impl PersistentPackageStore {
                 return Err(Error::Conflict("E04 root budget reference differs".into()));
             }
         }
-        let id = e16_storage_id("export-attempt", ctx.namespace(), ctx.actor(), request_key)?;
         let projection_bytes = store
             .read_blob(
                 ctx,
@@ -1980,16 +2179,64 @@ impl PersistentPackageStore {
         let projection = decode_package_projection(&projection_bytes)?;
         let export_files = local_export_files(&projection)?;
         let (package_tree_digest, delivered_bytes) = local_export_tree_digest(&export_files)?;
+        let mut session = store.session().await?;
+        let envelope = Self::prepare_export_in_session(
+            ctx,
+            &mut session,
+            request_key,
+            &staged,
+            &export_files,
+            &package_tree_digest,
+            delivered_bytes,
+            budget_ref,
+        )
+        .await?;
+        session.commit().await?;
+        Ok(envelope)
+    }
+
+    /// The export intent kernel in the caller's transaction: the same staged
+    /// asset, watermark and source closure as the outside projection, the
+    /// fixed local destination, one replayable attempt per request key.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn prepare_export_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        request_key: &str,
+        staged: &E16Envelope<StagedAssetPayload>,
+        files: &[LocalExportFile],
+        package_tree_digest: &str,
+        delivered_bytes: u64,
+        budget_ref: Option<E04BudgetRef>,
+    ) -> Result<E16Envelope<ExportAttemptPayload>> {
+        ctx.require(&[Role::Admin])?;
+        identifier(request_key)?;
+        let current_staged: E16Envelope<StagedAssetPayload> =
+            session.need(ctx, "artifact", &staged.id).await?;
+        if fingerprint(&current_staged)? != fingerprint(staged)?
+            || current_staged.namespace != ctx.namespace()
+            || current_staged.owner_actor != ctx.actor()
+            || current_staged.payload.state != StagedAssetState::Staged
+            || current_staged.payload.package_schema_version != PACKAGE_SCHEMA_V1
+        {
+            return Err(Error::Forbidden);
+        }
+        let export_files_tree = local_export_tree_digest(files)?;
+        if export_files_tree != (package_tree_digest.to_owned(), delivered_bytes) {
+            return Err(Error::Conflict(
+                "local export projection changed before intent".into(),
+            ));
+        }
+        let id = e16_storage_id("export-attempt", ctx.namespace(), ctx.actor(), request_key)?;
         let local_export_ref = format!("exports/{}/{}", hash(ctx.namespace().as_bytes()), id);
         let input_digest = fingerprint(&(
-            staged_asset_id,
+            staged.id.as_str(),
             staged.input_digest.as_str(),
-            destination_scope,
-            package_tree_digest.as_str(),
+            LOCAL_EXPORT_DESTINATION,
+            package_tree_digest,
             delivered_bytes,
             &budget_ref,
         ))?;
-        let mut session = store.session().await?;
         if let Some(existing) = session
             .get::<serde_json::Value>(ctx, "artifact", &id)
             .await?
@@ -2007,14 +2254,13 @@ impl PersistentPackageStore {
             }
             let existing = serde_json::from_value(existing)
                 .map_err(|_| Error::Invalid("invalid export attempt v2".into()))?;
-            session.commit().await?;
             return Ok(existing);
         }
-        let watermark = current_watermark(&mut session, ctx).await?;
+        let watermark = current_watermark(session, ctx).await?;
         if watermark != staged.revoke_watermark {
             return Err(Error::Conflict("staged asset watermark is stale".into()));
         }
-        verify_sources(&mut session, ctx, &staged.source_refs).await?;
+        verify_sources(session, ctx, &staged.source_refs).await?;
         let timestamp = now()?;
         let envelope = E16Envelope {
             schema_version: E16_EXPORT_ATTEMPT_SCHEMA.into(),
@@ -2032,28 +2278,27 @@ impl PersistentPackageStore {
                 asset_id: staged.payload.asset_id.clone(),
                 staged_asset_id: staged.id.clone(),
                 manifest_digest: staged.payload.manifest_digest.clone(),
-                projection_blob_digest: staged.payload.content_blob_digest,
+                projection_blob_digest: staged.payload.content_blob_digest.clone(),
                 projection_blob_bytes: staged.payload.content_bytes,
-                package_tree_digest,
+                package_tree_digest: package_tree_digest.into(),
                 delivered_bytes,
                 delivery_kind: LOCAL_EXPORT_KIND.into(),
                 local_export_ref,
                 state: ExportAttemptState::Prepared,
-                destination_scope: destination_scope.into(),
+                destination_scope: LOCAL_EXPORT_DESTINATION.into(),
                 delivery_audit_id: None,
                 completion_receipt_digest: None,
                 budget_ref,
                 error: None,
             },
         };
-        put_envelope(&mut session, ctx, &envelope).await?;
+        put_envelope(session, ctx, &envelope).await?;
         session
             .put_edge(ctx, "artifact", &envelope.id, "artifact", &staged.id)
             .await?;
         session
             .audit(ctx, "e16.export.prepare", &envelope.id)
             .await?;
-        session.commit().await?;
         Ok(envelope)
     }
 
@@ -2066,6 +2311,69 @@ impl PersistentPackageStore {
         E16Envelope<DeliveryAuditPayload>,
         LocalExportReceipt,
     )> {
+        ctx.require(&[Role::Admin])?;
+        match Self::prepare_export_completion(ctx, store, export_id).await? {
+            ExportCompletionPreparation::Completed(_, completion) => {
+                Ok((completion.attempt, completion.audit, completion.receipt))
+            }
+            ExportCompletionPreparation::Ready(prepared) => {
+                let (completed, audit) = build_export_completion(
+                    ctx,
+                    &prepared.attempt,
+                    &prepared.receipt,
+                    prepared.attempt.revoke_watermark,
+                )?;
+                let completed_value =
+                    serde_json::to_value(&completed).map_err(|_| Error::Internal)?;
+                let audit_value = serde_json::to_value(&audit).map_err(|_| Error::Internal)?;
+                match store
+                    .publish_registered_local_export(
+                        ctx,
+                        export_id,
+                        &prepared.files,
+                        &completed_value,
+                        &audit_value,
+                        &prepared.dependencies,
+                    )
+                    .await
+                {
+                    Ok(actual) if actual == prepared.receipt => Ok((completed, audit, actual)),
+                    Ok(_) => Err(Error::Conflict("local export receipt differs".into())),
+                    Err(Error::ClockRegressed) => Err(Error::ClockRegressed),
+                    Err(error) => {
+                        let mut session = store.session().await?;
+                        let raced: E16Envelope<ExportAttemptPayload> =
+                            session.need(ctx, "artifact", export_id).await?;
+                        if raced.payload.state != ExportAttemptState::Completed {
+                            return Err(error);
+                        }
+                        let audit_id = raced
+                            .payload
+                            .delivery_audit_id
+                            .as_deref()
+                            .ok_or(Error::Internal)?;
+                        let raced_audit: E16Envelope<DeliveryAuditPayload> =
+                            session.need(ctx, "artifact", audit_id).await?;
+                        session.commit().await?;
+                        let actual = store
+                            .verify_registered_local_export(ctx, export_id, &prepared.files)
+                            .await?;
+                        Ok((raced, raced_audit, actual))
+                    }
+                }
+            }
+        }
+    }
+
+    /// The outside-transaction half of one completion: the exact Prepared v2
+    /// attempt, its live staged asset, the frozen projection bytes, the local
+    /// tree, the deterministic receipt and the pinned dependency identities.
+    /// A v1 attempt is refused; a completed one is verified, never reopened.
+    pub(crate) async fn prepare_export_completion(
+        ctx: &Context,
+        store: &Store,
+        export_id: &str,
+    ) -> Result<ExportCompletionPreparation> {
         ctx.require(&[Role::Admin])?;
         let mut session = store.session().await?;
         let raw: serde_json::Value = session.need(ctx, "artifact", export_id).await?;
@@ -2113,6 +2421,12 @@ impl PersistentPackageStore {
         }
         let receipt =
             local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
+        let dependency_plan = store
+            .snapshot_local_export_dependencies(ctx, export_id)
+            .await?;
+        let dependency_snapshot = store
+            .prevalidate_local_export_dependency_blobs(ctx, dependency_plan)
+            .await?;
         if attempt.payload.state == ExportAttemptState::Completed {
             let audit_id = attempt
                 .payload
@@ -2135,104 +2449,345 @@ impl PersistentPackageStore {
                     "completed local export receipt differs".into(),
                 ));
             }
-            return Ok((attempt, audit, receipt));
+            return Ok(ExportCompletionPreparation::Completed(
+                Box::new(PreparedExportCompletion {
+                    files: export_files,
+                    dependencies: dependency_snapshot,
+                    attempt: attempt.clone(),
+                    receipt: receipt.clone(),
+                }),
+                Box::new(ExportCompletion {
+                    attempt,
+                    audit,
+                    receipt,
+                }),
+            ));
         }
         if attempt.payload.state != ExportAttemptState::Prepared {
             return Err(Error::Conflict("export attempt is not prepared".into()));
         }
-        let dependency_plan = store
-            .snapshot_local_export_dependencies(ctx, export_id)
-            .await?;
-        let dependency_snapshot = store
-            .prevalidate_local_export_dependency_blobs(ctx, dependency_plan)
-            .await?;
-        let mut session = store.session().await?;
-        let mut current: E16Envelope<ExportAttemptPayload> =
-            session.need(ctx, "artifact", export_id).await?;
-        let current_watermark = current_watermark(&mut session, ctx).await?;
-        if current.payload.state != ExportAttemptState::Prepared
-            || current.input_digest != attempt.input_digest
-            || current_watermark != current.revoke_watermark
+        Ok(ExportCompletionPreparation::Ready(Box::new(
+            PreparedExportCompletion {
+                files: export_files,
+                dependencies: dependency_snapshot,
+                attempt,
+                receipt,
+            },
+        )))
+    }
+
+    /// The in-session completion: re-derive the frozen tree under the held
+    /// publication lock, re-check the attempt/source closure/watermark/staged
+    /// asset and write the completed attempt, audit, edges and job state in the
+    /// caller's transaction. A fence checks the management claim before the
+    /// first DML and the first filesystem effect.
+    pub(crate) async fn complete_export_in_session(
+        ctx: &Context,
+        store: &Store,
+        session: &mut Session,
+        export_id: &str,
+        prepared: &PreparedExportCompletion,
+        fence: Option<&evo_storage::ManagementJobFence<'_>>,
+    ) -> Result<ExportCompletion> {
+        ctx.require(&[Role::Admin])?;
+        let raw: serde_json::Value = session.need(ctx, "artifact", export_id).await?;
+        if raw.get("schema_version").and_then(|value| value.as_str())
+            == Some("rsia.e16.export_attempt.v1")
         {
-            return Err(Error::Conflict(
-                "export state or watermark changed before completion".into(),
+            return Err(Error::Invalid(
+                "legacy export attempt has no verified local delivery".into(),
             ));
         }
-        verify_sources(&mut session, ctx, &current.source_refs).await?;
-        let audit_id = format!("e16-delivery-{}", fingerprint(&current.id)?);
-        current.payload.state = ExportAttemptState::Completed;
-        current.payload.delivery_audit_id = Some(audit_id.clone());
-        current.payload.completion_receipt_digest = Some(receipt.completion_receipt_digest.clone());
-        current.updated_at = now()?;
-        let audit = E16Envelope {
-            schema_version: E16_DELIVERY_AUDIT_SCHEMA.into(),
-            id: audit_id.clone(),
-            namespace: ctx.namespace().into(),
-            owner_actor: ctx.actor().into(),
-            request_key: current.request_key.clone(),
-            input_digest: fingerprint(&(
-                current.id.as_str(),
-                current.payload.package_tree_digest.as_str(),
-                current.payload.destination_scope.as_str(),
-                receipt.completion_receipt_digest.as_str(),
-            ))?,
-            created_at: now()?,
-            updated_at: now()?,
-            source_refs: current.source_refs.clone(),
-            revoke_watermark: current_watermark,
-            payload: DeliveryAuditPayload {
-                export_attempt_id: current.id.clone(),
-                package_id: format!("{}:{}", current.payload.publisher, current.payload.asset_id),
-                projection_blob_digest: current.payload.projection_blob_digest.clone(),
-                delivery_kind: receipt.delivery_kind.clone(),
-                local_export_ref: receipt.local_export_ref.clone(),
-                package_tree_digest: receipt.package_tree_digest.clone(),
-                delivered_bytes: receipt.delivered_bytes,
-                completion_receipt_digest: receipt.completion_receipt_digest.clone(),
-                delivered_to: current.payload.destination_scope.clone(),
-                delivered_at: now()?,
-                watermark_at_delivery: current_watermark,
-                revoked: false,
-                revocation_notice_sent: false,
-                remote_erasure_disclaimer: REMOTE_ERASURE_DISCLAIMER.into(),
-            },
-        };
-        session.commit().await?;
-        let current_value = serde_json::to_value(&current).map_err(|_| Error::Internal)?;
+        let current: E16Envelope<ExportAttemptPayload> = serde_json::from_value(raw)
+            .map_err(|_| Error::Invalid("invalid export attempt v2".into()))?;
+        if current.owner_actor != ctx.actor() {
+            return Err(Error::Forbidden);
+        }
+        if current.payload.state == ExportAttemptState::Completed {
+            let receipt = store
+                .verify_registered_local_export_in_session(
+                    ctx,
+                    session,
+                    export_id,
+                    &prepared.files,
+                    &prepared.dependencies,
+                )
+                .await?;
+            let audit_id = current
+                .payload
+                .delivery_audit_id
+                .as_deref()
+                .ok_or(Error::Internal)?;
+            let audit: E16Envelope<DeliveryAuditPayload> =
+                session.need(ctx, "artifact", audit_id).await?;
+            return Ok(ExportCompletion {
+                attempt: current,
+                audit,
+                receipt,
+            });
+        }
+        let current = Self::verify_prepared_export_completion_in_session(
+            ctx,
+            session,
+            export_id,
+            &prepared.attempt,
+        )
+        .await?;
+        let (completed, audit) =
+            build_export_completion(ctx, &current, &prepared.receipt, current.revoke_watermark)?;
+        let completed_value = serde_json::to_value(&completed).map_err(|_| Error::Internal)?;
         let audit_value = serde_json::to_value(&audit).map_err(|_| Error::Internal)?;
-        match store
-            .publish_registered_local_export(
+        let receipt = store
+            .publish_registered_local_export_in_session(
                 ctx,
+                session,
                 export_id,
-                &export_files,
-                &current_value,
+                &prepared.files,
+                &completed_value,
                 &audit_value,
-                &dependency_snapshot,
+                &prepared.dependencies,
+                fence,
             )
-            .await
+            .await?;
+        if receipt != prepared.receipt {
+            return Err(Error::Conflict("local export receipt differs".into()));
+        }
+        Ok(ExportCompletion {
+            attempt: completed,
+            audit,
+            receipt,
+        })
+    }
+
+    /// Re-check the Prepared completion preimage in the job transaction: the
+    /// same v2 attempt, staged asset, watermark, source closure and exactly the
+    /// frozen projection bytes/tree. Returns the current attempt.
+    async fn verify_prepared_export_completion_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        export_id: &str,
+        expected: &E16Envelope<ExportAttemptPayload>,
+    ) -> Result<E16Envelope<ExportAttemptPayload>> {
+        let current: E16Envelope<ExportAttemptPayload> =
+            session.need(ctx, "artifact", export_id).await?;
+        if current.schema_version != E16_EXPORT_ATTEMPT_SCHEMA
+            || current.owner_actor != ctx.actor()
+            || current.namespace != ctx.namespace()
+            || current.payload.state != ExportAttemptState::Prepared
+            || current.input_digest != expected.input_digest
+            || current.source_refs != expected.source_refs
+            || current.revoke_watermark != expected.revoke_watermark
+            || current.payload.projection_blob_digest != expected.payload.projection_blob_digest
+            || current.payload.projection_blob_bytes != expected.payload.projection_blob_bytes
+            || current.payload.package_tree_digest != expected.payload.package_tree_digest
+            || current.payload.delivered_bytes != expected.payload.delivered_bytes
+            || current.payload.staged_asset_id != expected.payload.staged_asset_id
         {
-            Ok(actual) if actual == receipt => Ok((current, audit, actual)),
-            Ok(_) => Err(Error::Conflict("local export receipt differs".into())),
-            Err(Error::ClockRegressed) => Err(Error::ClockRegressed),
-            Err(error) => {
-                let mut session = store.session().await?;
-                let raced: E16Envelope<ExportAttemptPayload> =
-                    session.need(ctx, "artifact", export_id).await?;
-                if raced.payload.state != ExportAttemptState::Completed {
-                    return Err(error);
+            return Err(Error::Conflict("export completion preimage changed".into()));
+        }
+        let staged: E16Envelope<StagedAssetPayload> = session
+            .need(ctx, "artifact", &current.payload.staged_asset_id)
+            .await?;
+        let watermark = current_watermark(session, ctx).await?;
+        if staged.schema_version != E16_STAGED_ASSET_SCHEMA
+            || staged.namespace != ctx.namespace()
+            || staged.owner_actor != ctx.actor()
+            || staged.payload.state != StagedAssetState::Staged
+            || staged.revoke_watermark != watermark
+            || staged.payload.content_blob_digest != current.payload.projection_blob_digest
+            || staged.payload.content_bytes != current.payload.projection_blob_bytes
+        {
+            return Err(Error::Conflict(
+                "export completion staged asset changed".into(),
+            ));
+        }
+        verify_sources(session, ctx, &staged.source_refs).await?;
+        let projection_bytes = session
+            .reverify_blob_input(
+                ctx,
+                &current.payload.projection_blob_digest,
+                MAX_PERSISTENT_PROJECTION,
+            )
+            .await?;
+        if hash(&projection_bytes) != current.payload.projection_blob_digest
+            || projection_bytes.len() as u64 != current.payload.projection_blob_bytes
+        {
+            return Err(Error::Conflict("final export projection changed".into()));
+        }
+        let projection = decode_package_projection(&projection_bytes)?;
+        let export_files = local_export_files(&projection)?;
+        let (tree_digest, delivered_bytes) = local_export_tree_digest(&export_files)?;
+        if tree_digest != current.payload.package_tree_digest
+            || delivered_bytes != current.payload.delivered_bytes
+        {
+            return Err(Error::Conflict(
+                "local export tree differs from Prepared".into(),
+            ));
+        }
+        Ok(current)
+    }
+
+    /// The read-only crash-recovery verdict of one export completion. It
+    /// distinguishes an absent tree from a tree whose identities changed.
+    pub(crate) async fn inspect_export_completion_recovery(
+        ctx: &Context,
+        store: &Store,
+        export_id: &str,
+    ) -> Result<ExportCompletionInspection> {
+        ctx.require(&[Role::Admin])?;
+        let directory = store.local_export_directory(ctx, export_id)?;
+        let directory_exists = tokio::fs::try_exists(&directory)
+            .await
+            .map_err(|_| Error::Internal)?;
+        let mut session = store.session().await?;
+        let raw: serde_json::Value = session.need(ctx, "artifact", export_id).await?;
+        if raw.get("schema_version").and_then(|value| value.as_str())
+            == Some("rsia.e16.export_attempt.v1")
+        {
+            session.commit().await?;
+            return Ok(ExportCompletionInspection::NotPublished);
+        }
+        let attempt: E16Envelope<ExportAttemptPayload> = serde_json::from_value(raw)
+            .map_err(|_| Error::Invalid("invalid export attempt v2".into()))?;
+        if attempt.owner_actor != ctx.actor() {
+            session.commit().await?;
+            return Err(Error::Forbidden);
+        }
+        session.commit().await?;
+        match attempt.payload.state {
+            ExportAttemptState::Aborted
+            | ExportAttemptState::Failed
+            | ExportAttemptState::Revoked => Ok(ExportCompletionInspection::NotPublished),
+            ExportAttemptState::Completed => {
+                match Self::prepare_export_completion(ctx, store, export_id).await {
+                    Ok(ExportCompletionPreparation::Completed(prepared, completion))
+                        if prepared.receipt == completion.receipt =>
+                    {
+                        match store
+                            .inspect_registered_local_export_tree(ctx, export_id, &prepared.files)
+                            .await
+                        {
+                            Ok(Some(receipt)) if receipt == prepared.receipt => {
+                                Ok(ExportCompletionInspection::Completed(prepared, completion))
+                            }
+                            Ok(Some(_)) => Ok(ExportCompletionInspection::PublishedUnverified),
+                            Ok(None) => Ok(ExportCompletionInspection::PublishedUnverified),
+                            Err(Error::ClockRegressed | Error::Internal) => Err(Error::Internal),
+                            Err(_) => Ok(ExportCompletionInspection::PublishedUnverified),
+                        }
+                    }
+                    Ok(_) => Ok(ExportCompletionInspection::PublishedUnverified),
+                    Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+                    Err(_) if directory_exists => {
+                        Ok(ExportCompletionInspection::PublishedUnverified)
+                    }
+                    Err(_) => Ok(ExportCompletionInspection::NotPublished),
                 }
-                let audit_id = raced
+            }
+            ExportAttemptState::Prepared => {
+                match Self::prepare_export_completion(ctx, store, export_id).await {
+                    Ok(ExportCompletionPreparation::Ready(prepared)) => {
+                        match store
+                            .inspect_registered_local_export_tree(ctx, export_id, &prepared.files)
+                            .await
+                        {
+                            Ok(Some(receipt)) if receipt == prepared.receipt => {
+                                Ok(ExportCompletionInspection::Ready(prepared))
+                            }
+                            Ok(Some(_)) => Ok(ExportCompletionInspection::PublishedUnverified),
+                            Ok(None) => Ok(ExportCompletionInspection::NotPublished),
+                            Err(Error::ClockRegressed | Error::Internal) => Err(Error::Internal),
+                            Err(_) => Ok(ExportCompletionInspection::PublishedUnverified),
+                        }
+                    }
+                    Ok(ExportCompletionPreparation::Completed(_, _)) => {
+                        Ok(ExportCompletionInspection::PublishedUnverified)
+                    }
+                    Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+                    Err(_) if directory_exists => {
+                        Ok(ExportCompletionInspection::PublishedUnverified)
+                    }
+                    Err(_) => Ok(ExportCompletionInspection::NotPublished),
+                }
+            }
+        }
+    }
+
+    /// Recover one published-tree completion in the job transaction: only the
+    /// SQL completion is written, under exact attempt/source/watermark/tree/
+    /// dependency/directory checks. No file is written, renamed or created.
+    pub(crate) async fn recover_export_completion_in_session(
+        ctx: &Context,
+        store: &Store,
+        session: &mut Session,
+        export_id: &str,
+        inspection: &ExportCompletionInspection,
+    ) -> Result<ExportCompletion> {
+        match inspection {
+            ExportCompletionInspection::NotPublished => {
+                Err(Error::Conflict("published local export is missing".into()))
+            }
+            ExportCompletionInspection::PublishedUnverified => Err(Error::Conflict(
+                "published local export cannot be verified".into(),
+            )),
+            ExportCompletionInspection::Completed(prepared, _) => {
+                let receipt = store
+                    .verify_registered_local_export_in_session(
+                        ctx,
+                        session,
+                        export_id,
+                        &prepared.files,
+                        &prepared.dependencies,
+                    )
+                    .await?;
+                let current: E16Envelope<ExportAttemptPayload> =
+                    session.need(ctx, "artifact", export_id).await?;
+                let audit_id = current
                     .payload
                     .delivery_audit_id
                     .as_deref()
                     .ok_or(Error::Internal)?;
-                let raced_audit: E16Envelope<DeliveryAuditPayload> =
+                let audit: E16Envelope<DeliveryAuditPayload> =
                     session.need(ctx, "artifact", audit_id).await?;
-                session.commit().await?;
-                let actual = store
-                    .verify_registered_local_export(ctx, export_id, &export_files)
+                Ok(ExportCompletion {
+                    attempt: current,
+                    audit,
+                    receipt,
+                })
+            }
+            ExportCompletionInspection::Ready(prepared) => {
+                let current = Self::verify_prepared_export_completion_in_session(
+                    ctx,
+                    session,
+                    export_id,
+                    &prepared.attempt,
+                )
+                .await?;
+                let (completed, audit) = build_export_completion(
+                    ctx,
+                    &current,
+                    &prepared.receipt,
+                    current.revoke_watermark,
+                )?;
+                let completed_value =
+                    serde_json::to_value(&completed).map_err(|_| Error::Internal)?;
+                let audit_value = serde_json::to_value(&audit).map_err(|_| Error::Internal)?;
+                let receipt = store
+                    .recover_registered_local_export_in_session(
+                        ctx,
+                        session,
+                        export_id,
+                        &prepared.files,
+                        &completed_value,
+                        &audit_value,
+                        &prepared.dependencies,
+                    )
                     .await?;
-                Ok((raced, raced_audit, actual))
+                Ok(ExportCompletion {
+                    attempt: completed,
+                    audit,
+                    receipt,
+                })
             }
         }
     }
@@ -2243,7 +2798,24 @@ impl PersistentPackageStore {
         export_id: &str,
     ) -> Result<E16Envelope<ExportAttemptPayload>> {
         ctx.require(&[Role::Admin])?;
-        let mut session = store.session().await?;
+        let mut session = store.registered_blob_write_session().await?;
+        let attempt =
+            Self::abort_export_in_session(ctx, store, &mut session, export_id, None).await?;
+        session.commit().await?;
+        Ok(attempt)
+    }
+
+    /// Abort one Prepared local export in the caller's transaction: no tree is
+    /// deleted, and a published tree is refused with the original
+    /// "must be recovered" conflict.
+    pub(crate) async fn abort_export_in_session(
+        ctx: &Context,
+        store: &Store,
+        session: &mut Session,
+        export_id: &str,
+        fence: Option<&evo_storage::ManagementJobFence<'_>>,
+    ) -> Result<E16Envelope<ExportAttemptPayload>> {
+        ctx.require(&[Role::Admin])?;
         let raw: serde_json::Value = session.need(ctx, "artifact", export_id).await?;
         if raw.get("schema_version").and_then(|value| value.as_str())
             == Some("rsia.e16.export_attempt.v1")
@@ -2258,7 +2830,6 @@ impl PersistentPackageStore {
             return Err(Error::Forbidden);
         }
         if attempt.payload.state == ExportAttemptState::Aborted {
-            session.commit().await?;
             return Ok(attempt);
         }
         if attempt.payload.state != ExportAttemptState::Prepared {
@@ -2266,10 +2837,9 @@ impl PersistentPackageStore {
         }
         attempt.payload.state = ExportAttemptState::Aborted;
         attempt.updated_at = now()?;
-        session.commit().await?;
         let value = serde_json::to_value(&attempt).map_err(|_| Error::Internal)?;
         store
-            .abort_registered_local_export(ctx, export_id, &value)
+            .abort_registered_local_export_in_session(ctx, session, export_id, &value, fence)
             .await?;
         Ok(attempt)
     }
@@ -2297,6 +2867,63 @@ impl PersistentPackageStore {
         }
         Ok(true)
     }
+}
+
+/// The deterministic completion of one Prepared local export: the same
+/// envelope moved to `completed` and its delivery audit. Only timestamps are
+/// observed here; every identity is derived from the Prepared attempt.
+fn build_export_completion(
+    ctx: &Context,
+    current: &E16Envelope<ExportAttemptPayload>,
+    receipt: &LocalExportReceipt,
+    watermark: u64,
+) -> Result<(
+    E16Envelope<ExportAttemptPayload>,
+    E16Envelope<DeliveryAuditPayload>,
+)> {
+    let audit_id = format!("e16-delivery-{}", fingerprint(&current.id)?);
+    let mut completed = current.clone();
+    completed.payload.state = ExportAttemptState::Completed;
+    completed.payload.delivery_audit_id = Some(audit_id.clone());
+    completed.payload.completion_receipt_digest = Some(receipt.completion_receipt_digest.clone());
+    completed.updated_at = now()?;
+    let audit = E16Envelope {
+        schema_version: E16_DELIVERY_AUDIT_SCHEMA.into(),
+        id: audit_id,
+        namespace: ctx.namespace().into(),
+        owner_actor: ctx.actor().into(),
+        request_key: completed.request_key.clone(),
+        input_digest: fingerprint(&(
+            completed.id.as_str(),
+            completed.payload.package_tree_digest.as_str(),
+            completed.payload.destination_scope.as_str(),
+            receipt.completion_receipt_digest.as_str(),
+        ))?,
+        created_at: now()?,
+        updated_at: now()?,
+        source_refs: completed.source_refs.clone(),
+        revoke_watermark: watermark,
+        payload: DeliveryAuditPayload {
+            export_attempt_id: completed.id.clone(),
+            package_id: format!(
+                "{}:{}",
+                completed.payload.publisher, completed.payload.asset_id
+            ),
+            projection_blob_digest: completed.payload.projection_blob_digest.clone(),
+            delivery_kind: receipt.delivery_kind.clone(),
+            local_export_ref: receipt.local_export_ref.clone(),
+            package_tree_digest: receipt.package_tree_digest.clone(),
+            delivered_bytes: receipt.delivered_bytes,
+            completion_receipt_digest: receipt.completion_receipt_digest.clone(),
+            delivered_to: completed.payload.destination_scope.clone(),
+            delivered_at: now()?,
+            watermark_at_delivery: watermark,
+            revoked: false,
+            revocation_notice_sent: false,
+            remote_erasure_disclaimer: REMOTE_ERASURE_DISCLAIMER.into(),
+        },
+    };
+    Ok((completed, audit))
 }
 
 pub fn package_dependency_ref_id(dependency: &PackageDependency) -> Result<String> {

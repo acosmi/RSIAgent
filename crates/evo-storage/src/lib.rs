@@ -509,6 +509,7 @@ pub enum ManagementResultV2 {
     Backup(ManagementBackupResultV2),
     Budget(ManagementBudgetResultV2),
     Import(ManagementImportResultV2),
+    AssetExport(ManagementAssetExportResultV2),
 }
 
 /// Closed management results of the four budget operations. They carry only
@@ -621,6 +622,59 @@ pub enum ManagementImportResultState {
     Complete,
     Partial,
     Failed,
+}
+
+/// Closed management results of the six asset/local-export operations. Each
+/// variant is bound to the physical operation that produced it and carries
+/// only identifiers, digests, bounded counters and a closed state: never
+/// member content, physical roots, paths, redaction snippets or fee claims.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementAssetExportResultV2 {
+    AssetStaged {
+        staged_asset_id: String,
+        manifest_digest: String,
+        content_blob_digest: String,
+        content_bytes: u64,
+        state: ManagementAssetExportState,
+    },
+    AssetAborted {
+        staged_asset_id: String,
+        state: ManagementAssetExportState,
+    },
+    AssetHandedOff {
+        staged_asset_id: String,
+        candidate_id: String,
+    },
+    ExportPrepared {
+        export_id: String,
+        staged_asset_id: String,
+        package_tree_digest: String,
+        delivered_bytes: u64,
+    },
+    ExportCompleted {
+        export_id: String,
+        staged_asset_id: String,
+        package_tree_digest: String,
+        delivered_bytes: u64,
+        receipt_digest: String,
+        delivery_audit_id: String,
+    },
+    ExportAborted {
+        export_id: String,
+        state: ManagementAssetExportState,
+    },
+}
+
+/// The closed state a staged asset or export attempt reports to a management
+/// result. `Staged`/`Quarantined` belong to a staged asset; `Aborted` to a
+/// closed staged asset or export attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementAssetExportState {
+    Staged,
+    Quarantined,
+    Aborted,
 }
 
 /// The server-derived location of one namespace-scoped registered blob. The
@@ -1028,6 +1082,30 @@ fn budget_result_binding_is_valid(job: &ManagementJobV2) -> bool {
     }
 }
 
+fn asset_export_result_binding_is_valid(job: &ManagementJobV2) -> bool {
+    let Some(ManagementResultV2::AssetExport(result)) = job.result.as_ref() else {
+        return true;
+    };
+    match result {
+        ManagementAssetExportResultV2::AssetStaged { state, .. } => {
+            job.operation == "asset.stage"
+                && matches!(
+                    state,
+                    ManagementAssetExportState::Staged | ManagementAssetExportState::Quarantined
+                )
+        }
+        ManagementAssetExportResultV2::AssetAborted { state, .. } => {
+            job.operation == "asset.abort" && *state == ManagementAssetExportState::Aborted
+        }
+        ManagementAssetExportResultV2::AssetHandedOff { .. } => job.operation == "asset.handoff",
+        ManagementAssetExportResultV2::ExportPrepared { .. } => job.operation == "export.prepare",
+        ManagementAssetExportResultV2::ExportCompleted { .. } => job.operation == "export.complete",
+        ManagementAssetExportResultV2::ExportAborted { state, .. } => {
+            job.operation == "export.abort" && *state == ManagementAssetExportState::Aborted
+        }
+    }
+}
+
 fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
     let invalid_shape = || Error::Conflict("management_job_invalid_shape".into());
     let schema = value
@@ -1070,6 +1148,7 @@ fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
                 ) && job.operation != "import.execute")
                 || (matches!(job.result, Some(ManagementResultV2::Import(_)))
                     && !matches!(job.operation.as_str(), "import.register" | "import.execute"))
+                || !asset_export_result_binding_is_valid(&job)
                 || !budget_result_binding_is_valid(&job)
             {
                 return Err(invalid_shape());
@@ -1193,6 +1272,18 @@ pub struct RegisteredBlobPublishPlan {
     max_bytes: usize,
     existing_identity: Option<BlobFileIdentity>,
     dependencies: LocalExportDependencySnapshot,
+}
+
+/// The narrow physical fence of one management job claim. A local export
+/// publication or abort verifies it in the same transaction, before its first
+/// DML and filesystem effect, so an old generation/lease/owner cannot publish
+/// or delete what a newer owner owns.
+#[derive(Debug, Clone, Copy)]
+pub struct ManagementJobFence<'a> {
+    pub job_id: &'a str,
+    pub operation: &'a str,
+    pub generation: u64,
+    pub lease_token: &'a str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3181,65 +3272,64 @@ impl Store {
         {
             return Err(Error::Forbidden);
         }
-        let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
-        let receipt =
-            local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
         let mut session = self.registered_blob_write_session().await?;
-        self.verify_prevalidated_dependency_identities(ctx, dependencies)
+        let receipt = self
+            .publish_registered_local_export_in_session(
+                ctx,
+                &mut session,
+                export_id,
+                files,
+                completed_attempt,
+                delivery_audit,
+                dependencies,
+                None,
+            )
             .await?;
-        if session
-            .revocation_dependency(ctx, "artifact", export_id)
-            .await?
-            .is_some()
+        session.commit().await?;
+        Ok(receipt)
+    }
+
+    /// The same publication as [`Self::publish_registered_local_export`] but in
+    /// the caller's request publication transaction: no second Session and no
+    /// commit. The optional management job fence is judged before the first DML
+    /// and the first filesystem effect.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_registered_local_export_in_session(
+        &self,
+        ctx: &Context,
+        session: &mut Session,
+        export_id: &str,
+        files: &[LocalExportFile],
+        completed_attempt: &Value,
+        delivery_audit: &Value,
+        dependencies: &LocalExportDependencySnapshot,
+        fence: Option<&ManagementJobFence<'_>>,
+    ) -> Result<LocalExportReceipt> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        session.require_request_publication("local export publication")?;
+        validate_export_id(export_id)?;
+        if dependencies.plan.namespace != ctx.namespace()
+            || dependencies.plan.export_id != export_id
         {
             return Err(Error::Forbidden);
         }
-        let attempt: Value = session.need(ctx, "artifact", export_id).await?;
-        validate_local_export_attempt(ctx, export_id, &attempt, &receipt, "prepared")?;
-        let expected_watermark = attempt["revoke_watermark"]
-            .as_u64()
-            .ok_or_else(|| Error::Conflict("export attempt lacks watermark".into()))?;
-        let actual_watermark = session
-            .watermark(ctx)
-            .await?
-            .and_then(|(sequence, _)| u64::try_from(sequence).ok())
-            .ok_or_else(|| Error::Conflict("current watermark is unavailable".into()))?;
-        if actual_watermark != expected_watermark {
-            return Err(Error::Conflict("export watermark changed".into()));
+        if let Some(fence) = fence {
+            session.ensure_management_job_fence(ctx, fence).await?;
         }
-        let refs = attempt["source_refs"]
-            .as_array()
-            .ok_or_else(|| Error::Conflict("export attempt lacks source_refs".into()))?;
-        verify_export_source_refs(&mut session, ctx, refs).await?;
-        verify_dependency_snapshot_in_session(&mut session, ctx, dependencies).await?;
-        validate_local_export_completion(
+        let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
+        let receipt =
+            local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
+        self.validate_local_export_completion_for_publish(
             ctx,
+            session,
             export_id,
             completed_attempt,
             delivery_audit,
+            dependencies,
             &receipt,
-            actual_watermark,
-        )?;
-        if completed_attempt["input_digest"] != attempt["input_digest"]
-            || completed_attempt["source_refs"] != attempt["source_refs"]
-            || completed_attempt["revoke_watermark"] != attempt["revoke_watermark"]
-            || delivery_audit["source_refs"] != attempt["source_refs"]
-            || delivery_audit["revoke_watermark"] != attempt["revoke_watermark"]
-        {
-            return Err(Error::Conflict(
-                "local export completion changed its source closure".into(),
-            ));
-        }
-        let mut expected_completed = attempt.clone();
-        expected_completed["updated_at"] = completed_attempt["updated_at"].clone();
-        expected_completed["payload"]["state"] = Value::String("completed".into());
-        expected_completed["payload"]["delivery_audit_id"] =
-            completed_attempt["payload"]["delivery_audit_id"].clone();
-        expected_completed["payload"]["completion_receipt_digest"] =
-            completed_attempt["payload"]["completion_receipt_digest"].clone();
-        if expected_completed != *completed_attempt {
-            return Err(Error::Conflict("completed export content differs".into()));
-        }
+        )
+        .await?;
 
         let namespace_hash = hash(ctx.namespace().as_bytes());
         let staging_root = self.root.join(".export-staging");
@@ -3299,6 +3389,12 @@ impl Store {
         }
 
         if preverified_final.is_none() {
+            // The freeze requires the real fence before the first filesystem
+            // effect and again immediately before the final rename, so a
+            // lease that expired during staging cannot publish.
+            if let Some(fence) = fence {
+                session.ensure_management_job_fence(ctx, fence).await?;
+            }
             if !publish_blob_no_replace(staging.path(), &final_path)? {
                 return Err(Error::Conflict(
                     "local export target raced after write fence".into(),
@@ -3313,6 +3409,164 @@ impl Store {
             }
         }
 
+        self.commit_local_export_rows_in_session(
+            ctx,
+            session,
+            export_id,
+            completed_attempt,
+            delivery_audit,
+        )
+        .await?;
+        Ok(receipt)
+    }
+
+    /// Complete a delivery whose tree was already published but whose SQL
+    /// completion did not commit. It never stages, renames or rewrites files:
+    /// the existing directory must already be exactly the expected tree, and
+    /// only the attempt, delivery audit, edges and audit record are written in
+    /// the caller's transaction.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn recover_registered_local_export_in_session(
+        &self,
+        ctx: &Context,
+        session: &mut Session,
+        export_id: &str,
+        files: &[LocalExportFile],
+        completed_attempt: &Value,
+        delivery_audit: &Value,
+        dependencies: &LocalExportDependencySnapshot,
+    ) -> Result<LocalExportReceipt> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        session.require_request_publication("local export recovery")?;
+        validate_export_id(export_id)?;
+        if dependencies.plan.namespace != ctx.namespace()
+            || dependencies.plan.export_id != export_id
+        {
+            return Err(Error::Forbidden);
+        }
+        let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
+        let receipt =
+            local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
+        self.validate_local_export_completion_for_publish(
+            ctx,
+            session,
+            export_id,
+            completed_attempt,
+            delivery_audit,
+            dependencies,
+            &receipt,
+        )
+        .await?;
+        let final_path = self.local_export_directory(ctx, export_id)?;
+        if !tokio::fs::try_exists(&final_path).await.map_err(internal)? {
+            return Err(Error::Conflict("published local export is missing".into()));
+        }
+        if verify_local_export_directory(&final_path, files).await?
+            != (receipt.package_tree_digest.clone(), receipt.delivered_bytes)
+        {
+            return Err(Error::Conflict("published local export differs".into()));
+        }
+        let identity = local_export_identity(&final_path).await?;
+        if local_export_identity(&final_path).await? != identity {
+            return Err(Error::Conflict(
+                "published local export identity changed".into(),
+            ));
+        }
+        self.commit_local_export_rows_in_session(
+            ctx,
+            session,
+            export_id,
+            completed_attempt,
+            delivery_audit,
+        )
+        .await?;
+        Ok(receipt)
+    }
+
+    /// The shared pre-publication decision of one Prepared local export: its
+    /// pinned dependencies, revocation closure, Prepared attempt, source
+    /// closure, watermark and exact deterministic completion all agree.
+    #[allow(clippy::too_many_arguments)]
+    async fn validate_local_export_completion_for_publish(
+        &self,
+        ctx: &Context,
+        session: &mut Session,
+        export_id: &str,
+        completed_attempt: &Value,
+        delivery_audit: &Value,
+        dependencies: &LocalExportDependencySnapshot,
+        receipt: &LocalExportReceipt,
+    ) -> Result<()> {
+        self.verify_prevalidated_dependency_identities(ctx, dependencies)
+            .await?;
+        if session
+            .revocation_dependency(ctx, "artifact", export_id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Forbidden);
+        }
+        let attempt: Value = session.need(ctx, "artifact", export_id).await?;
+        validate_local_export_attempt(ctx, export_id, &attempt, receipt, "prepared")?;
+        let expected_watermark = attempt["revoke_watermark"]
+            .as_u64()
+            .ok_or_else(|| Error::Conflict("export attempt lacks watermark".into()))?;
+        let actual_watermark = session
+            .watermark(ctx)
+            .await?
+            .and_then(|(sequence, _)| u64::try_from(sequence).ok())
+            .ok_or_else(|| Error::Conflict("current watermark is unavailable".into()))?;
+        if actual_watermark != expected_watermark {
+            return Err(Error::Conflict("export watermark changed".into()));
+        }
+        let refs = attempt["source_refs"]
+            .as_array()
+            .ok_or_else(|| Error::Conflict("export attempt lacks source_refs".into()))?;
+        verify_export_source_refs(session, ctx, refs).await?;
+        verify_dependency_snapshot_in_session(session, ctx, dependencies).await?;
+        validate_local_export_completion(
+            ctx,
+            export_id,
+            completed_attempt,
+            delivery_audit,
+            receipt,
+            actual_watermark,
+        )?;
+        if completed_attempt["input_digest"] != attempt["input_digest"]
+            || completed_attempt["source_refs"] != attempt["source_refs"]
+            || completed_attempt["revoke_watermark"] != attempt["revoke_watermark"]
+            || delivery_audit["source_refs"] != attempt["source_refs"]
+            || delivery_audit["revoke_watermark"] != attempt["revoke_watermark"]
+        {
+            return Err(Error::Conflict(
+                "local export completion changed its source closure".into(),
+            ));
+        }
+        let mut expected_completed = attempt.clone();
+        expected_completed["updated_at"] = completed_attempt["updated_at"].clone();
+        expected_completed["payload"]["state"] = Value::String("completed".into());
+        expected_completed["payload"]["delivery_audit_id"] =
+            completed_attempt["payload"]["delivery_audit_id"].clone();
+        expected_completed["payload"]["completion_receipt_digest"] =
+            completed_attempt["payload"]["completion_receipt_digest"].clone();
+        if expected_completed != *completed_attempt {
+            return Err(Error::Conflict("completed export content differs".into()));
+        }
+        Ok(())
+    }
+
+    /// Write the completed attempt, its delivery audit and both edges in the
+    /// caller's transaction. The audit record is idempotent under the same
+    /// deterministic id and exact content.
+    async fn commit_local_export_rows_in_session(
+        &self,
+        ctx: &Context,
+        session: &mut Session,
+        export_id: &str,
+        completed_attempt: &Value,
+        delivery_audit: &Value,
+    ) -> Result<()> {
         let audit_id = delivery_audit["id"]
             .as_str()
             .ok_or_else(|| Error::Conflict("delivery audit lacks id".into()))?;
@@ -3335,8 +3589,7 @@ impl Store {
             .put_edge(ctx, "artifact", export_id, "artifact", audit_id)
             .await?;
         session.audit(ctx, "e16.export.complete", export_id).await?;
-        session.commit().await?;
-        Ok(receipt)
+        Ok(())
     }
 
     pub async fn verify_registered_local_export(
@@ -3403,6 +3656,107 @@ impl Store {
         Ok(receipt)
     }
 
+    /// Re-verify a completed local export in the caller's transaction with
+    /// already prevalidated dependencies. No commit and no filesystem write.
+    #[doc(hidden)]
+    pub async fn verify_registered_local_export_in_session(
+        &self,
+        ctx: &Context,
+        session: &mut Session,
+        export_id: &str,
+        files: &[LocalExportFile],
+        dependencies: &LocalExportDependencySnapshot,
+    ) -> Result<LocalExportReceipt> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        validate_export_id(export_id)?;
+        if dependencies.plan.namespace != ctx.namespace()
+            || dependencies.plan.export_id != export_id
+        {
+            return Err(Error::Forbidden);
+        }
+        let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
+        let receipt =
+            local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
+        let path = self.local_export_directory(ctx, export_id)?;
+        if verify_local_export_directory(&path, files).await?
+            != (receipt.package_tree_digest.clone(), receipt.delivered_bytes)
+        {
+            return Err(Error::Conflict(
+                "completed local export is unavailable".into(),
+            ));
+        }
+        let identity = local_export_identity(&path).await?;
+        if local_export_identity(&path).await? != identity {
+            return Err(Error::Conflict(
+                "completed local export identity changed".into(),
+            ));
+        }
+        self.verify_prevalidated_dependency_identities(ctx, dependencies)
+            .await?;
+        if session
+            .revocation_dependency(ctx, "artifact", export_id)
+            .await?
+            .is_some()
+        {
+            return Err(Error::Forbidden);
+        }
+        let attempt: Value = session.need(ctx, "artifact", export_id).await?;
+        validate_local_export_attempt(ctx, export_id, &attempt, &receipt, "completed")?;
+        let watermark = session
+            .watermark(ctx)
+            .await?
+            .and_then(|(sequence, _)| u64::try_from(sequence).ok())
+            .ok_or_else(|| Error::Conflict("current watermark is unavailable".into()))?;
+        if attempt["revoke_watermark"].as_u64() != Some(watermark) {
+            return Err(Error::Conflict("completed export sources are stale".into()));
+        }
+        let refs = attempt["source_refs"]
+            .as_array()
+            .ok_or_else(|| Error::Conflict("completed export lacks source_refs".into()))?;
+        verify_export_source_refs(session, ctx, refs).await?;
+        verify_dependency_snapshot_in_session(session, ctx, dependencies).await?;
+        let audit_id = attempt["payload"]["delivery_audit_id"]
+            .as_str()
+            .ok_or_else(|| Error::Conflict("completed export lacks delivery audit".into()))?;
+        let audit: Value = session.need(ctx, "artifact", audit_id).await?;
+        validate_local_export_completion(ctx, export_id, &attempt, &audit, &receipt, watermark)?;
+        Ok(receipt)
+    }
+
+    /// Whether the formal directory of one local export already exists and, if
+    /// so, whether it is exactly `files`. `None` proves the tree is absent; a
+    /// `Conflict` proves it exists with different content/identity. Callers use
+    /// this to distinguish "never published" from "published but unverified".
+    pub async fn inspect_registered_local_export_tree(
+        &self,
+        ctx: &Context,
+        export_id: &str,
+        files: &[LocalExportFile],
+    ) -> Result<Option<LocalExportReceipt>> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        validate_export_id(export_id)?;
+        let (tree_digest, delivered_bytes) = local_export_tree_digest(files)?;
+        let receipt =
+            local_export_receipt(ctx.namespace(), export_id, &tree_digest, delivered_bytes)?;
+        let path = self.local_export_directory(ctx, export_id)?;
+        if !tokio::fs::try_exists(&path).await.map_err(internal)? {
+            return Ok(None);
+        }
+        if verify_local_export_directory(&path, files).await?
+            != (receipt.package_tree_digest.clone(), receipt.delivered_bytes)
+        {
+            return Err(Error::Conflict("published local export differs".into()));
+        }
+        let _guard = self.blob_lock.read().await;
+        let identity = local_export_identity(&path).await?;
+        if local_export_identity(&path).await? != identity {
+            return Err(Error::Conflict(
+                "published local export identity changed".into(),
+            ));
+        }
+        Ok(Some(receipt))
+    }
+
     pub async fn abort_registered_local_export(
         &self,
         ctx: &Context,
@@ -3411,8 +3765,37 @@ impl Store {
     ) -> Result<()> {
         ctx.require(&[evo_core::Role::Admin])?;
         validate_export_id(export_id)?;
-        let _guard = self.blob_lock.write().await;
-        let mut session = self.session().await?;
+        let mut session = self.registered_blob_write_session().await?;
+        self.abort_registered_local_export_in_session(
+            ctx,
+            &mut session,
+            export_id,
+            aborted_attempt,
+            None,
+        )
+        .await?;
+        session.commit().await
+    }
+
+    /// Abort one Prepared local export in the caller's request publication
+    /// transaction. No Session, lock or commit of its own; the optional
+    /// management job fence is judged before the first DML. A tree that already
+    /// exists is never deleted: it must be recovered, not aborted.
+    #[doc(hidden)]
+    pub async fn abort_registered_local_export_in_session(
+        &self,
+        ctx: &Context,
+        session: &mut Session,
+        export_id: &str,
+        aborted_attempt: &Value,
+        fence: Option<&ManagementJobFence<'_>>,
+    ) -> Result<()> {
+        ctx.require(&[evo_core::Role::Admin])?;
+        session.require_request_publication("local export abort")?;
+        validate_export_id(export_id)?;
+        if let Some(fence) = fence {
+            session.ensure_management_job_fence(ctx, fence).await?;
+        }
         let fenced = sqlx::query(
             "UPDATE objects SET revision=revision WHERE namespace=? AND kind='artifact' AND id=?",
         )
@@ -3450,7 +3833,7 @@ impl Store {
             .put(ctx, "artifact", export_id, ctx.actor(), aborted_attempt)
             .await?;
         session.audit(ctx, "e16.export.abort", export_id).await?;
-        session.commit().await
+        Ok(())
     }
 
     /// Stage the frozen candidate of one `reviewed` trace export record. The
@@ -3708,6 +4091,48 @@ impl Store {
     }
 }
 impl Session {
+    fn require_request_publication(&self, what: &str) -> Result<()> {
+        if self.blob_write.is_none() {
+            return Err(Error::Conflict(format!(
+                "{what} requires the request publication session"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The narrow physical management-job fence: the persisted job row is the
+    /// same owner/operation/generation/lease this worker claimed, still
+    /// Running, and its lease has not expired. Read-only.
+    #[doc(hidden)]
+    pub async fn ensure_management_job_fence(
+        &mut self,
+        ctx: &Context,
+        fence: &ManagementJobFence<'_>,
+    ) -> Result<()> {
+        identifier(fence.job_id)?;
+        identifier(fence.operation)?;
+        identifier(fence.lease_token)?;
+        let row = self
+            .object_row(ctx, "job", fence.job_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        let record = decode_management_job(&row.body)?;
+        let identity = record.identity();
+        if row.owner != ctx.actor()
+            || identity.id != fence.job_id
+            || identity.operation != fence.operation
+            || identity.owner_actor != ctx.actor()
+            || identity.owner_role != ctx.role()
+            || identity.state != ManagementJobState::Running
+            || record.generation() != fence.generation
+            || identity.lease_token != Some(fence.lease_token)
+            || identity.lease_until <= now()?
+        {
+            return Err(Error::Conflict("management job lease fence changed".into()));
+        }
+        Ok(())
+    }
+
     /// Re-read every physical dependency blob under this request's blob lock,
     /// before registering any Prepared envelope. All intermediate kinds count.
     #[doc(hidden)]
