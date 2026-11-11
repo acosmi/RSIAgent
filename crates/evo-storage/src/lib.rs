@@ -4281,11 +4281,11 @@ impl Session {
                 } else {
                     // Recompute the tail row itself: the cached digest must
                     // still be the row's stored digest and bind its
-                    // `previous_hash` and payload. This rejects a changed
-                    // link, digest or payload without re-hashing the prefix.
-                    // Oversized tails fall through to the full walk.
-                    let tail: Option<(String, String, i64, String)> = sqlx::query_as(
-                        "SELECT previous_hash,digest,length(CAST(payload AS BLOB)),substr(payload,1,65537) FROM audit WHERE namespace=? AND seq=?",
+                    // `previous_hash` and payload. Byte operations keep
+                    // embedded NULs visible, so a TEXT tail cannot hide bytes
+                    // from the hash. Oversized tails fall to the full walk.
+                    let tail: Option<(String, String, i64, Vec<u8>)> = sqlx::query_as(
+                        "SELECT previous_hash,digest,length(CAST(payload AS BLOB)),substr(CAST(payload AS BLOB),1,65537) FROM audit WHERE namespace=? AND seq=?",
                     )
                     .bind(ctx.namespace())
                     .bind(state.watermark)
@@ -4296,7 +4296,15 @@ impl Session {
                         previous == state.previous
                             && digest == state.digest
                             && payload_bytes <= 64 * 1024
-                            && hash(format!("{previous}\n{payload}").as_bytes()) == state.digest
+                            && usize::try_from(payload_bytes).ok() == Some(payload.len())
+                            && {
+                                let mut authenticated =
+                                    Vec::with_capacity(previous.len() + 1 + payload.len());
+                                authenticated.extend_from_slice(previous.as_bytes());
+                                authenticated.push(b'\n');
+                                authenticated.extend_from_slice(&payload);
+                                hash(&authenticated) == state.digest
+                            }
                     })
                 };
                 link_is_current.then_some(state)

@@ -110,26 +110,35 @@ async fn assert_tail_tamper_is_rejected(field: &str) {
     session.audit(&admin, &op, &value).await.unwrap();
     session.commit().await.unwrap();
     assert!(witness(&store, &reader, &op, &value).await);
-    let (statement, replacement) = match field {
+    let (statement, replacement): (&str, Option<String>) = match field {
         "previous_hash" => (
             "UPDATE audit SET previous_hash=? WHERE namespace=? AND seq=(SELECT MAX(seq) FROM audit WHERE namespace=?)",
-            hash(b"wrong previous link"),
+            Some(hash(b"wrong previous link")),
         ),
         "digest" => (
             "UPDATE audit SET digest=? WHERE namespace=? AND seq=(SELECT MAX(seq) FROM audit WHERE namespace=?)",
-            hash(b"wrong digest"),
+            Some(hash(b"wrong digest")),
         ),
         "payload" => (
             "UPDATE audit SET payload=? WHERE namespace=? AND seq=(SELECT MAX(seq) FROM audit WHERE namespace=?)",
-            "{\"wrong\":true}".to_owned(),
+            Some("{\"wrong\":true}".to_owned()),
+        ),
+        // SQLite TEXT functions see only the prefix before an embedded NUL;
+        // appending one must still be rejected by the byte-wise guard.
+        "payload_nul" => (
+            "UPDATE audit SET payload=payload||char(0)||'x' WHERE namespace=? AND seq=(SELECT MAX(seq) FROM audit WHERE namespace=?)",
+            None,
         ),
         other => panic!("unknown tail field {other}"),
     };
     let mut connection = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
         .await
         .unwrap();
-    sqlx::query(statement)
-        .bind(replacement)
+    let mut query = sqlx::query(statement);
+    if let Some(replacement) = replacement {
+        query = query.bind(replacement);
+    }
+    query
         .bind("ns-a")
         .bind("ns-a")
         .execute(&mut connection)
@@ -161,4 +170,9 @@ async fn witness_prefix_rechecks_the_tail_digest() {
 #[tokio::test]
 async fn witness_prefix_rechecks_the_tail_payload() {
     assert_tail_tamper_is_rejected("payload").await;
+}
+
+#[tokio::test]
+async fn witness_prefix_rechecks_the_tail_payload_with_nul() {
+    assert_tail_tamper_is_rejected("payload_nul").await;
 }
