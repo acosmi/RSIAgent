@@ -802,6 +802,11 @@ impl Session {
             DevelopmentCycle => development_cycles(&mut self.tx).await,
             FailureRecord => failure_records(&mut self.tx).await,
             ConcurrentOptimizationJob => active_optimization_jobs(&mut self.tx).await,
+            // Trace export records keep a redacted history slot, so this uses
+            // the same cross-namespace counter as the producer's own write
+            // gate instead of the occupants() path, which frees lawful
+            // redactions.
+            TraceExport => crate::count_trace_exports_all_namespaces(&mut self.tx).await,
             // Prepare slots live in the Store guard; owner-scoped items are
             // admitted against their owner; the rest have no producer yet.
             _ => Ok(0),
