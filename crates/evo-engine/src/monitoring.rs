@@ -2188,6 +2188,9 @@ impl MonitoringCoordinator {
         scope_id: &str,
         reason: &str,
     ) -> Result<EnvironmentDriftRecord> {
+        // Preserve the original public error ordering: authority and input
+        // shape were judged before a Session was opened. The in-session kernel
+        // repeats the checks for the management handler path.
         ctx.require(&[Role::Admin])?;
         for value in [previous_environment_id, current_environment_id, scope_id] {
             identifier(value)?;
@@ -2196,6 +2199,42 @@ impl MonitoringCoordinator {
             return Err(Error::Invalid("drift reason must be 1..=512 bytes".into()));
         }
         let mut session = store.session().await?;
+        let drift = Self::record_environment_drift_in_session(
+            ctx,
+            &mut session,
+            previous_environment_id,
+            current_environment_id,
+            scope_id,
+            reason,
+        )
+        .await?;
+        session.commit().await?;
+        Ok(drift)
+    }
+
+    /// The drift writer composed into a caller-owned transaction: the
+    /// management handler writes the drift, the scope invalidation, the two
+    /// environment edges, the audit record and its job terminal state in one
+    /// commit. Both environments and their actual run/application/execution
+    /// source closures, the revoke watermark, the namespace and the stored
+    /// scope index are re-read and re-checked in this session before its first
+    /// write. The public entry above keeps the original open-session/commit
+    /// behaviour.
+    pub(crate) async fn record_environment_drift_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        previous_environment_id: &str,
+        current_environment_id: &str,
+        scope_id: &str,
+        reason: &str,
+    ) -> Result<EnvironmentDriftRecord> {
+        ctx.require(&[Role::Admin])?;
+        for value in [previous_environment_id, current_environment_id, scope_id] {
+            identifier(value)?;
+        }
+        if reason.is_empty() || reason.len() > 512 {
+            return Err(Error::Invalid("drift reason must be 1..=512 bytes".into()));
+        }
         let previous: LoadedEnvironment = session
             .need(ctx, ARTIFACT_KIND, previous_environment_id)
             .await?;
@@ -2204,12 +2243,16 @@ impl MonitoringCoordinator {
             .await?;
         validate_environment_record(&previous)?;
         validate_environment_record(&current)?;
-        validate_environment_live(&mut session, ctx, &previous).await?;
-        validate_environment_live(&mut session, ctx, &current).await?;
+        validate_environment_live(session, ctx, &previous).await?;
+        validate_environment_live(session, ctx, &current).await?;
         if previous.identity_digest == current.identity_digest {
             return Err(Error::Conflict("environment identity did not drift".into()));
         }
         let mut index: ConsolidationScopeIndex = session.need(ctx, ARTIFACT_KIND, scope_id).await?;
+        validate_scope_index(&index)?;
+        if index.scope.namespace != ctx.namespace() {
+            return Err(Error::Forbidden);
+        }
         if index.scope.environment_identity_digest != previous.identity_digest {
             return Err(Error::Conflict(
                 "drift does not describe the persisted scope environment".into(),
@@ -2236,7 +2279,6 @@ impl MonitoringCoordinator {
             if fingerprint(&existing)? != fingerprint(&drift)? {
                 return Err(Error::Conflict("environment drift id changed".into()));
             }
-            session.commit().await?;
             return Ok(existing);
         }
         if let Some(old) = &index.invalidated_by
@@ -2250,7 +2292,7 @@ impl MonitoringCoordinator {
         session
             .put(ctx, ARTIFACT_KIND, scope_id, ctx.actor(), &index)
             .await?;
-        put_immutable(&mut session, ctx, &id, &drift).await?;
+        put_immutable(session, ctx, &id, &drift).await?;
         for environment_id in [previous_environment_id, current_environment_id] {
             session
                 .put_edge(ctx, ARTIFACT_KIND, &id, ARTIFACT_KIND, environment_id)
@@ -2259,7 +2301,6 @@ impl MonitoringCoordinator {
         session
             .audit(ctx, "monitoring.environment.drift", &id)
             .await?;
-        session.commit().await?;
         Ok(drift)
     }
 }

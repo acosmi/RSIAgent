@@ -510,6 +510,22 @@ pub enum ManagementResultV2 {
     Budget(ManagementBudgetResultV2),
     Import(ManagementImportResultV2),
     AssetExport(ManagementAssetExportResultV2),
+    Monitoring(ManagementMonitoringResultV2),
+}
+
+/// Closed management results of the monitoring operations. A result carries
+/// only the committed monitoring identifiers (the drift and its two
+/// environments/scope); never the diagnostic reason text, an environment
+/// snapshot, a source or a physical path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementMonitoringResultV2 {
+    EnvironmentDriftRecorded {
+        drift_id: String,
+        previous_environment_id: String,
+        current_environment_id: String,
+        invalidated_scope_id: String,
+    },
 }
 
 /// Closed management results of the four budget operations. They carry only
@@ -1106,6 +1122,14 @@ fn asset_export_result_binding_is_valid(job: &ManagementJobV2) -> bool {
     }
 }
 
+fn monitoring_result_binding_is_valid(job: &ManagementJobV2) -> bool {
+    let Some(ManagementResultV2::Monitoring(result)) = job.result.as_ref() else {
+        return true;
+    };
+    let ManagementMonitoringResultV2::EnvironmentDriftRecorded { .. } = result;
+    job.operation == "monitoring.drift.record"
+}
+
 fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
     let invalid_shape = || Error::Conflict("management_job_invalid_shape".into());
     let schema = value
@@ -1149,6 +1173,7 @@ fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
                 || (matches!(job.result, Some(ManagementResultV2::Import(_)))
                     && !matches!(job.operation.as_str(), "import.register" | "import.execute"))
                 || !asset_export_result_binding_is_valid(&job)
+                || !monitoring_result_binding_is_valid(&job)
                 || !budget_result_binding_is_valid(&job)
             {
                 return Err(invalid_shape());
