@@ -4276,14 +4276,13 @@ impl Session {
                 let link_is_current = if state.watermark == 0 {
                     true
                 } else {
-                    let digest: Option<String> = sqlx::query_scalar(
-                        "SELECT digest FROM audit WHERE namespace=? AND seq=?",
-                    )
-                    .bind(ctx.namespace())
-                    .bind(state.watermark)
-                    .fetch_optional(&mut *self.tx)
-                    .await
-                    .map_err(internal)?;
+                    let digest: Option<String> =
+                        sqlx::query_scalar("SELECT digest FROM audit WHERE namespace=? AND seq=?")
+                            .bind(ctx.namespace())
+                            .bind(state.watermark)
+                            .fetch_optional(&mut *self.tx)
+                            .await
+                            .map_err(internal)?;
                     digest.as_deref() == Some(state.digest.as_str())
                 };
                 link_is_current.then_some(state)
@@ -4298,7 +4297,8 @@ impl Session {
             // An incremental prefix may have been truncated or replaced. The
             // full walk re-checks every link and yields the same judgement.
             Err(_) if start.is_some() => {
-                self.walk_audit(ctx, count, watermark, None, &subject).await?
+                self.walk_audit(ctx, count, watermark, None, &subject)
+                    .await?
             }
             Err(error) => return Err(error),
         };
@@ -4333,9 +4333,7 @@ impl Session {
         let count: i64 = snapshot.try_get("row_count").map_err(internal)?;
         let watermark: i64 = snapshot.try_get("watermark").map_err(internal)?;
         if count < 0 || watermark < 0 {
-            return Err(Error::Conflict(
-                "audit chain or payload mismatch".into(),
-            ));
+            return Err(Error::Conflict("audit chain or payload mismatch".into()));
         }
         Ok((count, watermark))
     }
@@ -4368,7 +4366,9 @@ impl Session {
         let mut scanned = start.map(|state| state.count).unwrap_or(0);
         let mut after = start.map(|state| state.watermark).unwrap_or(0);
         let mut previous = start.map(|state| state.digest.clone()).unwrap_or_default();
-        let mut witnesses = start.map(|state| state.witnesses.clone()).unwrap_or_default();
+        let mut witnesses = start
+            .map(|state| state.witnesses.clone())
+            .unwrap_or_default();
         let mut service_facts = Vec::new();
         let mut previous_row: Option<(i64, String, evo_core::Role, String, String, String)> = None;
         loop {

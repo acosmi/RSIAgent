@@ -33,9 +33,7 @@ async fn witness(store: &Store, reader: &Context, op: &str, value: &str) -> bool
 #[tokio::test]
 async fn witness_prefix_keeps_the_latest_row_across_sessions() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("rsia.sqlite3"))
-        .await
-        .unwrap();
+    let store = Store::open(&dir.path().join("rsia.sqlite3")).await.unwrap();
     let admin = ctx("ns-a", "admin", Role::Admin);
     let reader = ctx("ns-a", "worker", Role::Worker);
     let op = operation("ns-a", "artifact", "host");
@@ -60,9 +58,7 @@ async fn witness_prefix_keeps_the_latest_row_across_sessions() {
 #[tokio::test]
 async fn witness_prefix_is_invalidated_by_a_rolled_back_append() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("rsia.sqlite3"))
-        .await
-        .unwrap();
+    let store = Store::open(&dir.path().join("rsia.sqlite3")).await.unwrap();
     let admin = ctx("ns-a", "admin", Role::Admin);
     let reader = ctx("ns-a", "worker", Role::Worker);
     let op = operation("ns-a", "artifact", "profile");
@@ -85,9 +81,7 @@ async fn witness_prefix_is_invalidated_by_a_rolled_back_append() {
 #[tokio::test]
 async fn witness_prefix_is_namespace_scoped() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(&dir.path().join("rsia.sqlite3"))
-        .await
-        .unwrap();
+    let store = Store::open(&dir.path().join("rsia.sqlite3")).await.unwrap();
     let admin = ctx("ns-a", "admin", Role::Admin);
     let reader_a = ctx("ns-a", "worker-a", Role::Worker);
     let reader_b = ctx("ns-b", "worker-b", Role::Worker);
