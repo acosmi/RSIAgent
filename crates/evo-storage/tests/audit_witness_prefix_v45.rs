@@ -96,33 +96,45 @@ async fn witness_prefix_is_namespace_scoped() {
     store.close().await;
 }
 
-#[tokio::test]
-async fn witness_prefix_rechecks_the_tail_like_a_broken_chain() {
+/// Warm the prefix, then corrupt exactly one tail field while the Store stays
+/// open. The next witness read must fall back to the full walk and reject it.
+async fn assert_tail_tamper_is_rejected(field: &str) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rsia.sqlite3");
     let store = Store::open(&path).await.unwrap();
     let admin = ctx("ns-a", "admin", Role::Admin);
     let reader = ctx("ns-a", "worker", Role::Worker);
     let op = operation("ns-a", "artifact", "host");
-    let value = entity("ns-a", "artifact", "host", "tail");
+    let value = entity("ns-a", "artifact", "host", field);
     let mut session = store.session().await.unwrap();
     session.audit(&admin, &op, &value).await.unwrap();
     session.commit().await.unwrap();
-    // Warm the verified prefix, then break only the tail row's link while the
-    // same Store stays open. A prefix hit must not skip this check.
     assert!(witness(&store, &reader, &op, &value).await);
+    let (statement, replacement) = match field {
+        "previous_hash" => (
+            "UPDATE audit SET previous_hash=? WHERE namespace=? AND seq=(SELECT MAX(seq) FROM audit WHERE namespace=?)",
+            hash(b"wrong previous link"),
+        ),
+        "digest" => (
+            "UPDATE audit SET digest=? WHERE namespace=? AND seq=(SELECT MAX(seq) FROM audit WHERE namespace=?)",
+            hash(b"wrong digest"),
+        ),
+        "payload" => (
+            "UPDATE audit SET payload=? WHERE namespace=? AND seq=(SELECT MAX(seq) FROM audit WHERE namespace=?)",
+            "{\"wrong\":true}".to_owned(),
+        ),
+        other => panic!("unknown tail field {other}"),
+    };
     let mut connection = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
         .await
         .unwrap();
-    sqlx::query(
-        "UPDATE audit SET previous_hash=? WHERE namespace=? AND seq=(SELECT MAX(seq) FROM audit WHERE namespace=?)",
-    )
-    .bind(hash(b"wrong previous link"))
-    .bind("ns-a")
-    .bind("ns-a")
-    .execute(&mut connection)
-    .await
-    .unwrap();
+    sqlx::query(statement)
+        .bind(replacement)
+        .bind("ns-a")
+        .bind("ns-a")
+        .execute(&mut connection)
+        .await
+        .unwrap();
     connection.close().await.unwrap();
     let mut session = store.session().await.unwrap();
     let matched = session
@@ -131,7 +143,22 @@ async fn witness_prefix_rechecks_the_tail_like_a_broken_chain() {
     session.commit().await.unwrap();
     assert!(
         matches!(matched, Err(Error::Conflict(_))),
-        "a warm prefix must re-check the tail link: {matched:?}"
+        "a warm prefix must re-check the tail {field}: {matched:?}"
     );
     store.close().await;
+}
+
+#[tokio::test]
+async fn witness_prefix_rechecks_the_tail_previous_hash() {
+    assert_tail_tamper_is_rejected("previous_hash").await;
+}
+
+#[tokio::test]
+async fn witness_prefix_rechecks_the_tail_digest() {
+    assert_tail_tamper_is_rejected("digest").await;
+}
+
+#[tokio::test]
+async fn witness_prefix_rechecks_the_tail_payload() {
+    assert_tail_tamper_is_rejected("payload").await;
 }

@@ -4279,20 +4279,22 @@ impl Session {
                 let link_is_current = if state.watermark == 0 {
                     true
                 } else {
-                    // Recompute the tail row itself: the cached digest already
-                    // binds its `previous_hash` and payload, so this rejects a
-                    // changed link or payload without re-hashing the prefix.
+                    // Recompute the tail row itself: the cached digest must
+                    // still be the row's stored digest and bind its
+                    // `previous_hash` and payload. This rejects a changed
+                    // link, digest or payload without re-hashing the prefix.
                     // Oversized tails fall through to the full walk.
-                    let tail: Option<(String, i64, String)> = sqlx::query_as(
-                        "SELECT previous_hash,length(CAST(payload AS BLOB)),payload FROM audit WHERE namespace=? AND seq=?",
+                    let tail: Option<(String, String, i64, String)> = sqlx::query_as(
+                        "SELECT previous_hash,digest,length(CAST(payload AS BLOB)),substr(payload,1,65537) FROM audit WHERE namespace=? AND seq=?",
                     )
                     .bind(ctx.namespace())
                     .bind(state.watermark)
                     .fetch_optional(&mut *self.tx)
                     .await
                     .map_err(internal)?;
-                    tail.is_some_and(|(previous, payload_bytes, payload)| {
+                    tail.is_some_and(|(previous, digest, payload_bytes, payload)| {
                         previous == state.previous
+                            && digest == state.digest
                             && payload_bytes <= 64 * 1024
                             && hash(format!("{previous}\n{payload}").as_bytes()) == state.digest
                     })
