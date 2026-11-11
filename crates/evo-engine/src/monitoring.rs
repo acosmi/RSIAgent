@@ -2188,6 +2188,16 @@ impl MonitoringCoordinator {
         scope_id: &str,
         reason: &str,
     ) -> Result<EnvironmentDriftRecord> {
+        // Preserve the original public error ordering: authority and input
+        // shape were judged before a Session was opened. The in-session kernel
+        // repeats the checks for the management handler path.
+        ctx.require(&[Role::Admin])?;
+        for value in [previous_environment_id, current_environment_id, scope_id] {
+            identifier(value)?;
+        }
+        if reason.is_empty() || reason.len() > 512 {
+            return Err(Error::Invalid("drift reason must be 1..=512 bytes".into()));
+        }
         let mut session = store.session().await?;
         let drift = Self::record_environment_drift_in_session(
             ctx,
