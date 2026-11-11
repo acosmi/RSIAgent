@@ -4284,17 +4284,18 @@ impl Session {
                     // `previous_hash` and payload. Byte operations keep
                     // embedded NULs visible, so a TEXT tail cannot hide bytes
                     // from the hash. Oversized tails fall to the full walk.
-                    let tail: Option<(String, String, i64, Vec<u8>)> = sqlx::query_as(
-                        "SELECT previous_hash,digest,length(CAST(payload AS BLOB)),substr(CAST(payload AS BLOB),1,65537) FROM audit WHERE namespace=? AND seq=?",
+                    let tail: Option<(String, String, String, i64, Vec<u8>)> = sqlx::query_as(
+                        "SELECT previous_hash,digest,typeof(payload),length(CAST(payload AS BLOB)),substr(CAST(payload AS BLOB),1,65537) FROM audit WHERE namespace=? AND seq=?",
                     )
                     .bind(ctx.namespace())
                     .bind(state.watermark)
                     .fetch_optional(&mut *self.tx)
                     .await
                     .map_err(internal)?;
-                    tail.is_some_and(|(previous, digest, payload_bytes, payload)| {
+                    tail.is_some_and(|(previous, digest, payload_type, payload_bytes, payload)| {
                         previous == state.previous
                             && digest == state.digest
+                            && payload_type == "text"
                             && payload_bytes <= 64 * 1024
                             && usize::try_from(payload_bytes).ok() == Some(payload.len())
                             && {

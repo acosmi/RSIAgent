@@ -129,6 +129,12 @@ async fn assert_tail_tamper_is_rejected(field: &str) {
             "UPDATE audit SET payload=payload||char(0)||'x' WHERE namespace=? AND seq=(SELECT MAX(seq) FROM audit WHERE namespace=?)",
             None,
         ),
+        // Same bytes, different storage class: the chain walk only accepts a
+        // TEXT payload, so a prefix hit must not accept the BLOB either.
+        "payload_blob" => (
+            "UPDATE audit SET payload=CAST(payload AS BLOB) WHERE namespace=? AND seq=(SELECT MAX(seq) FROM audit WHERE namespace=?)",
+            None,
+        ),
         other => panic!("unknown tail field {other}"),
     };
     let mut connection = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
@@ -175,4 +181,9 @@ async fn witness_prefix_rechecks_the_tail_payload() {
 #[tokio::test]
 async fn witness_prefix_rechecks_the_tail_payload_with_nul() {
     assert_tail_tamper_is_rejected("payload_nul").await;
+}
+
+#[tokio::test]
+async fn witness_prefix_rechecks_the_tail_payload_storage_class() {
+    assert_tail_tamper_is_rejected("payload_blob").await;
 }
