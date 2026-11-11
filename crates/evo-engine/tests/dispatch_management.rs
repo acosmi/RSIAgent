@@ -3763,3 +3763,91 @@ async fn legacy_terminal_result_is_read_without_rewriting_old_job() {
         "restart status GET changed any full database fact"
     );
 }
+
+/// The management idempotency row is keyed by namespace/actor/operation/key
+/// and does not carry the role. A second authenticated role of the same actor
+/// with the same key therefore collides with an existing Admin job; the role
+/// gate refuses before that shared row can be read, claimed or rewritten, and
+/// the original owner still replays its immutable terminal.
+#[tokio::test]
+async fn same_actor_different_roles_fail_closed_on_idempotency_collision() {
+    let (_dir, store) = store().await;
+    let admin = Context::new("n", "dual-role", Role::Admin).unwrap();
+    let evaluator = Context::new("n", "dual-role", Role::Evaluator).unwrap();
+    let dispatcher =
+        ManagementDispatcher::new(store.clone(), vec![admin.clone(), evaluator.clone()]).unwrap();
+    let payload = json!({
+        "schema_version": "rsia.management.meta_start.v1",
+        "request_key": "dual-role-key"
+    });
+    let queued = dispatcher
+        .submit(&admin, "meta.start", payload.clone())
+        .await
+        .map(current_management_job)
+        .unwrap();
+    let done = wait_terminal(&dispatcher, &admin, &queued.id).await;
+    assert_eq!(done.state, ManagementJobState::Blocked);
+    let (jobs_before, artifacts_before) = {
+        let mut session = store.session().await.unwrap();
+        let counts = (
+            session.namespace_object_count(&admin, "job").await.unwrap(),
+            session
+                .namespace_object_count(&admin, "artifact")
+                .await
+                .unwrap(),
+        );
+        session.commit().await.unwrap();
+        counts
+    };
+    // The same actor under another role and the same request key: the Admin
+    // role requirement answers before the role-less cache row is touched.
+    let refused = dispatcher
+        .submit(&evaluator, "meta.start", payload.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, Error::Forbidden), "{refused:?}");
+    let (jobs_after, artifacts_after) = {
+        let mut session = store.session().await.unwrap();
+        let counts = (
+            session.namespace_object_count(&admin, "job").await.unwrap(),
+            session
+                .namespace_object_count(&admin, "artifact")
+                .await
+                .unwrap(),
+        );
+        session.commit().await.unwrap();
+        counts
+    };
+    assert_eq!(jobs_after, jobs_before, "a refused role writes no job");
+    assert_eq!(
+        artifacts_after, artifacts_before,
+        "a refused role writes no private input"
+    );
+    // The original owner replays the immutable terminal from the same row;
+    // the refused role never replaced it.
+    let replay = dispatcher
+        .submit(&admin, "meta.start", payload)
+        .await
+        .map(current_management_job)
+        .unwrap();
+    assert_eq!(replay.id, done.id);
+    assert_eq!(replay.state, done.state);
+    assert_eq!(
+        serde_json::to_value(&replay.result).unwrap(),
+        serde_json::to_value(&done.result).unwrap()
+    );
+    // And the Evaluator is still refused afterwards.
+    assert!(matches!(
+        dispatcher
+            .submit(
+                &evaluator,
+                "meta.start",
+                json!({
+                    "schema_version": "rsia.management.meta_start.v1",
+                    "request_key": "dual-role-key"
+                })
+            )
+            .await,
+        Err(Error::Forbidden)
+    ));
+}

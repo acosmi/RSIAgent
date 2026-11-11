@@ -100,9 +100,11 @@ fn model_tools_keep_their_surface_and_are_disjoint_from_the_catalog() {
 /// requirements, and every newly registered but unimplemented name —
 /// including the dedicated sync view — fails closed inside `submit` with zero rows
 /// written: no job, no private input, no audit, no call. The four budget
-/// operations and the two import operations are wired, so they fail at their
-/// own strict DTO boundary rather than `management_operation_not_wired`; their
-/// real consumers are exercised by the positive controls below.
+/// operations, the two import operations and `monitoring.drift.record` are
+/// wired, so they fail at their own strict DTO boundary rather than
+/// `management_operation_not_wired`; their real consumers are exercised by the
+/// positive controls below. `monitoring.environment.record` stays unwired in
+/// this drift-only range.
 #[tokio::test]
 async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemented_names() {
     let (dir, store) = store().await;
@@ -193,6 +195,15 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
                     | "export.abort",
                     _,
                 ) => "invalid management payload",
+                // monitoring.drift.record migrated from the unwired set to its
+                // real handler, whose strict request needs both environment
+                // ids, the scope and a reason: this boundary payload is
+                // refused at the DTO before any session, with zero writes.
+                ("monitoring.drift.record", _) => "invalid management payload",
+                // monitoring.environment.record stays unwired in this
+                // drift-only range: its Host entry and same-session registered
+                // control source are not implemented here.
+                ("monitoring.environment.record", _) => "management_operation_not_wired",
                 (_, ExecutionKind::AsyncJob) => "management_operation_not_wired",
                 _ => "management operation requires dedicated route",
             }),

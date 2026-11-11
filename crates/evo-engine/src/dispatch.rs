@@ -84,7 +84,11 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
         | "budget.root.authorize"
         | "budget.stage_plan.bind"
         | "budget.calls.list_open"
-        | "budget.call.reconcile" => ctx.require(&[Role::Admin]),
+        | "budget.call.reconcile"
+        // monitoring.environment.record stays on the unknown-operation default:
+        // its Host entry and same-session registered-control source are not
+        // implemented here. The drift administration itself is Admin-only.
+        | "monitoring.drift.record" => ctx.require(&[Role::Admin]),
         _ => Err(Error::Invalid("management_operation_not_wired".into())),
     }
 }
@@ -93,11 +97,11 @@ pub use evo_storage::{
     ManagementAssetExportResultV2, ManagementAssetExportState, ManagementBackupResultV2,
     ManagementBudgetResultV2, ManagementCancelArrival, ManagementDiagnostic,
     ManagementImportResultState, ManagementImportResultV2, ManagementImportStatusCounts,
-    ManagementJob, ManagementJobState, ManagementJobV2, ManagementOptimizationCallProducer,
-    ManagementOptimizationCallRef, ManagementOptimizationProgressV2,
-    ManagementOptimizationResultV2, ManagementOptimizationStageRef, ManagementPartialResultV2,
-    ManagementPendingTerminalState, ManagementResult, ManagementResultV2,
-    ManagementTraceExportResultV2, VersionedManagementJob,
+    ManagementJob, ManagementJobState, ManagementJobV2, ManagementMonitoringResultV2,
+    ManagementOptimizationCallProducer, ManagementOptimizationCallRef,
+    ManagementOptimizationProgressV2, ManagementOptimizationResultV2,
+    ManagementOptimizationStageRef, ManagementPartialResultV2, ManagementPendingTerminalState,
+    ManagementResult, ManagementResultV2, ManagementTraceExportResultV2, VersionedManagementJob,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -343,6 +347,24 @@ struct ImportExecuteManagementRequest {
     selection_id: String,
 }
 
+const MONITORING_DRIFT_RECORD_SCHEMA: &str = "rsia.management.monitoring_drift_record.v1";
+
+/// `monitoring.drift.record`: the two existing environment origins, the stored
+/// consolidation scope they invalidate and a bounded diagnostic reason. Every
+/// environment snapshot, source, path, role, owner, namespace and authority
+/// carrier is not part of the wire; the reason is an input only and is never
+/// returned in the result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MonitoringDriftRecordManagementRequest {
+    schema_version: String,
+    request_key: String,
+    previous_environment_id: String,
+    current_environment_id: String,
+    scope_id: String,
+    reason: String,
+}
+
 const ASSET_STAGE_SCHEMA: &str = "rsia.management.asset_stage.v1";
 const ASSET_ABORT_SCHEMA: &str = "rsia.management.asset_abort.v1";
 const ASSET_HANDOFF_SCHEMA: &str = "rsia.management.asset_handoff.v1";
@@ -427,6 +449,7 @@ enum ParsedRequest {
     ExportPrepare(Box<ExportPrepareManagementRequest>),
     ExportComplete(Box<ExportAttemptManagementRequest>),
     ExportAbort(Box<ExportAttemptManagementRequest>),
+    MonitoringDriftRecord(Box<MonitoringDriftRecordManagementRequest>),
 }
 
 impl<'de> Deserialize<'de> for ParsedRequest {
@@ -466,6 +489,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             ExportPrepare(Box<ExportPrepareManagementRequest>),
             ExportComplete(Box<ExportAttemptManagementRequest>),
             ExportAbort(Box<ExportAttemptManagementRequest>),
+            MonitoringDriftRecord(Box<MonitoringDriftRecordManagementRequest>),
         }
         Ok(
             match serde_json::from_value::<Other>(value).map_err(serde::de::Error::custom)? {
@@ -491,6 +515,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::ExportPrepare(value) => Self::ExportPrepare(value),
                 Other::ExportComplete(value) => Self::ExportComplete(value),
                 Other::ExportAbort(value) => Self::ExportAbort(value),
+                Other::MonitoringDriftRecord(value) => Self::MonitoringDriftRecord(value),
             },
         )
     }
@@ -1328,6 +1353,7 @@ impl ParsedRequest {
             Self::ExportPrepare(request) => &request.request_key,
             Self::ExportComplete(request) => &request.request_key,
             Self::ExportAbort(request) => &request.request_key,
+            Self::MonitoringDriftRecord(request) => &request.request_key,
         }
     }
 }
@@ -1559,6 +1585,9 @@ impl JobOutcome {
             // Staged/aborted/handed-off assets and prepared/completed/aborted
             // local exports all commit real business rows.
             Some(ManagementResultV2::AssetExport(_)) => true,
+            // A recorded drift commits the drift fact, the scope invalidation
+            // and its edges with the terminal job state.
+            Some(ManagementResultV2::Monitoring(_)) => true,
             Some(ManagementResultV2::Original(
                 ManagementResult::EvaluationStatus { .. }
                 | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -2313,6 +2342,10 @@ async fn execute_request(
         }
         ParsedRequest::ExportAbort(request) => {
             return run_export_abort(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::MonitoringDriftRecord(request) => {
+            return run_monitoring_drift_record(ctx, store, claimed.clone(), *request, control)
+                .await;
         }
         ParsedRequest::Blocked(_) => {
             control.admit_step()?;
@@ -3820,6 +3853,58 @@ async fn run_export_abort(
     commit_management_outcome(session, claimed, finished).await
 }
 
+async fn run_monitoring_drift_record(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: MonitoringDriftRecordManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    let mut session = store.session().await?;
+    let finished = async {
+        // The same transaction re-reads the job's private input, its role and
+        // dependencies, both live environments with their actual run/
+        // application/execution source closures, the namespace revoke
+        // watermark, the scope index and its namespace; then it writes the
+        // drift, the scope invalidation, the edges, the audit record and the
+        // terminal job state in one commit.
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        let drift = crate::monitoring::MonitoringCoordinator::record_environment_drift_in_session(
+            ctx,
+            &mut session,
+            &request.previous_environment_id,
+            &request.current_environment_id,
+            &request.scope_id,
+            &request.reason,
+        )
+        .await?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "environment_drift_recorded".into(),
+            result: Some(ManagementResultV2::Monitoring(
+                ManagementMonitoringResultV2::EnvironmentDriftRecorded {
+                    drift_id: drift.id.clone(),
+                    previous_environment_id: drift.previous_environment_id.clone(),
+                    current_environment_id: drift.current_environment_id.clone(),
+                    invalidated_scope_id: drift.invalidated_scope_id.clone(),
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
 fn import_management_result_state(
     state: crate::import::ImportResultState,
 ) -> ManagementImportResultState {
@@ -4008,6 +4093,19 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
         ParsedRequest::ExportComplete(request) | ParsedRequest::ExportAbort(request) => {
             ctx.require(&[Role::Admin])?;
             identifier(&request.export_id)?;
+        }
+        ParsedRequest::MonitoringDriftRecord(request) => {
+            ctx.require(&[Role::Admin])?;
+            for value in [
+                &request.previous_environment_id,
+                &request.current_environment_id,
+                &request.scope_id,
+            ] {
+                identifier(value)?;
+            }
+            if request.reason.is_empty() || request.reason.len() > 512 {
+                return Err(Error::Invalid("drift reason must be 1..=512 bytes".into()));
+            }
         }
         ParsedRequest::TraceExportPrepare(request) => {
             ctx.require(&[Role::Admin])?;
@@ -5308,6 +5406,24 @@ async fn consumer_progress(
         }
         return Ok(ConsumerProgress::NotCommitted);
     }
+    if record.identity().operation == "monitoring.drift.record" {
+        // The drift handler writes the drift record, the scope invalidation,
+        // its two environment edges, the audit record and the terminal job
+        // state in one transaction. A non-terminal record therefore proves no
+        // drift effect; a terminal one with its bound result is its own
+        // committed outcome. The reason text is never re-derived here.
+        if is_terminal(record.identity().state)
+            && matches!(record.result(), Some(ManagementResultV2::Monitoring(_)))
+        {
+            return Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                state: record.identity().state,
+                step: record.step().into(),
+                result: record.result(),
+                error_code: record.error_code().map(str::to_owned),
+            })));
+        }
+        return Ok(ConsumerProgress::NotCommitted);
+    }
     if record.identity().operation == "export.complete"
         && is_terminal(record.identity().state)
         && matches!(
@@ -5925,6 +6041,8 @@ async fn consumer_progress(
         | ParsedRequest::AssetHandoff(_)
         | ParsedRequest::ExportPrepare(_)
         | ParsedRequest::ExportAbort(_) => Ok(ConsumerProgress::NotCommitted),
+        // Unreachable: the drift short-circuit above owns this operation.
+        ParsedRequest::MonitoringDriftRecord(_) => Ok(ConsumerProgress::NotCommitted),
         ParsedRequest::ExportComplete(request) => {
             // A published tree whose SQL completion did not commit is an
             // exact-effect question, never an empty-failure guess: only the
@@ -6712,7 +6830,9 @@ async fn cancel_job_atomic(
                     | "export.prepare"
                     | "export.complete"
                     | "export.abort"
-            ) && matches!(saved.result, Some(ManagementResultV2::AssetExport(_)))))
+            ) && matches!(saved.result, Some(ManagementResultV2::AssetExport(_))))
+            || (saved.operation == "monitoring.drift.record"
+                && matches!(saved.result, Some(ManagementResultV2::Monitoring(_)))))
     {
         let mut job = saved.clone();
         now()?;
@@ -6824,6 +6944,7 @@ fn stored_result_has_side_effect(result: Option<&ManagementResultV2>) -> bool {
         Some(ManagementResultV2::Budget(_)) => true,
         Some(ManagementResultV2::Import(_)) => true,
         Some(ManagementResultV2::AssetExport(_)) => true,
+        Some(ManagementResultV2::Monitoring(_)) => true,
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }
             | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -7035,6 +7156,16 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
                 ));
             }
         },
+        "monitoring.drift.record" => match payload["schema_version"].as_str() {
+            Some(MONITORING_DRIFT_RECORD_SCHEMA) => ParsedRequest::MonitoringDriftRecord(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
@@ -7073,6 +7204,7 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::ExportPrepare(request) => &request.schema_version,
         ParsedRequest::ExportComplete(request) => &request.schema_version,
         ParsedRequest::ExportAbort(request) => &request.schema_version,
+        ParsedRequest::MonitoringDriftRecord(request) => &request.schema_version,
     };
     if actual != &expected {
         return Err(Error::Invalid(
@@ -7243,6 +7375,14 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
         }
         ParsedRequest::ExportComplete(request) => {
             dependencies.push(("artifact".into(), request.export_id.clone()));
+        }
+        ParsedRequest::MonitoringDriftRecord(request) => {
+            // Both existing environment origins and the stored consolidation
+            // scope are the physical inputs of the drift write; the same
+            // session re-checks their liveness and upstream closure.
+            dependencies.push(("artifact".into(), request.previous_environment_id.clone()));
+            dependencies.push(("artifact".into(), request.current_environment_id.clone()));
+            dependencies.push(("artifact".into(), request.scope_id.clone()));
         }
         ParsedRequest::TraceExportPrepare(request) => {
             // The private input depends on every captured source run, so a
@@ -7565,6 +7705,12 @@ pub enum ManagementCommittedEffect {
     ExportAborted {
         export_id: String,
     },
+    EnvironmentDrift {
+        drift_id: String,
+        previous_environment_id: String,
+        current_environment_id: String,
+        invalidated_scope_id: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7795,6 +7941,19 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
             ..
         })) => vec![ManagementCommittedEffect::ExportAborted {
             export_id: export_id.clone(),
+        }],
+        Some(ManagementResultV2::Monitoring(
+            ManagementMonitoringResultV2::EnvironmentDriftRecorded {
+                drift_id,
+                previous_environment_id,
+                current_environment_id,
+                invalidated_scope_id,
+            },
+        )) => vec![ManagementCommittedEffect::EnvironmentDrift {
+            drift_id: drift_id.clone(),
+            previous_environment_id: previous_environment_id.clone(),
+            current_environment_id: current_environment_id.clone(),
+            invalidated_scope_id: invalidated_scope_id.clone(),
         }],
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }

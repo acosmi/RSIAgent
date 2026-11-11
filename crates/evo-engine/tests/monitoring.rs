@@ -26,8 +26,8 @@ use evo_engine::model::{
 use evo_engine::monitoring::{
     ApplicationStatus, ClaimOutcome, CompleteDevelopmentCycleRequest, ConsolidationClaimState,
     ConsolidationDevRunner, ConsolidationModelPort, ConsolidationRunOutcome,
-    EnvironmentEvidenceScope, MonitoringCoordinator, QualityStatus, RecordEnvironmentRequest,
-    RecordedEnvironment,
+    EnvironmentDriftRecord, EnvironmentEvidenceScope, MonitoringCoordinator, QualityStatus,
+    RecordEnvironmentRequest, RecordedEnvironment,
 };
 use evo_engine::optimization::{
     BundleCompileContext, DevRunner, DevelopmentExecutionProvenance, DevelopmentManifest,
@@ -44,7 +44,7 @@ use evo_storage::budget::{
     RootBudgetRecord,
 };
 use evo_storage::lifecycle::{LifecycleStore, TypedObjectRef};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use trusted_compiler_inputs::StoreOptimizationJournal;
@@ -332,6 +332,71 @@ impl Fixture {
             hidden_payload,
         )
         .await
+    }
+
+    /// The original drift prefix: one healthy development cycle on the first
+    /// environment and a second, different-model environment from its own real
+    /// run/application fixture.
+    async fn drift_ready(&self) -> (RecordedEnvironment, String) {
+        let fact = self.stage_report(1, true, false, false).await;
+        let cycle = MonitoringCoordinator::close_development_cycle(
+            &self.worker,
+            &self.store,
+            self.cycle_request(fact),
+        )
+        .await
+        .unwrap();
+        let snapshot = ReleaseStore::prepare_complete_run(
+            &self.host,
+            &self.store,
+            CompletePrepareRunRequest {
+                run_id: "host-run-2".into(),
+                profile_id: "profile".into(),
+                system_snapshot: system("model-v2"),
+                host_surface_id: "surface".into(),
+                host_capabilities: HostCapabilities {
+                    available: BTreeSet::new(),
+                    granted: BTreeSet::new(),
+                },
+                task_input_digest: d("task-input-2"),
+                evolution_enabled: true,
+                capability_level: CapabilityLevel::ToolOnly,
+            },
+        )
+        .await
+        .unwrap();
+        ReleaseStore::record_applied_request(
+            &self.host,
+            &self.store,
+            "host-run-2",
+            TrustedHostExecutionEvidence {
+                actual_request_material: snapshot.request_material.clone(),
+                environment_digest: snapshot.environment_digest.clone(),
+                host_surface_digest: snapshot.host_surface_digest.clone(),
+                host_capabilities_digest: snapshot.host_capabilities_digest.clone(),
+                offered: vec![],
+                attached: vec![],
+                used: vec![],
+                execution_receipt_id: None,
+                truncated: false,
+            },
+        )
+        .await
+        .unwrap();
+        let current = MonitoringCoordinator::record_environment_from_run(
+            &self.host,
+            &self.store,
+            RecordEnvironmentRequest {
+                run_id: "host-run-2".into(),
+                development_manifest_digest: self.manifest_digest.clone(),
+                grader_digest: self.grader_digest.clone(),
+                generation_strategy_digest: self.strategy_digest.clone(),
+                revoke_watermark: 1,
+            },
+        )
+        .await
+        .unwrap();
+        (current, cycle.scope_id)
     }
 }
 
@@ -1015,6 +1080,146 @@ async fn environment_drift_invalidates_old_scope_and_unknown_is_not_harmful() {
         .await,
         Err(Error::Conflict(_))
     ));
+}
+
+#[tokio::test]
+async fn management_drift_keeps_historical_reason_and_unknown_quality() {
+    let fixture = Fixture::new().await;
+    let (current, scope_id) = fixture.drift_ready().await;
+    let root_before = {
+        let mut session = fixture.store.session().await.unwrap();
+        let root = session
+            .root_budget(&fixture.admin, &fixture.budget.billing_scope)
+            .await
+            .unwrap()
+            .unwrap();
+        session.commit().await.unwrap();
+        root
+    };
+    let artifacts_before = monitoring_artifact_wire(&fixture.store, &fixture.admin).await;
+    let drift = MonitoringCoordinator::record_environment_drift(
+        &fixture.admin,
+        &fixture.store,
+        &fixture.environment.environment.id,
+        &current.environment.id,
+        &scope_id,
+        "model deployment changed",
+    )
+    .await
+    .unwrap();
+    assert_eq!(drift.reason, "model deployment changed");
+    assert_eq!(drift.schema_version, "rsia.monitoring.environment_drift.v1");
+    let stored: EnvironmentDriftRecord = {
+        let mut session = fixture.store.session().await.unwrap();
+        let stored = session
+            .need(&fixture.admin, "artifact", &drift.id)
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        stored
+    };
+    assert_eq!(stored, drift, "the original reason is kept verbatim");
+    assert_eq!(current.observation.quality_status, QualityStatus::Unknown);
+    // The drift is diagnostic: it does not create an Active release, an
+    // approval fact or a stopped root, and it rewrites no environment row.
+    let root_after = {
+        let mut session = fixture.store.session().await.unwrap();
+        let root = session
+            .root_budget(&fixture.admin, &fixture.budget.billing_scope)
+            .await
+            .unwrap()
+            .unwrap();
+        session.commit().await.unwrap();
+        root
+    };
+    assert_eq!(root_after, root_before, "root authorization/stop unchanged");
+    let artifacts_after = monitoring_artifact_wire(&fixture.store, &fixture.admin).await;
+    let added: Vec<_> = artifacts_after
+        .difference(&artifacts_before)
+        .map(|(schema, _)| schema.as_str())
+        .collect();
+    assert!(
+        added
+            .iter()
+            .all(|schema| *schema == "rsia.monitoring.environment_drift.v1"),
+        "only the drift fact is added: {added:?}"
+    );
+    assert!(matches!(
+        MonitoringCoordinator::claim_consolidation(&fixture.worker, &fixture.store, &scope_id)
+            .await,
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn management_drift_preserves_original_environment_wire() {
+    let fixture = Fixture::new().await;
+    let (current, scope_id) = fixture.drift_ready().await;
+    let previous_id = fixture.environment.environment.id.clone();
+    let current_id = current.environment.id.clone();
+    let before_previous = raw_artifact(&fixture.store, &fixture.admin, &previous_id).await;
+    let before_current = raw_artifact(&fixture.store, &fixture.admin, &current_id).await;
+    let before_scope = raw_artifact(&fixture.store, &fixture.admin, &scope_id).await;
+    MonitoringCoordinator::record_environment_drift(
+        &fixture.admin,
+        &fixture.store,
+        &previous_id,
+        &current_id,
+        &scope_id,
+        "wire preserved",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        raw_artifact(&fixture.store, &fixture.admin, &previous_id).await,
+        before_previous,
+        "the previous environment wire is never rewritten"
+    );
+    assert_eq!(
+        raw_artifact(&fixture.store, &fixture.admin, &current_id).await,
+        before_current,
+        "the current environment wire is never rewritten"
+    );
+    let after_scope: Value =
+        serde_json::from_str(&raw_artifact(&fixture.store, &fixture.admin, &scope_id).await)
+            .unwrap();
+    let before_scope: Value = serde_json::from_str(&before_scope).unwrap();
+    assert!(after_scope["invalidated_by"].is_string());
+    let mut expected = before_scope;
+    expected["invalidated_by"] = after_scope["invalidated_by"].clone();
+    assert_eq!(
+        after_scope, expected,
+        "only invalidated_by changes on the scope index"
+    );
+}
+
+async fn monitoring_artifact_wire(store: &Store, ctx: &Context) -> BTreeSet<(String, String)> {
+    let mut session = store.session().await.unwrap();
+    let artifacts: Vec<Value> = session.list(ctx, "artifact").await.unwrap();
+    session.commit().await.unwrap();
+    artifacts
+        .into_iter()
+        .map(|value| {
+            (
+                value["schema_version"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                value["id"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
+async fn raw_artifact(store: &Store, ctx: &Context, id: &str) -> String {
+    let mut session = store.session().await.unwrap();
+    let row = session
+        .object_row(ctx, "artifact", id)
+        .await
+        .unwrap()
+        .unwrap();
+    session.commit().await.unwrap();
+    row.body
 }
 
 #[tokio::test]
