@@ -4221,6 +4221,12 @@ async fn cleanup_node_content(
         // E09 practice: the unique registration-to-set binding records that a K=3
         // registration was spent; a revocation never reopens that authorization.
         ("artifact", "rsia.practice_registration_binding.v1", _) => true,
+        // E09 practice: an attempt's request closure records that this request was
+        // authorized after the whole request was checked and before the first runner
+        // call. It holds ids, digests, enums and timestamps only (no source-derived
+        // text), so a source revocation preserves it as a historical fact instead of
+        // isolating the cleanup as an unknown scope.
+        ("artifact", "rsia.practice.request_closure.v1", _) => true,
         // E10/E11 replay-economic facts: the preregistered experiment, the job
         // started over it, the per-component cost receipts and the blocked report
         // are the record of an experiment that was run and of what it was billed.

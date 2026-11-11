@@ -1952,6 +1952,15 @@ async fn run_practice_set_unboxed(
                 session
                     .put(ctx, ARTIFACT_KIND, &closure.id, ctx.actor(), &closure)
                     .await?;
+                // The closure consumes the control's sources. Without this typed
+                // edge a revocation cleanup starting at a source never reaches the
+                // closure, even though the closure is the fact that authorized the
+                // attempt. The edge is written in the same prepare transaction.
+                for source in &control.source_ids {
+                    session
+                        .put_edge(ctx, ARTIFACT_KIND, &closure.id, "run", source)
+                        .await?;
+                }
             }
             session
                 .audit(ctx, "practice.request_closure.record", &request.set_id)

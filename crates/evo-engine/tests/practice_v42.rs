@@ -3587,3 +3587,32 @@ async fn practice_v1_v2_legacy_and_redaction_keep_registration_spent() {
         matches!(run_practice_set(&fixture.admin,&fixture.store,&fixture.counting(),practice_request("wire-history-other",plan)).await,Err(Error::Conflict(message)) if message==spent_message(&registration.id,"wire-history"))
     );
 }
+
+#[tokio::test]
+async fn practice_request_closures_depend_on_the_control_sources() {
+    let fixture = Fixture::new().await;
+    let runner = fixture.counting();
+    run_practice_set(
+        &fixture.admin,
+        &fixture.store,
+        &runner,
+        practice_request("closure-edges", plan_k1()),
+    )
+    .await
+    .unwrap();
+    let mut session = fixture.store.session().await.unwrap();
+    for source in ["run-a", "run-b"] {
+        let closures = session
+            .dependents(&fixture.admin, "run", source)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, id)| kind == "artifact" && id.starts_with("practice-closure-"))
+            .count();
+        assert_eq!(
+            closures, 1,
+            "PARENT-EXPECTED-FAILURE: the request closure must depend on every control source ({source})"
+        );
+    }
+    session.commit().await.unwrap();
+}
