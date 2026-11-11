@@ -6214,7 +6214,21 @@ impl ManagementDispatcher {
                     "export completion job input differs".into(),
                 ));
             }
-            Err(_) => return Ok(None),
+            // A revocation tombstone hides the export id but does not prove
+            // that no tree was published. Keep this uncertainty Draining
+            // instead of letting the generic path record Failed.
+            Err(InputFault::Redacted { .. }) => {
+                return self
+                    .mark_export_complete_draining(ctx, claimed)
+                    .await
+                    .map(Some);
+            }
+            Err(InputFault::Other(error @ (Error::ClockRegressed | Error::Internal))) => {
+                return Err(error);
+            }
+            // Absent/damaged input without a recoverable export id: the
+            // generic NotCommitted path answers honestly.
+            Err(InputFault::Other(_)) => return Ok(None),
         };
         let inspection =
             crate::packages::PersistentPackageStore::inspect_export_completion_recovery(

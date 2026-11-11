@@ -3389,6 +3389,12 @@ impl Store {
         }
 
         if preverified_final.is_none() {
+            // The freeze requires the real fence before the first filesystem
+            // effect and again immediately before the final rename, so a
+            // lease that expired during staging cannot publish.
+            if let Some(fence) = fence {
+                session.ensure_management_job_fence(ctx, fence).await?;
+            }
             if !publish_blob_no_replace(staging.path(), &final_path)? {
                 return Err(Error::Conflict(
                     "local export target raced after write fence".into(),
