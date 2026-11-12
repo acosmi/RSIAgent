@@ -1224,8 +1224,16 @@ impl ManagementDispatcher {
             let at = now()?;
             let capacity_at = u64::try_from(at).map_err(|_| Error::ClockRegressed)?;
             let usage = session.capacity_usage_v41(capacity_at).await?;
-            evo_core::capacity::CapacityItem::ConcurrentManagementDispatch
-                .admit(usage.concurrent_dispatches, 1)?;
+            // Closure operations only close or list existing objects and derive
+            // no new work: a Draining job holding the only dispatch slot must not
+            // block the reconciliation that lets it finish (AG-207).
+            if !matches!(
+                job.operation.as_str(),
+                "budget.call.reconcile" | "budget.calls.list_open" | "export.abort" | "asset.abort"
+            ) {
+                evo_core::capacity::CapacityItem::ConcurrentManagementDispatch
+                    .admit(usage.concurrent_dispatches, 1)?;
+            }
             evo_core::capacity::CapacityItem::ActiveLease.admit(usage.active_leases, 1)?;
             let claim_at = now()?;
             job.generation = job

@@ -2017,3 +2017,184 @@ c.execute('ROLLBACK');c.close();print(json.dumps({'schema':[[a.hex(),b.hex(),d.h
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }
+
+/// AG-207: a cancelled paid step stays Draining (holding the only concurrent
+/// dispatch slot) until its uncertain call is reconciled and its execution
+/// closed. The closure operations that make this possible -- listing open
+/// calls and reconciling them -- are claimed regardless of that slot, while a
+/// new non-closure job still waits Queued behind it. Every state here comes
+/// from the real broker, dispatcher and store; no job row is edited.
+#[tokio::test]
+async fn closure_operations_are_claimed_while_a_draining_job_holds_the_dispatch_slot() {
+    let fx = paid_fixture(1).await;
+    let claimed = paid_start(&fx).await;
+    fx.dispatcher.cancel(&fx.admin, &claimed.id).await.unwrap();
+    fx.gate.release.add_permits(1);
+    let pending_started = Instant::now();
+    let draining = loop {
+        let job = current(fx.dispatcher.status(&fx.admin, &claimed.id).await.unwrap());
+        if job.state == ManagementJobState::Draining && job.pending_terminal_state.is_some() {
+            break job;
+        }
+        assert!(
+            pending_started.elapsed() < Duration::from_secs(60),
+            "actual worker did not record its draining terminal outcome: {job:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        draining.pending_terminal_state,
+        Some(evo_storage::ManagementPendingTerminalState::Blocked)
+    );
+    let slot = || async {
+        let mut s = fx.store.session().await.unwrap();
+        let used = s
+            .capacity_usage_v41(now().unwrap() as u64)
+            .await
+            .unwrap()
+            .concurrent_dispatches;
+        s.commit().await.unwrap();
+        used
+    };
+    assert_eq!(slot().await, 1);
+    let calls = call_rows(&fx).await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].state, BudgetCallState::Uncertain);
+    assert!(!calls[0].execution_closed);
+    let witness = fx.gate.witnesses.lock().unwrap()[0].clone();
+
+    // A new non-closure job is still refused the slot and waits Queued.
+    let other = fx
+        .dispatcher
+        .submit(
+            &fx.admin,
+            "budget.root.authorize",
+            json!({
+                "schema_version": "rsia.management.budget_root_authorize.v1",
+                "request_key": "closure-slot-other-root",
+                "root_budget_id": "closure-other-root",
+                "billing_scope": "closure-other-scope",
+                "allowed_namespaces": ["n"],
+                "currency": "USD",
+                "pricing_version": "price-v1",
+                "payment_subject": "fixture-only",
+                "authorization_receipt_digest": hash(b"closure-other-receipt"),
+                "per_call_cap_micros": 20,
+                "total_limit_micros": 1000,
+            }),
+        )
+        .await
+        .unwrap();
+    let other_id = other.identity().id.to_owned();
+
+    let terminal = |id: String| {
+        let fx = &fx;
+        async move {
+            let started = Instant::now();
+            loop {
+                let job = current(fx.dispatcher.status(&fx.admin, &id).await.unwrap());
+                if matches!(
+                    job.state,
+                    ManagementJobState::Succeeded
+                        | ManagementJobState::Failed
+                        | ManagementJobState::Cancelled
+                        | ManagementJobState::Blocked
+                ) {
+                    break job;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "closure job never reached a terminal state: {job:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+
+    // The Admin lists the open call, then reconciles it from the bill.
+    let listed = fx
+        .dispatcher
+        .submit(
+            &fx.admin,
+            "budget.calls.list_open",
+            json!({
+                "schema_version": "rsia.management.budget_calls_list_open.v1",
+                "request_key": "closure-slot-list",
+                "billing_scope": "management-scope",
+            }),
+        )
+        .await
+        .unwrap();
+    let listed = terminal(listed.identity().id.to_owned()).await;
+    assert_eq!(listed.state, ManagementJobState::Succeeded, "{listed:?}");
+    let Some(evo_storage::ManagementResultV2::Budget(
+        evo_storage::ManagementBudgetResultV2::OpenCallsListed { page },
+    )) = &listed.result
+    else {
+        panic!("expected the open-call listing: {listed:?}");
+    };
+    assert!(
+        page.entries
+            .iter()
+            .any(|entry| entry.call_id == witness.call_id)
+    );
+    let reconciled = fx
+        .dispatcher
+        .submit(
+            &fx.admin,
+            "budget.call.reconcile",
+            json!({
+                "schema_version": "rsia.management.budget_call_reconcile.v1",
+                "request_key": "closure-slot-reconcile",
+                "billing_scope": "management-scope",
+                "call_id": witness.call_id,
+                "provider_request_id": witness.charge.provider_request_id,
+                "usage_record_id": witness.charge.usage_record_id,
+                "output_digest": witness.charge.output_digest,
+                "amount_micros": witness.charge.amount_micros,
+                "currency": witness.charge.currency,
+                "pricing_version": witness.charge.pricing_version,
+            }),
+        )
+        .await
+        .unwrap();
+    let reconciled = terminal(reconciled.identity().id.to_owned()).await;
+    assert_eq!(
+        reconciled.state,
+        ManagementJobState::Succeeded,
+        "{reconciled:?}"
+    );
+    assert_eq!(reconciled.step, "call_reconciled");
+
+    // The slot rule still holds for the non-closure job behind the Draining one.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        current(fx.dispatcher.status(&fx.admin, &other_id).await.unwrap()).state,
+        ManagementJobState::Queued
+    );
+    assert_eq!(
+        current(fx.dispatcher.status(&fx.admin, &claimed.id).await.unwrap()).state,
+        ManagementJobState::Draining
+    );
+
+    // Once the exited worker's execution is closed nothing is pending: the
+    // Draining job lands on its recorded terminal state and frees the slot.
+    fx.store
+        .close_budget_call_execution(
+            &fx.admin,
+            "management-scope",
+            &witness.call_id,
+            &witness.dispatch_id,
+            "actual_fixture_worker_exited",
+            now().unwrap(),
+        )
+        .await
+        .unwrap();
+    let done = paid_state(&fx, &claimed.id, ManagementJobState::Blocked).await;
+    assert_eq!(done.step, draining.step);
+    let calls = call_rows(&fx).await;
+    assert_eq!(calls[0].state, BudgetCallState::Finalized);
+    assert_eq!(calls[0].actual_cost_micros, Some(10));
+    let other = terminal(other_id).await;
+    assert_eq!(other.state, ManagementJobState::Succeeded, "{other:?}");
+}
