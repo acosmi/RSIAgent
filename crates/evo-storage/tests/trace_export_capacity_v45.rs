@@ -1,17 +1,21 @@
-//! AG-203: the instance-wide trace export bound must be visible through the
-//! shared capacity API, not only through the producer's private write gate.
+//! AG-203/AG-205: the instance-wide trace export bound (§3.3.2) is the shared
+//! `CapacityItem::TraceExport` measurement, the one gate behind `capacity_used`,
+//! `admit_capacity` and the producer's own `Session::put`, which refuses with
+//! the typed capacity conflict.
 //!
-//! A trace export record keeps its slot after a lawful redaction, so the
-//! counter is cross-namespace and includes redacted history. The tests write
-//! through the real `Session::put` gate and never fabricate stored rows.
+//! The counter is cross-namespace and covers every record except one redacted
+//! by a completed revocation cleanup. The tests write through the real
+//! `Session::put` gate and the real revocation lifecycle and never fabricate
+//! stored rows.
 
-use evo_core::capacity::CapacityItem;
-use evo_core::{Context, Role};
+use evo_core::capacity::{CapacityConflict, CapacityItem};
+use evo_core::{Context, Error, Role};
+use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
 use evo_storage::{Store, TRACE_EXPORT_SCHEMA};
 use serde_json::{Value, json};
 
 const DATABASE: &str = "trace-export-capacity.sqlite3";
-const LIMIT: usize = 1_000;
+const LIMIT: usize = CapacityItem::TraceExport.limit() as usize;
 
 fn admin(namespace: &str) -> Context {
     Context::new(namespace, "admin", Role::Admin).unwrap()
@@ -40,6 +44,24 @@ fn record(export_id: &str) -> Value {
         "created_at": 1,
         "updated_at": 2,
     })
+}
+
+/// A new trace export at the full bound is exactly the typed capacity conflict.
+fn assert_at_limit(refused: Result<(), Error>) {
+    match refused {
+        Err(Error::Capacity(conflict)) => assert_eq!(
+            conflict,
+            CapacityConflict {
+                item: CapacityItem::TraceExport,
+                used: LIMIT as u64,
+                limit: LIMIT as u64,
+                delta: 1,
+            }
+        ),
+        other => {
+            panic!("a new trace export at the limit must be a typed capacity conflict: {other:?}")
+        }
+    }
 }
 
 #[tokio::test]
@@ -103,36 +125,144 @@ async fn trace_export_capacity_is_enforced_at_the_instance_limit() {
         "PARENT-EXPECTED-FAILURE: capacity_used(TraceExport) must reach the real instance count"
     );
 
-    let admitted = session
-        .admit_capacity(&[(CapacityItem::TraceExport, 1)])
-        .await;
-    assert!(
-        admitted.is_err(),
-        "PARENT-EXPECTED-FAILURE: admit_capacity must refuse past the trace export instance limit"
-    );
-    let conflict = admitted.unwrap_err();
-    assert!(
-        format!("{conflict}").contains("capacity_conflict"),
-        "{conflict}"
+    assert_at_limit(
+        session
+            .admit_capacity(&[(CapacityItem::TraceExport, 1)])
+            .await,
     );
 
     let export_id = "export-over-limit";
-    let over = session
+    assert_at_limit(
+        session
+            .put(
+                &ctx,
+                "artifact",
+                &format!("trace-export-record-{export_id}"),
+                ctx.actor(),
+                &record(export_id),
+            )
+            .await,
+    );
+}
+
+/// §3.3.2: a record redacted by a completed revocation cleanup stops counting
+/// and nothing is deleted to make room. At the full bound the one freed slot
+/// admits exactly one new record, here from another namespace.
+#[tokio::test]
+async fn lawful_revocation_cleanup_frees_one_trace_export_slot() {
+    let (_dir, store) = store().await;
+    let ctx = admin("tenant-a");
+    let other = admin("tenant-b");
+    let revoked = "trace-export-record-export-0";
+    let mut session = store.session().await.unwrap();
+    // The first record names a real run: the dependency a revocation follows.
+    session
         .put(
             &ctx,
-            "artifact",
-            &format!("trace-export-record-{export_id}"),
+            "run",
+            "source-run",
             ctx.actor(),
-            &record(export_id),
+            &json!({"id": "source-run", "facts": "captured service facts"}),
         )
-        .await;
-    assert!(
-        over.is_err(),
-        "PARENT-EXPECTED-FAILURE: put must refuse a new trace export past the instance limit"
+        .await
+        .unwrap();
+    for index in 0..LIMIT {
+        let export_id = format!("export-{index}");
+        session
+            .put(
+                &ctx,
+                "artifact",
+                &format!("trace-export-record-{export_id}"),
+                ctx.actor(),
+                &record(&export_id),
+            )
+            .await
+            .unwrap();
+    }
+    session
+        .put_edge(&ctx, "artifact", revoked, "run", "source-run")
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .capacity_used(CapacityItem::TraceExport)
+            .await
+            .unwrap(),
+        LIMIT as u64
     );
-    let conflict = over.unwrap_err();
-    assert!(
-        format!("{conflict}").contains("MVP capacity exceeded"),
-        "{conflict}"
+    assert_at_limit(
+        session
+            .admit_capacity(&[(CapacityItem::TraceExport, 1)])
+            .await,
     );
+    session.commit().await.unwrap();
+
+    let mut status = LifecycleStore::begin_revoke(
+        &ctx,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: "source-run".into(),
+        },
+        "trace export source revoked",
+        10,
+    )
+    .await
+    .unwrap();
+    for now in 11..200 {
+        if status.state == CleanupState::Complete {
+            break;
+        }
+        assert_ne!(status.state, CleanupState::Failed, "{status:?}");
+        status = LifecycleStore::cleanup_step(&ctx, &store, &status.job_id, 8, now)
+            .await
+            .unwrap();
+    }
+    assert_eq!(status.state, CleanupState::Complete, "{status:?}");
+
+    let mut session = store.session().await.unwrap();
+    assert_eq!(
+        session
+            .capacity_used(CapacityItem::TraceExport)
+            .await
+            .unwrap(),
+        LIMIT as u64 - 1,
+        "PARENT-EXPECTED-FAILURE: a lawfully redacted trace export record must stop counting"
+    );
+    let history = session
+        .object_row(&ctx, "artifact", revoked)
+        .await
+        .unwrap()
+        .expect("the redacted history row is kept, not deleted to free the slot");
+    let history: Value = serde_json::from_str(&history.body).unwrap();
+    assert_eq!(history["schema_version"], "rsia.redacted.v1");
+    session
+        .put(
+            &other,
+            "artifact",
+            "trace-export-record-export-new",
+            other.actor(),
+            &record("export-new"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .capacity_used(CapacityItem::TraceExport)
+            .await
+            .unwrap(),
+        LIMIT as u64
+    );
+    assert_at_limit(
+        session
+            .put(
+                &ctx,
+                "artifact",
+                "trace-export-record-export-late",
+                ctx.actor(),
+                &record("export-late"),
+            )
+            .await,
+    );
+    session.commit().await.unwrap();
 }
