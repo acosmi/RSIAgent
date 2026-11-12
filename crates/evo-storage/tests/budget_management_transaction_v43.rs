@@ -325,10 +325,15 @@ async fn session_reconcile_without_output_finalizes_the_known_charge_only() {
 
     // A worker settlement still requires the output it received: it is
     // refused at the boundary and writes nothing.
+    // (A separate root: call-1's open execution holds scope-1's dispatch slot.)
     let mut billed = charge(12, "billed");
     billed.output_digest = None;
+    store
+        .authorize_root_budget(&admin, &authorization("root-2", "scope-2"))
+        .await
+        .unwrap();
     let mut worker_call = store
-        .reserve_budget_call(&worker, &reservation("scope-1", "call-w", 30, 4))
+        .reserve_budget_call(&worker, &reservation("scope-2", "call-w", 30, 4))
         .await
         .unwrap();
     worker_call = store
@@ -342,7 +347,7 @@ async fn session_reconcile_without_output_finalizes_the_known_charge_only() {
         .unwrap_err();
     assert!(matches!(refused, Error::Invalid(_)), "{refused:?}");
     let still = store
-        .budget_call(&worker, "scope-1", "call-w")
+        .budget_call(&worker, "scope-2", "call-w")
         .await
         .unwrap()
         .unwrap();
@@ -376,7 +381,7 @@ async fn session_reconcile_without_output_finalizes_the_known_charge_only() {
     assert_eq!(stored, applied);
     let root = store.root_budget(&admin, "scope-1").await.unwrap().unwrap();
     assert_eq!(root.spent_micros, 12);
-    assert_eq!(root.reserved_micros, 30);
+    assert_eq!(root.reserved_micros, 0);
     let view = BudgetCallSettlementView::new(&stored, &root);
     assert_eq!(view.output_digest, None);
     assert_eq!(view.actual_cost_micros, Some(12));
@@ -422,7 +427,7 @@ async fn session_reconcile_without_output_finalizes_the_known_charge_only() {
     // cannot be replayed as "output not received".
     let finalized_w = store
         // AG-206: past call-w's dispatch lease (until 104).
-        .reconcile_budget_call_cost(&admin, "scope-1", "call-w", &charge(5, "w"), 105)
+        .reconcile_budget_call_cost(&admin, "scope-2", "call-w", &charge(5, "w"), 105)
         .await
         .unwrap();
     assert_eq!(
@@ -432,22 +437,24 @@ async fn session_reconcile_without_output_finalizes_the_known_charge_only() {
     let mut without_output = charge(5, "w");
     without_output.output_digest = None;
     let error = store
-        .reconcile_budget_call_cost(&admin, "scope-1", "call-w", &without_output, 106)
+        .reconcile_budget_call_cost(&admin, "scope-2", "call-w", &without_output, 106)
         .await
         .unwrap_err();
     assert!(
         matches!(error, Error::Conflict(ref reason) if reason == "finalized_call_reused_with_different_charge"),
         "{error:?}"
     );
-    assert_eq!(
-        store
-            .root_budget(&admin, "scope-1")
-            .await
-            .unwrap()
-            .unwrap()
-            .spent_micros,
-        17
-    );
+    for (scope, spent) in [("scope-1", 12), ("scope-2", 5)] {
+        assert_eq!(
+            store
+                .root_budget(&admin, scope)
+                .await
+                .unwrap()
+                .unwrap()
+                .spent_micros,
+            spent
+        );
+    }
     store.close().await;
 }
 
@@ -515,6 +522,18 @@ async fn reconcile_refuses_a_dispatched_call_whose_lease_is_still_live() {
         .unwrap();
     assert_eq!(reconciled.state, BudgetCallState::Finalized);
     assert_eq!(reconciled.actual_cost_micros, Some(12));
+    // The exited worker's execution is closed so the root admits the next call.
+    store
+        .close_budget_call_execution(
+            &worker,
+            "scope-1",
+            "call-1",
+            dispatched.dispatch_id.as_deref().unwrap(),
+            "process_confirmed_stopped",
+            104,
+        )
+        .await
+        .unwrap();
 
     // An uncertain call is reconciled regardless of its lease.
     let other = store

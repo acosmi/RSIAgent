@@ -1048,7 +1048,20 @@ async fn reconcile_without_output_charges_the_bill_and_keeps_the_output_unknown(
     assert_eq!(refused.error_code.as_deref(), Some("conflict"));
 
     // The reverse order is refused too: a call reconciled with its output
-    // cannot be replayed as "output not received".
+    // cannot be replayed as "output not received". (call-1's exited execution
+    // is closed first so the root admits another dispatch.)
+    fixture
+        .store
+        .close_budget_call_execution(
+            &fixture.worker,
+            SCOPE,
+            "call-1",
+            dispatched.dispatch_id.as_deref().unwrap(),
+            "process_confirmed_stopped",
+            5,
+        )
+        .await
+        .unwrap();
     let other = fixture
         .store
         .reserve_budget_call(&fixture.worker, &reservation(SCOPE, "call-2", 30, 5))
