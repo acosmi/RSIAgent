@@ -632,7 +632,7 @@ async fn a_settled_late_response_recovered_after_a_restart_is_still_blocked() {
                     pricing_version: "price-v1".into(),
                     provider_request_id: completion.provider_request_id.clone(),
                     usage_record_id: completion.usage_record_id.clone(),
-                    output_digest,
+                    output_digest: Some(output_digest),
                 },
                 &ModelCallSettlementEvidence {
                     provenance: BudgetExecutionProvenance::Fixture,

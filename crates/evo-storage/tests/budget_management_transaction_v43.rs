@@ -7,7 +7,7 @@ use evo_storage::budget::{
     BUDGET_OPEN_CALLS_PAGE_SCHEMA, BudgetArtifact, BudgetCallFence, BudgetCallRecord,
     BudgetCallReservation, BudgetCallSettlementView, BudgetCallState, BudgetOpenCallView,
     BudgetOpenCallsPage, BudgetReconcileOutcome, BudgetStage, RootBudgetAuthorization,
-    RootBudgetRecord, RootStagePlanBinding, UsageCharge,
+    RootBudgetRecord, RootBudgetUnresolvedReason, RootStagePlanBinding, UsageCharge,
 };
 use evo_storage::{
     ManagementBudgetResultV2, ManagementJobState, ManagementJobV2, ManagementResultV2, Store,
@@ -71,7 +71,7 @@ fn charge(amount: i64, suffix: &str) -> UsageCharge {
         pricing_version: "price-v1".into(),
         provider_request_id: format!("provider-{suffix}"),
         usage_record_id: format!("usage-{suffix}"),
-        output_digest: d(&format!("output-{suffix}")),
+        output_digest: Some(d(&format!("output-{suffix}"))),
     }
 }
 
@@ -228,10 +228,10 @@ async fn session_reconcile_rolls_back_and_store_overflow_keeps_its_committed_fac
         .unwrap();
 
     // A Session reconcile that is rolled back changes neither the call nor the
-    // root amounts.
+    // root amounts. (AG-206: it runs after the dispatch lease, until 102.)
     let mut session = store.session().await.unwrap();
     let outcome = session
-        .reconcile_budget_call_cost(&admin, "scope-1", "call-1", &charge(20, "rollback"), 4)
+        .reconcile_budget_call_cost(&admin, "scope-1", "call-1", &charge(20, "rollback"), 103)
         .await
         .unwrap();
     assert!(matches!(outcome, BudgetReconcileOutcome::Applied(_)));
@@ -262,7 +262,8 @@ async fn session_reconcile_rolls_back_and_store_overflow_keeps_its_committed_fac
             &overflow_call.billing_scope,
             &overflow_call.call_id,
             &overflow_charge,
-            7,
+            // AG-206: past the overflow call's dispatch lease (until 103).
+            104,
         )
         .await
         .unwrap_err();
@@ -294,6 +295,259 @@ async fn session_reconcile_rolls_back_and_store_overflow_keeps_its_committed_fac
     store.close().await;
 }
 
+/// AG-206: a crash-left call whose bill is known but whose output was never
+/// received is reconciled by provider_request_id alone. The stored output stays
+/// NULL (nothing is invented), the amount is charged, and the finalized call is
+/// a valid ledger state. Replays compare the output as an Option.
+#[tokio::test]
+async fn session_reconcile_without_output_finalizes_the_known_charge_only() {
+    let (_dir, store) = store().await;
+    let admin = ctx("ns-a", "admin", Role::Admin);
+    let worker = ctx("ns-a", "worker", Role::Worker);
+    store
+        .authorize_root_budget(&admin, &authorization("root-1", "scope-1"))
+        .await
+        .unwrap();
+    let call = store
+        .reserve_budget_call(&worker, &reservation("scope-1", "call-1", 30, 2))
+        .await
+        .unwrap();
+    let dispatched = store
+        .begin_budget_dispatch(&worker, &fence(&call, 3))
+        .await
+        .unwrap()
+        .call;
+    let uncertain = store
+        .cancel_budget_call(&worker, &fence(&dispatched, 4), "process_lost")
+        .await
+        .unwrap();
+    assert_eq!(uncertain.state, BudgetCallState::Uncertain);
+
+    // A worker settlement still requires the output it received: it is
+    // refused at the boundary and writes nothing.
+    let mut billed = charge(12, "billed");
+    billed.output_digest = None;
+    let mut worker_call = store
+        .reserve_budget_call(&worker, &reservation("scope-1", "call-w", 30, 4))
+        .await
+        .unwrap();
+    worker_call = store
+        .begin_budget_dispatch(&worker, &fence(&worker_call, 5))
+        .await
+        .unwrap()
+        .call;
+    let refused = store
+        .finalize_budget_call(&worker, &fence(&worker_call, 6), &billed)
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, Error::Invalid(_)), "{refused:?}");
+    let still = store
+        .budget_call(&worker, "scope-1", "call-w")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(still.state, BudgetCallState::Dispatched);
+    assert_eq!(still.actual_cost_micros, None);
+
+    let mut session = store.session().await.unwrap();
+    let outcome = session
+        .reconcile_budget_call_cost(&admin, "scope-1", "call-1", &billed, 7)
+        .await
+        .unwrap();
+    let BudgetReconcileOutcome::Applied(applied) = outcome else {
+        panic!("expected an applied reconciliation");
+    };
+    session.commit().await.unwrap();
+    assert_eq!(applied.state, BudgetCallState::Finalized);
+    assert_eq!(
+        applied.provider_request_id.as_deref(),
+        Some("provider-billed")
+    );
+    assert_eq!(applied.usage_record_id.as_deref(), Some("usage-billed"));
+    assert_eq!(applied.actual_cost_micros, Some(12));
+    assert_eq!(applied.output_digest, None);
+    // Reconciliation does not close the execution it never observed.
+    assert!(!applied.execution_closed);
+    let stored = store
+        .budget_call(&admin, "scope-1", "call-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, applied);
+    let root = store.root_budget(&admin, "scope-1").await.unwrap().unwrap();
+    assert_eq!(root.spent_micros, 12);
+    assert_eq!(root.reserved_micros, 30);
+    let view = BudgetCallSettlementView::new(&stored, &root);
+    assert_eq!(view.output_digest, None);
+    assert_eq!(view.actual_cost_micros, Some(12));
+
+    // A finalized call without output is a valid ledger state, not an
+    // invalid call.
+    let mut session = store.session().await.unwrap();
+    let snapshot = session
+        .root_budget_monetary_snapshot(&admin, "scope-1")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert!(
+        !snapshot.unresolved.iter().any(|issue| issue.reason
+            == RootBudgetUnresolvedReason::InvalidCallState
+            && issue.call_id.as_deref() == Some("call-1")),
+        "{:?}",
+        snapshot.unresolved
+    );
+
+    // The same no-output charge is an idempotent replay; adding an output
+    // afterwards is a different charge and is refused without writes.
+    let mut session = store.session().await.unwrap();
+    let replay = session
+        .reconcile_budget_call_cost(&admin, "scope-1", "call-1", &billed, 8)
+        .await
+        .unwrap();
+    assert!(
+        matches!(replay, BudgetReconcileOutcome::AlreadyFinalized(ref same) if *same == stored)
+    );
+    let with_output = charge(12, "billed");
+    let error = session
+        .reconcile_budget_call_cost(&admin, "scope-1", "call-1", &with_output, 8)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::Conflict(ref reason) if reason == "finalized_call_reused_with_different_charge"),
+        "{error:?}"
+    );
+    drop(session);
+
+    // The reverse order is refused as well: a call reconciled with an output
+    // cannot be replayed as "output not received".
+    let finalized_w = store
+        // AG-206: past call-w's dispatch lease (until 104).
+        .reconcile_budget_call_cost(&admin, "scope-1", "call-w", &charge(5, "w"), 105)
+        .await
+        .unwrap();
+    assert_eq!(
+        finalized_w.output_digest.as_deref(),
+        Some(d("output-w").as_str())
+    );
+    let mut without_output = charge(5, "w");
+    without_output.output_digest = None;
+    let error = store
+        .reconcile_budget_call_cost(&admin, "scope-1", "call-w", &without_output, 106)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, Error::Conflict(ref reason) if reason == "finalized_call_reused_with_different_charge"),
+        "{error:?}"
+    );
+    assert_eq!(
+        store
+            .root_budget(&admin, "scope-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .spent_micros,
+        17
+    );
+    store.close().await;
+}
+
+/// AG-206: while its dispatch lease is live the worker may still settle a
+/// dispatched call, so Admin reconciliation is refused with zero writes; after
+/// the lease expires it succeeds. An uncertain call ignores the lease.
+#[tokio::test]
+async fn reconcile_refuses_a_dispatched_call_whose_lease_is_still_live() {
+    let (_dir, store) = store().await;
+    let admin = ctx("ns-a", "admin", Role::Admin);
+    let worker = ctx("ns-a", "worker", Role::Worker);
+    store
+        .authorize_root_budget(&admin, &authorization("root-1", "scope-1"))
+        .await
+        .unwrap();
+    let call = store
+        .reserve_budget_call(&worker, &reservation("scope-1", "call-1", 30, 2))
+        .await
+        .unwrap();
+    let dispatched = store
+        .begin_budget_dispatch(&worker, &fence(&call, 3))
+        .await
+        .unwrap()
+        .call;
+    assert_eq!(dispatched.lease_until, 102);
+    let snapshot = || async {
+        let mut session = store.session().await.unwrap();
+        let snapshot = session
+            .root_budget_monetary_snapshot(&admin, "scope-1")
+            .await
+            .unwrap();
+        session.commit().await.unwrap();
+        snapshot
+    };
+    let before = snapshot().await;
+    // Both the Store wrapper and the Session kernel refuse, up to and
+    // including the lease bound itself.
+    for now in [4, 102] {
+        let error = store
+            .reconcile_budget_call_cost(&admin, "scope-1", "call-1", &charge(12, "a"), now)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Conflict(ref reason) if reason == "reconcile_requires_expired_dispatch_lease"),
+            "{error:?}"
+        );
+        let mut session = store.session().await.unwrap();
+        let error = session
+            .reconcile_budget_call_cost(&admin, "scope-1", "call-1", &charge(12, "a"), now)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::Conflict(ref reason) if reason == "reconcile_requires_expired_dispatch_lease"),
+            "{error:?}"
+        );
+        session.commit().await.unwrap();
+    }
+    // Call row, root ledger and events are unchanged.
+    assert_eq!(snapshot().await, before);
+
+    // Once the lease has expired only Admin can close it, and it succeeds.
+    let reconciled = store
+        .reconcile_budget_call_cost(&admin, "scope-1", "call-1", &charge(12, "a"), 103)
+        .await
+        .unwrap();
+    assert_eq!(reconciled.state, BudgetCallState::Finalized);
+    assert_eq!(reconciled.actual_cost_micros, Some(12));
+
+    // An uncertain call is reconciled regardless of its lease.
+    let other = store
+        .reserve_budget_call(&worker, &reservation("scope-1", "call-2", 30, 104))
+        .await
+        .unwrap();
+    let other = store
+        .begin_budget_dispatch(&worker, &fence(&other, 105))
+        .await
+        .unwrap()
+        .call;
+    store
+        .cancel_budget_call(&worker, &fence(&other, 106), "process_lost")
+        .await
+        .unwrap();
+    assert!(107 <= other.lease_until);
+    let uncertain = store
+        .reconcile_budget_call_cost(&admin, "scope-1", "call-2", &charge(7, "b"), 107)
+        .await
+        .unwrap();
+    assert_eq!(uncertain.state, BudgetCallState::Finalized);
+    assert_eq!(
+        store
+            .root_budget(&admin, "scope-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .spent_micros,
+        19
+    );
+    store.close().await;
+}
+
 #[tokio::test]
 async fn session_overflow_outcome_preserves_facts_in_one_commit() {
     let (_dir, store) = store().await;
@@ -308,7 +562,8 @@ async fn session_overflow_outcome_preserves_facts_in_one_commit() {
             &overflow_call.billing_scope,
             &overflow_call.call_id,
             &overflow_charge,
-            7,
+            // AG-206: past the overflow call's dispatch lease (until 103).
+            104,
         )
         .await
         .unwrap();

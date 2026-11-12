@@ -982,7 +982,7 @@ async fn forged_output_or_projection_does_not_verify_even_with_recomputed_outer_
             pricing_version: "local-zero-v1".into(),
             provider_request_id: format!("registered-config-projection:{dispatch_id}"),
             usage_record_id: format!("config-settler-usage-{index}"),
-            output_digest,
+            output_digest: Some(output_digest),
         };
         let accounted = if let Some(provenance) = provenance {
             let forged = BudgetArtifact::from_serializable(

@@ -593,7 +593,7 @@ async fn settle_open(world: &World, bound: &BoundModelRequest) -> ModelResponse 
                 pricing_version: completion.pricing_version.clone(),
                 provider_request_id: completion.provider_request_id.clone(),
                 usage_record_id: completion.usage_record_id.clone(),
-                output_digest,
+                output_digest: Some(output_digest),
             },
             &ModelCallSettlementEvidence {
                 provenance: BudgetExecutionProvenance::Fixture,
@@ -1261,7 +1261,7 @@ async fn ag121_session_settle_open_with_artifacts(
                 pricing_version: completion.pricing_version.clone(),
                 provider_request_id: completion.provider_request_id.clone(),
                 usage_record_id: completion.usage_record_id.clone(),
-                output_digest,
+                output_digest: Some(output_digest),
             },
             &ModelCallSettlementEvidence {
                 provenance: BudgetExecutionProvenance::Fixture,
@@ -1910,7 +1910,7 @@ async fn q03_unsettled_or_missing_response_refusal_is_zero_write() {
                             pricing_version: completion.pricing_version,
                             provider_request_id: completion.provider_request_id,
                             usage_record_id: completion.usage_record_id,
-                            output_digest: hash(completion.output.as_bytes()),
+                            output_digest: Some(hash(completion.output.as_bytes())),
                         },
                     )
                     .await

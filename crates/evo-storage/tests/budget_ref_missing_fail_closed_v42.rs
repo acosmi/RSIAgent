@@ -423,7 +423,7 @@ fn late_charge(call_id: &str, amount: i64) -> UsageCharge {
         pricing_version: "price-v1".into(),
         provider_request_id: format!("provider-{call_id}"),
         usage_record_id: format!("usage-{call_id}"),
-        output_digest: hash(OUTPUT.as_bytes()),
+        output_digest: Some(hash(OUTPUT.as_bytes())),
     }
 }
 

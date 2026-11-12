@@ -389,7 +389,7 @@ async fn dispatch_and_settle(store: &Store, call: &BudgetCallRecord) {
                 pricing_version: "price-v1".into(),
                 provider_request_id: format!("provider-{}", call.call_id),
                 usage_record_id: format!("usage-{}", call.call_id),
-                output_digest: hash(OUTPUT.as_bytes()),
+                output_digest: Some(hash(OUTPUT.as_bytes())),
             },
             &settlement_evidence(&call.call_id),
         )

@@ -132,7 +132,7 @@ fn charge(call_id: &str, amount: i64) -> UsageCharge {
         pricing_version: "price-v1".into(),
         provider_request_id: format!("provider-{call_id}"),
         usage_record_id: format!("usage-{call_id}"),
-        output_digest: hash(b"output"),
+        output_digest: Some(hash(b"output")),
     }
 }
 
@@ -1193,7 +1193,8 @@ mod e16_mode {
                 "scope-1",
                 "invalid-facts",
                 &charge("invalid-facts", 9),
-                5,
+                // AG-206: past the dispatch lease (until 100).
+                101,
             )
             .await
             .unwrap();
@@ -1226,7 +1227,7 @@ mod e16_mode {
                 call_id: call.call_id.clone(),
                 dispatch_id: call.dispatch_id.clone().unwrap(),
                 request_digest: call.actual_input_digest.clone(),
-                output_digest: zero.output_digest.clone(),
+                output_digest: zero.output_digest.clone().unwrap(),
                 target_id: "target".into(),
                 target_digest: hash(b"target"),
                 runner_digest: hash(b"runner"),
@@ -1239,7 +1240,8 @@ mod e16_mode {
             );
             assert_eq!(before, all_rows(&dir).await);
             let reconciled = store
-                .reconcile_budget_call_cost(&admin(), "scope-1", "registered", &zero, 5)
+                // AG-206: past the dispatch lease (until 100).
+                .reconcile_budget_call_cost(&admin(), "scope-1", "registered", &zero, 101)
                 .await
                 .unwrap();
             assert!(!reconciled.execution_closed);
@@ -1302,7 +1304,8 @@ mod e16_mode {
                 "scope-1",
                 "mode-switch",
                 &charge("mode-switch", 9),
-                5,
+                // AG-206: past the dispatch lease (until 100).
+                101,
             )
             .await
             .unwrap();
@@ -1778,7 +1781,8 @@ mod e16_mode {
                 "scope-1",
                 "sql-fault",
                 &charge("sql-fault", 9),
-                5,
+                // AG-206: past the dispatch lease (until 100).
+                101,
             )
             .await
             .unwrap();
@@ -2121,7 +2125,8 @@ mod e16_mode {
                 "scope-1",
                 "run-json-fault",
                 &charge("run-json-fault", 9),
-                5,
+                // AG-206: past the dispatch lease (until 100).
+                101,
             )
             .await
             .unwrap();

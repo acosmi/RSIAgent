@@ -1329,7 +1329,7 @@ async fn q03_late_transitive_revocation_settlement_keeps_charge_and_redacts_cont
         pricing_version: "price-v1".into(),
         provider_request_id: "q03-provider".into(),
         usage_record_id: "q03-usage".into(),
-        output_digest: hash(output.as_bytes()),
+        output_digest: Some(hash(output.as_bytes())),
     };
     let settled = store
         .settle_model_budget_call(&broker_host(), &q03_fence(&call), &charge, &evidence)

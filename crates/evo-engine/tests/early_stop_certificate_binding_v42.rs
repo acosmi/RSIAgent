@@ -934,7 +934,7 @@ async fn execute(
                 pricing_version: "fixture-pricing-v1".into(),
                 provider_request_id: format!("fixture-request-{ordinal}"),
                 usage_record_id: format!("fixture-usage-{ordinal}"),
-                output_digest: receipt.output_digest,
+                output_digest: Some(receipt.output_digest),
             },
         )
         .await
@@ -1746,7 +1746,8 @@ async fn start_pending(fixture: &Fixture) -> Pending {
                 request_artifact: None,
                 max_cost_micros: 100,
                 lease_token: "pending-lease".into(),
-                lease_until: 3_000,
+                // AG-206: the lease ends before Admin's reconciliation at 1_200.
+                lease_until: 1_199,
                 now: 170,
             },
         )
@@ -1855,7 +1856,7 @@ async fn reconcile(fixture: &Fixture, pending: &Pending) {
                 pricing_version: "fixture-pricing-v1".into(),
                 provider_request_id: "fixture-late-request".into(),
                 usage_record_id: "fixture-late-usage".into(),
-                output_digest: receipt.output_digest,
+                output_digest: Some(receipt.output_digest),
             },
             1_200,
         )

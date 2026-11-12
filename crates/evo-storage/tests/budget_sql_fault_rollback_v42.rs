@@ -161,7 +161,7 @@ async fn control_ledger(store: &Store) -> (Context, RootBudgetRecord) {
                 pricing_version: "price-v1".into(),
                 provider_request_id: "ag082-fixture-provider-request".into(),
                 usage_record_id: "ag082-fixture-usage".into(),
-                output_digest: hash(b"ag082-fixture-output"),
+                output_digest: Some(hash(b"ag082-fixture-output")),
             },
         )
         .await

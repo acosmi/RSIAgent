@@ -65,7 +65,7 @@ fn charge(id: &str, amount_micros: i64) -> UsageCharge {
         pricing_version: "price-v1".into(),
         provider_request_id: format!("provider-{id}"),
         usage_record_id: format!("usage-{id}"),
-        output_digest: hash(id.as_bytes()),
+        output_digest: Some(hash(id.as_bytes())),
     }
 }
 
@@ -1001,7 +1001,8 @@ async fn overflow_keeps_exact_known_charge_and_original_accounting_without_unkno
                 "scope",
                 &call.call_id,
                 &charge("overflow-paid", i64::MAX),
-                12
+                // AG-206: past the dispatch lease (until 10_010).
+                10_011
             )
             .await,
         Err(Error::Conflict(_))
@@ -1035,7 +1036,7 @@ async fn overflow_keeps_exact_known_charge_and_original_accounting_without_unkno
             .any(|issue| issue.reason == RootBudgetUnresolvedReason::AuthorizationLimitExceeded)
     );
     let sealed = session
-        .seal_root_budget(&admin, "scope", "preserve overflow", 13)
+        .seal_root_budget(&admin, "scope", "preserve overflow", 10_012)
         .await
         .unwrap();
     assert!(!sealed.monetary_complete);

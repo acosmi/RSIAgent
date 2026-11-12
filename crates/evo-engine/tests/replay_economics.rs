@@ -790,7 +790,7 @@ async fn real_budget_call_state_maps_to_final_uncertain_and_not_incurred_without
                 pricing_version: "price-v1".into(),
                 provider_request_id: "provider-fixed".into(),
                 usage_record_id: "usage-fixed".into(),
-                output_digest: d("output-fixed"),
+                output_digest: Some(d("output-fixed")),
             },
         )
         .await

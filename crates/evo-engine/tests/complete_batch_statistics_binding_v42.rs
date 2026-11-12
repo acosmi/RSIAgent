@@ -960,7 +960,7 @@ async fn execute(
                 pricing_version: "fixture-pricing-v1".into(),
                 provider_request_id: format!("fixture-request-{ordinal}"),
                 usage_record_id: format!("fixture-usage-{ordinal}"),
-                output_digest: receipt.output_digest,
+                output_digest: Some(receipt.output_digest),
             },
         )
         .await

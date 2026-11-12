@@ -561,7 +561,7 @@ async fn execute_output(
                 pricing_version: "pricing-v1".into(),
                 provider_request_id: format!("provider-{ordinal}"),
                 usage_record_id: format!("usage-{ordinal}"),
-                output_digest: receipt.output_digest,
+                output_digest: Some(receipt.output_digest),
             },
         )
         .await
@@ -2676,7 +2676,7 @@ print(sum(1 for r in rows if r['operation']=='late_execution_receipt_after_forma
                 pricing_version: "pricing-v1".into(),
                 provider_request_id: "fixture-late-provider-record".into(),
                 usage_record_id: "fixture-late-usage-record".into(),
-                output_digest: late.output_digest,
+                output_digest: Some(late.output_digest),
             },
             late_fence.now,
         )

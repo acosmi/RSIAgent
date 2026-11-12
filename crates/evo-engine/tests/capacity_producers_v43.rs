@@ -2875,7 +2875,7 @@ mod monitoring {
                         pricing_version: "pricing-v1".into(),
                         provider_request_id: "fixture-runner".into(),
                         usage_record_id: usage.clone(),
-                        output_digest: d("development-output"),
+                        output_digest: Some(d("development-output")),
                     },
                 )
                 .await?;

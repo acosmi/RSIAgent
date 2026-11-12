@@ -413,7 +413,7 @@ async fn revoke_blocks_immediately_resumes_after_restart_and_preserves_accountin
                 pricing_version: "pricing-v1".into(),
                 provider_request_id: "provider-1".into(),
                 usage_record_id: "usage-1".into(),
-                output_digest: hash(marker.as_bytes()),
+                output_digest: Some(hash(marker.as_bytes())),
             },
             &ModelCallSettlementEvidence {
                 provenance: BudgetExecutionProvenance::Fixture,

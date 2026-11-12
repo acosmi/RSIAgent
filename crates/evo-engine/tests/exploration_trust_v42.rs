@@ -830,7 +830,7 @@ impl ContrastRunner {
                     pricing_version: "pricing-v1".into(),
                     provider_request_id: format!("registered-pure-function:{dispatch_id}"),
                     usage_record_id: format!("usage-{}", &fingerprint(&call_id)?[..32]),
-                    output_digest: output_digest.clone(),
+                    output_digest: Some(output_digest.clone()),
                 },
                 &RegisteredExecutionSettlement {
                     schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA.into(),

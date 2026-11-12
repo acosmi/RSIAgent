@@ -1388,7 +1388,7 @@ async fn current_diagnostic_semantics_do_not_grant_promotion_authority() {
                         pricing_version: "pricing-v1".into(),
                         provider_request_id: format!("software-provider-{ordinal}"),
                         usage_record_id: format!("software-usage-{ordinal}"),
-                        output_digest: receipt.output_digest,
+                        output_digest: Some(receipt.output_digest),
                     },
                 )
                 .await
