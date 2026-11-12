@@ -244,6 +244,7 @@ fn row_class(item: CapacityItem) -> Option<String> {
             artifact("'rsia.practice_attempt_set.v1','rsia.practice_attempt_set.v2'")
         }
         HostSurface => artifact("'rsia.host_surface_record.v1','rsia.host_surface_record.v2'"),
+        TraceExport => artifact(&format!("'{}'", crate::TRACE_EXPORT_SCHEMA)),
         ExternalService => artifact(
             "'rsia.registered_external_provider.v1','rsia.registered_external_provider.v2',\
              'rsia.registered_external_provider.v3','rsia.registered_resource_instrumentation.v1'",
@@ -802,11 +803,6 @@ impl Session {
             DevelopmentCycle => development_cycles(&mut self.tx).await,
             FailureRecord => failure_records(&mut self.tx).await,
             ConcurrentOptimizationJob => active_optimization_jobs(&mut self.tx).await,
-            // Trace export records keep a redacted history slot, so this uses
-            // the same cross-namespace counter as the producer's own write
-            // gate instead of the occupants() path, which frees lawful
-            // redactions.
-            TraceExport => crate::count_trace_exports_all_namespaces(&mut self.tx).await,
             // Prepare slots live in the Store guard; owner-scoped items are
             // admitted against their owner; the rest have no producer yet.
             _ => Ok(0),

@@ -1,4 +1,5 @@
 //! Actual service-success fact capture; no external Host or Native-export claim.
+use evo_core::capacity::{CapacityConflict, CapacityItem};
 use evo_core::contract::{
     CapabilityLevel, HostCapabilities, HostSurfaceClassificationV2, HostSurfaceRegistrationV2,
     ReviewedHostSourceEnvelopeV1, SurfaceCoverage,
@@ -1337,10 +1338,11 @@ async fn trace_export_unknown_license_or_source_grant_is_refused() {
 }
 
 /// The all-instance trace export record bound and the same-key rule at the
-/// limit, through the real storage `put` gate the prepare job also passes.
-/// Boundary seeds are minimal trace-export identities only: they fabricate no
-/// review, delivery or Current phase, exactly like the replay-world capacity
-/// seeds.
+/// limit, through the real storage `put` gate the prepare job also passes. The
+/// refusal is the typed capacity conflict of `CapacityItem::TraceExport`, the
+/// one authority of the limit. Boundary seeds are minimal trace-export
+/// identities only: they fabricate no review, delivery or Current phase,
+/// exactly like the replay-world capacity seeds.
 #[tokio::test]
 async fn trace_export_global_capacity_and_same_key_at_limit() {
     let dir = tempfile::tempdir().unwrap();
@@ -1354,7 +1356,14 @@ async fn trace_export_global_capacity_and_same_key_at_limit() {
     // namespace of the instance, so the last slot is spent by another
     // namespace's record.
     let mut session = store.session().await.unwrap();
-    let last = (evo_storage::MVP_MAX_TRACE_EXPORTS - 1) as usize;
+    let limit = CapacityItem::TraceExport.limit();
+    let full = CapacityConflict {
+        item: CapacityItem::TraceExport,
+        used: limit,
+        limit,
+        delta: 1,
+    };
+    let last = (limit - 1) as usize;
     for index in 0..last {
         let id = format!("trace-seed-{index:04}");
         session
@@ -1372,10 +1381,7 @@ async fn trace_export_global_capacity_and_same_key_at_limit() {
             .put(ctx, "artifact", id, ctx.actor(), &seed(id))
             .await
         {
-            Err(Error::Conflict(message)) => assert_eq!(
-                message,
-                "MVP capacity exceeded: trace exports 1000 >= limit 1000"
-            ),
+            Err(Error::Capacity(conflict)) => assert_eq!(conflict, full),
             other => panic!("{id} must hit the all-instance bound, got {other:?}"),
         }
         assert!(
@@ -1420,8 +1426,10 @@ async fn trace_export_global_capacity_and_same_key_at_limit() {
         }
         other => panic!("deleting trace history must be retained, got {other:?}"),
     }
-    // A real revocation redaction of one record keeps occupying the same
-    // all-instance quota and stays read-only: no slot is freed by redacting.
+    // A redacted body put directly has no completed revocation cleanup behind
+    // it, so it is no lawful redaction (§3.3.2): it keeps occupying its slot
+    // and stays read-only. Only a completed cleanup frees a slot; that case is
+    // the storage capacity test's.
     let redacted_id = "trace-seed-0002".to_string();
     let row = session
         .object_row(&admin, "artifact", &redacted_id)
@@ -1448,11 +1456,10 @@ async fn trace_export_global_capacity_and_same_key_at_limit() {
         )
         .await
     {
-        Err(Error::Conflict(message)) => assert_eq!(
-            message,
-            "MVP capacity exceeded: trace exports 1000 >= limit 1000"
-        ),
-        other => panic!("the redacted placeholder keeps its slot, got {other:?}"),
+        Err(Error::Capacity(conflict)) => assert_eq!(conflict, full),
+        other => {
+            panic!("a redacted body without a completed cleanup keeps its slot, got {other:?}")
+        }
     }
     match session
         .put(

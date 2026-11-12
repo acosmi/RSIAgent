@@ -349,7 +349,6 @@ pub const TRACE_EXPORT_SCHEMA: &str = "rsia.trace_export.v1";
 /// member set. The engine string-matches this one reason so crash recovery can
 /// tell "no proof of publication" apart from a drifted source closure.
 pub const TRACE_EXPORT_TREE_UNAVAILABLE: &str = "published trace export tree is unavailable";
-pub const MVP_MAX_TRACE_EXPORTS: u64 = 1_000;
 /// The directory root of published trace export trees under the store root.
 pub const TRACE_EXPORT_ROOT: &str = "trace-exports";
 /// Schema identifiers the capacity measurement recognises. They mirror the
@@ -1626,22 +1625,6 @@ async fn count_management_job_capacity(
         }
     }
     Ok(counts)
-}
-
-/// Trace export records across every namespace, live or redacted: redacted
-/// history keeps its slot, so the instance bound is never freed by revocation.
-async fn count_trace_exports_all_namespaces(conn: &mut sqlx::SqliteConnection) -> Result<u64> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM objects WHERE kind='artifact' AND (
-           json_extract(body,'$.schema_version')=?1 OR (
-             json_extract(body,'$.schema_version')='rsia.redacted.v1'
-             AND json_extract(body,'$.original_schema')=?1))",
-    )
-    .bind(TRACE_EXPORT_SCHEMA)
-    .fetch_one(&mut *conn)
-    .await
-    .map_err(internal)?;
-    count_to_u64(count)
 }
 
 /// The retained trace export class, live or redacted; never proof that its
@@ -4751,12 +4734,8 @@ impl Session {
                         "trace export redaction requires its original record".into(),
                     ));
                 }
-                let used = count_trace_exports_all_namespaces(&mut self.tx).await?;
-                if used >= MVP_MAX_TRACE_EXPORTS {
-                    return Err(Error::Conflict(format!(
-                        "MVP capacity exceeded: trace exports {used} >= limit {MVP_MAX_TRACE_EXPORTS}"
-                    )));
-                }
+                self.admit_capacity(&[(evo_core::capacity::CapacityItem::TraceExport, 1)])
+                    .await?;
             }
         }
         let changed = sqlx::query(
