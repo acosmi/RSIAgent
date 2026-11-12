@@ -28,6 +28,7 @@ use evo_engine::packages::{
 use evo_engine::release_store::{
     CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
 };
+use evo_storage::budget::RootBudgetAuthorization;
 use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
 use evo_storage::{Store, decode_management_job};
 use serde_json::{Value, json};
@@ -1523,6 +1524,7 @@ async fn export_complete_of_an_absent_export_id_fails_instead_of_draining() {
     )
     .await;
     assert_eq!(status.state, ManagementJobState::Failed, "{status:?}");
+    assert_eq!(status.step, "failed");
     assert_eq!(status.error_code.as_deref(), Some("not_found"));
     assert!(status.result.is_none());
     assert_eq!(status.generation, 1, "one claim, no re-run");
@@ -1554,8 +1556,9 @@ async fn redacted_export_complete_without_a_tree_fails_as_source_revoked() {
 
 // The same redaction, but the cleanup was blocked at the formal directory (a
 // plain file sits there) and left it: the job stays Draining and names the
-// operator action, and the dispatcher deletes nothing. Once the operator has
-// moved it away the job fails.
+// operator action, and the dispatcher deletes nothing. While it waits it holds
+// the only dispatch slot, yet a closure operation is still claimed. Once the
+// operator has moved the file away the job fails.
 #[tokio::test]
 async fn redacted_export_complete_with_a_tree_waits_for_the_operator_then_fails() {
     let (_dir, store, seeded, export_id) = redacted_export_job("redacted-tree", true).await;
@@ -1569,6 +1572,46 @@ async fn redacted_export_complete_with_a_tree_waits_for_the_operator_then_fails(
         "PARENT-EXPECTED-FAILURE: a Draining job must tell the operator what to do"
     );
     assert!(export_dir.is_file(), "nothing is deleted");
+
+    // Listing open calls derives no new work, so it is claimed although the
+    // Draining job holds the only slot (AG-207). The listing needs an
+    // authorized root for its billing scope.
+    store
+        .authorize_root_budget(
+            &ctx,
+            &RootBudgetAuthorization {
+                root_budget_id: "draining-root".into(),
+                billing_scope: "draining-scope".into(),
+                allowed_namespaces: vec!["tenant".into()],
+                currency: "USD".into(),
+                pricing_version: "price-v1".into(),
+                payment_subject: "fixture-only".into(),
+                authorization_receipt_digest: hash(b"draining-root-authorization"),
+                per_call_cap_micros: 20,
+                total_limit_micros: 1000,
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let listed = done(
+        &dispatcher,
+        &ctx,
+        "budget.calls.list_open",
+        json!({
+            "schema_version": "rsia.management.budget_calls_list_open.v1",
+            "request_key": "draining-list-open",
+            "billing_scope": "draining-scope",
+        }),
+    )
+    .await;
+    assert_eq!(listed.state, ManagementJobState::Succeeded, "{listed:?}");
+    let held = dispatcher.status_view(&ctx, &seeded.id).await.unwrap();
+    assert_eq!(
+        held.state,
+        ManagementJobState::Draining,
+        "the closure job ran while the export.complete still held the slot: {held:?}"
+    );
 
     tokio::fs::remove_file(&export_dir).await.unwrap();
     let restarted = ManagementDispatcher::new(store.clone(), vec![ctx.clone()]).unwrap();
@@ -1589,7 +1632,7 @@ async fn redacted_export_complete_with_a_tree_waits_for_the_operator_then_fails(
 // Closing the stuck job frees the only dispatch slot: a non-closure job that was
 // kept Queued behind it is claimed and succeeds.
 #[tokio::test]
-async fn closing_a_draining_export_complete_frees_the_dispatch_slot() {
+async fn closing_a_running_export_complete_frees_the_dispatch_slot() {
     let (_dir, store, seeded, _export_id) = redacted_export_job("slot-holder", false).await;
     let ctx = admin();
     let live = source(&store, &ctx, "slot-live-source").await;
