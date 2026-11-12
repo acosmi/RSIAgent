@@ -1746,8 +1746,7 @@ async fn start_pending(fixture: &Fixture) -> Pending {
                 request_artifact: None,
                 max_cost_micros: 100,
                 lease_token: "pending-lease".into(),
-                // AG-206: the lease ends before Admin's reconciliation at 1_200.
-                lease_until: 1_199,
+                lease_until: 3_000,
                 now: 170,
             },
         )
@@ -1858,7 +1857,9 @@ async fn reconcile(fixture: &Fixture, pending: &Pending) {
                 usage_record_id: "fixture-late-usage".into(),
                 output_digest: Some(receipt.output_digest),
             },
-            1_200,
+            // AG-206: Admin reconciles only after the dispatch lease (until
+            // 3_000, also in the frozen legacy history) has expired.
+            3_001,
         )
         .await
         .unwrap();
@@ -1870,7 +1871,7 @@ async fn reconcile(fixture: &Fixture, pending: &Pending) {
             &pending.call_id,
             &pending.dispatch_id,
             "late_audit_closed",
-            1_201,
+            3_002,
         )
         .await
         .unwrap();
