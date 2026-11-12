@@ -20,9 +20,9 @@ use consolidation_cycles::{
 };
 use evo_core::{Context, Error, Role, hash, now};
 use evo_engine::dispatch::{
-    ManagementCancelArrival, ManagementConsolidationTriggerState, ManagementDispatcher,
-    ManagementJobState, ManagementJobStatusV1, ManagementJobV2, ManagementMonitoringResultV2,
-    ManagementResultV2,
+    ManagementCancelArrival, ManagementConsolidationClaimState,
+    ManagementConsolidationTriggerState, ManagementDispatcher, ManagementJobState,
+    ManagementJobStatusV1, ManagementJobV2, ManagementMonitoringResultV2, ManagementResultV2,
 };
 use evo_storage::lifecycle::{LifecycleStore, TypedObjectRef};
 use serde_json::{Value, json};
@@ -82,7 +82,7 @@ struct Triggered {
     completed_cycles: u64,
     trigger_state: ManagementConsolidationTriggerState,
     claim_id: Option<String>,
-    claim_state: Option<String>,
+    claim_state: Option<ManagementConsolidationClaimState>,
     terminated_generations: Vec<u64>,
 }
 
@@ -192,7 +192,10 @@ async fn the_trigger_closes_the_actual_cycle_and_only_claims() {
         ManagementConsolidationTriggerState::Claimed
     );
     assert_eq!(second.completed_cycles, 2);
-    assert_eq!(second.claim_state.as_deref(), Some("claimed"));
+    assert_eq!(
+        second.claim_state,
+        Some(ManagementConsolidationClaimState::Claimed)
+    );
     assert!(second.terminated_generations.is_empty());
     assert_eq!(second.scope_id, first.scope_id);
 
@@ -257,7 +260,10 @@ async fn the_same_report_under_another_key_adds_no_cycle_or_claim() {
     triggered(&trigger(&fixture, &dispatcher, "trigger-1", &first_fact).await);
     let original_status = trigger(&fixture, &dispatcher, "trigger-2", &second_fact).await;
     let original = triggered(&original_status);
-    assert_eq!(original.claim_state.as_deref(), Some("no_contrast"));
+    assert_eq!(
+        original.claim_state,
+        Some(ManagementConsolidationClaimState::NoContrast)
+    );
     let scope = fixture.raw(&original.scope_id).await;
     let claim = fixture.raw(original.claim_id.as_deref().unwrap()).await;
 
@@ -268,7 +274,10 @@ async fn the_same_report_under_another_key_adds_no_cycle_or_claim() {
     );
     assert_eq!(again.cycle_id, original.cycle_id);
     assert_eq!(again.claim_id, original.claim_id);
-    assert_eq!(again.claim_state.as_deref(), Some("no_contrast"));
+    assert_eq!(
+        again.claim_state,
+        Some(ManagementConsolidationClaimState::NoContrast)
+    );
     assert_eq!(business_rows(&fixture).await, (2, 1, 1));
     assert_eq!(fixture.raw(&original.scope_id).await, scope);
     assert_eq!(

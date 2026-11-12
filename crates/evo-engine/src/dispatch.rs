@@ -101,10 +101,10 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
 
 pub use evo_storage::{
     ManagementAssetExportResultV2, ManagementAssetExportState, ManagementBackupResultV2,
-    ManagementBudgetResultV2, ManagementCancelArrival, ManagementConsolidationTriggerState,
-    ManagementDiagnostic, ManagementImportResultState, ManagementImportResultV2,
-    ManagementImportStatusCounts, ManagementJob, ManagementJobState, ManagementJobV2,
-    ManagementMonitoringResultV2, ManagementOptimizationCallProducer,
+    ManagementBudgetResultV2, ManagementCancelArrival, ManagementConsolidationClaimState,
+    ManagementConsolidationTriggerState, ManagementDiagnostic, ManagementImportResultState,
+    ManagementImportResultV2, ManagementImportStatusCounts, ManagementJob, ManagementJobState,
+    ManagementJobV2, ManagementMonitoringResultV2, ManagementOptimizationCallProducer,
     ManagementOptimizationCallRef, ManagementOptimizationProgressV2,
     ManagementOptimizationResultV2, ManagementOptimizationStageRef, ManagementPartialResultV2,
     ManagementPendingTerminalState, ManagementResult, ManagementResultV2,
@@ -4043,16 +4043,22 @@ async fn run_consolidation_trigger(
                 Some(claim),
             ),
         };
-        // The claim state's fixed serde code, never a free-text description.
-        let claim_state = match &claim {
-            Some(claim) => Some(
-                serde_json::from_value::<String>(
-                    serde_json::to_value(claim.state).map_err(|_| Error::Internal)?,
-                )
-                .map_err(|_| Error::Internal)?,
-            ),
-            None => None,
-        };
+        let claim_state = claim.as_ref().map(|claim| {
+            use crate::monitoring::ConsolidationClaimState as State;
+            use ManagementConsolidationClaimState as Reported;
+            match claim.state {
+                State::Claimed => Reported::Claimed,
+                State::NoContrast => Reported::NoContrast,
+                State::Running => Reported::Running,
+                State::CompletedNoChange => Reported::CompletedNoChange,
+                State::CompletedCandidate => Reported::CompletedCandidate,
+                State::CompletedRejected => Reported::CompletedRejected,
+                State::CompletedUncertain => Reported::CompletedUncertain,
+                State::CompletedRevoked => Reported::CompletedRevoked,
+                State::BlockedBudget => Reported::BlockedBudget,
+                State::GenerationExpired => Reported::GenerationExpired,
+            }
+        });
         let outcome = JobOutcome {
             state: ManagementJobState::Succeeded,
             step: "consolidation_triggered".into(),

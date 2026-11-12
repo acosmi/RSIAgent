@@ -566,8 +566,7 @@ pub enum ManagementMonitoringResultV2 {
         completed_cycles: u64,
         trigger_state: ManagementConsolidationTriggerState,
         claim_id: Option<String>,
-        /// The claim's fixed state code (`claimed`, `no_contrast`, ...).
-        claim_state: Option<String>,
+        claim_state: Option<ManagementConsolidationClaimState>,
         /// Older generations the trigger wrote as terminal, ascending.
         terminated_generations: Vec<u64>,
     },
@@ -580,6 +579,23 @@ pub enum ManagementConsolidationTriggerState {
     NotEligible,
     Claimed,
     AlreadyClaimed,
+}
+
+/// The reported claim's state, mirroring the engine's `ConsolidationClaimState`
+/// codes so a persisted result can only hold a known state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementConsolidationClaimState {
+    Claimed,
+    NoContrast,
+    Running,
+    CompletedNoChange,
+    CompletedCandidate,
+    CompletedRejected,
+    CompletedUncertain,
+    CompletedRevoked,
+    BlockedBudget,
+    GenerationExpired,
 }
 
 /// Closed management results of the four budget operations. They carry only
