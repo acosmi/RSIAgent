@@ -29,7 +29,7 @@ use serde_json::{Value, json};
 
 const OPERATION: &str = "consolidation.trigger";
 
-fn dispatcher(fixture: &Fixture) -> ManagementDispatcher {
+fn new_dispatcher(fixture: &Fixture) -> ManagementDispatcher {
     ManagementDispatcher::new(fixture.store.clone(), vec![fixture.admin.clone()]).unwrap()
 }
 
@@ -173,7 +173,7 @@ async fn put_job(fixture: &Fixture, job: &ManagementJobV2) {
 #[tokio::test]
 async fn the_trigger_closes_the_actual_cycle_and_only_claims() {
     let fixture = Fixture::new().await;
-    let dispatcher = dispatcher(&fixture);
+    let dispatcher = new_dispatcher(&fixture);
     let first_fact = fixture.stage(1, true).await;
     let second_fact = fixture.stage(2, true).await;
 
@@ -251,7 +251,7 @@ async fn the_trigger_closes_the_actual_cycle_and_only_claims() {
 #[tokio::test]
 async fn the_same_report_under_another_key_adds_no_cycle_or_claim() {
     let fixture = Fixture::new().await;
-    let dispatcher = dispatcher(&fixture);
+    let dispatcher = new_dispatcher(&fixture);
     let first_fact = fixture.stage(1, false).await;
     let second_fact = fixture.stage(2, false).await;
     triggered(&trigger(&fixture, &dispatcher, "trigger-1", &first_fact).await);
@@ -292,7 +292,7 @@ async fn the_same_report_under_another_key_adds_no_cycle_or_claim() {
 async fn a_revoked_source_or_watermark_writes_no_business_row() {
     // A revoked source refuses the submit at its dependency gate.
     let fixture = Fixture::new().await;
-    let dispatcher = dispatcher(&fixture);
+    let dispatcher = new_dispatcher(&fixture);
     let fact = fixture.stage(1, true).await;
     LifecycleStore::begin_revoke(
         &fixture.admin,
@@ -319,7 +319,7 @@ async fn a_revoked_source_or_watermark_writes_no_business_row() {
     // A watermark that moved after the request froze it fails the job before
     // its first business write.
     let fixture = Fixture::new().await;
-    let dispatcher = dispatcher(&fixture);
+    let dispatcher = new_dispatcher(&fixture);
     let fact = fixture.stage(1, true).await;
     let mut session = fixture.store.session().await.unwrap();
     session
@@ -337,7 +337,7 @@ async fn a_revoked_source_or_watermark_writes_no_business_row() {
 #[tokio::test]
 async fn a_claim_failure_rolls_the_cycle_back() {
     let fixture = Fixture::new().await;
-    let dispatcher = dispatcher(&fixture);
+    let dispatcher = new_dispatcher(&fixture);
     let first_fact = fixture.stage(1, true).await;
     let second_fact = fixture.stage(2, true).await;
     triggered(&trigger(&fixture, &dispatcher, "trigger-1", &first_fact).await);
@@ -383,7 +383,7 @@ async fn a_claim_failure_rolls_the_cycle_back() {
 #[tokio::test]
 async fn the_cycle_claim_and_terminal_job_state_share_one_commit() {
     let fixture = Fixture::new().await;
-    let dispatcher = dispatcher(&fixture);
+    let dispatcher = new_dispatcher(&fixture);
     let first_fact = fixture.stage(1, true).await;
     let second_fact = fixture.stage(2, true).await;
     fixture.sqlite(
@@ -408,7 +408,7 @@ async fn the_cycle_claim_and_terminal_job_state_share_one_commit() {
 #[tokio::test]
 async fn the_trigger_role_and_wire_are_strict() {
     let fixture = Fixture::new().await;
-    let dispatcher = dispatcher(&fixture);
+    let dispatcher = new_dispatcher(&fixture);
     let fact = fixture.stage(1, true).await;
     let rows = fixture.rows().await;
     for role in [Role::Worker, Role::Host, Role::Evaluator] {
@@ -444,7 +444,7 @@ async fn the_trigger_role_and_wire_are_strict() {
 #[tokio::test]
 async fn cancelling_before_the_effect_creates_no_business_rows() {
     let fixture = Fixture::new().await;
-    let dispatcher = dispatcher(&fixture);
+    let dispatcher = new_dispatcher(&fixture);
     let job = seeded_job(&fixture.admin, "cancel-before", ManagementJobState::Queued);
     put_job(&fixture, &job).await;
     let cancelled = dispatcher.cancel(&fixture.admin, &job.id).await.unwrap();
@@ -460,7 +460,7 @@ async fn cancelling_before_the_effect_creates_no_business_rows() {
 #[tokio::test]
 async fn cancelling_after_the_effect_keeps_the_cycle_and_claim() {
     let fixture = Fixture::new().await;
-    let dispatcher = dispatcher(&fixture);
+    let dispatcher = new_dispatcher(&fixture);
     let first_fact = fixture.stage(1, true).await;
     let second_fact = fixture.stage(2, true).await;
     triggered(&trigger(&fixture, &dispatcher, "trigger-1", &first_fact).await);
@@ -526,7 +526,7 @@ async fn a_stale_lease_cannot_write_and_a_restarted_trigger_fails_closed_without
 
     // A new process owns the data directory: the Running trigger left no
     // effect, so it is NotCommitted and fails closed, never Draining.
-    let restarted = dispatcher(&fixture);
+    let restarted = new_dispatcher(&fixture);
     assert_eq!(restarted.recover_pending().await.unwrap(), 1);
     let failed = terminal(&restarted, &fixture.admin, &job.id).await;
     assert_eq!(failed.state, ManagementJobState::Failed, "{failed:?}");
