@@ -1035,7 +1035,11 @@ async fn t6_interrupted_dispatches_become_uncertain_with_their_executions_closed
     );
     for table in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
         if table != "root_budget_calls" && table != "root_budget_events" {
-            assert_eq!(before.get(table), after.get(table), "recovery wrote {table}");
+            assert_eq!(
+                before.get(table),
+                after.get(table),
+                "recovery wrote {table}"
+            );
         }
     }
     let (events_before, events_after) =
@@ -1092,7 +1096,10 @@ async fn t6_interrupted_dispatches_become_uncertain_with_their_executions_closed
         events_of(&path, "call-u", "usage_uncertain").await,
         [(40, json!({"reason": "provider receipt pending"}))]
     );
-    assert_eq!(events_of(&path, "call-u", "execution_closed").await.len(), 1);
+    assert_eq!(
+        events_of(&path, "call-u", "execution_closed").await.len(),
+        1
+    );
     assert_eq!(call_of(&store, "scope-s", "call-s").await, settled);
     assert_eq!(call_of(&store, "scope-f", "call-f").await, unanswered);
     assert_eq!(
@@ -1163,7 +1170,10 @@ async fn t7_a_recovered_call_refuses_a_late_settlement_and_is_reconciled() {
         .unwrap();
     assert_eq!(reconciled.state, BudgetCallState::Finalized);
     assert_eq!(reconciled.actual_cost_micros, Some(9));
-    assert_eq!(reconciled.execution_close_reason.as_deref(), Some(RESTARTED));
+    assert_eq!(
+        reconciled.execution_close_reason.as_deref(),
+        Some(RESTARTED)
+    );
     assert!(execution_open(&store, "scope-a").await.is_empty());
     assert_eq!(begin(&store, &next, 14).await, Ok(true));
 }

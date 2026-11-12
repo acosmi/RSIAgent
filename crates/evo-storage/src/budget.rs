@@ -2328,14 +2328,8 @@ impl Store {
     /// dispatched, or uncertain with its execution open, and its job drains forever,
     /// because reconciliation books the cost but never closes the execution.
     ///
-    /// It reads, page by page in key order and across every namespace of the data
-    /// directory (plan §6.1.1), the dispatched calls and the uncertain calls whose execution
-    /// is open. One update per call, in a transaction of its own, turns a dispatched
-    /// call uncertain (its cost is unknown until an Admin reconciles it) and closes an
-    /// open execution, both with `process_restarted`, plus one event for each change.
-    /// No amount moves and nothing is redispatched, so a second run reads no call and
-    /// writes nothing. It must never run while this process dispatches: it would
-    /// close live executions. Returns the calls it changed, in key order.
+    /// It covers every namespace of the data directory (plan §6.1.1). It must never
+    /// run while this process dispatches: it would close live executions.
     pub async fn recover_interrupted_dispatches(&self, now: i64) -> Result<Vec<BudgetCallKey>> {
         const REASON: &str = "process_restarted";
         const PAGE: i64 = 128;
@@ -2378,7 +2372,10 @@ impl Store {
                 };
                 cursor = Some((key.billing_scope.clone(), key.call_id.clone()));
                 let state: String = row.try_get("state").map_err(internal)?;
-                let open = row.try_get::<i64, _>("execution_closed").map_err(internal)? == 0;
+                let open = row
+                    .try_get::<i64, _>("execution_closed")
+                    .map_err(internal)?
+                    == 0;
                 // The dispatch writes the dispatch id in the update that opens the
                 // execution, so every call read here holds one.
                 let dispatch_id: String = row.try_get("dispatch_id").map_err(internal)?;
