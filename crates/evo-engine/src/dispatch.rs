@@ -94,7 +94,11 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
         // implemented here. The drift administration itself is Admin-only.
         | "monitoring.drift.record"
         // consolidation.run stays unwired: only the claim-only trigger is.
-        | "consolidation.trigger" => ctx.require(&[Role::Admin]),
+        | "consolidation.trigger"
+        // Failed cleanup retries are Admin-only (§6.1.2); the management face
+        // of revocation is Admin for both operations.
+        | "source.revoke"
+        | "cleanup.continue" => ctx.require(&[Role::Admin]),
         _ => Err(Error::Invalid("management_operation_not_wired".into())),
     }
 }
@@ -108,8 +112,8 @@ pub use evo_storage::{
     ManagementOptimizationCallRef, ManagementOptimizationProgressV2,
     ManagementOptimizationResultV2, ManagementOptimizationStageRef, ManagementPartialResultV2,
     ManagementPendingTerminalState, ManagementResult, ManagementResultV2,
-    ManagementSeedClassification, ManagementSeedResultV2, ManagementTraceExportResultV2,
-    VersionedManagementJob,
+    ManagementRevocationResultV2, ManagementSeedClassification, ManagementSeedResultV2,
+    ManagementTraceExportResultV2, VersionedManagementJob,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -375,6 +379,46 @@ struct MonitoringDriftRecordManagementRequest {
     reason: String,
 }
 
+const SOURCE_REVOKE_SCHEMA: &str = "rsia.management.source_revoke.v1";
+
+/// The fixed revocation reason of the management face. The tombstone keeps its
+/// reason permanently and carries it into every backup anchor, and free text
+/// cannot be checked for source content or secrets (§11.3.1), so the wire has
+/// no reason field.
+const SOURCE_REVOKE_REASON: &str = "management_source_revoke";
+
+/// The two registered revocable source kinds (§11.3.1): a trusted run or a
+/// strict E16 `import_source` artifact.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceRevokeKind {
+    Run,
+    Artifact,
+}
+
+/// `source.revoke`: the one source whose watermark is raised. Actor, role,
+/// namespace, time and watermark come from authentication and the store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceRevokeManagementRequest {
+    schema_version: String,
+    request_key: String,
+    source_kind: SourceRevokeKind,
+    source_id: String,
+}
+
+const CLEANUP_CONTINUE_SCHEMA: &str = "rsia.management.cleanup_continue.v1";
+
+/// `cleanup.continue`: one persistent cleanup page of an existing revocation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupContinueManagementRequest {
+    schema_version: String,
+    request_key: String,
+    cleanup_job_id: String,
+    edge_page_limit: usize,
+}
+
 const CONSOLIDATION_TRIGGER_SCHEMA: &str = "rsia.management.consolidation_trigger.v1";
 
 /// `consolidation.trigger`: the complete development-cycle request it closes,
@@ -505,6 +549,8 @@ enum ParsedRequest {
     MonitoringDriftRecord(Box<MonitoringDriftRecordManagementRequest>),
     ConsolidationTrigger(Box<ConsolidationTriggerManagementRequest>),
     SeedInstall(Box<SeedInstallManagementRequest>),
+    SourceRevoke(Box<SourceRevokeManagementRequest>),
+    CleanupContinue(Box<CleanupContinueManagementRequest>),
 }
 
 impl<'de> Deserialize<'de> for ParsedRequest {
@@ -547,6 +593,8 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             MonitoringDriftRecord(Box<MonitoringDriftRecordManagementRequest>),
             ConsolidationTrigger(Box<ConsolidationTriggerManagementRequest>),
             SeedInstall(Box<SeedInstallManagementRequest>),
+            SourceRevoke(Box<SourceRevokeManagementRequest>),
+            CleanupContinue(Box<CleanupContinueManagementRequest>),
         }
         Ok(
             match serde_json::from_value::<Other>(value).map_err(serde::de::Error::custom)? {
@@ -575,6 +623,8 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::MonitoringDriftRecord(value) => Self::MonitoringDriftRecord(value),
                 Other::ConsolidationTrigger(value) => Self::ConsolidationTrigger(value),
                 Other::SeedInstall(value) => Self::SeedInstall(value),
+                Other::SourceRevoke(value) => Self::SourceRevoke(value),
+                Other::CleanupContinue(value) => Self::CleanupContinue(value),
             },
         )
     }
@@ -1257,10 +1307,18 @@ impl ManagementDispatcher {
             let usage = session.capacity_usage_v41(capacity_at).await?;
             // Closure operations only close or list existing objects and derive
             // no new work: a Draining job holding the only dispatch slot must not
-            // block the reconciliation that lets it finish (AG-207).
+            // block the reconciliation that lets it finish (AG-207). Revocation
+            // is protective: it raises the watermark before anything else may
+            // generate, export or use the source (§11.3), so an unrelated stuck
+            // job must not starve it, and its cleanup closes existing objects.
             if !matches!(
                 job.operation.as_str(),
-                "budget.call.reconcile" | "budget.calls.list_open" | "export.abort" | "asset.abort"
+                "budget.call.reconcile"
+                    | "budget.calls.list_open"
+                    | "export.abort"
+                    | "asset.abort"
+                    | "source.revoke"
+                    | "cleanup.continue"
             ) {
                 evo_core::capacity::CapacityItem::ConcurrentManagementDispatch
                     .admit(usage.concurrent_dispatches, 1)?;
@@ -1423,6 +1481,8 @@ impl ParsedRequest {
             Self::MonitoringDriftRecord(request) => &request.request_key,
             Self::ConsolidationTrigger(request) => &request.request_key,
             Self::SeedInstall(request) => &request.request_key,
+            Self::SourceRevoke(request) => &request.request_key,
+            Self::CleanupContinue(request) => &request.request_key,
         }
     }
 }
@@ -1662,6 +1722,9 @@ impl JobOutcome {
             // registered blobs, the edges and the audit record (or replays an
             // already committed immutable image).
             Some(ManagementResultV2::Seed(_)) => true,
+            // A revocation commits the watermark, tombstone and cleanup rows
+            // (or replays them); a cleanup page commits its frontier progress.
+            Some(ManagementResultV2::Revocation(_)) => true,
             Some(ManagementResultV2::Original(
                 ManagementResult::EvaluationStatus { .. }
                 | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -2426,6 +2489,12 @@ async fn execute_request(
         }
         ParsedRequest::SeedInstall(request) => {
             return run_seed_install(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::SourceRevoke(request) => {
+            return run_source_revoke(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::CleanupContinue(request) => {
+            return run_cleanup_continue(ctx, store, claimed.clone(), *request, control).await;
         }
         ParsedRequest::Blocked(_) => {
             control.admit_step()?;
@@ -4088,6 +4157,128 @@ async fn run_consolidation_trigger(
     commit_management_outcome(session, claimed, finished).await
 }
 
+async fn run_source_revoke(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: SourceRevokeManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    let mut session = store.session().await?;
+    let finished = async {
+        // One transaction raises the watermark, writes the tombstone, the
+        // pending cleanup row, its frontier and event, and the terminal job
+        // state. Revoking an already revoked source writes nothing and returns
+        // its existing cleanup job. No budget call is made, so the job has no
+        // unresolved effect to drain.
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        let source = evo_storage::lifecycle::TypedObjectRef {
+            kind: match request.source_kind {
+                SourceRevokeKind::Run => "run",
+                SourceRevokeKind::Artifact => "artifact",
+            }
+            .into(),
+            id: request.source_id,
+        };
+        let status = evo_storage::lifecycle::LifecycleStore::begin_revoke_in_session(
+            ctx,
+            &mut session,
+            source,
+            SOURCE_REVOKE_REASON,
+            now()?,
+        )
+        .await?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "source_revoked".into(),
+            result: Some(ManagementResultV2::Revocation(
+                ManagementRevocationResultV2::SourceRevoked {
+                    source_kind: status.source.kind,
+                    source_id: status.source.id,
+                    cleanup_job_id: status.job_id,
+                    watermark_seq: status.watermark_seq,
+                    cleanup_state: status.state,
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
+async fn run_cleanup_continue(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: CleanupContinueManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    // A cleanup page deletes local export directories and blobs with its rows.
+    let mut session = store.registered_blob_write_session().await?;
+    let finished = async {
+        // Exactly one cleanup page and the terminal job state share one
+        // transaction, so no page is ever partially committed. Succeeded means
+        // this page committed; the result reports whether the cleanup is still
+        // pending. An Admin page over a failed cleanup starts one new
+        // verification round.
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        let status = evo_storage::lifecycle::LifecycleStore::cleanup_step_in_session(
+            ctx,
+            store,
+            &mut session,
+            &request.cleanup_job_id,
+            request.edge_page_limit,
+            now()?,
+        )
+        .await?;
+        // A page that met an unknown scope commits the kernel's `failed`
+        // state; the job reports the fixed code, never the kernel's
+        // diagnostic text (it may quote stored schema strings).
+        let failed = status.state == evo_storage::lifecycle::CleanupState::Failed;
+        let outcome = JobOutcome {
+            state: if failed {
+                ManagementJobState::Blocked
+            } else {
+                ManagementJobState::Succeeded
+            },
+            step: "cleanup_continued".into(),
+            result: Some(ManagementResultV2::Revocation(
+                ManagementRevocationResultV2::CleanupContinued {
+                    cleanup_job_id: status.job_id,
+                    source_kind: status.source.kind,
+                    source_id: status.source.id,
+                    watermark_seq: status.watermark_seq,
+                    cleanup_state: status.state,
+                    processed_nodes: status.processed_nodes,
+                    pending_nodes: status.pending_nodes,
+                },
+            )),
+            error_code: failed.then(|| "blocked_unknown_scope".into()),
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
 /// Only a successful seed comparison class has a management wire value. The
 /// error classes never reach a success result; an adapter that sees one refuses
 /// instead of inventing a classification.
@@ -4443,6 +4634,21 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
             identifier(&request.environment_id)?;
             for source_id in &request.source_ids {
                 identifier(source_id)?;
+            }
+        }
+        ParsedRequest::SourceRevoke(request) => {
+            ctx.require(&[Role::Admin])?;
+            identifier(&request.source_id)?;
+        }
+        ParsedRequest::CleanupContinue(request) => {
+            ctx.require(&[Role::Admin])?;
+            identifier(&request.cleanup_job_id)?;
+            if request.edge_page_limit == 0
+                || request.edge_page_limit > evo_storage::lifecycle::MAX_CLEANUP_EDGE_PAGE
+            {
+                return Err(Error::Invalid(
+                    "cleanup edge page limit must be 1..=1000".into(),
+                ));
             }
         }
         ParsedRequest::SeedInstall(request) => {
@@ -5780,6 +5986,28 @@ async fn consumer_progress(
         }
         return Ok(ConsumerProgress::NotCommitted);
     }
+    if matches!(
+        record.identity().operation,
+        "source.revoke" | "cleanup.continue"
+    ) {
+        // Each handler writes the revocation (watermark, tombstone, cleanup
+        // rows) or one cleanup page together with the terminal job state in
+        // one transaction and makes no budget call. A non-terminal record
+        // therefore proves no effect (it is never Unknown, so neither job
+        // drains); a terminal one with its bound result is its own committed
+        // outcome.
+        if is_terminal(record.identity().state)
+            && matches!(record.result(), Some(ManagementResultV2::Revocation(_)))
+        {
+            return Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                state: record.identity().state,
+                step: record.step().into(),
+                result: record.result(),
+                error_code: record.error_code().map(str::to_owned),
+            })));
+        }
+        return Ok(ConsumerProgress::NotCommitted);
+    }
     if record.identity().operation == "seed.install" {
         // The install handler writes Prepared, the three registered blobs,
         // Installed, the edges, the audit record and the terminal job state in
@@ -6421,6 +6649,10 @@ async fn consumer_progress(
         }
         // Unreachable: the seed short-circuit above owns this operation.
         ParsedRequest::SeedInstall(_) => Ok(ConsumerProgress::NotCommitted),
+        // Unreachable: the revocation short-circuit above owns these two.
+        ParsedRequest::SourceRevoke(_) | ParsedRequest::CleanupContinue(_) => {
+            Ok(ConsumerProgress::NotCommitted)
+        }
         ParsedRequest::ExportComplete(request) => {
             // A published tree whose SQL completion did not commit is an
             // exact-effect question, never an empty-failure guess: only the
@@ -7294,7 +7526,11 @@ async fn cancel_job_atomic(
                 "monitoring.drift.record" | "consolidation.trigger"
             ) && matches!(saved.result, Some(ManagementResultV2::Monitoring(_))))
             || (saved.operation == "seed.install"
-                && matches!(saved.result, Some(ManagementResultV2::Seed(_)))))
+                && matches!(saved.result, Some(ManagementResultV2::Seed(_))))
+            || (matches!(
+                saved.operation.as_str(),
+                "source.revoke" | "cleanup.continue"
+            ) && matches!(saved.result, Some(ManagementResultV2::Revocation(_)))))
     {
         let mut job = saved.clone();
         now()?;
@@ -7408,6 +7644,7 @@ fn stored_result_has_side_effect(result: Option<&ManagementResultV2>) -> bool {
         Some(ManagementResultV2::AssetExport(_)) => true,
         Some(ManagementResultV2::Monitoring(_)) => true,
         Some(ManagementResultV2::Seed(_)) => true,
+        Some(ManagementResultV2::Revocation(_)) => true,
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }
             | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -7639,6 +7876,26 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
                 ));
             }
         },
+        "source.revoke" => match payload["schema_version"].as_str() {
+            Some(SOURCE_REVOKE_SCHEMA) => ParsedRequest::SourceRevoke(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
+        "cleanup.continue" => match payload["schema_version"].as_str() {
+            Some(CLEANUP_CONTINUE_SCHEMA) => ParsedRequest::CleanupContinue(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "seed.install" => match payload["schema_version"].as_str() {
             Some(SEED_INSTALL_SCHEMA) => ParsedRequest::SeedInstall(Box::new(
                 serde_json::from_value(payload).map_err(|_| invalid())?,
@@ -7690,6 +7947,8 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::MonitoringDriftRecord(request) => &request.schema_version,
         ParsedRequest::ConsolidationTrigger(request) => &request.schema_version,
         ParsedRequest::SeedInstall(request) => &request.schema_version,
+        ParsedRequest::SourceRevoke(request) => &request.schema_version,
+        ParsedRequest::CleanupContinue(request) => &request.schema_version,
     };
     if actual != &expected {
         return Err(Error::Invalid(
@@ -7849,8 +8108,13 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             dependencies.push(("blob".into(), request.input_blob_digest.clone()));
         }
         // Abort is closure: it must remain possible after a source revocation
-        // and never opens a new use of the cancelled material.
-        ParsedRequest::AssetAbort(_) | ParsedRequest::ExportAbort(_) => {}
+        // and never opens a new use of the cancelled material. Revocation and
+        // its cleanup likewise must never be refused because a source is
+        // already revoked, and must not redact their own private input.
+        ParsedRequest::AssetAbort(_)
+        | ParsedRequest::ExportAbort(_)
+        | ParsedRequest::SourceRevoke(_)
+        | ParsedRequest::CleanupContinue(_) => {}
         ParsedRequest::AssetHandoff(request) => {
             dependencies.push(("artifact".into(), request.staged_asset_id.clone()));
             dependencies.push(("artifact".into(), request.candidate_id.clone()));
@@ -8229,6 +8493,17 @@ pub enum ManagementCommittedEffect {
         baseline_digest: String,
         local_digest: String,
     },
+    SourceRevoked {
+        source_kind: String,
+        source_id: String,
+        cleanup_job_id: String,
+        watermark_seq: u64,
+    },
+    CleanupContinued {
+        cleanup_job_id: String,
+        processed_nodes: u64,
+        pending_nodes: u64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -8494,6 +8769,28 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
             install_id: install_id.clone(),
             baseline_digest: baseline_digest.clone(),
             local_digest: local_digest.clone(),
+        }],
+        Some(ManagementResultV2::Revocation(ManagementRevocationResultV2::SourceRevoked {
+            source_kind,
+            source_id,
+            cleanup_job_id,
+            watermark_seq,
+            ..
+        })) => vec![ManagementCommittedEffect::SourceRevoked {
+            source_kind: source_kind.clone(),
+            source_id: source_id.clone(),
+            cleanup_job_id: cleanup_job_id.clone(),
+            watermark_seq: *watermark_seq,
+        }],
+        Some(ManagementResultV2::Revocation(ManagementRevocationResultV2::CleanupContinued {
+            cleanup_job_id,
+            processed_nodes,
+            pending_nodes,
+            ..
+        })) => vec![ManagementCommittedEffect::CleanupContinued {
+            cleanup_job_id: cleanup_job_id.clone(),
+            processed_nodes: *processed_nodes,
+            pending_nodes: *pending_nodes,
         }],
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }

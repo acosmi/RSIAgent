@@ -214,6 +214,11 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
                 // any session, with zero writes. consolidation.run stays
                 // unwired.
                 ("consolidation.trigger", _) => "invalid management payload",
+                // source.revoke and cleanup.continue migrated from the unwired
+                // set to their strict wires: this boundary payload lacks the
+                // source or the cleanup job and page limit, so each is refused
+                // at the DTO before any session, with zero writes.
+                ("source.revoke" | "cleanup.continue", _) => "invalid management payload",
                 // seed.reset_stage stays unwired in this install-only range:
                 // the trusted current environment supplier it needs is not
                 // implemented here.
@@ -585,7 +590,6 @@ async fn registered_unwired_async_rejects_before_payload_or_first_session() {
     let before = management_sql_snapshot(&path);
     let session = store.session().await.unwrap();
     for name in [
-        "source.revoke",
         "development.probe_compose.enable",
         "development.probe_compose.disable",
     ] {
@@ -646,7 +650,6 @@ async fn management_submit_distinguishes_unknown_other_plane_and_unwired() {
         );
     }
     for name in [
-        "source.revoke",
         "consolidation.run",
         "development.probe_compose.enable",
         "development.probe_compose.disable",
