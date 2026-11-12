@@ -2319,6 +2319,119 @@ impl Store {
         }
     }
 
+    /// Closes what a crashed process left dispatched; `rsia serve` runs it once at
+    /// startup, under the data-directory lock and before anything recovers or serves.
+    ///
+    /// Every execution runs inside the process that holds the lock (plan §7.3.1), so
+    /// holding it proves the previous process and its executions have ended. That is
+    /// the exit evidence no other writer records: without it a crashed call stays
+    /// dispatched, or uncertain with its execution open, and its job drains forever,
+    /// because reconciliation books the cost but never closes the execution.
+    ///
+    /// It reads, page by page in key order and across every namespace of the data
+    /// directory (plan §6.1.1), the dispatched calls and the uncertain calls whose execution
+    /// is open. One update per call, in a transaction of its own, turns a dispatched
+    /// call uncertain (its cost is unknown until an Admin reconciles it) and closes an
+    /// open execution, both with `process_restarted`, plus one event for each change.
+    /// No amount moves and nothing is redispatched, so a second run reads no call and
+    /// writes nothing. It must never run while this process dispatches: it would
+    /// close live executions. Returns the calls it changed, in key order.
+    pub async fn recover_interrupted_dispatches(&self, now: i64) -> Result<Vec<BudgetCallKey>> {
+        const REASON: &str = "process_restarted";
+        const PAGE: i64 = 128;
+        valid_time(now)?;
+        let mut recovered = Vec::new();
+        let mut cursor: Option<(String, String)> = None;
+        loop {
+            let (after_scope, after_call) = match &cursor {
+                Some((scope, call)) => (Some(scope.as_str()), Some(call.as_str())),
+                None => (None, None),
+            };
+            // A page is read and released before anything is written: the store has
+            // a single connection. Nothing else writes before serving starts, so the
+            // page's values are still current when each call is written.
+            let mut tx = self.pool.begin().await.map_err(internal)?;
+            let rows = sqlx::query(
+                "SELECT billing_scope,call_id,state,dispatch_id,execution_closed
+                 FROM root_budget_calls
+                 WHERE (state='dispatched'
+                     OR (state='uncertain' AND dispatch_id IS NOT NULL AND execution_closed=0))
+                   AND (? IS NULL OR billing_scope>? OR (billing_scope=? AND call_id>?))
+                 ORDER BY billing_scope,call_id LIMIT ?",
+            )
+            .bind(after_scope)
+            .bind(after_scope)
+            .bind(after_scope)
+            .bind(after_call)
+            .bind(PAGE)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(internal)?;
+            tx.commit().await.map_err(internal)?;
+            if rows.is_empty() {
+                return Ok(recovered);
+            }
+            for row in &rows {
+                let key = BudgetCallKey {
+                    billing_scope: row.try_get("billing_scope").map_err(internal)?,
+                    call_id: row.try_get("call_id").map_err(internal)?,
+                };
+                cursor = Some((key.billing_scope.clone(), key.call_id.clone()));
+                let state: String = row.try_get("state").map_err(internal)?;
+                let open = row.try_get::<i64, _>("execution_closed").map_err(internal)? == 0;
+                // The dispatch writes the dispatch id in the update that opens the
+                // execution, so every call read here holds one.
+                let dispatch_id: String = row.try_get("dispatch_id").map_err(internal)?;
+                let mut tx = self.pool.begin().await.map_err(internal)?;
+                // SQLite evaluates every assignment against the old row, so the
+                // CASEs see the state and close flag the page read.
+                sqlx::query(
+                    "UPDATE root_budget_calls SET state='uncertain',
+                       terminal_reason=CASE WHEN state='dispatched'
+                         THEN COALESCE(terminal_reason,?) ELSE terminal_reason END,
+                       execution_closed_at=CASE WHEN execution_closed=0
+                         THEN ? ELSE execution_closed_at END,
+                       execution_close_reason=CASE WHEN execution_closed=0
+                         THEN ? ELSE execution_close_reason END,
+                       execution_closed=1
+                     WHERE billing_scope=? AND call_id=?",
+                )
+                .bind(REASON)
+                .bind(now)
+                .bind(REASON)
+                .bind(&key.billing_scope)
+                .bind(&key.call_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(internal)?;
+                if state == "dispatched" {
+                    insert_event(
+                        &mut tx,
+                        &key.billing_scope,
+                        Some(&key.call_id),
+                        "usage_uncertain",
+                        now,
+                        json!({"reason": REASON}),
+                    )
+                    .await?;
+                }
+                if open {
+                    insert_event(
+                        &mut tx,
+                        &key.billing_scope,
+                        Some(&key.call_id),
+                        "execution_closed",
+                        now,
+                        json!({"dispatch_id": dispatch_id, "reason": REASON}),
+                    )
+                    .await?;
+                }
+                tx.commit().await.map_err(internal)?;
+                recovered.push(key);
+            }
+        }
+    }
+
     pub async fn stop_root_budget(
         &self,
         ctx: &Context,

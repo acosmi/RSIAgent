@@ -257,6 +257,16 @@ async fn async_main() -> Result<()> {
             let mounted_store = service.store().clone();
             let serving: Result<()> = async {
                 gate.admit()?;
+                // The lock proves the previous process and its executions ended; only
+                // here, before anything dispatches, may its calls be closed as such.
+                let interrupted = service
+                    .store()
+                    .recover_interrupted_dispatches(evo_core::now()?)
+                    .await?;
+                eprintln!(
+                    "rsia startup interrupted dispatch recovery: recovered={}",
+                    interrupted.len()
+                );
                 let prepare_config = http_prepare_config(&prepare_config)?;
                 let mut entries = Vec::new();
                 if let Some(token) = auth_token {

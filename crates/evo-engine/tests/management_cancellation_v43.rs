@@ -2198,3 +2198,184 @@ async fn closure_operations_are_claimed_while_a_draining_job_holds_the_dispatch_
     let other = terminal(other_id).await;
     assert_eq!(other.state, ManagementJobState::Succeeded, "{other:?}");
 }
+
+/// AG-184: a cancelled paid step drains with its call uncertain and its execution
+/// open, and then the process crashes. The restart's startup, run in `rsia serve`
+/// order on a reopened store, closes that execution as `process_restarted` (the
+/// lock proves the executor ended), so once an Admin lists the open call and
+/// reconciles it from the bill, the job lands on its recorded pending terminal
+/// state. No execution is closed by hand and nothing is redispatched.
+#[tokio::test]
+async fn startup_recovery_lets_a_crashed_draining_job_reach_its_pending_terminal_state() {
+    let (fx, claimed, draining) = tokio::task::spawn_blocking(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            let fx = paid_fixture(1).await;
+            let claimed = paid_start(&fx).await;
+            fx.dispatcher.cancel(&fx.admin, &claimed.id).await.unwrap();
+            fx.gate.release.add_permits(1);
+            let started = Instant::now();
+            let draining = loop {
+                let job = current(fx.dispatcher.status(&fx.admin, &claimed.id).await.unwrap());
+                if job.state == ManagementJobState::Draining && job.pending_terminal_state.is_some()
+                {
+                    break job;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "actual worker did not record its draining terminal outcome: {job:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            (fx, claimed, draining)
+        });
+        // Ending the runtime ends this process's supervisor without any further
+        // write: the crash.
+        drop(runtime);
+        result
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        draining.pending_terminal_state,
+        Some(evo_storage::ManagementPendingTerminalState::Blocked)
+    );
+    let witness = fx.gate.witnesses.lock().unwrap()[0].clone();
+    let reopened = Store::open(&fx.path).await.unwrap();
+    let call = reopened
+        .budget_call(&fx.admin, "management-scope", &witness.call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, BudgetCallState::Uncertain);
+    assert!(!call.execution_closed);
+
+    // The restart, in `rsia serve` startup order.
+    let restart = ManagementDispatcher::new(reopened.clone(), vec![fx.admin.clone()]).unwrap();
+    // BEGIN AG-184 startup step
+    assert_eq!(
+        reopened
+            .recover_interrupted_dispatches(now().unwrap())
+            .await
+            .unwrap(),
+        [evo_storage::budget::BudgetCallKey {
+            billing_scope: "management-scope".into(),
+            call_id: witness.call_id.clone(),
+        }]
+    );
+    // END AG-184 startup step
+    restart.recover_pending().await.unwrap();
+    reopened
+        .recover_settled_open_executions(&fx.admin, now().unwrap())
+        .await
+        .unwrap();
+
+    let terminal = |id: String| {
+        let restart = &restart;
+        let admin = &fx.admin;
+        async move {
+            let started = Instant::now();
+            loop {
+                let job = current(restart.status(admin, &id).await.unwrap());
+                if matches!(
+                    job.state,
+                    ManagementJobState::Succeeded
+                        | ManagementJobState::Failed
+                        | ManagementJobState::Cancelled
+                        | ManagementJobState::Blocked
+                ) {
+                    break job;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(90),
+                    "{id} never reached a terminal state: {job:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    };
+    let listed = restart
+        .submit(
+            &fx.admin,
+            "budget.calls.list_open",
+            json!({
+                "schema_version": "rsia.management.budget_calls_list_open.v1",
+                "request_key": "restart-list",
+                "billing_scope": "management-scope",
+            }),
+        )
+        .await
+        .unwrap();
+    let listed = terminal(listed.identity().id.to_owned()).await;
+    assert_eq!(listed.state, ManagementJobState::Succeeded, "{listed:?}");
+    let Some(evo_storage::ManagementResultV2::Budget(
+        evo_storage::ManagementBudgetResultV2::OpenCallsListed { page },
+    )) = &listed.result
+    else {
+        panic!("expected the open-call listing: {listed:?}");
+    };
+    assert!(
+        page.entries
+            .iter()
+            .any(|entry| entry.call_id == witness.call_id)
+    );
+    let reconciled = restart
+        .submit(
+            &fx.admin,
+            "budget.call.reconcile",
+            json!({
+                "schema_version": "rsia.management.budget_call_reconcile.v1",
+                "request_key": "restart-reconcile",
+                "billing_scope": "management-scope",
+                "call_id": witness.call_id,
+                "provider_request_id": witness.charge.provider_request_id,
+                "usage_record_id": witness.charge.usage_record_id,
+                "output_digest": witness.charge.output_digest,
+                "amount_micros": witness.charge.amount_micros,
+                "currency": witness.charge.currency,
+                "pricing_version": witness.charge.pricing_version,
+            }),
+        )
+        .await
+        .unwrap();
+    let reconciled = terminal(reconciled.identity().id.to_owned()).await;
+    assert_eq!(
+        reconciled.state,
+        ManagementJobState::Succeeded,
+        "{reconciled:?}"
+    );
+    assert_eq!(reconciled.step, "call_reconciled");
+
+    // The supervisor of the restart re-reads the job's calls on its own period.
+    let started = Instant::now();
+    let done = loop {
+        let job = current(restart.status(&fx.admin, &claimed.id).await.unwrap());
+        if job.state != ManagementJobState::Draining {
+            break job;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(90),
+            "PARENT-EXPECTED-FAILURE: the reconciled job still drains: {job:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(done.state, ManagementJobState::Blocked, "{done:?}");
+    assert_eq!(done.generation, draining.generation);
+    assert_eq!(done.step, draining.step);
+    assert_eq!(done.error_code, draining.error_code);
+    let call = reopened
+        .budget_call(&fx.admin, "management-scope", &witness.call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, BudgetCallState::Finalized);
+    assert_eq!(call.actual_cost_micros, Some(10));
+    assert_eq!(
+        call.execution_close_reason.as_deref(),
+        Some("process_restarted")
+    );
+    assert_eq!(fx.gate.calls.load(Ordering::SeqCst), 1);
+}
