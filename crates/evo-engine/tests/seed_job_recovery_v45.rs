@@ -7,7 +7,8 @@
 //! content-addressed bytes; a same-key cached job is never re-run, a new key
 //! with the same material converges on the shared kernel, a stale lease cannot
 //! finalize, cancellation before the first write is zero-effect, and a source
-//! or watermark change blocks every later install attempt.
+//! or watermark change blocks every later install attempt (a same-key cached
+//! replay serves the original immutable job; it is not a new attempt).
 use evo_core::{Context, Error, Role, fingerprint, hash, now};
 use evo_engine::dispatch::{
     ManagementDispatcher, ManagementJobState, ManagementJobStatusV1, ManagementJobV2,
@@ -351,10 +352,13 @@ async fn seed_blob_publish_then_crash_recovers_same_material() {
     fixture.store.close().await;
 }
 
-/// A stale generation, lease or operation can neither finalize nor replace the
-/// baseline; only the current claim passes the physical fence.
+/// The storage fence itself: a stale generation, lease or operation cannot
+/// finalize or replace the baseline, and only the current claim passes
+/// `Session::ensure_management_job_fence` on a seeded Running job. The
+/// handler-level stale-claim arbitration (claim CAS before the fence) is not
+/// directly driven here.
 #[tokio::test]
-async fn seed_stale_lease_cannot_finalize_or_replace_baseline() {
+async fn seed_storage_fence_refuses_stale_lease_generation_and_operation() {
     let fixture = Fixture::new("seed-recovery-stale.sqlite3").await;
     let job_id = "management-job-seed-fence";
     let lease = hash(b"current-lease");
@@ -528,6 +532,8 @@ async fn seed_cancel_before_and_after_effect_are_honest() {
 
 /// A revoked source or an advanced watermark blocks every later install
 /// attempt with zero business writes; the committed record and bytes survive.
+/// (A same-key cached replay is served from the original immutable job and is
+/// not a new install attempt.)
 #[tokio::test]
 async fn seed_changed_source_or_watermark_blocks_resume() {
     let fixture = Fixture::new("seed-recovery-revoke.sqlite3").await;

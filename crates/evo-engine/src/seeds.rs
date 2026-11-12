@@ -478,7 +478,8 @@ pub const SEED_INSTALL_INPUT_MAX_BYTES: usize = 64 * 1024;
 /// management request. It carries only the catalog selector, the real source
 /// closure and the environment/compiler labels of the first managed copy;
 /// paths, roots, publishers, roles, owners, namespaces, markers, verification
-/// flags and clocks are not part of it.
+/// flags and clocks are not part of it. `source_refs` has no separate count
+/// limit: the 64 KiB strict input bound is the only size limit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeedInstallInputV1 {
@@ -490,8 +491,10 @@ pub struct SeedInstallInputV1 {
 }
 
 /// Decode the strict transient install input. Duplicate keys, unknown fields,
-/// a wrong schema, an unregistered selector, an empty/broken source closure or
-/// an invalid environment/compiler label are refused before any session.
+/// a wrong schema, an empty/broken source closure or an invalid
+/// environment/compiler label are refused before any session; the separate
+/// catalog lookup then refuses an unregistered selector before the job
+/// transaction.
 pub fn decode_seed_install_input(bytes: &[u8]) -> Result<SeedInstallInputV1> {
     if bytes.is_empty() || bytes.len() > SEED_INSTALL_INPUT_MAX_BYTES {
         return Err(Error::Invalid("invalid seed install input size".into()));

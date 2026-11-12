@@ -377,6 +377,19 @@ async fn seed_install_uses_real_blob_and_catalog_identity() {
             .local_digest,
         entry.content_sha256
     );
+    // The install envelope's real source edge is committed in the same
+    // transaction: the registered source now lists the install as a dependent.
+    let mut session = fixture.store.session().await.unwrap();
+    let mut dependents = session
+        .dependents(&fixture.admin, "artifact", "seed-source")
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    dependents.sort();
+    assert!(
+        dependents.contains(&("artifact".to_string(), install_id.clone())),
+        "{dependents:?}"
+    );
     assert_no_listed_effects(&fixture.store, &fixture.admin).await;
     assert_eq!(fixture.job_count().await, 1);
     assert!(fixture.store.verify_audit(&fixture.admin).await.unwrap() > 0);
@@ -463,7 +476,9 @@ async fn seed_install_requires_real_builtin_identity_and_license() {
     assert_eq!(catalog.entries.len(), 1);
     assert_eq!(catalog.entries[0].license.name, "Source-Available");
     assert_eq!(catalog.entries[0].license.path, "LICENSE");
-    let unregistered = fixture.input_digest("org.rsia/not-a-seed").await;
+    // A syntactically valid identifier that no builtin catalog entry carries:
+    // the request passes selector syntax and fails at the real catalog lookup.
+    let unregistered = fixture.input_digest("not-a-seed").await;
     let failed = fixture
         .done(
             &dispatcher,
@@ -670,6 +685,10 @@ async fn seed_management_results_never_return_private_content() {
 /// One request key freezes one intent: a same-key same-wire replay returns the
 /// original immutable job and result, changed material under the same key
 /// conflicts at submit, and a new key cannot replace the committed first copy.
+/// The `seed_install_replayed` handler step is not exercised here: it is only
+/// reachable through defensive recovery of a committed install whose terminal
+/// job state was not recorded; the normal same-key path is served from the
+/// cached job and never reaches the handler.
 #[tokio::test]
 async fn seed_install_replays_same_key_and_conflicts_on_changed_material() {
     let fixture = Fixture::new().await;
