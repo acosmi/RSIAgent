@@ -536,6 +536,85 @@ async fn transport_failure_becomes_uncertain_and_retry_does_not_call_again() {
     assert_eq!(call.reserved_micros, 20);
 }
 
+/// Cancels its own call while the provider is awaited, then returns a valid
+/// completion: the cancellation reached the call first.
+#[derive(Clone)]
+struct CancellingTransport {
+    store: Store,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ModelTransport for CancellingTransport {
+    fn provenance(&self) -> Option<ModelExecutionProvenance> {
+        Some(ModelExecutionProvenance::Fixture)
+    }
+
+    async fn execute(
+        &self,
+        request: &ModelRequest,
+        _dispatch_id: &str,
+    ) -> Result<TransportCompletion> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let worker = Context::new("ns-a", "trusted-broker", Role::Worker)?;
+        let call = self
+            .store
+            .budget_call(&worker, "scope-1", &request.request_id)
+            .await?
+            .ok_or(Error::NotFound)?;
+        self.store
+            .cancel_budget_call(&worker, &call_fence(&call, 10), "management_job_stopped")
+            .await?;
+        Ok(completion(request, false))
+    }
+}
+
+/// AG-209: a cancellation that reached the call before its transport returned
+/// leaves the late completion unsettled (the call is no longer dispatched), but
+/// the returned future still closes the execution; the charge stays unknown for
+/// reconciliation and the transport is called once.
+#[tokio::test]
+async fn cancel_before_a_valid_completion_closes_the_execution_and_keeps_the_charge_unknown() {
+    let (_dir, store) = store().await;
+    authorize(&store).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let broker = PersistentModelBroker::with_clock(
+        store.clone(),
+        CancellingTransport {
+            store: store.clone(),
+            calls: calls.clone(),
+        },
+        config(),
+        fixed_clock(),
+    )
+    .unwrap();
+    let result = broker
+        .dispatch(request("request-cancelled", ModelStage::Merge))
+        .await;
+    assert!(matches!(result, Err(Error::Conflict(_))), "{result:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let worker = Context::new("ns-a", "trusted-broker", Role::Worker).unwrap();
+    let call = store
+        .budget_call(&worker, "scope-1", "request-cancelled")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, BudgetCallState::Uncertain);
+    assert_eq!(
+        call.terminal_reason.as_deref(),
+        Some("management_job_stopped")
+    );
+    assert_eq!(call.actual_cost_micros, None);
+    assert!(call.response_artifact.is_none());
+    assert!(call.execution_closed);
+    assert_eq!(call.execution_closed_at, Some(10));
+    assert_eq!(
+        call.execution_close_reason.as_deref(),
+        Some("transport_returned_usage_unknown")
+    );
+    assert_eq!(call.reserved_micros, 20);
+}
+
 #[tokio::test]
 async fn invalid_charge_identity_freezes_dispatched_call_as_uncertain() {
     let (_dir, store) = store().await;

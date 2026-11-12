@@ -29,6 +29,9 @@ const PRE_DISPATCH_REASON_PREFIX: &str = "broker_pre_dispatch_v1.";
 /// The close a bound replay records for a settled call whose execution close was
 /// lost between its settlement commit and its close commit.
 const BOUND_RECOVERY_CLOSE_REASON: &str = "recovered_bound_response";
+/// The close recorded once the transport future has returned without a settled cost:
+/// its execution has ended, though what it cost is left to reconciliation.
+const TRANSPORT_RETURNED_CLOSE_REASON: &str = "transport_returned_usage_unknown";
 
 const BOUND_REQUEST_ARTIFACT_SCHEMA: &str = "rsia.bound_model_request.v1";
 const REDACTED_ARTIFACT_SCHEMA: &str = "rsia.redacted.v1";
@@ -390,6 +393,8 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                         "formal_provider_or_capture_unresolved",
                     )
                     .await?;
+                self.close_returned_execution(&ctx, &fence, &dispatch_id, self.now()?)
+                    .await?;
                 return Err(error);
             }
         };
@@ -397,6 +402,8 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         if let Err(error) = completion.validate() {
             self.store
                 .mark_budget_call_uncertain(&ctx, &fence, "formal_completion_invalid")
+                .await?;
+            self.close_returned_execution(&ctx, &fence, &dispatch_id, self.now()?)
                 .await?;
             return Err(error);
         }
@@ -407,6 +414,8 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
         {
             self.store
                 .mark_budget_call_uncertain(&ctx, &fence, "formal_capture_binding_mismatch")
+                .await?;
+            self.close_returned_execution(&ctx, &fence, &dispatch_id, self.now()?)
                 .await?;
             return Err(Error::Conflict(
                 "formal provider/application capture differs".into(),
@@ -648,6 +657,28 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
             return Err(Error::ClockRegressed);
         }
         Ok(now)
+    }
+
+    /// Closes a call's execution once its transport future has returned unsettled.
+    /// The returned future is the evidence that the execution ended (plan §6.6); the
+    /// close accepts a call a cancellation or a reconciliation reached first.
+    async fn close_returned_execution(
+        &self,
+        ctx: &Context,
+        fence: &BudgetCallFence,
+        dispatch_id: &str,
+        now: i64,
+    ) -> Result<BudgetCallRecord> {
+        self.store
+            .close_budget_call_execution(
+                ctx,
+                &fence.billing_scope,
+                &fence.call_id,
+                dispatch_id,
+                TRANSPORT_RETURNED_CLOSE_REASON,
+                now,
+            )
+            .await
     }
 
     /// Judge the validated request's full source closure in one read-only
@@ -1603,6 +1634,10 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                         "transport_failed_after_dispatch",
                     )
                     .await?;
+                // The fence's clock reading is reused: a second read could fail after
+                // the mark and leave the execution open.
+                self.close_returned_execution(&ctx, &fence, &dispatch_id, failure_fence.now)
+                    .await?;
                 return Ok(ModelResponse::Uncertain {
                     request_id: request.request_id,
                     dispatch_id,
@@ -1703,6 +1738,8 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
             self.store
                 .mark_budget_call_uncertain(&ctx, &failure_fence, "invalid_transport_completion")
                 .await?;
+            self.close_returned_execution(&ctx, &fence, &dispatch_id, failure_fence.now)
+                .await?;
             return Err(error);
         }
         let model_matches = completion.actual_model_digest == request.model_digest;
@@ -1793,6 +1830,9 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                         &settlement_fence,
                         "model_settlement_failed_after_dispatch",
                     )
+                    .await;
+                let _ = self
+                    .close_returned_execution(&ctx, &fence, &dispatch_id, settled_at)
                     .await;
                 return Err(error);
             }

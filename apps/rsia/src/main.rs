@@ -301,8 +301,9 @@ async fn async_main() -> Result<()> {
                         None,
                     )?;
                 management.recover_pending().await?;
-                // Settled model calls whose execution close a crash lost: closed when they
-                // carry their persisted response, counted and left open when they do not.
+                // Settled model calls whose execution close a crash lost and that carry
+                // their persisted response; those without one were closed above, through
+                // the lock's evidence, so none is left open here.
                 let budget = service
                     .store()
                     .recover_settled_open_executions(

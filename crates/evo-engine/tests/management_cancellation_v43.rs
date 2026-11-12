@@ -1396,17 +1396,22 @@ async fn reconcile(fx: &PaidFixture) {
             )
             .await
             .unwrap();
-        fx.store
-            .close_budget_call_execution(
-                &fx.admin,
-                "management-scope",
-                &witness.call_id,
-                &witness.dispatch_id,
-                "actual_fixture_worker_exited",
-                now().unwrap(),
-            )
-            .await
-            .unwrap();
+        // AG-209: a returned transport future already closed the execution. A
+        // panicking worker (mode 2) never returns it, so its execution stays open
+        // as a restart would find it; this close stands in for that restart.
+        if fx.gate.mode == 2 {
+            fx.store
+                .close_budget_call_execution(
+                    &fx.admin,
+                    "management-scope",
+                    &witness.call_id,
+                    &witness.dispatch_id,
+                    "actual_fixture_worker_exited",
+                    now().unwrap(),
+                )
+                .await
+                .unwrap();
+        }
     }
 }
 
@@ -2024,6 +2029,8 @@ c.execute('ROLLBACK');c.close();print(json.dumps({'schema':[[a.hex(),b.hex(),d.h
 /// calls and reconciling them -- are claimed regardless of that slot, while a
 /// new non-closure job still waits Queued behind it. Every state here comes
 /// from the real broker, dispatcher and store; no job row is edited.
+/// AG-209: the cancellation reaches the call first, and the returned transport
+/// still closes its execution, so the reconciliation alone finishes the job.
 #[tokio::test]
 async fn closure_operations_are_claimed_while_a_draining_job_holds_the_dispatch_slot() {
     let fx = paid_fixture(1).await;
@@ -2060,7 +2067,11 @@ async fn closure_operations_are_claimed_while_a_draining_job_holds_the_dispatch_
     let calls = call_rows(&fx).await;
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].state, BudgetCallState::Uncertain);
-    assert!(!calls[0].execution_closed);
+    assert!(calls[0].execution_closed);
+    assert_eq!(
+        calls[0].execution_close_reason.as_deref(),
+        Some("transport_returned_usage_unknown")
+    );
     let witness = fx.gate.witnesses.lock().unwrap()[0].clone();
 
     // A new non-closure job is still refused the slot and waits Queued.
@@ -2086,6 +2097,15 @@ async fn closure_operations_are_claimed_while_a_draining_job_holds_the_dispatch_
         .await
         .unwrap();
     let other_id = other.identity().id.to_owned();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        current(fx.dispatcher.status(&fx.admin, &other_id).await.unwrap()).state,
+        ManagementJobState::Queued
+    );
+    assert_eq!(
+        current(fx.dispatcher.status(&fx.admin, &claimed.id).await.unwrap()).state,
+        ManagementJobState::Draining
+    );
 
     let terminal = |id: String| {
         let fx = &fx;
@@ -2166,30 +2186,8 @@ async fn closure_operations_are_claimed_while_a_draining_job_holds_the_dispatch_
     );
     assert_eq!(reconciled.step, "call_reconciled");
 
-    // The slot rule still holds for the non-closure job behind the Draining one.
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert_eq!(
-        current(fx.dispatcher.status(&fx.admin, &other_id).await.unwrap()).state,
-        ManagementJobState::Queued
-    );
-    assert_eq!(
-        current(fx.dispatcher.status(&fx.admin, &claimed.id).await.unwrap()).state,
-        ManagementJobState::Draining
-    );
-
-    // Once the exited worker's execution is closed nothing is pending: the
-    // Draining job lands on its recorded terminal state and frees the slot.
-    fx.store
-        .close_budget_call_execution(
-            &fx.admin,
-            "management-scope",
-            &witness.call_id,
-            &witness.dispatch_id,
-            "actual_fixture_worker_exited",
-            now().unwrap(),
-        )
-        .await
-        .unwrap();
+    // Reconciled with its execution closed, nothing is pending: the Draining job
+    // lands on its recorded terminal state and frees the slot.
     let done = paid_state(&fx, &claimed.id, ManagementJobState::Blocked).await;
     assert_eq!(done.step, draining.step);
     let calls = call_rows(&fx).await;
@@ -2205,6 +2203,8 @@ async fn closure_operations_are_claimed_while_a_draining_job_holds_the_dispatch_
 /// lock proves the executor ended), so once an Admin lists the open call and
 /// reconciles it from the bill, the job lands on its recorded pending terminal
 /// state. No execution is closed by hand and nothing is redispatched.
+/// AG-209: its worker panics (mode 2), as a returned transport would close the
+/// execution itself.
 #[tokio::test]
 async fn startup_recovery_lets_a_crashed_draining_job_reach_its_pending_terminal_state() {
     let (fx, claimed, draining) = tokio::task::spawn_blocking(|| {
@@ -2213,7 +2213,7 @@ async fn startup_recovery_lets_a_crashed_draining_job_reach_its_pending_terminal
             .build()
             .unwrap();
         let result = runtime.block_on(async {
-            let fx = paid_fixture(1).await;
+            let fx = paid_fixture(2).await;
             let claimed = paid_start(&fx).await;
             fx.dispatcher.cancel(&fx.admin, &claimed.id).await.unwrap();
             fx.gate.release.add_permits(1);
@@ -2241,7 +2241,7 @@ async fn startup_recovery_lets_a_crashed_draining_job_reach_its_pending_terminal
     .unwrap();
     assert_eq!(
         draining.pending_terminal_state,
-        Some(evo_storage::ManagementPendingTerminalState::Blocked)
+        Some(evo_storage::ManagementPendingTerminalState::Cancelled)
     );
     let witness = fx.gate.witnesses.lock().unwrap()[0].clone();
     let reopened = Store::open(&fx.path).await.unwrap();
@@ -2362,7 +2362,7 @@ async fn startup_recovery_lets_a_crashed_draining_job_reach_its_pending_terminal
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert_eq!(done.state, ManagementJobState::Blocked, "{done:?}");
+    assert_eq!(done.state, ManagementJobState::Cancelled, "{done:?}");
     assert_eq!(done.generation, draining.generation);
     assert_eq!(done.step, draining.step);
     assert_eq!(done.error_code, draining.error_code);
@@ -2377,5 +2377,115 @@ async fn startup_recovery_lets_a_crashed_draining_job_reach_its_pending_terminal
         call.execution_close_reason.as_deref(),
         Some("process_restarted")
     );
+    assert_eq!(fx.gate.calls.load(Ordering::SeqCst), 1);
+}
+
+/// AG-209: an uncancelled paid step whose transport returns an error drains with
+/// its call uncertain. The returned future is the evidence that the execution
+/// ended, so the broker closes it there, and an Admin's reconciliation from the
+/// bill alone lets the job land on its recorded pending terminal state: nothing
+/// closes an execution by hand and nothing is redispatched.
+#[tokio::test]
+async fn transport_failure_then_reconcile_alone_finishes_the_job() {
+    let fx = paid_fixture(1).await;
+    let claimed = paid_start(&fx).await;
+    fx.gate.release.add_permits(1);
+    let started = Instant::now();
+    let draining = loop {
+        let job = current(fx.dispatcher.status(&fx.admin, &claimed.id).await.unwrap());
+        if job.state == ManagementJobState::Draining && job.pending_terminal_state.is_some() {
+            break job;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "actual worker did not record its draining terminal outcome: {job:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(!draining.cancel_requested);
+    let witness = fx.gate.witnesses.lock().unwrap()[0].clone();
+    let calls = call_rows(&fx).await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].state, BudgetCallState::Uncertain);
+    assert_eq!(
+        calls[0].terminal_reason.as_deref(),
+        Some("transport_failed_after_dispatch")
+    );
+    assert_eq!(calls[0].actual_cost_micros, None);
+    let closed_before_reconcile = calls[0].execution_closed;
+
+    fx.store
+        .reconcile_budget_call_cost(
+            &fx.admin,
+            "management-scope",
+            &witness.call_id,
+            &witness.charge,
+            now().unwrap(),
+        )
+        .await
+        .unwrap();
+    // The supervisor re-reads the job's calls on its own period.
+    let started = Instant::now();
+    let done = loop {
+        let job = current(fx.dispatcher.status(&fx.admin, &claimed.id).await.unwrap());
+        if job.state != ManagementJobState::Draining || started.elapsed() > Duration::from_secs(60)
+        {
+            break job;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        closed_before_reconcile && done.state != ManagementJobState::Draining,
+        "AG-209 PARENT-EXPECTED-FAILURE: execution closed before reconciliation = \
+         {closed_before_reconcile}; the job after reconciliation: {done:?}"
+    );
+    assert_eq!(
+        draining.pending_terminal_state,
+        Some(evo_storage::ManagementPendingTerminalState::Blocked)
+    );
+    assert_eq!(done.state, ManagementJobState::Blocked, "{done:?}");
+    assert_eq!(done.generation, draining.generation);
+    assert_eq!(done.step, draining.step);
+    assert_eq!(done.error_code, draining.error_code);
+
+    let call = fx
+        .store
+        .budget_call(&fx.admin, "management-scope", &witness.call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, BudgetCallState::Finalized);
+    assert_eq!(call.actual_cost_micros, Some(10));
+    assert!(call.execution_closed);
+    assert_eq!(
+        call.execution_close_reason.as_deref(),
+        Some("transport_returned_usage_unknown")
+    );
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", fx.path.display()))
+        .await
+        .unwrap();
+    let closes: Vec<String> = sqlx::query_scalar(
+        "SELECT details FROM root_budget_events WHERE call_id=? AND event_kind='execution_closed'",
+    )
+    .bind(&witness.call_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&closes[0]).unwrap(),
+        json!({
+            "dispatch_id": witness.dispatch_id,
+            "reason": "transport_returned_usage_unknown",
+        })
+    );
+    let root = fx
+        .store
+        .root_budget(&fx.admin, "management-scope")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((root.reserved_micros, root.spent_micros), (0, 10));
     assert_eq!(fx.gate.calls.load(Ordering::SeqCst), 1);
 }
