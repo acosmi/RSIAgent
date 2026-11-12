@@ -298,7 +298,7 @@ async fn seed_historical_facts(connection: &mut SqliteConnection) {
         (3,'legacy-b','artifact','shared','owner-b','{"id":"shared","v":"other namespace"}',31),
         (950,'legacy-a','artifact','missing-body-id','owner-legacy','{"legacy":true}',41);
         INSERT INTO idempotency VALUES('legacy-a','actor','operation','key','payload','shared',' { "ok" : true } ',0);
-        INSERT INTO audit(seq,namespace,payload,previous_hash,digest) VALUES(27,'legacy-a',' { "event" : "old" } ','previous','digest');
+        INSERT INTO audit(seq,namespace,payload,previous_hash,digest) VALUES(27,'legacy-a',' { "event" : "old" , "timestamp" : 1 } ','previous','digest');
         INSERT INTO dependencies VALUES('legacy-a','artifact','last','run','shared');
         INSERT INTO revoke_watermark VALUES('legacy-a',9,'watermark');
         INSERT INTO replay_worlds VALUES('legacy-a','world',1,' { "sealed" : true } ');

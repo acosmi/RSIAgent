@@ -242,7 +242,7 @@ async fn seed(connection: &mut SqliteConnection, versions: &[i64]) {
     }
     sqlx::raw_sql(
         r#"INSERT INTO idempotency VALUES('legacy-a','actor','operation','key','payload','shared',' { "ok" : true } ',0);
-        INSERT INTO audit(seq,namespace,payload,previous_hash,digest) VALUES(27,'legacy-a',' { "event" : "old" } ','previous','digest');
+        INSERT INTO audit(seq,namespace,payload,previous_hash,digest) VALUES(27,'legacy-a',' { "event" : "old" , "timestamp" : 1 } ','previous','digest');
         INSERT INTO dependencies VALUES('legacy-a','artifact','first','run','run-0');
         INSERT INTO replay_worlds VALUES('legacy-a','world',1,' { "sealed" : true } ');
         INSERT INTO skill_fts(namespace,candidate_id,tokens) VALUES('legacy-a','shared','old tokens');"#,
