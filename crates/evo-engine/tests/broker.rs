@@ -886,7 +886,7 @@ async fn restart_after_atomic_settlement_returns_persisted_response_without_tran
                 pricing_version: "price-v1".into(),
                 provider_request_id: completion.provider_request_id.clone(),
                 usage_record_id: completion.usage_record_id.clone(),
-                output_digest,
+                output_digest: Some(output_digest),
             },
             &ModelCallSettlementEvidence {
                 provenance: BudgetExecutionProvenance::Fixture,

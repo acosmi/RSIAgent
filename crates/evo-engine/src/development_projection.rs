@@ -1532,7 +1532,7 @@ async fn execute_side(
             pricing_version: root.pricing_version.clone(),
             provider_request_id: format!("registered-config-projection:{dispatch_id}"),
             usage_record_id: execution_usage_record_id(&request.request_id, &task.task_id, side)?,
-            output_digest: output_digest.clone(),
+            output_digest: Some(output_digest.clone()),
         };
         store
             .settle_registered_execution_call(ctx, &fence, &charge, &settlement)

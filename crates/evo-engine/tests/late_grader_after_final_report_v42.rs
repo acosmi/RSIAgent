@@ -687,7 +687,7 @@ fn execute_raw<'a>(
                     pricing_version: "fixture-pricing-v1".into(),
                     provider_request_id: format!("fixture-request-{ordinal}"),
                     usage_record_id: format!("fixture-usage-{ordinal}"),
-                    output_digest: receipt.output_digest.clone(),
+                    output_digest: Some(receipt.output_digest.clone()),
                 },
             )
             .await
@@ -1336,7 +1336,7 @@ fn reconcile_without_receipt<'a>(fixture: &'a Fixture, pending: &'a Pending) -> 
                     pricing_version: "fixture-pricing-v1".into(),
                     provider_request_id: "fixture-late-request".into(),
                     usage_record_id: "fixture-late-usage".into(),
-                    output_digest: hash(GOOD_OUTPUT.as_bytes()),
+                    output_digest: Some(hash(GOOD_OUTPUT.as_bytes())),
                 },
                 1_200,
             )

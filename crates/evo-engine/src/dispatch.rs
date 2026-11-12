@@ -313,7 +313,9 @@ struct BudgetCallReconcileRequest {
     call_id: String,
     provider_request_id: String,
     usage_record_id: String,
-    output_digest: String,
+    /// Absent or `null`: the bill is known but no output was received.
+    #[serde(default)]
+    output_digest: Option<String>,
     amount_micros: i64,
     currency: String,
     pricing_version: String,
@@ -1581,7 +1583,8 @@ struct JobOutcome {
 
 impl JobOutcome {
     fn has_committed_side_effect(&self) -> bool {
-        if self.step == "experiment_already_registered" {
+        // Both replays of an already committed business fact write nothing new.
+        if self.step == "experiment_already_registered" || self.step == "call_already_reconciled" {
             return false;
         }
         match self.result.as_ref() {
@@ -3200,6 +3203,8 @@ async fn run_budget_calls_list_open(
 /// A persisted charge identity may only be reconciled with the same actual
 /// facts. The finalized case keeps the kernel's own six-field conflict; the
 /// dispatched/uncertain case refuses to overwrite a preserved overflow charge.
+/// A preserved charge (known amount) fixes its output, received or not; an
+/// output a worker already stored must be repeated.
 fn ensure_budget_charge_matches_persisted(
     call: &evo_storage::budget::BudgetCallRecord,
     charge: &evo_storage::budget::UsageCharge,
@@ -3212,7 +3217,8 @@ fn ensure_budget_charge_matches_persisted(
         call.provider_request_id.as_deref(),
         &charge.provider_request_id,
     ) || !same(call.usage_record_id.as_deref(), &charge.usage_record_id)
-        || !same(call.output_digest.as_deref(), &charge.output_digest)
+        || ((call.actual_cost_micros.is_some() || call.output_digest.is_some())
+            && call.output_digest != charge.output_digest)
         || !same(call.actual_currency.as_deref(), &charge.currency)
         || !same(
             call.actual_pricing_version.as_deref(),

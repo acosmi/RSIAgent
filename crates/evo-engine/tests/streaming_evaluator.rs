@@ -675,7 +675,7 @@ async fn execute_output(
                 pricing_version: "pricing-v1".into(),
                 provider_request_id: format!("provider-{ordinal}"),
                 usage_record_id: format!("usage-{ordinal}"),
-                output_digest: receipt.output_digest,
+                output_digest: Some(receipt.output_digest),
             },
         )
         .await
@@ -808,7 +808,7 @@ async fn reconcile_pending(fixture: &Fixture, pending: &PendingExecution, now: i
                 pricing_version: "pricing-v1".into(),
                 provider_request_id: format!("provider-pending-{now}"),
                 usage_record_id: format!("usage-pending-{now}"),
-                output_digest: pending.output_digest.clone(),
+                output_digest: Some(pending.output_digest.clone()),
             },
         )
         .await

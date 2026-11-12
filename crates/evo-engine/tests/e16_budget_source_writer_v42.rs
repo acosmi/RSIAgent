@@ -399,7 +399,7 @@ async fn startup_gate_detects_only_new_ref_drift_with_identical_real_ledger_and_
             pricing_version: "price".into(),
             provider_request_id: "provider".into(),
             usage_record_id: "usage".into(),
-            output_digest: hash(b"output"),
+            output_digest: Some(hash(b"output")),
         };
         let response = BudgetArtifact::from_serializable(
             "test.response.v1",

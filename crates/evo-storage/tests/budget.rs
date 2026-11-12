@@ -60,7 +60,7 @@ fn charge(amount: i64, suffix: &str) -> UsageCharge {
         pricing_version: "price-v1".into(),
         provider_request_id: format!("provider-{suffix}"),
         usage_record_id: format!("usage-{suffix}"),
-        output_digest: hash(format!("output-{suffix}").as_bytes()),
+        output_digest: Some(hash(format!("output-{suffix}").as_bytes())),
     }
 }
 
@@ -396,7 +396,8 @@ async fn late_overrun_is_charged_and_never_clears_an_existing_stop() {
         .await
         .unwrap();
     let finalized = store
-        .reconcile_budget_call_cost(&admin, "scope-1", "call-a", &charge(15, "overrun"), 5)
+        // AG-206: the dispatch lease (until 102) has expired before Admin reconciles.
+        .reconcile_budget_call_cost(&admin, "scope-1", "call-a", &charge(15, "overrun"), 103)
         .await
         .unwrap();
     assert_eq!(finalized.actual_cost_micros, Some(15));

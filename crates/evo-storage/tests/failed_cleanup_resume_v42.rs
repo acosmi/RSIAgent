@@ -844,7 +844,7 @@ async fn budget_call(store: &Store, scope: &str, id: &str, schema: &str) {
                 pricing_version: "pricing-v1".into(),
                 provider_request_id: format!("provider-{scope}"),
                 usage_record_id: format!("usage-{scope}"),
-                output_digest: hash(b"actual fixture output"),
+                output_digest: Some(hash(b"actual fixture output")),
             },
         )
         .await

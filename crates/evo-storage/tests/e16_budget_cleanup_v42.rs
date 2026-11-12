@@ -101,7 +101,7 @@ fn charge(id: &str) -> UsageCharge {
         pricing_version: "price".into(),
         provider_request_id: format!("provider-{id}"),
         usage_record_id: format!("usage-{id}"),
-        output_digest: hash(b"output"),
+        output_digest: Some(hash(b"output")),
     }
 }
 fn evidence() -> ModelCallSettlementEvidence {

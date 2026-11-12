@@ -501,7 +501,9 @@ pub struct UsageCharge {
     pub pricing_version: String,
     pub provider_request_id: String,
     pub usage_record_id: String,
-    pub output_digest: String,
+    /// `None` only on the Admin reconciliation path: the cost is known from the
+    /// provider bill but no output was received. Worker settlements require it.
+    pub output_digest: Option<String>,
 }
 
 /// Non-persistent classification of one reconcile transaction. The overflow
@@ -1525,7 +1527,7 @@ impl Store {
     ) -> Result<BudgetCallRecord> {
         require_budget_caller(ctx)?;
         validate_fence(fence)?;
-        validate_charge(charge)?;
+        validate_worker_charge(charge)?;
         let mut tx = self.pool.begin().await.map_err(internal)?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
             .await?
@@ -1568,7 +1570,7 @@ impl Store {
     ) -> Result<BudgetCallRecord> {
         ctx.require(&[Role::Worker, Role::Host])?;
         validate_fence(fence)?;
-        validate_charge(charge)?;
+        validate_worker_charge(charge)?;
         settlement.validate()?;
         if charge.amount_micros != 0 {
             return Err(Error::Invalid(
@@ -1577,7 +1579,7 @@ impl Store {
         }
         if settlement.call_id != fence.call_id
             || settlement.request_digest != fence.actual_input_digest
-            || settlement.output_digest != charge.output_digest
+            || charge.output_digest.as_deref() != Some(settlement.output_digest.as_str())
         {
             return Err(Error::Conflict(
                 "registered settlement differs from its fence and charge".into(),
@@ -1765,7 +1767,7 @@ impl Store {
     ) -> Result<ModelCallSettlement> {
         ctx.require(&[Role::Host, Role::Admin])?;
         validate_fence(fence)?;
-        validate_charge(charge)?;
+        validate_worker_charge(charge)?;
         validate_model_settlement_evidence(evidence)?;
         let mut tx = self.pool.begin().await.map_err(internal)?;
         let call = load_call(&mut tx, &fence.billing_scope, &fence.call_id)
@@ -3315,7 +3317,6 @@ async fn root_budget_monetary_snapshot_in_tx(
                     || call.finalized_at.is_none()
                     || call.provider_request_id.is_none()
                     || call.usage_record_id.is_none()
-                    || call.output_digest.is_none()
             }
             BudgetCallState::Released | BudgetCallState::Cancelled => call.dispatch_id.is_some(),
         };
@@ -5240,6 +5241,13 @@ async fn reconcile_budget_call_cost_in_tx(
             "reconcile_requires_dispatched_or_uncertain_call".into(),
         ));
     }
+    // A worker may still settle a dispatched call until its lease expires
+    // (`finalize_budget_call` refuses only after it); only one side may close it.
+    if call.state == BudgetCallState::Dispatched && now <= call.lease_until {
+        return Err(Error::Conflict(
+            "reconcile_requires_expired_dispatch_lease".into(),
+        ));
+    }
     let accounting_overflow = apply_charge(tx, &call, charge, now, "cost_reconciled").await?;
     let updated = load_call(tx, billing_scope, call_id)
         .await?
@@ -5516,7 +5524,20 @@ fn validate_charge(value: &UsageCharge) -> Result<()> {
     identifier(&value.pricing_version)?;
     text(&value.provider_request_id, "provider_request_id", 256)?;
     identifier(&value.usage_record_id)?;
-    validate_digest(&value.output_digest, "output_digest")
+    match &value.output_digest {
+        Some(digest) => validate_digest(digest, "output_digest"),
+        None => Ok(()),
+    }
+}
+
+/// A worker/host settlement always carries the output it received; only the
+/// Admin reconciliation may settle a known cost without one.
+fn validate_worker_charge(value: &UsageCharge) -> Result<()> {
+    validate_charge(value)?;
+    if value.output_digest.is_none() {
+        return Err(Error::Invalid("settlement requires output_digest".into()));
+    }
+    Ok(())
 }
 
 fn validate_model_settlement_evidence(value: &ModelCallSettlementEvidence) -> Result<()> {
@@ -5905,7 +5926,7 @@ fn same_reservation(
 fn ensure_same_charge(call: &BudgetCallRecord, charge: &UsageCharge) -> Result<()> {
     if call.provider_request_id.as_deref() != Some(charge.provider_request_id.as_str())
         || call.usage_record_id.as_deref() != Some(charge.usage_record_id.as_str())
-        || call.output_digest.as_deref() != Some(charge.output_digest.as_str())
+        || call.output_digest != charge.output_digest
         || call.actual_cost_micros != Some(charge.amount_micros)
         || call.actual_currency.as_deref() != Some(charge.currency.as_str())
         || call.actual_pricing_version.as_deref() != Some(charge.pricing_version.as_str())

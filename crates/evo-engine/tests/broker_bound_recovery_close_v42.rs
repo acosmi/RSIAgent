@@ -599,7 +599,7 @@ async fn settle_open(world: &World, bound: &impl serde::Serialize) -> ModelRespo
                 pricing_version: completion.pricing_version.clone(),
                 provider_request_id: completion.provider_request_id.clone(),
                 usage_record_id: completion.usage_record_id.clone(),
-                output_digest,
+                output_digest: Some(output_digest),
             },
             &ModelCallSettlementEvidence {
                 provenance: BudgetExecutionProvenance::Fixture,

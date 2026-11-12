@@ -934,7 +934,7 @@ async fn execute(
                 pricing_version: "fixture-pricing-v1".into(),
                 provider_request_id: format!("fixture-request-{ordinal}"),
                 usage_record_id: format!("fixture-usage-{ordinal}"),
-                output_digest: receipt.output_digest,
+                output_digest: Some(receipt.output_digest),
             },
         )
         .await
@@ -1855,9 +1855,11 @@ async fn reconcile(fixture: &Fixture, pending: &Pending) {
                 pricing_version: "fixture-pricing-v1".into(),
                 provider_request_id: "fixture-late-request".into(),
                 usage_record_id: "fixture-late-usage".into(),
-                output_digest: receipt.output_digest,
+                output_digest: Some(receipt.output_digest),
             },
-            1_200,
+            // AG-206: Admin reconciles only after the dispatch lease (until
+            // 3_000, also in the frozen legacy history) has expired.
+            3_001,
         )
         .await
         .unwrap();
@@ -1869,7 +1871,7 @@ async fn reconcile(fixture: &Fixture, pending: &Pending) {
             &pending.call_id,
             &pending.dispatch_id,
             "late_audit_closed",
-            1_201,
+            3_002,
         )
         .await
         .unwrap();

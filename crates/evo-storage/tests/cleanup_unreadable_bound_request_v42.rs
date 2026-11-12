@@ -405,7 +405,7 @@ async fn settle(store: &Store, call: CallKey, request: BudgetArtifact) {
                 pricing_version: "pricing-v1".into(),
                 provider_request_id: format!("provider-{}", call.0),
                 usage_record_id: format!("usage-{}", call.0),
-                output_digest: hash(b"actual fixture output"),
+                output_digest: Some(hash(b"actual fixture output")),
             },
         )
         .await

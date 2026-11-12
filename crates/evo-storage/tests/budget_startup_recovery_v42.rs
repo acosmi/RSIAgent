@@ -155,7 +155,7 @@ fn charge(call_id: &str) -> UsageCharge {
         pricing_version: "price-v1".into(),
         provider_request_id: format!("provider-{call_id}"),
         usage_record_id: format!("usage-{call_id}"),
-        output_digest: hash(format!("output-{call_id}").as_bytes()),
+        output_digest: Some(hash(format!("output-{call_id}").as_bytes())),
     }
 }
 

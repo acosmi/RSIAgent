@@ -151,7 +151,7 @@ impl Fixture {
                             pricing_version: "fixture-price".into(),
                             provider_request_id: "fixture-provider".into(),
                             usage_record_id: "fixture-usage".into(),
-                            output_digest: output.digest.clone(),
+                            output_digest: Some(output.digest.clone()),
                         },
                         &ModelCallSettlementEvidence {
                             provenance: BudgetExecutionProvenance::Fixture,

@@ -925,7 +925,7 @@ impl ModelTransport for Gate {
             pricing_version: "price-v1".into(),
             provider_request_id: format!("fixture-provider-{}", request.request_id),
             usage_record_id: format!("fixture-usage-{}", request.request_id),
-            output_digest: hash(output.as_bytes()),
+            output_digest: Some(hash(output.as_bytes())),
         };
         self.witnesses.lock().unwrap().push(Witness {
             call_id: request.request_id.clone(),
@@ -1228,7 +1228,10 @@ async fn paid_fixture(mode: u8) -> PaidFixture {
                 currency: "USD".into(),
                 pricing_version: "price-v1".into(),
                 max_cost_micros: 20,
-                lease_seconds: 180,
+                // AG-206: a worker that exits without settling (mode 2) leaves
+                // a dispatched call that Admin may reconcile only after its
+                // lease; keep that real-clock wait short.
+                lease_seconds: if mode == 2 { 3 } else { 180 },
             },
         )
         .unwrap(),
@@ -1369,6 +1372,20 @@ async fn call_rows(fx: &PaidFixture) -> Vec<BudgetCallRecord> {
 async fn reconcile(fx: &PaidFixture) {
     let witnesses = fx.gate.witnesses.lock().unwrap().clone();
     for witness in witnesses {
+        // AG-206: a dispatched call is reconcilable only once the worker's
+        // lease has expired on the real clock.
+        loop {
+            let call = fx
+                .store
+                .budget_call(&fx.admin, "management-scope", &witness.call_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if call.state != BudgetCallState::Dispatched || now().unwrap() > call.lease_until {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         fx.store
             .reconcile_budget_call_cost(
                 &fx.admin,

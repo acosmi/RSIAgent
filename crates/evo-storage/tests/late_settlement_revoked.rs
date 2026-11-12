@@ -396,7 +396,7 @@ fn late_charge(call_id: &str, amount: i64) -> UsageCharge {
         pricing_version: "price-v1".into(),
         provider_request_id: format!("provider-{call_id}"),
         usage_record_id: format!("usage-{call_id}"),
-        output_digest: hash(OUTPUT.as_bytes()),
+        output_digest: Some(hash(OUTPUT.as_bytes())),
     }
 }
 
@@ -1235,7 +1235,8 @@ async fn an_unreadable_source_closure_fails_the_settlement_and_leaves_the_cost_r
     assert!(found_in(&path, OUTPUT).await.is_empty());
 
     let reconciled = store
-        .reconcile_budget_call_cost(&admin(), SCOPE, "call-1", &late_charge("call-1", 10), 21)
+        // AG-206: Admin reconciles once the dispatch lease (until 100) expired.
+        .reconcile_budget_call_cost(&admin(), SCOPE, "call-1", &late_charge("call-1", 10), 101)
         .await
         .unwrap();
     assert_eq!(reconciled.state, BudgetCallState::Finalized);

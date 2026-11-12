@@ -2596,7 +2596,7 @@ async fn ag122_unit_matcher_preserves_roles_lifecycle_and_opaque_refusals() {
                         pricing_version: "pricing-v1".into(),
                         provider_request_id: "ag122-unit-provider-receipt".into(),
                         usage_record_id: "ag122-unit-usage".into(),
-                        output_digest: output.clone(),
+                        output_digest: Some(output.clone()),
                     },
                     now + 1,
                 )

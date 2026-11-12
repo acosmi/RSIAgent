@@ -2962,7 +2962,7 @@ impl RegisteredDevelopmentRunner {
                         &task.task_id,
                         side,
                     )?,
-                    output_digest: output_digest.clone(),
+                    output_digest: Some(output_digest.clone()),
                 };
                 self.store
                     .settle_registered_execution_call(&self.executor, &fence, &charge, &settlement)
@@ -3742,7 +3742,7 @@ mod pre_dispatch_tests {
                                 pricing_version: "price".into(),
                                 provider_request_id: "registered".into(),
                                 usage_record_id: "usage".into(),
-                                output_digest: hash(b"output"),
+                                output_digest: Some(hash(b"output")),
                             },
                         )
                         .await

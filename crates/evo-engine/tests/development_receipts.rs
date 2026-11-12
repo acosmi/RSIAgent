@@ -1134,7 +1134,7 @@ async fn budget_rows_must_be_closed_development_rows_with_a_registered_settlemen
         pricing_version: "pricing-v1".into(),
         provider_request_id: "registered-pure-function:test".into(),
         usage_record_id: usage.into(),
-        output_digest: output_digest.clone(),
+        output_digest: Some(output_digest.clone()),
     };
     let settlement =
         |call_id: &str, dispatch_id: &str, input: &str| RegisteredExecutionSettlement {
@@ -2165,7 +2165,7 @@ async fn reserve_execution(
             pricing_version: "pricing-v1".into(),
             provider_request_id: format!("registered-pure-function:{call_id}"),
             usage_record_id: format!("usage-{call_id}"),
-            output_digest: output_digest.clone(),
+            output_digest: Some(output_digest.clone()),
         },
         RegisteredExecutionSettlement {
             schema_version: REGISTERED_EXECUTION_SETTLEMENT_SCHEMA.into(),
@@ -2225,7 +2225,7 @@ async fn settlement_records_actual_actor_and_role_without_caller_fields() {
             pricing_version: "pricing-v1".into(),
             provider_request_id: "registered-pure-function:ag183".into(),
             usage_record_id: format!("ag183-writer-usage-{index}"),
-            output_digest: output_digest.clone(),
+            output_digest: Some(output_digest.clone()),
         };
         let before = fixture
             .store
@@ -2323,7 +2323,7 @@ async fn settlement_preserves_legacy_bytes_and_current_identity_on_replay() {
         pricing_version: "pricing-v1".into(),
         provider_request_id: "registered-pure-function:ag183-replay".into(),
         usage_record_id: "ag183-replay-usage".into(),
-        output_digest,
+        output_digest: Some(output_digest),
     };
     let first = fixture
         .store

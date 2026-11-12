@@ -301,7 +301,7 @@ async fn lawful_cleanup_releases_only_content_quota_and_keeps_history() {
                 pricing_version: "price".into(),
                 provider_request_id: "provider".into(),
                 usage_record_id: "usage".into(),
-                output_digest: hash(b"output"),
+                output_digest: Some(hash(b"output")),
             },
         )
         .await

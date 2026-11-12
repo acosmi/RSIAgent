@@ -240,7 +240,7 @@ fn charge(amount: i64, suffix: &str) -> UsageCharge {
         pricing_version: "price-v1".into(),
         provider_request_id: format!("provider-{suffix}"),
         usage_record_id: format!("usage-{suffix}"),
-        output_digest: hash(format!("output-{suffix}").as_bytes()),
+        output_digest: Some(hash(format!("output-{suffix}").as_bytes())),
     }
 }
 
@@ -928,7 +928,7 @@ async fn registered_settlement_after_the_revoke_closes_the_call() {
         call_id: "call-1".into(),
         dispatch_id: dispatched.dispatch_id.clone().unwrap(),
         request_digest: dispatched.actual_input_digest.clone(),
-        output_digest: charge.output_digest.clone(),
+        output_digest: charge.output_digest.clone().unwrap(),
         target_id: "target-1".into(),
         target_digest: hash(b"target"),
         runner_digest: hash(b"runner"),

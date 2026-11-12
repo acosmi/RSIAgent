@@ -1145,7 +1145,7 @@ async fn execute_output(
                 pricing_version: "pricing-v1".into(),
                 provider_request_id: format!("provider-{ordinal}"),
                 usage_record_id: format!("usage-{ordinal}"),
-                output_digest: receipt.output_digest,
+                output_digest: Some(receipt.output_digest),
             },
         )
         .await

@@ -114,7 +114,7 @@ fn charge(amount: i64, suffix: &str) -> UsageCharge {
         pricing_version: "price-v1".into(),
         provider_request_id: format!("provider-{suffix}"),
         usage_record_id: format!("usage-{suffix}"),
-        output_digest: d(&format!("output-{suffix}")),
+        output_digest: Some(d(&format!("output-{suffix}"))),
     }
 }
 
@@ -912,6 +912,8 @@ async fn reconcile_finalized_same_charge_is_idempotent_and_different_charge_is_r
         panic!("expected an idempotent call_reconciled");
     };
     assert_eq!(view.actual_cost_micros, Some(12));
+    // The replay wrote nothing new: no committed business effect is claimed.
+    assert!(matches!(same.committed_side_effects.as_deref(), Some([])));
 
     let mut changed = actual.clone();
     changed.amount_micros = 13;
@@ -939,6 +941,208 @@ async fn reconcile_finalized_same_charge_is_idempotent_and_different_charge_is_r
             .unwrap()
             .spent_micros,
         12
+    );
+    fixture.store.close().await;
+}
+
+/// AG-206: a crash-left uncertain call whose bill is known but whose output
+/// was never received is reconciled without an output digest (absent or
+/// `null` on the wire). Nothing is invented: the stored and shown output stays
+/// unknown, the amount is charged once, and replays compare it as an Option.
+#[tokio::test]
+async fn reconcile_without_output_charges_the_bill_and_keeps_the_output_unknown() {
+    let fixture = fixture().await;
+    authorize_root(&fixture).await;
+    let call = fixture
+        .store
+        .reserve_budget_call(&fixture.worker, &reservation(SCOPE, "call-1", 30, 2))
+        .await
+        .unwrap();
+    let dispatched = fixture
+        .store
+        .begin_budget_dispatch(&fixture.worker, &fence(&call, 3))
+        .await
+        .unwrap()
+        .call;
+    let uncertain = fixture
+        .store
+        .cancel_budget_call(&fixture.worker, &fence(&dispatched, 4), "process_lost")
+        .await
+        .unwrap();
+    assert_eq!(uncertain.state, BudgetCallState::Uncertain);
+
+    let mut billed = charge(12, "billed");
+    billed.output_digest = None;
+    let mut absent = reconcile_payload("reconcile-billed", SCOPE, "call-1", &billed);
+    absent.as_object_mut().unwrap().remove("output_digest");
+    let status = submit_wait(&fixture, "budget.call.reconcile", absent).await;
+    assert_eq!(status.state, ManagementJobState::Succeeded, "{status:?}");
+    assert_eq!(status.step, "call_reconciled");
+    let ManagementBudgetResultV2::CallReconciled {
+        call: view,
+        accounting_overflow: false,
+        provider_source_verified: false,
+    } = budget_result(&status)
+    else {
+        panic!("expected call_reconciled");
+    };
+    assert_eq!(view.state, BudgetCallState::Finalized);
+    assert_eq!(view.actual_cost_micros, Some(12));
+    assert_eq!(view.provider_request_id.as_deref(), Some("provider-billed"));
+    assert_eq!(view.output_digest, None);
+    assert!(!view.execution_closed);
+    assert!(matches!(
+        status.committed_side_effects.as_deref(),
+        Some([ManagementCommittedEffect::BudgetReconciliation {
+            accounting_overflow: false,
+            ..
+        }])
+    ));
+    let stored = fixture
+        .store
+        .budget_call(&fixture.admin, SCOPE, "call-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, BudgetCallState::Finalized);
+    assert_eq!(stored.output_digest, None);
+    assert_eq!(stored.actual_cost_micros, Some(12));
+    let spent = || async {
+        fixture
+            .store
+            .root_budget(&fixture.admin, SCOPE)
+            .await
+            .unwrap()
+            .unwrap()
+            .spent_micros
+    };
+    assert_eq!(spent().await, 12);
+
+    // An explicit `null` is the same request: the same key replays the
+    // original job.
+    let null = reconcile_payload("reconcile-billed", SCOPE, "call-1", &billed);
+    assert_eq!(null["output_digest"], Value::Null);
+    let replay = submit_wait(&fixture, "budget.call.reconcile", null).await;
+    assert_eq!(replay.id, status.id);
+
+    // A new key with the same no-output charge is the already finalized fact:
+    // it succeeds, charges nothing and claims no committed effect.
+    let again = submit_wait(
+        &fixture,
+        "budget.call.reconcile",
+        reconcile_payload("reconcile-billed-2", SCOPE, "call-1", &billed),
+    )
+    .await;
+    assert_eq!(again.state, ManagementJobState::Succeeded, "{again:?}");
+    assert_eq!(again.step, "call_already_reconciled");
+    assert!(matches!(again.committed_side_effects.as_deref(), Some([])));
+
+    // Adding an output afterwards is a different charge.
+    let refused = submit_wait(
+        &fixture,
+        "budget.call.reconcile",
+        reconcile_payload("reconcile-billed-3", SCOPE, "call-1", &charge(12, "billed")),
+    )
+    .await;
+    assert_eq!(refused.state, ManagementJobState::Failed, "{refused:?}");
+    assert_eq!(refused.error_code.as_deref(), Some("conflict"));
+
+    // The reverse order is refused too: a call reconciled with its output
+    // cannot be replayed as "output not received". (call-1's exited execution
+    // is closed first so the root admits another dispatch.)
+    fixture
+        .store
+        .close_budget_call_execution(
+            &fixture.worker,
+            SCOPE,
+            "call-1",
+            dispatched.dispatch_id.as_deref().unwrap(),
+            "process_confirmed_stopped",
+            5,
+        )
+        .await
+        .unwrap();
+    let other = fixture
+        .store
+        .reserve_budget_call(&fixture.worker, &reservation(SCOPE, "call-2", 30, 5))
+        .await
+        .unwrap();
+    fixture
+        .store
+        .begin_budget_dispatch(&fixture.worker, &fence(&other, 6))
+        .await
+        .unwrap();
+    let with_output = submit_wait(
+        &fixture,
+        "budget.call.reconcile",
+        reconcile_payload("reconcile-out", SCOPE, "call-2", &charge(5, "out")),
+    )
+    .await;
+    assert_eq!(with_output.state, ManagementJobState::Succeeded);
+    let mut no_output = charge(5, "out");
+    no_output.output_digest = None;
+    let refused = submit_wait(
+        &fixture,
+        "budget.call.reconcile",
+        reconcile_payload("reconcile-out-2", SCOPE, "call-2", &no_output),
+    )
+    .await;
+    assert_eq!(refused.state, ManagementJobState::Failed, "{refused:?}");
+    assert_eq!(refused.error_code.as_deref(), Some("conflict"));
+    assert_eq!(spent().await, 17);
+    fixture.store.close().await;
+}
+
+/// AG-206: the dispatcher reconciles on the real clock, so a dispatched call
+/// whose worker lease is still live is refused by the kernel: the job fails
+/// with a conflict, claims no committed effect and changes no budget fact.
+#[tokio::test]
+async fn reconcile_of_a_live_dispatch_lease_fails_without_side_effects() {
+    let fixture = fixture().await;
+    authorize_root(&fixture).await;
+    let at = evo_core::now().unwrap();
+    let call = fixture
+        .store
+        .reserve_budget_call(&fixture.worker, &reservation(SCOPE, "call-live", 30, at))
+        .await
+        .unwrap();
+    let dispatched = fixture
+        .store
+        .begin_budget_dispatch(&fixture.worker, &fence(&call, at))
+        .await
+        .unwrap()
+        .call;
+    let root_before = fixture
+        .store
+        .root_budget(&fixture.admin, SCOPE)
+        .await
+        .unwrap()
+        .unwrap();
+    let status = submit_wait(
+        &fixture,
+        "budget.call.reconcile",
+        reconcile_payload("reconcile-live", SCOPE, "call-live", &charge(12, "live")),
+    )
+    .await;
+    assert_eq!(status.state, ManagementJobState::Failed, "{status:?}");
+    assert_eq!(status.error_code.as_deref(), Some("conflict"));
+    assert!(status.result.is_none());
+    assert!(matches!(status.committed_side_effects.as_deref(), Some([])));
+    let stored = fixture
+        .store
+        .budget_call(&fixture.admin, SCOPE, "call-live")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored, dispatched);
+    assert_eq!(
+        fixture
+            .store
+            .root_budget(&fixture.admin, SCOPE)
+            .await
+            .unwrap()
+            .unwrap(),
+        root_before
     );
     fixture.store.close().await;
 }

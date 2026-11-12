@@ -830,7 +830,7 @@ async fn history() -> History {
                 pricing_version: "price-v1".into(),
                 provider_request_id: "provider-fixed".into(),
                 usage_record_id: "usage-fixed".into(),
-                output_digest: d("output-fixed"),
+                output_digest: Some(d("output-fixed")),
             },
         )
         .await

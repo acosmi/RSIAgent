@@ -450,7 +450,7 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                     pricing_version: completion.pricing_version.clone(),
                     provider_request_id: completion.provider_request_id.clone(),
                     usage_record_id: completion.usage_record_id.clone(),
-                    output_digest: capture.output_digest.clone(),
+                    output_digest: Some(capture.output_digest.clone()),
                 },
                 &ModelCallSettlementEvidence {
                     provenance: BudgetExecutionProvenance::ExternalProvider,
@@ -1664,7 +1664,7 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
                             pricing_version: completion.pricing_version.clone(),
                             provider_request_id: completion.provider_request_id.clone(),
                             usage_record_id: completion.usage_record_id.clone(),
-                            output_digest,
+                            output_digest: Some(output_digest),
                         },
                         &ModelCallSettlementEvidence {
                             provenance: storage_provenance(provenance),
@@ -1713,7 +1713,7 @@ impl<T: ModelTransport> PersistentModelBroker<T> {
             pricing_version: completion.pricing_version.clone(),
             provider_request_id: completion.provider_request_id.clone(),
             usage_record_id: completion.usage_record_id.clone(),
-            output_digest: output_digest.clone(),
+            output_digest: Some(output_digest.clone()),
         };
         let receipt = ModelExecutionReceipt {
             call_id: decision.call.call_id.clone(),
