@@ -1,5 +1,7 @@
 use evo_core::hash;
+use evo_engine::dispatch::management_seed_classification;
 use evo_engine::seeds::{SeedClass, SeedTriple, auto_activate, classify};
+use evo_storage::ManagementSeedClassification;
 
 fn complete() -> SeedTriple {
     let b = hash(b"baseline");
@@ -164,4 +166,75 @@ fn legacy_classification_wire_values_and_legacy_triple_shapes_remain_readable() 
     let old: SeedTriple = serde_json::from_str(LEGACY).unwrap();
     assert_eq!(classify(&old), SeedClass::Unknown);
     assert!(old.asset_id_bundled.is_none() && old.kind_local.is_none());
+}
+
+// AG-166c: the management result adapter consumes the real BLU classification.
+// Only the five success classes have a closed wire value; every error class is
+// refused before a success result and still cannot auto-activate.
+#[test]
+fn management_seed_adapter_uses_actual_blu_qualification() {
+    let b = hash(b"baseline");
+    let l = hash(b"edited local");
+    let u = hash(b"new upstream");
+    for (local, upstream, seed_class, wire, wire_text) in [
+        (
+            b.clone(),
+            b.clone(),
+            SeedClass::Unmodified,
+            ManagementSeedClassification::Unmodified,
+            "\"unmodified\"",
+        ),
+        (
+            l.clone(),
+            b.clone(),
+            SeedClass::LocallyEdited,
+            ManagementSeedClassification::LocallyEdited,
+            "\"locally_edited\"",
+        ),
+        (
+            b.clone(),
+            u.clone(),
+            SeedClass::UpstreamNewer,
+            ManagementSeedClassification::UpstreamNewer,
+            "\"upstream_newer\"",
+        ),
+        (
+            l.clone(),
+            u.clone(),
+            SeedClass::BothChanged,
+            ManagementSeedClassification::BothChanged,
+            "\"both_changed\"",
+        ),
+        (
+            u.clone(),
+            u.clone(),
+            SeedClass::IdenticalToUpstream,
+            ManagementSeedClassification::IdenticalToUpstream,
+            "\"identical_to_upstream\"",
+        ),
+    ] {
+        let mut t = complete();
+        t.local = Some(local);
+        t.upstream = Some(upstream);
+        let actual = classify(&t);
+        assert_eq!(actual, seed_class);
+        assert_eq!(management_seed_classification(actual), Some(wire));
+        assert_eq!(serde_json::to_string(&wire).unwrap(), wire_text);
+        assert!(auto_activate(actual).is_err());
+    }
+    let mut missing_marker = complete();
+    missing_marker.local_marked = false;
+    let mut different_publisher = complete();
+    different_publisher.publisher_local = "foreign.publisher".into();
+    let mut unknown = complete();
+    unknown.bundled = None;
+    for class in [
+        classify(&missing_marker),
+        classify(&different_publisher),
+        classify(&unknown),
+        SeedClass::CorruptBaseline,
+    ] {
+        assert_eq!(management_seed_classification(class), None, "{class:?}");
+        assert!(auto_activate(class).is_err());
+    }
 }

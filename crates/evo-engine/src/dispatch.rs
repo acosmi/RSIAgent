@@ -85,6 +85,10 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
         | "budget.stage_plan.bind"
         | "budget.calls.list_open"
         | "budget.call.reconcile"
+        // seed.install is the one wired seed operation. seed.reset_stage
+        // keeps the unknown-operation default: its trusted current
+        // environment supplier does not exist, so it is not wired here.
+        | "seed.install"
         // monitoring.environment.record stays on the unknown-operation default:
         // its Host entry and same-session registered-control source are not
         // implemented here. The drift administration itself is Admin-only.
@@ -101,7 +105,8 @@ pub use evo_storage::{
     ManagementOptimizationCallProducer, ManagementOptimizationCallRef,
     ManagementOptimizationProgressV2, ManagementOptimizationResultV2,
     ManagementOptimizationStageRef, ManagementPartialResultV2, ManagementPendingTerminalState,
-    ManagementResult, ManagementResultV2, ManagementTraceExportResultV2, VersionedManagementJob,
+    ManagementResult, ManagementResultV2, ManagementSeedClassification, ManagementSeedResultV2,
+    ManagementTraceExportResultV2, VersionedManagementJob,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,6 +370,24 @@ struct MonitoringDriftRecordManagementRequest {
     reason: String,
 }
 
+const SEED_INSTALL_SCHEMA: &str = "rsia.management.seed_install.v1";
+
+/// `seed.install`: the first managed copy of one registered builtin catalog
+/// entry. The wire carries only the request key, the transient input-blob
+/// digest and the three material blob digests; a path, root, publisher, role,
+/// owner, namespace, marker, verification flag, permission boolean, content or
+/// body clock is not part of it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeedInstallManagementRequest {
+    schema_version: String,
+    request_key: String,
+    install_input_blob_digest: String,
+    baseline_blob_digest: String,
+    local_blob_digest: String,
+    upstream_blob_digest: String,
+}
+
 const ASSET_STAGE_SCHEMA: &str = "rsia.management.asset_stage.v1";
 const ASSET_ABORT_SCHEMA: &str = "rsia.management.asset_abort.v1";
 const ASSET_HANDOFF_SCHEMA: &str = "rsia.management.asset_handoff.v1";
@@ -450,6 +473,7 @@ enum ParsedRequest {
     ExportComplete(Box<ExportAttemptManagementRequest>),
     ExportAbort(Box<ExportAttemptManagementRequest>),
     MonitoringDriftRecord(Box<MonitoringDriftRecordManagementRequest>),
+    SeedInstall(Box<SeedInstallManagementRequest>),
 }
 
 impl<'de> Deserialize<'de> for ParsedRequest {
@@ -490,6 +514,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             ExportComplete(Box<ExportAttemptManagementRequest>),
             ExportAbort(Box<ExportAttemptManagementRequest>),
             MonitoringDriftRecord(Box<MonitoringDriftRecordManagementRequest>),
+            SeedInstall(Box<SeedInstallManagementRequest>),
         }
         Ok(
             match serde_json::from_value::<Other>(value).map_err(serde::de::Error::custom)? {
@@ -516,6 +541,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::ExportComplete(value) => Self::ExportComplete(value),
                 Other::ExportAbort(value) => Self::ExportAbort(value),
                 Other::MonitoringDriftRecord(value) => Self::MonitoringDriftRecord(value),
+                Other::SeedInstall(value) => Self::SeedInstall(value),
             },
         )
     }
@@ -1354,6 +1380,7 @@ impl ParsedRequest {
             Self::ExportComplete(request) => &request.request_key,
             Self::ExportAbort(request) => &request.request_key,
             Self::MonitoringDriftRecord(request) => &request.request_key,
+            Self::SeedInstall(request) => &request.request_key,
         }
     }
 }
@@ -1588,6 +1615,10 @@ impl JobOutcome {
             // A recorded drift commits the drift fact, the scope invalidation
             // and its edges with the terminal job state.
             Some(ManagementResultV2::Monitoring(_)) => true,
+            // A seed install commits the Prepared/Installed record, the three
+            // registered blobs, the edges and the audit record (or replays an
+            // already committed immutable image).
+            Some(ManagementResultV2::Seed(_)) => true,
             Some(ManagementResultV2::Original(
                 ManagementResult::EvaluationStatus { .. }
                 | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -2346,6 +2377,9 @@ async fn execute_request(
         ParsedRequest::MonitoringDriftRecord(request) => {
             return run_monitoring_drift_record(ctx, store, claimed.clone(), *request, control)
                 .await;
+        }
+        ParsedRequest::SeedInstall(request) => {
+            return run_seed_install(ctx, store, claimed.clone(), *request, control).await;
         }
         ParsedRequest::Blocked(_) => {
             control.admit_step()?;
@@ -3905,6 +3939,151 @@ async fn run_monitoring_drift_record(
     commit_management_outcome(session, claimed, finished).await
 }
 
+/// Only a successful seed comparison class has a management wire value. The
+/// error classes never reach a success result; an adapter that sees one refuses
+/// instead of inventing a classification.
+pub fn management_seed_classification(
+    class: crate::seeds::SeedClass,
+) -> Option<ManagementSeedClassification> {
+    match class {
+        crate::seeds::SeedClass::Unmodified => Some(ManagementSeedClassification::Unmodified),
+        crate::seeds::SeedClass::LocallyEdited => Some(ManagementSeedClassification::LocallyEdited),
+        crate::seeds::SeedClass::UpstreamNewer => Some(ManagementSeedClassification::UpstreamNewer),
+        crate::seeds::SeedClass::BothChanged => Some(ManagementSeedClassification::BothChanged),
+        crate::seeds::SeedClass::IdenticalToUpstream => {
+            Some(ManagementSeedClassification::IdenticalToUpstream)
+        }
+        crate::seeds::SeedClass::SameNameDifferentPublisher
+        | crate::seeds::SeedClass::MissingMarker
+        | crate::seeds::SeedClass::CorruptBaseline
+        | crate::seeds::SeedClass::Unknown => None,
+    }
+}
+
+async fn run_seed_install(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: SeedInstallManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    // The transient controlled input is read and decoded before the job
+    // transaction. It only selects one registered builtin catalog entry and
+    // carries the real source closure plus the environment/compiler labels.
+    let input = store
+        .verified_blob_input(
+            ctx,
+            &request.install_input_blob_digest,
+            crate::seeds::SEED_INSTALL_INPUT_MAX_BYTES,
+        )
+        .await?;
+    let install_input = crate::seeds::decode_seed_install_input(&input.bytes)?;
+    // Publisher, asset id, kind, version, path, content digest and license are
+    // derived from the compiled-in audited catalog; the wire cannot self-award
+    // any of them.
+    let entry = crate::seeds::builtin_entry_by_asset_id(&install_input.catalog_asset_id)?;
+    let identity = crate::seeds::SeedIdentity {
+        publisher: entry.publisher.clone(),
+        asset_id: entry.asset_id.clone(),
+        kind: entry.kind.clone(),
+    };
+    let mut session = store.registered_blob_write_session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        // The transient input blob is re-read under the held blob lock: the
+        // selector and source closure decoded above cannot have been swapped.
+        let input_now = session
+            .reverify_blob_input(
+                ctx,
+                &request.install_input_blob_digest,
+                crate::seeds::SEED_INSTALL_INPUT_MAX_BYTES,
+            )
+            .await?;
+        if input_now != input.bytes {
+            return Err(Error::Conflict("seed install input changed".into()));
+        }
+        // The three referenced material blobs come from the server-derived
+        // namespace paths (`blobs/<hash(namespace)>/<digest>`); each must be
+        // exactly one registered I0 content. The kernel then re-checks the
+        // catalog identity before it publishes any byte.
+        let mut material = Vec::with_capacity(3);
+        for digest in [
+            &request.baseline_blob_digest,
+            &request.local_blob_digest,
+            &request.upstream_blob_digest,
+        ] {
+            let bytes = session
+                .reverify_blob_input(ctx, digest, crate::packages::MAX_FILE as usize)
+                .await?;
+            if hash(&bytes) != entry.content_sha256 {
+                return Err(Error::Invalid("seed_catalog_mismatch".into()));
+            }
+            material.push(bytes);
+        }
+        let upstream_bytes = material.pop().ok_or(Error::Internal)?;
+        let local_bytes = material.pop().ok_or(Error::Internal)?;
+        let baseline_bytes = material.pop().ok_or(Error::Internal)?;
+        let seed_request = crate::seeds::InstallCurrentSeedRequest {
+            request_key: request.request_key.clone(),
+            baseline_identity: Some(identity.clone()),
+            local_identity: Some(identity),
+            local_marked: true,
+            baseline_bytes: Some(baseline_bytes),
+            local_bytes: Some(local_bytes),
+            upstream: Some(crate::seeds::SeedUpstream {
+                path: entry.path.clone(),
+                content_digest: entry.content_sha256.clone(),
+                bytes: upstream_bytes,
+            }),
+            environment_digest: install_input.environment_digest.clone(),
+            source_refs: install_input.source_refs.clone(),
+            compiler_version: install_input.compiler_version.clone(),
+            confirmed_bytes: None,
+        };
+        // Prepared, the three registered blobs, Installed, the edges, the
+        // audits and the terminal job state share this one transaction.
+        let installed = crate::seeds::PersistentSeedStore::install_in_session(
+            ctx,
+            &mut session,
+            seed_request,
+            true,
+        )
+        .await?;
+        let classification = management_seed_classification(installed.class)
+            .ok_or_else(|| Error::Invalid("seed_comparison_unknown".into()))?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: if installed.replayed_installed {
+                "seed_install_replayed".into()
+            } else {
+                "seed_installed".into()
+            },
+            result: Some(ManagementResultV2::Seed(
+                ManagementSeedResultV2::SeedInstalled {
+                    install_id: installed.install_id.clone(),
+                    classification,
+                    baseline_digest: installed.baseline_digest.clone(),
+                    local_digest: installed.local_digest.clone(),
+                    upstream_digest: installed.upstream_digest.clone(),
+                    staged_asset_id: installed.staged_asset_id.clone(),
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
 fn import_management_result_state(
     state: crate::import::ImportResultState,
 ) -> ManagementImportResultState {
@@ -4105,6 +4284,18 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
             }
             if request.reason.is_empty() || request.reason.len() > 512 {
                 return Err(Error::Invalid("drift reason must be 1..=512 bytes".into()));
+            }
+        }
+        ParsedRequest::SeedInstall(request) => {
+            ctx.require(&[Role::Admin])?;
+            identifier(&request.request_key)?;
+            for digest in [
+                &request.install_input_blob_digest,
+                &request.baseline_blob_digest,
+                &request.local_blob_digest,
+                &request.upstream_blob_digest,
+            ] {
+                crate::packages::validate_digest(digest, "seed install blob")?;
             }
         }
         ParsedRequest::TraceExportPrepare(request) => {
@@ -5424,6 +5615,24 @@ async fn consumer_progress(
         }
         return Ok(ConsumerProgress::NotCommitted);
     }
+    if record.identity().operation == "seed.install" {
+        // The install handler writes Prepared, the three registered blobs,
+        // Installed, the edges, the audit record and the terminal job state in
+        // one transaction. A non-terminal record therefore proves no install
+        // effect; a terminal one with its bound result is its own committed
+        // outcome.
+        if is_terminal(record.identity().state)
+            && matches!(record.result(), Some(ManagementResultV2::Seed(_)))
+        {
+            return Ok(ConsumerProgress::Committed(Box::new(JobOutcome {
+                state: record.identity().state,
+                step: record.step().into(),
+                result: record.result(),
+                error_code: record.error_code().map(str::to_owned),
+            })));
+        }
+        return Ok(ConsumerProgress::NotCommitted);
+    }
     if record.identity().operation == "export.complete"
         && is_terminal(record.identity().state)
         && matches!(
@@ -6043,6 +6252,8 @@ async fn consumer_progress(
         | ParsedRequest::ExportAbort(_) => Ok(ConsumerProgress::NotCommitted),
         // Unreachable: the drift short-circuit above owns this operation.
         ParsedRequest::MonitoringDriftRecord(_) => Ok(ConsumerProgress::NotCommitted),
+        // Unreachable: the seed short-circuit above owns this operation.
+        ParsedRequest::SeedInstall(_) => Ok(ConsumerProgress::NotCommitted),
         ParsedRequest::ExportComplete(request) => {
             // A published tree whose SQL completion did not commit is an
             // exact-effect question, never an empty-failure guess: only the
@@ -6832,7 +7043,9 @@ async fn cancel_job_atomic(
                     | "export.abort"
             ) && matches!(saved.result, Some(ManagementResultV2::AssetExport(_))))
             || (saved.operation == "monitoring.drift.record"
-                && matches!(saved.result, Some(ManagementResultV2::Monitoring(_)))))
+                && matches!(saved.result, Some(ManagementResultV2::Monitoring(_))))
+            || (saved.operation == "seed.install"
+                && matches!(saved.result, Some(ManagementResultV2::Seed(_)))))
     {
         let mut job = saved.clone();
         now()?;
@@ -6945,6 +7158,7 @@ fn stored_result_has_side_effect(result: Option<&ManagementResultV2>) -> bool {
         Some(ManagementResultV2::Import(_)) => true,
         Some(ManagementResultV2::AssetExport(_)) => true,
         Some(ManagementResultV2::Monitoring(_)) => true,
+        Some(ManagementResultV2::Seed(_)) => true,
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }
             | ManagementResult::EvaluationStatusReadV2 { .. },
@@ -7166,6 +7380,16 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
                 ));
             }
         },
+        "seed.install" => match payload["schema_version"].as_str() {
+            Some(SEED_INSTALL_SCHEMA) => ParsedRequest::SeedInstall(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
@@ -7205,6 +7429,7 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::ExportComplete(request) => &request.schema_version,
         ParsedRequest::ExportAbort(request) => &request.schema_version,
         ParsedRequest::MonitoringDriftRecord(request) => &request.schema_version,
+        ParsedRequest::SeedInstall(request) => &request.schema_version,
     };
     if actual != &expected {
         return Err(Error::Invalid(
@@ -7383,6 +7608,19 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             dependencies.push(("artifact".into(), request.previous_environment_id.clone()));
             dependencies.push(("artifact".into(), request.current_environment_id.clone()));
             dependencies.push(("artifact".into(), request.scope_id.clone()));
+        }
+        ParsedRequest::SeedInstall(request) => {
+            // The transient install input and the three material blobs are the
+            // physical inputs of the first managed copy; every digest is
+            // content-addressed and carries no caller-selected path.
+            for digest in [
+                &request.install_input_blob_digest,
+                &request.baseline_blob_digest,
+                &request.local_blob_digest,
+                &request.upstream_blob_digest,
+            ] {
+                dependencies.push(("blob".into(), digest.clone()));
+            }
         }
         ParsedRequest::TraceExportPrepare(request) => {
             // The private input depends on every captured source run, so a
@@ -7711,6 +7949,11 @@ pub enum ManagementCommittedEffect {
         current_environment_id: String,
         invalidated_scope_id: String,
     },
+    SeedInstalled {
+        install_id: String,
+        baseline_digest: String,
+        local_digest: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7954,6 +8197,16 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
             previous_environment_id: previous_environment_id.clone(),
             current_environment_id: current_environment_id.clone(),
             invalidated_scope_id: invalidated_scope_id.clone(),
+        }],
+        Some(ManagementResultV2::Seed(ManagementSeedResultV2::SeedInstalled {
+            install_id,
+            baseline_digest,
+            local_digest,
+            ..
+        })) => vec![ManagementCommittedEffect::SeedInstalled {
+            install_id: install_id.clone(),
+            baseline_digest: baseline_digest.clone(),
+            local_digest: local_digest.clone(),
         }],
         Some(ManagementResultV2::Original(
             ManagementResult::EvaluationStatus { .. }

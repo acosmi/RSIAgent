@@ -9,7 +9,7 @@ use crate::packages::{
     put_envelope, validate_digest, verify_sources,
 };
 use evo_core::{Context, Error, Result, Role, fingerprint, hash, identifier, now};
-use evo_storage::Store;
+use evo_storage::{Session, Store};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +459,68 @@ fn builtin_entry(identity: &SeedIdentity) -> Result<BuiltinSeedEntry> {
         .ok_or_else(|| Error::Invalid("seed_catalog_unregistered".into()))
 }
 
+/// Select one registered builtin catalog entry by its asset id alone. The
+/// publisher, kind, version, path, content digest and license are then derived
+/// from the compiled-in, audited catalog: no request field can self-authorize.
+pub fn builtin_entry_by_asset_id(asset_id: &str) -> Result<BuiltinSeedEntry> {
+    identifier(asset_id)?;
+    builtin_seed_catalog()?
+        .entries
+        .into_iter()
+        .find(|entry| entry.asset_id == asset_id)
+        .ok_or_else(|| Error::Invalid("seed_catalog_unregistered".into()))
+}
+
+pub const SEED_INSTALL_INPUT_SCHEMA: &str = "rsia.management.seed_install_input.v1";
+pub const SEED_INSTALL_INPUT_MAX_BYTES: usize = 64 * 1024;
+
+/// The transient, namespace-scoped controlled blob of one `seed.install`
+/// management request. It carries only the catalog selector, the real source
+/// closure and the environment/compiler labels of the first managed copy;
+/// paths, roots, publishers, roles, owners, namespaces, markers, verification
+/// flags and clocks are not part of it. `source_refs` has no separate count
+/// limit: the 64 KiB strict input bound is the only size limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedInstallInputV1 {
+    pub schema_version: String,
+    pub catalog_asset_id: String,
+    pub source_refs: Vec<E16SourceRef>,
+    pub environment_digest: String,
+    pub compiler_version: String,
+}
+
+/// Decode the strict transient install input. Duplicate keys, unknown fields,
+/// a wrong schema, an empty/broken source closure or an invalid
+/// environment/compiler label are refused before any session; the separate
+/// catalog lookup then refuses an unregistered selector before the job
+/// transaction.
+pub fn decode_seed_install_input(bytes: &[u8]) -> Result<SeedInstallInputV1> {
+    if bytes.is_empty() || bytes.len() > SEED_INSTALL_INPUT_MAX_BYTES {
+        return Err(Error::Invalid("invalid seed install input size".into()));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| Error::Invalid("seed install input is not UTF-8".into()))?;
+    let value = evo_storage::lifecycle::parse_strict_json(text)?;
+    let mut input: SeedInstallInputV1 = serde_json::from_value(value)
+        .map_err(|_| Error::Invalid("invalid seed install input".into()))?;
+    if input.schema_version != SEED_INSTALL_INPUT_SCHEMA {
+        return Err(Error::Invalid(
+            "unsupported seed install input schema".into(),
+        ));
+    }
+    identifier(&input.catalog_asset_id)?;
+    validate_digest(&input.environment_digest, "environment_digest")?;
+    identifier(&input.compiler_version)?;
+    if input.source_refs.is_empty() {
+        return Err(Error::Invalid(
+            "seed install input requires a source closure".into(),
+        ));
+    }
+    input.source_refs = canonical_sources(input.source_refs)?;
+    Ok(input)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SeedInstallPayloadV1 {
@@ -530,6 +592,23 @@ pub struct SeedInstallComparison {
     pub class: SeedClass,
     pub diff: ThreeWayDiff,
     pub staged: Option<E16Envelope<StagedAssetPayload>>,
+}
+
+/// The committed facts of one in-session install kernel run. The public
+/// wrappers read the records back after their own commit; the management
+/// handler builds its bounded result from these facts without a second read.
+#[derive(Debug, Clone)]
+pub(crate) struct SeedInstallSessionOutcome {
+    pub install_id: String,
+    pub class: SeedClass,
+    pub diff: ThreeWayDiff,
+    pub staged_asset_id: Option<String>,
+    pub baseline_digest: String,
+    pub local_digest: String,
+    pub upstream_digest: Option<String>,
+    /// The request replayed an already Installed immutable image; no business
+    /// row was written by this run.
+    pub replayed_installed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -609,14 +688,39 @@ impl PersistentSeedStore {
         request: InstallCurrentSeedRequest,
         initial_builtin: bool,
     ) -> Result<SeedInstallComparison> {
+        let mut session = store.registered_blob_write_session().await?;
+        let outcome = Self::install_in_session(ctx, &mut session, request, initial_builtin).await?;
+        session.commit().await?;
+        let install = Self::read_install(ctx, store, &outcome.install_id).await?;
+        let staged = match outcome.staged_asset_id.as_deref() {
+            Some(id) => Some(PersistentPackageStore::read_staged(ctx, store, id).await?),
+            None => None,
+        };
+        Ok(SeedInstallComparison {
+            install,
+            class: outcome.class,
+            diff: outcome.diff,
+            staged,
+        })
+    }
+
+    /// The one in-transaction install kernel shared by the public Current API
+    /// and the `seed.install` management handler. It never commits and never
+    /// reads the record back through a second session: the caller owns the
+    /// single `registered_blob_write_session` transaction and commits it.
+    pub(crate) async fn install_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        request: InstallCurrentSeedRequest,
+        initial_builtin: bool,
+    ) -> Result<SeedInstallSessionOutcome> {
         ctx.require(&[Role::Admin])?;
         identifier(&request.request_key)?;
         identifier(&request.compiler_version)?;
         validate_digest(&request.environment_digest, "environment_digest")?;
         let sources = canonical_sources(request.source_refs.clone())?;
-        let mut session = store.registered_blob_write_session().await?;
-        let watermark = current_watermark(&mut session, ctx).await?;
-        verify_sources(&mut session, ctx, &sources).await?;
+        let watermark = current_watermark(session, ctx).await?;
+        verify_sources(session, ctx, &sources).await?;
         let unknown = || Error::Invalid("seed_comparison_unknown".into());
         let (Some(b), Some(l), Some(u), Some(identity), Some(local_identity)) = (
             request.baseline_bytes.as_ref(),
@@ -755,21 +859,20 @@ impl PersistentSeedStore {
                     "seed identity or immutable baseline changed".into(),
                 ));
             }
-            verify_sources(&mut session, ctx, &existing.source_refs).await?;
+            verify_sources(session, ctx, &existing.source_refs).await?;
         } else if let Some(entry) = &catalog
             && baseline_digest != entry.content_sha256
         {
             return Err(Error::Invalid("seed_catalog_mismatch".into()));
         }
+        let mut replayed_installed = false;
         if let Some(existing) = &existing {
             if existing.payload.status == SeedStatus::Installed {
-                session.commit().await?;
-                Self::read_install(ctx, store, &id).await?;
-                session = store.registered_blob_write_session().await?;
-                verify_sources(&mut session, ctx, &sources).await?;
-                if current_watermark(&mut session, ctx).await? != watermark {
-                    return Err(Error::Conflict("seed install watermark advanced".into()));
-                }
+                // The original immutable image is verified read-only inside
+                // this same session; the caller then only adds the job terminal
+                // state (management replay) or a legal staging update.
+                Self::verify_installed_image_in_session(ctx, session, existing).await?;
+                replayed_installed = true;
             } else if existing.payload.status != SeedStatus::Prepared {
                 return Err(Error::Conflict(
                     "seed install content is not finalized".into(),
@@ -792,7 +895,7 @@ impl PersistentSeedStore {
         }
         let stage_sources = canonical_sources(stage_sources)?;
         let stage_input = if let Some(bytes) = stage_bytes {
-            verify_sources(&mut session, ctx, &stage_sources).await?;
+            verify_sources(session, ctx, &stage_sources).await?;
             Some(fingerprint(&(
                 "rsia.seed.update.v1",
                 &input_digest,
@@ -828,7 +931,7 @@ impl PersistentSeedStore {
             )?;
         }
         for producer_id in [&id, &stage_id] {
-            if crate::revocation_gate::judge_dependency(ctx, &mut session, "artifact", producer_id)
+            if crate::revocation_gate::judge_dependency(ctx, session, "artifact", producer_id)
                 .await?
                 .is_some()
             {
@@ -877,7 +980,7 @@ impl PersistentSeedStore {
                     confirmed_content_digest: confirmed_content_digest.clone(),
                 },
             };
-            put_envelope(&mut session, ctx, &envelope).await?;
+            put_envelope(session, ctx, &envelope).await?;
             session.audit(ctx, "e16.seed_install.prepare", &id).await?;
         }
         if let (Some(bytes), Some(stage_input)) = (stage_bytes, &stage_input)
@@ -920,7 +1023,7 @@ impl PersistentSeedStore {
                     candidate_ref: None,
                 },
             };
-            put_envelope(&mut session, ctx, &envelope).await?;
+            put_envelope(session, ctx, &envelope).await?;
             session
                 .put_edge(ctx, "artifact", &stage_id, "artifact", &id)
                 .await?;
@@ -949,7 +1052,7 @@ impl PersistentSeedStore {
                 session.need(ctx, "artifact", &id).await?;
             if current.input_digest != input_digest
                 || current.payload.status != SeedStatus::Prepared
-                || current.revoke_watermark != current_watermark(&mut session, ctx).await?
+                || current.revoke_watermark != current_watermark(session, ctx).await?
             {
                 return Err(Error::Conflict(
                     "seed install changed before blob finalization".into(),
@@ -957,7 +1060,7 @@ impl PersistentSeedStore {
             }
             current.payload.status = SeedStatus::Installed;
             current.updated_at = now()?;
-            put_envelope(&mut session, ctx, &current).await?;
+            put_envelope(session, ctx, &current).await?;
             session.audit(ctx, "e16.seed_install.finalize", &id).await?;
         }
         let has_staged = stage_bytes.is_some();
@@ -980,7 +1083,7 @@ impl PersistentSeedStore {
                 session.need(ctx, "artifact", &stage_id).await?;
             if current.input_digest != stage_input
                 || current.payload.state != StagedAssetState::Prepared
-                || current.revoke_watermark != current_watermark(&mut session, ctx).await?
+                || current.revoke_watermark != current_watermark(session, ctx).await?
             {
                 return Err(Error::Conflict(
                     "seed update changed before blob finalization".into(),
@@ -988,24 +1091,104 @@ impl PersistentSeedStore {
             }
             current.payload.state = StagedAssetState::Staged;
             current.updated_at = now()?;
-            put_envelope(&mut session, ctx, &current).await?;
+            put_envelope(session, ctx, &current).await?;
             session
                 .audit(ctx, "e16.seed_update.finalize", &stage_id)
                 .await?;
         }
-        session.commit().await?;
-        let install = Self::read_install(ctx, store, &id).await?;
-        let staged = if has_staged {
-            Some(PersistentPackageStore::read_staged(ctx, store, &stage_id).await?)
-        } else {
-            None
-        };
-        Ok(SeedInstallComparison {
-            install,
+        Ok(SeedInstallSessionOutcome {
+            install_id: id,
             class,
             diff,
-            staged,
+            staged_asset_id: has_staged.then_some(stage_id),
+            baseline_digest,
+            local_digest,
+            upstream_digest: Some(upstream_digest),
+            replayed_installed,
         })
+    }
+
+    /// Verify an already Installed immutable image read-only inside the
+    /// caller's write session. The payload-derived input digest, the derived
+    /// id, the current watermark, the status and the upstream pairing are
+    /// rechecked; the whole source closure is judged live; and the three
+    /// recorded material blobs are re-read and re-hashed under the held blob
+    /// lock. No row is written.
+    async fn verify_installed_image_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        current: &E16Envelope<SeedInstallPayloadV2>,
+    ) -> Result<()> {
+        let invalid = || Error::Conflict("seed install is invalid".into());
+        let payload = &current.payload;
+        if current.schema_version != E16_CURRENT_SEED_INSTALL_SCHEMA
+            || current.namespace != ctx.namespace()
+            || payload.status != SeedStatus::Installed
+            || payload.upstream_blob_digest.is_some() != payload.upstream_digest.is_some()
+        {
+            return Err(invalid());
+        }
+        let identity = SeedIdentity {
+            publisher: payload.publisher.clone(),
+            asset_id: payload.asset_id.clone(),
+            kind: payload.kind.clone(),
+        };
+        let upstream_digest = payload.upstream_digest.as_ref().ok_or_else(invalid)?;
+        let expected = fingerprint(&(
+            E16_CURRENT_SEED_INSTALL_SCHEMA,
+            &current.request_key,
+            &identity,
+            &payload.local_identity,
+            payload.local_marked,
+            &payload.baseline_digest,
+            &payload.local_digest,
+            upstream_digest,
+            &payload.upstream_path,
+            &payload.environment_digest,
+            &current.source_refs,
+            &payload.compiler_version,
+            &payload.confirmed_content_digest,
+            &payload.catalog_version,
+        ))?;
+        if expected != current.input_digest
+            || current.id
+                != format!(
+                    "e16-seed-install-{}",
+                    fingerprint(&(E16_CURRENT_SEED_INSTALL_SCHEMA, ctx.namespace(), &identity))?
+                )
+            || current_watermark(session, ctx).await? != current.revoke_watermark
+        {
+            return Err(invalid());
+        }
+        verify_sources(session, ctx, &current.source_refs).await?;
+        for (blob, digest) in [
+            (
+                payload.baseline_blob_digest.as_str(),
+                payload.baseline_digest.as_str(),
+            ),
+            (
+                payload.local_blob_digest.as_str(),
+                payload.local_digest.as_str(),
+            ),
+        ] {
+            let bytes = session
+                .reverify_blob_input(ctx, blob, MAX_FILE as usize)
+                .await?;
+            if hash(&bytes) != digest {
+                return Err(Error::Conflict("seed blob content changed".into()));
+            }
+        }
+        if let (Some(blob), Some(digest)) =
+            (&payload.upstream_blob_digest, &payload.upstream_digest)
+        {
+            let bytes = session
+                .reverify_blob_input(ctx, blob, MAX_FILE as usize)
+                .await?;
+            if hash(&bytes) != *digest {
+                return Err(Error::Conflict("upstream seed blob changed".into()));
+            }
+        }
+        Ok(())
     }
 
     async fn read_material(ctx: &Context, store: &Store, id: &str) -> Result<ReadSeedInstall> {
