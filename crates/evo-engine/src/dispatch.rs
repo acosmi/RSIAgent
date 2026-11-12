@@ -6541,9 +6541,9 @@ impl ManagementDispatcher {
 
 impl ManagementDispatcher {
     /// Own the `export.complete` crash reconciliation. `Some` means this path
-    /// decided the job (recovered, already completed, or an unverified tree
-    /// kept Draining); `None` means the formal tree is absent and the generic
-    /// NotCommitted path answers honestly.
+    /// decided the job (recovered, already completed, failed with no tree left
+    /// behind, or an unverified tree kept Draining); `None` means the formal
+    /// tree is absent and the generic NotCommitted path answers honestly.
     async fn finish_export_complete(
         &self,
         ctx: &Context,
@@ -6557,14 +6557,30 @@ impl ManagementDispatcher {
                     "export completion job input differs".into(),
                 ));
             }
-            // A revocation tombstone hides the export id but does not prove
-            // that no tree was published. Keep this uncertainty Draining
-            // instead of letting the generic path record Failed.
+            // A revocation tombstone hides the export id, but the dependency
+            // edge written at submit still names it.
             Err(InputFault::Redacted { .. }) => {
+                let mut session = self.store.session().await?;
+                let edges = session
+                    .dependency_edges(ctx, "artifact", &claimed.private_input_ref)
+                    .await?;
+                session.commit().await?;
+                let [(_, export_id)] = edges.as_slice() else {
+                    // Not expected: without the id nothing can be proven.
+                    return self
+                        .mark_export_complete_draining(ctx, claimed, None)
+                        .await
+                        .map(Some);
+                };
+                let revoked = JobOutcome {
+                    state: ManagementJobState::Failed,
+                    step: "private_input_redacted".into(),
+                    result: None,
+                    error_code: Some(SOURCE_REVOKED_CODE.into()),
+                };
                 return self
-                    .mark_export_complete_draining(ctx, claimed)
-                    .await
-                    .map(Some);
+                    .export_tree_unverified(ctx, claimed, export_id, Some(revoked))
+                    .await;
             }
             Err(InputFault::Other(error @ (Error::ClockRegressed | Error::Internal))) => {
                 return Err(error);
@@ -6584,21 +6600,25 @@ impl ManagementDispatcher {
             Ok(inspection) => inspection,
             Err(error @ (Error::ClockRegressed | Error::Internal)) => return Err(error),
             // The stored attempt or its closure cannot be read as the exact
-            // preimage. Without a proven absent tree this is uncertainty, not
-            // a zero-effect failure.
-            Err(_) => {
+            // preimage (absent, foreign or redacted).
+            Err(error) => {
+                let failed = JobOutcome {
+                    state: ManagementJobState::Failed,
+                    step: "failed".into(),
+                    result: None,
+                    error_code: Some(error_code(&error).into()),
+                };
                 return self
-                    .mark_export_complete_draining(ctx, claimed)
-                    .await
-                    .map(Some);
+                    .export_tree_unverified(ctx, claimed, &request.export_id, Some(failed))
+                    .await;
             }
         };
         match inspection {
             crate::packages::ExportCompletionInspection::NotPublished => Ok(None),
-            crate::packages::ExportCompletionInspection::PublishedUnverified => self
-                .mark_export_complete_draining(ctx, claimed)
-                .await
-                .map(Some),
+            crate::packages::ExportCompletionInspection::PublishedUnverified => {
+                self.export_tree_unverified(ctx, claimed, &request.export_id, None)
+                    .await
+            }
             crate::packages::ExportCompletionInspection::Ready(_)
             | crate::packages::ExportCompletionInspection::Completed(_, _) => self
                 .recover_export_complete(ctx, claimed, &request.export_id, &inspection)
@@ -6607,10 +6627,63 @@ impl ManagementDispatcher {
         }
     }
 
+    /// The tree cannot be verified. The formal directory is the only residue a
+    /// worker can leave and the worker is gone: while it exists the job stays
+    /// Draining for an operator (nothing is deleted here); once it is gone the
+    /// job left nothing behind and `failed`, if any, is its end.
+    async fn export_tree_unverified(
+        &self,
+        ctx: &Context,
+        claimed: &ManagementJobV2,
+        export_id: &str,
+        failed: Option<JobOutcome>,
+    ) -> Result<Option<ManagementJobState>> {
+        let directory = self.store.local_export_directory(ctx, export_id)?;
+        match tokio::fs::symlink_metadata(&directory).await {
+            Ok(_) => self
+                .mark_export_complete_draining(
+                    ctx,
+                    claimed,
+                    Some("export_tree_unverified_operator_action"),
+                )
+                .await
+                .map(Some),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(outcome) = failed else {
+                    return Ok(None);
+                };
+                let mut session = self.store.session().await?;
+                let record = load_job_record_in_session(ctx, &mut session, &claimed.id).await?;
+                if is_terminal(record.identity().state) {
+                    let state = record.identity().state;
+                    session.commit().await?;
+                    return Ok(Some(state));
+                }
+                let mut current = record.into_unfinished_v2()?;
+                if !same_claim_fields(&current, claimed) {
+                    return Err(Error::Conflict("management job lease fence changed".into()));
+                }
+                apply_completed_outcome(&mut current, &outcome)?;
+                now()?;
+                session
+                    .put(ctx, "job", &current.id, ctx.actor(), &current)
+                    .await?;
+                session
+                    .audit(ctx, "management.job.finish", &current.id)
+                    .await?;
+                session.commit().await?;
+                Ok(Some(current.state))
+            }
+            Err(_) => Err(Error::Internal),
+        }
+    }
+
+    /// Draining writes only when the state or a given `step` changes.
     async fn mark_export_complete_draining(
         &self,
         ctx: &Context,
         claimed: &ManagementJobV2,
+        step: Option<&str>,
     ) -> Result<ManagementJobState> {
         let mut session = self.store.session().await?;
         let record = load_job_record_in_session(ctx, &mut session, &claimed.id).await?;
@@ -6623,8 +6696,13 @@ impl ManagementDispatcher {
         if !same_claim_fields(&current, claimed) {
             return Err(Error::Conflict("management job lease fence changed".into()));
         }
-        if current.state != ManagementJobState::Draining {
+        if current.state != ManagementJobState::Draining
+            || step.is_some_and(|step| current.step != step)
+        {
             current.state = ManagementJobState::Draining;
+            if let Some(step) = step {
+                current.step = step.into();
+            }
             now()?;
             session
                 .put(ctx, "job", &current.id, ctx.actor(), &current)
