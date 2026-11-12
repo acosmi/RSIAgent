@@ -2380,7 +2380,7 @@ async fn the_trigger_claims_one_generation_per_two_cycles() {
 }
 
 #[tokio::test]
-async fn closing_four_cycles_without_the_trigger_skips_generation_one_for_good() {
+async fn closing_four_cycles_without_the_trigger_still_terminates_generation_one() {
     let fixture = Fixture::new().await;
     for n in 1..=4 {
         let staged = fixture.stage_trusted(n).await;
@@ -2394,10 +2394,92 @@ async fn closing_four_cycles_without_the_trigger_skips_generation_one_for_good()
     else {
         panic!("the newest generation was not claimed")
     };
-    // Only the newest complete generation is ever claimed.
+    // Only the newest complete generation is claimed; generation one is not
+    // skipped silently (plan L851) but written as terminal: these real runner
+    // cycles hold no contrast, so it is `no_contrast`.
     assert_eq!(claim.generation, 2);
     let index = fixture.scope_index().await;
-    assert_eq!(index.claim_ids.keys().copied().collect::<Vec<_>>(), vec![2]);
+    assert_eq!(
+        index.claim_ids.keys().copied().collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    let first = fixture.claim(&index.claim_ids[&1]).await;
+    assert_eq!(first.generation, 1);
+    assert_eq!(first.state, ConsolidationClaimState::NoContrast);
+    assert_eq!(first.cycle_ids, index.cycle_ids[..2].to_vec());
+}
+
+/// AG-139a: a `Claimed` generation that never ran is expired when the next one
+/// is claimed, and its run is refused before any write or model call.
+#[tokio::test]
+async fn a_superseded_claim_that_never_ran_is_expired_and_its_run_is_refused() {
+    let fixture = Fixture::new().await;
+    let first = fixture.claimed().await;
+    for cycle in 3..=4 {
+        fixture
+            .close_fixture_cycle(cycle, &score_only_contrast())
+            .await
+            .unwrap();
+    }
+    let scope_id = fixture.scope_id().await;
+    let ClaimOutcome::Claimed(second) =
+        MonitoringCoordinator::claim_consolidation(&fixture.worker, &fixture.store, &scope_id)
+            .await
+            .unwrap()
+    else {
+        panic!("the second generation was not claimed")
+    };
+    assert_eq!(second.generation, 2);
+    assert_eq!(
+        fixture.claim(&first.id).await.state,
+        ConsolidationClaimState::GenerationExpired
+    );
+    let material = StepMaterial::new(&fixture).await;
+    let model = EditingModelPort {
+        calls: AtomicUsize::new(0),
+    };
+    let runner = fixture.runner();
+    let journal = fixture.journal();
+    let all_before: Vec<Value> = {
+        let mut session = fixture.store.session().await.unwrap();
+        let all = session.list(&fixture.worker, "artifact").await.unwrap();
+        session.commit().await.unwrap();
+        all
+    };
+    let audits = fixture.store.verify_audit(&fixture.admin).await.unwrap();
+    let refused = MonitoringCoordinator::run_consolidation(
+        &fixture.worker,
+        &fixture.store,
+        &first.id,
+        Some(&model),
+        Some(&runner),
+        Some(&journal),
+        material.request(&fixture, &first.id, 1),
+    )
+    .await;
+    assert!(
+        matches!(&refused, Err(Error::Conflict(message)) if message == "claim is not dispatchable"),
+        "{refused:?}"
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    let all_after: Vec<Value> = {
+        let mut session = fixture.store.session().await.unwrap();
+        let all = session.list(&fixture.worker, "artifact").await.unwrap();
+        session.commit().await.unwrap();
+        all
+    };
+    assert_eq!(all_after, all_before);
+    assert_eq!(
+        fixture.store.verify_audit(&fixture.admin).await.unwrap(),
+        audits
+    );
+    let root = fixture
+        .store
+        .root_budget(&fixture.admin, SCOPE)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((root.spent_micros, root.reserved_micros), (0, 0));
 }
 
 /// Closes the named facts at once, each on its own task of a multi-thread runtime.

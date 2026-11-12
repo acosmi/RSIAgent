@@ -977,5 +977,6 @@ async fn drift_stale_lease_or_revoked_watermark_blocks_completion() {
 fn drift_id(result: &ManagementMonitoringResultV2) -> &str {
     match result {
         ManagementMonitoringResultV2::EnvironmentDriftRecorded { drift_id, .. } => drift_id,
+        other => panic!("expected a drift result, got {other:?}"),
     }
 }

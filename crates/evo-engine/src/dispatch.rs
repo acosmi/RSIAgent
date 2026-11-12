@@ -92,21 +92,24 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
         // monitoring.environment.record stays on the unknown-operation default:
         // its Host entry and same-session registered-control source are not
         // implemented here. The drift administration itself is Admin-only.
-        | "monitoring.drift.record" => ctx.require(&[Role::Admin]),
+        | "monitoring.drift.record"
+        // consolidation.run stays unwired: only the claim-only trigger is.
+        | "consolidation.trigger" => ctx.require(&[Role::Admin]),
         _ => Err(Error::Invalid("management_operation_not_wired".into())),
     }
 }
 
 pub use evo_storage::{
     ManagementAssetExportResultV2, ManagementAssetExportState, ManagementBackupResultV2,
-    ManagementBudgetResultV2, ManagementCancelArrival, ManagementDiagnostic,
-    ManagementImportResultState, ManagementImportResultV2, ManagementImportStatusCounts,
-    ManagementJob, ManagementJobState, ManagementJobV2, ManagementMonitoringResultV2,
-    ManagementOptimizationCallProducer, ManagementOptimizationCallRef,
-    ManagementOptimizationProgressV2, ManagementOptimizationResultV2,
-    ManagementOptimizationStageRef, ManagementPartialResultV2, ManagementPendingTerminalState,
-    ManagementResult, ManagementResultV2, ManagementSeedClassification, ManagementSeedResultV2,
-    ManagementTraceExportResultV2, VersionedManagementJob,
+    ManagementBudgetResultV2, ManagementCancelArrival, ManagementConsolidationTriggerState,
+    ManagementDiagnostic, ManagementImportResultState, ManagementImportResultV2,
+    ManagementImportStatusCounts, ManagementJob, ManagementJobState, ManagementJobV2,
+    ManagementMonitoringResultV2, ManagementOptimizationCallProducer,
+    ManagementOptimizationCallRef, ManagementOptimizationProgressV2,
+    ManagementOptimizationResultV2, ManagementOptimizationStageRef, ManagementPartialResultV2,
+    ManagementPendingTerminalState, ManagementResult, ManagementResultV2,
+    ManagementSeedClassification, ManagementSeedResultV2, ManagementTraceExportResultV2,
+    VersionedManagementJob,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -372,6 +375,31 @@ struct MonitoringDriftRecordManagementRequest {
     reason: String,
 }
 
+const CONSOLIDATION_TRIGGER_SCHEMA: &str = "rsia.management.consolidation_trigger.v1";
+
+/// `consolidation.trigger`: the complete development-cycle request it closes,
+/// then claims for. Actor, role, namespace and time come from authentication
+/// and the store, never from the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConsolidationTriggerManagementRequest {
+    schema_version: String,
+    request_key: String,
+    skill_id: String,
+    profile_id: String,
+    environment_id: String,
+    development_manifest_digest: String,
+    grader_digest: String,
+    generation_strategy_digest: String,
+    parent_skill_digest: String,
+    parent_bundle_digest: String,
+    billing_scope: String,
+    root_budget_id: String,
+    report_fact_id: String,
+    source_ids: Vec<String>,
+    revoke_watermark: u64,
+}
+
 const SEED_INSTALL_SCHEMA: &str = "rsia.management.seed_install.v1";
 
 /// `seed.install`: the first managed copy of one registered builtin catalog
@@ -475,6 +503,7 @@ enum ParsedRequest {
     ExportComplete(Box<ExportAttemptManagementRequest>),
     ExportAbort(Box<ExportAttemptManagementRequest>),
     MonitoringDriftRecord(Box<MonitoringDriftRecordManagementRequest>),
+    ConsolidationTrigger(Box<ConsolidationTriggerManagementRequest>),
     SeedInstall(Box<SeedInstallManagementRequest>),
 }
 
@@ -516,6 +545,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             ExportComplete(Box<ExportAttemptManagementRequest>),
             ExportAbort(Box<ExportAttemptManagementRequest>),
             MonitoringDriftRecord(Box<MonitoringDriftRecordManagementRequest>),
+            ConsolidationTrigger(Box<ConsolidationTriggerManagementRequest>),
             SeedInstall(Box<SeedInstallManagementRequest>),
         }
         Ok(
@@ -543,6 +573,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::ExportComplete(value) => Self::ExportComplete(value),
                 Other::ExportAbort(value) => Self::ExportAbort(value),
                 Other::MonitoringDriftRecord(value) => Self::MonitoringDriftRecord(value),
+                Other::ConsolidationTrigger(value) => Self::ConsolidationTrigger(value),
                 Other::SeedInstall(value) => Self::SeedInstall(value),
             },
         )
@@ -1390,6 +1421,7 @@ impl ParsedRequest {
             Self::ExportComplete(request) => &request.request_key,
             Self::ExportAbort(request) => &request.request_key,
             Self::MonitoringDriftRecord(request) => &request.request_key,
+            Self::ConsolidationTrigger(request) => &request.request_key,
             Self::SeedInstall(request) => &request.request_key,
         }
     }
@@ -2388,6 +2420,9 @@ async fn execute_request(
         ParsedRequest::MonitoringDriftRecord(request) => {
             return run_monitoring_drift_record(ctx, store, claimed.clone(), *request, control)
                 .await;
+        }
+        ParsedRequest::ConsolidationTrigger(request) => {
+            return run_consolidation_trigger(ctx, store, claimed.clone(), *request, control).await;
         }
         ParsedRequest::SeedInstall(request) => {
             return run_seed_install(ctx, store, claimed.clone(), *request, control).await;
@@ -3953,6 +3988,100 @@ async fn run_monitoring_drift_record(
     commit_management_outcome(session, claimed, finished).await
 }
 
+async fn run_consolidation_trigger(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: ConsolidationTriggerManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    let mut session = store.session().await?;
+    let finished = async {
+        // One transaction closes the cycle, claims the newest generation (and
+        // settles every older one) and writes the terminal job state, so a claim
+        // failure rolls the cycle back. It only claims and records (plan L802):
+        // no budget is reserved and nothing is dispatched, so the job has no
+        // unresolved effect to drain.
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        let cycle = crate::monitoring::MonitoringCoordinator::close_development_cycle_in_session(
+            ctx,
+            &mut session,
+            crate::monitoring::CompleteDevelopmentCycleRequest {
+                skill_id: request.skill_id,
+                profile_id: request.profile_id,
+                environment_id: request.environment_id,
+                development_manifest_digest: request.development_manifest_digest,
+                grader_digest: request.grader_digest,
+                generation_strategy_digest: request.generation_strategy_digest,
+                parent_skill_digest: request.parent_skill_digest,
+                parent_bundle_digest: request.parent_bundle_digest,
+                billing_scope: request.billing_scope,
+                root_budget_id: request.root_budget_id,
+                report_fact_id: request.report_fact_id,
+                source_ids: request.source_ids,
+                revoke_watermark: request.revoke_watermark,
+            },
+        )
+        .await?;
+        let claimed_generation =
+            crate::monitoring::MonitoringCoordinator::claim_consolidation_in_session(
+                ctx,
+                &mut session,
+                &cycle.scope_id,
+            )
+            .await?;
+        let (trigger_state, claim) = match claimed_generation.outcome {
+            crate::monitoring::ClaimOutcome::NotEligible { .. } => {
+                (ManagementConsolidationTriggerState::NotEligible, None)
+            }
+            crate::monitoring::ClaimOutcome::Claimed(claim) => {
+                (ManagementConsolidationTriggerState::Claimed, Some(claim))
+            }
+            crate::monitoring::ClaimOutcome::AlreadyClaimed(claim) => (
+                ManagementConsolidationTriggerState::AlreadyClaimed,
+                Some(claim),
+            ),
+        };
+        // The claim state's fixed serde code, never a free-text description.
+        let claim_state = match &claim {
+            Some(claim) => Some(
+                serde_json::from_value::<String>(
+                    serde_json::to_value(claim.state).map_err(|_| Error::Internal)?,
+                )
+                .map_err(|_| Error::Internal)?,
+            ),
+            None => None,
+        };
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "consolidation_triggered".into(),
+            result: Some(ManagementResultV2::Monitoring(
+                ManagementMonitoringResultV2::ConsolidationTriggered {
+                    cycle_id: cycle.id,
+                    scope_id: cycle.scope_id,
+                    completed_cycles: claimed_generation.completed_cycles as u64,
+                    trigger_state,
+                    claim_id: claim.map(|claim| claim.id),
+                    claim_state,
+                    terminated_generations: claimed_generation.terminated_generations,
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
 /// Only a successful seed comparison class has a management wire value. The
 /// error classes never reach a success result; an adapter that sees one refuses
 /// instead of inventing a classification.
@@ -4298,6 +4427,16 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
             }
             if request.reason.is_empty() || request.reason.len() > 512 {
                 return Err(Error::Invalid("drift reason must be 1..=512 bytes".into()));
+            }
+        }
+        ParsedRequest::ConsolidationTrigger(request) => {
+            ctx.require(&[Role::Admin])?;
+            // The ids below become dependency rows at submit; the remaining
+            // fields are checked by the cycle close before its first write.
+            identifier(&request.report_fact_id)?;
+            identifier(&request.environment_id)?;
+            for source_id in &request.source_ids {
+                identifier(source_id)?;
             }
         }
         ParsedRequest::SeedInstall(request) => {
@@ -5611,12 +5750,18 @@ async fn consumer_progress(
         }
         return Ok(ConsumerProgress::NotCommitted);
     }
-    if record.identity().operation == "monitoring.drift.record" {
+    if matches!(
+        record.identity().operation,
+        "monitoring.drift.record" | "consolidation.trigger"
+    ) {
         // The drift handler writes the drift record, the scope invalidation,
         // its two environment edges, the audit record and the terminal job
-        // state in one transaction. A non-terminal record therefore proves no
-        // drift effect; a terminal one with its bound result is its own
-        // committed outcome. The reason text is never re-derived here.
+        // state in one transaction; the trigger likewise commits the cycle, the
+        // claims, the scope index, their audit records and the terminal job
+        // state together. A non-terminal record therefore proves no effect (it
+        // is never Unknown, so neither job drains); a terminal one with its
+        // bound result is its own committed outcome. The reason text is never
+        // re-derived here.
         if is_terminal(record.identity().state)
             && matches!(record.result(), Some(ManagementResultV2::Monitoring(_)))
         {
@@ -6264,8 +6409,10 @@ async fn consumer_progress(
         | ParsedRequest::AssetHandoff(_)
         | ParsedRequest::ExportPrepare(_)
         | ParsedRequest::ExportAbort(_) => Ok(ConsumerProgress::NotCommitted),
-        // Unreachable: the drift short-circuit above owns this operation.
-        ParsedRequest::MonitoringDriftRecord(_) => Ok(ConsumerProgress::NotCommitted),
+        // Unreachable: the monitoring short-circuit above owns these two.
+        ParsedRequest::MonitoringDriftRecord(_) | ParsedRequest::ConsolidationTrigger(_) => {
+            Ok(ConsumerProgress::NotCommitted)
+        }
         // Unreachable: the seed short-circuit above owns this operation.
         ParsedRequest::SeedInstall(_) => Ok(ConsumerProgress::NotCommitted),
         ParsedRequest::ExportComplete(request) => {
@@ -7136,8 +7283,10 @@ async fn cancel_job_atomic(
                     | "export.complete"
                     | "export.abort"
             ) && matches!(saved.result, Some(ManagementResultV2::AssetExport(_))))
-            || (saved.operation == "monitoring.drift.record"
-                && matches!(saved.result, Some(ManagementResultV2::Monitoring(_))))
+            || (matches!(
+                saved.operation.as_str(),
+                "monitoring.drift.record" | "consolidation.trigger"
+            ) && matches!(saved.result, Some(ManagementResultV2::Monitoring(_))))
             || (saved.operation == "seed.install"
                 && matches!(saved.result, Some(ManagementResultV2::Seed(_)))))
     {
@@ -7474,6 +7623,16 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
                 ));
             }
         },
+        "consolidation.trigger" => match payload["schema_version"].as_str() {
+            Some(CONSOLIDATION_TRIGGER_SCHEMA) => ParsedRequest::ConsolidationTrigger(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "seed.install" => match payload["schema_version"].as_str() {
             Some(SEED_INSTALL_SCHEMA) => ParsedRequest::SeedInstall(Box::new(
                 serde_json::from_value(payload).map_err(|_| invalid())?,
@@ -7523,6 +7682,7 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::ExportComplete(request) => &request.schema_version,
         ParsedRequest::ExportAbort(request) => &request.schema_version,
         ParsedRequest::MonitoringDriftRecord(request) => &request.schema_version,
+        ParsedRequest::ConsolidationTrigger(request) => &request.schema_version,
         ParsedRequest::SeedInstall(request) => &request.schema_version,
     };
     if actual != &expected {
@@ -7702,6 +7862,15 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             dependencies.push(("artifact".into(), request.previous_environment_id.clone()));
             dependencies.push(("artifact".into(), request.current_environment_id.clone()));
             dependencies.push(("artifact".into(), request.scope_id.clone()));
+        }
+        ParsedRequest::ConsolidationTrigger(request) => {
+            // The report fact, the environment and every cycle source are the
+            // physical inputs of the cycle the trigger closes.
+            dependencies.push(("artifact".into(), request.report_fact_id.clone()));
+            dependencies.push(("artifact".into(), request.environment_id.clone()));
+            for source_id in &request.source_ids {
+                dependencies.push(("run".into(), source_id.clone()));
+            }
         }
         ParsedRequest::SeedInstall(request) => {
             // The transient install input and the three material blobs are the
@@ -8044,6 +8213,11 @@ pub enum ManagementCommittedEffect {
         current_environment_id: String,
         invalidated_scope_id: String,
     },
+    ConsolidationTriggered {
+        cycle_id: String,
+        scope_id: String,
+        claim_id: Option<String>,
+    },
     SeedInstalled {
         install_id: String,
         baseline_digest: String,
@@ -8292,6 +8466,18 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
             previous_environment_id: previous_environment_id.clone(),
             current_environment_id: current_environment_id.clone(),
             invalidated_scope_id: invalidated_scope_id.clone(),
+        }],
+        Some(ManagementResultV2::Monitoring(
+            ManagementMonitoringResultV2::ConsolidationTriggered {
+                cycle_id,
+                scope_id,
+                claim_id,
+                ..
+            },
+        )) => vec![ManagementCommittedEffect::ConsolidationTriggered {
+            cycle_id: cycle_id.clone(),
+            scope_id: scope_id.clone(),
+            claim_id: claim_id.clone(),
         }],
         Some(ManagementResultV2::Seed(ManagementSeedResultV2::SeedInstalled {
             install_id,

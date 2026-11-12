@@ -101,8 +101,9 @@ fn model_tools_keep_their_surface_and_are_disjoint_from_the_catalog() {
 /// including the dedicated sync view — fails closed inside `submit` with zero rows
 /// written: no job, no private input, no audit, no call. The four budget
 /// operations, the two import operations, the six asset/local-export
-/// operations, `monitoring.drift.record` and `seed.install` are wired, so they
-/// fail at their own strict DTO boundary rather than
+/// operations, `monitoring.drift.record`, `seed.install` and
+/// `consolidation.trigger` are wired, so they fail at their own strict DTO
+/// boundary rather than
 /// `management_operation_not_wired`; their real consumers are exercised by the
 /// positive controls. `monitoring.environment.record` stays unwired in this
 /// drift-only range, and `seed.reset_stage` stays unwired in the install-only
@@ -207,6 +208,12 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
                 // digests, so it is refused at the DTO before any session,
                 // with zero writes.
                 ("seed.install", _) => "invalid management payload",
+                // consolidation.trigger migrated from the unwired set to its
+                // strict cycle-request wire: this boundary payload lacks the
+                // thirteen cycle fields, so it is refused at the DTO before
+                // any session, with zero writes. consolidation.run stays
+                // unwired.
+                ("consolidation.trigger", _) => "invalid management payload",
                 // seed.reset_stage stays unwired in this install-only range:
                 // the trusted current environment supplier it needs is not
                 // implemented here.

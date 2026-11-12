@@ -712,7 +712,10 @@ async fn drift_reloads_both_environments_and_scope() {
         previous_environment_id,
         current_environment_id,
         invalidated_scope_id,
-    } = result;
+    } = result
+    else {
+        panic!("expected a drift result, got {result:?}")
+    };
     assert_eq!(previous_environment_id, fixture.previous_id());
     assert_eq!(current_environment_id, fixture.current_id());
     assert_eq!(invalidated_scope_id, &fixture.scope_id);
