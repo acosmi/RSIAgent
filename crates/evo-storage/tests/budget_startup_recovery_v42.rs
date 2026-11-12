@@ -978,8 +978,9 @@ const RESTARTED: &str = "process_restarted";
 /// dispatched turns uncertain and every open execution of a dispatched or uncertain
 /// call is closed, in every namespace of the data directory (a root the service
 /// Admin is not a member of included). A close already recorded keeps its reason, an
-/// uncertain reason is kept, and finalized calls are not read. A second run writes
-/// nothing.
+/// uncertain reason is kept, a finalized call without a response has only its
+/// execution closed (AG-209), and one with a response is not read. A second run
+/// writes nothing.
 #[tokio::test]
 async fn t6_interrupted_dispatches_become_uncertain_with_their_executions_closed() {
     let (_dir, path, store) = database().await;

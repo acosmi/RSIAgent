@@ -63,6 +63,31 @@ struct GroupStoppingTransport {
     calls: Arc<AtomicUsize>,
 }
 
+/// Returns a completion whose cost is negative, so neither it nor its accounting
+/// validates.
+#[derive(Clone)]
+struct InvalidAccountingTransport {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl ModelTransport for InvalidAccountingTransport {
+    fn provenance(&self) -> Option<ModelExecutionProvenance> {
+        Some(ModelExecutionProvenance::Fixture)
+    }
+
+    async fn execute(
+        &self,
+        request: &ModelRequest,
+        _dispatch_id: &str,
+    ) -> Result<TransportCompletion> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut completion = completion(request, false);
+        completion.actual_cost_micros = -1;
+        Ok(completion)
+    }
+}
+
 #[derive(Clone)]
 struct InvalidOutputTransport {
     calls: Arc<AtomicUsize>,
@@ -613,6 +638,46 @@ async fn cancel_before_a_valid_completion_closes_the_execution_and_keeps_the_cha
         Some("transport_returned_usage_unknown")
     );
     assert_eq!(call.reserved_micros, 20);
+}
+
+/// AG-209: a completion whose accounting is invalid leaves the cost unknown, and
+/// the returned future still closes the execution.
+#[tokio::test]
+async fn invalid_completion_with_invalid_accounting_closes_the_execution_as_uncertain() {
+    let (_dir, store) = store().await;
+    authorize(&store).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let broker = PersistentModelBroker::with_clock(
+        store.clone(),
+        InvalidAccountingTransport {
+            calls: calls.clone(),
+        },
+        config(),
+        fixed_clock(),
+    )
+    .unwrap();
+    let result = broker
+        .dispatch(request("request-invalid-accounting", ModelStage::Merge))
+        .await;
+    assert!(matches!(result, Err(Error::Invalid(_))), "{result:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let worker = Context::new("ns-a", "trusted-broker", Role::Worker).unwrap();
+    let call = store
+        .budget_call(&worker, "scope-1", "request-invalid-accounting")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, BudgetCallState::Uncertain);
+    assert_eq!(
+        call.terminal_reason.as_deref(),
+        Some("invalid_transport_completion")
+    );
+    assert_eq!(call.actual_cost_micros, None);
+    assert!(call.execution_closed);
+    assert_eq!(
+        call.execution_close_reason.as_deref(),
+        Some("transport_returned_usage_unknown")
+    );
 }
 
 #[tokio::test]

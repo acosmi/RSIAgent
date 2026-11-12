@@ -1092,8 +1092,9 @@ pub struct SettledOpenRecovery {
     /// The finalized calls with a persisted response whose execution this run closed.
     pub closed: Vec<BudgetCallKey>,
     /// The finalized calls whose execution is open and that carry no persisted
-    /// response. Nothing shows that their execution ended, so they are left open
-    /// for an Admin to close or reconcile explicitly.
+    /// response, left open: no response shows that their execution ended. Under
+    /// `rsia serve` none is left, as `recover_interrupted_dispatches` closes them
+    /// first under the lock.
     pub open_without_artifact: Vec<BudgetCallKey>,
 }
 

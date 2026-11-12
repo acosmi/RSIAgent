@@ -2489,3 +2489,101 @@ async fn transport_failure_then_reconcile_alone_finishes_the_job() {
     assert_eq!((root.reserved_micros, root.spent_micros), (0, 10));
     assert_eq!(fx.gate.calls.load(Ordering::SeqCst), 1);
 }
+
+/// AG-209: the way out registered for a worker that never returns its transport
+/// future. An uncancelled paid step whose worker panics (mode 2) drains with its
+/// call dispatched and its execution open. Once the call's lease has expired an
+/// Admin reconciles it, which finalizes it but leaves the execution open, so the
+/// job still drains. The restart's startup step then closes the execution as
+/// `process_restarted`, and the job lands on its recorded pending terminal state.
+#[tokio::test]
+async fn lease_expiry_reconcile_then_restart_finishes_a_panicked_job() {
+    let fx = paid_fixture(2).await;
+    let claimed = paid_start(&fx).await;
+    fx.gate.release.add_permits(1);
+    let started = Instant::now();
+    let draining = loop {
+        let job = current(fx.dispatcher.status(&fx.admin, &claimed.id).await.unwrap());
+        if job.state == ManagementJobState::Draining && job.pending_terminal_state.is_some() {
+            break job;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "actual worker did not record its draining terminal outcome: {job:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(!draining.cancel_requested);
+    assert_eq!(
+        draining.pending_terminal_state,
+        Some(evo_storage::ManagementPendingTerminalState::Failed)
+    );
+    let witness = fx.gate.witnesses.lock().unwrap()[0].clone();
+    let call = fx
+        .store
+        .budget_call(&fx.admin, "management-scope", &witness.call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, BudgetCallState::Dispatched);
+    assert!(!call.execution_closed);
+
+    // A dispatched call is reconcilable only once its lease has expired.
+    while now().unwrap() <= call.lease_until {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let reconciled = fx
+        .store
+        .reconcile_budget_call_cost(
+            &fx.admin,
+            "management-scope",
+            &witness.call_id,
+            &witness.charge,
+            now().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reconciled.state, BudgetCallState::Finalized);
+    assert_eq!(reconciled.actual_cost_micros, Some(10));
+    assert!(!reconciled.execution_closed);
+    assert_eq!(
+        current(fx.dispatcher.status(&fx.admin, &claimed.id).await.unwrap()).state,
+        ManagementJobState::Draining
+    );
+
+    // The restart's startup step. The worker has exited and nothing dispatches.
+    assert_eq!(
+        fx.store
+            .recover_interrupted_dispatches(now().unwrap())
+            .await
+            .unwrap(),
+        [evo_storage::budget::BudgetCallKey {
+            billing_scope: "management-scope".into(),
+            call_id: witness.call_id.clone(),
+        }]
+    );
+    let done = paid_state(&fx, &claimed.id, ManagementJobState::Failed).await;
+    assert_eq!(done.generation, draining.generation);
+    assert_eq!(done.step, draining.step);
+    assert_eq!(done.error_code, draining.error_code);
+    let call = fx
+        .store
+        .budget_call(&fx.admin, "management-scope", &witness.call_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(call.state, BudgetCallState::Finalized);
+    assert_eq!(call.actual_cost_micros, Some(10));
+    assert_eq!(
+        call.execution_close_reason.as_deref(),
+        Some("process_restarted")
+    );
+    let root = fx
+        .store
+        .root_budget(&fx.admin, "management-scope")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((root.reserved_micros, root.spent_micros), (0, 10));
+    assert_eq!(fx.gate.calls.load(Ordering::SeqCst), 1);
+}
