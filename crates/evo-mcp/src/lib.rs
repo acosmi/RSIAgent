@@ -404,6 +404,7 @@ fn structured_error(error: Error) -> CallToolResult {
         Error::Budget => "budget_unavailable",
         Error::Cancelled => "cancelled",
         Error::ClockRegressed => "clock_regressed",
+        Error::OccurrenceTimeColumnInvalid => "occurrence_time_column_invalid",
         Error::Internal => "internal_error",
     };
     let mut body = json!({"error":{"code":code}});

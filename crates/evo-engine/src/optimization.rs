@@ -2741,7 +2741,9 @@ impl From<&Error> for StepErrorKind {
             Error::Budget => Self::Budget,
             Error::Conflict(_) | Error::Capacity(_) => Self::Conflict,
             Error::Cancelled => Self::Cancelled,
-            Error::ClockRegressed | Error::Internal => Self::Internal,
+            Error::ClockRegressed | Error::OccurrenceTimeColumnInvalid | Error::Internal => {
+                Self::Internal
+            }
         }
     }
 }

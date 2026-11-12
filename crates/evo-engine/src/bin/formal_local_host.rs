@@ -117,6 +117,7 @@ async fn async_main() -> std::process::ExitCode {
                 Error::Conflict(_) | Error::Capacity(_) => "conflict",
                 Error::Cancelled => "cancelled",
                 Error::ClockRegressed => "clock_regressed",
+                Error::OccurrenceTimeColumnInvalid => "occurrence_time_column_invalid",
                 Error::Internal => "internal",
             };
             let mut body = serde_json::json!({"status":"refused","reason":code});

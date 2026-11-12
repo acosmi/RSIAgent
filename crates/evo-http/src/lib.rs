@@ -589,6 +589,9 @@ impl From<Error> for HttpError {
             Error::Budget => Self::new(StatusCode::TOO_MANY_REQUESTS, "budget_unavailable"),
             Error::Cancelled => Self::new(StatusCode::CONFLICT, "cancelled"),
             Error::ClockRegressed => Self::new(StatusCode::CONFLICT, "clock_regressed"),
+            Error::OccurrenceTimeColumnInvalid => {
+                Self::new(StatusCode::CONFLICT, "occurrence_time_column_invalid")
+            }
             Error::Internal => Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         }
     }

@@ -3303,6 +3303,7 @@ fn error_category(error: &Error) -> &'static str {
         Error::Conflict(_) | Error::Capacity(_) => "conflict",
         Error::Cancelled => "cancelled",
         Error::ClockRegressed => "clock_regressed",
+        Error::OccurrenceTimeColumnInvalid => "occurrence_time_column_invalid",
         Error::Internal => "internal",
     }
 }

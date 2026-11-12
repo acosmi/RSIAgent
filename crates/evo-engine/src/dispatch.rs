@@ -6374,7 +6374,9 @@ async fn consumer_progress_or_unknown(
                 Ok(ConsumerProgress::Unknown)
             }
         }
-        Err(error @ (Error::ClockRegressed | Error::Internal)) => Err(error),
+        Err(
+            error @ (Error::ClockRegressed | Error::OccurrenceTimeColumnInvalid | Error::Internal),
+        ) => Err(error),
         Err(
             Error::Invalid(_)
             | Error::Forbidden
@@ -7748,6 +7750,7 @@ fn error_code(error: &Error) -> &'static str {
         Error::Budget => "budget_unavailable",
         Error::Cancelled => "cancelled",
         Error::ClockRegressed => "clock_regressed",
+        Error::OccurrenceTimeColumnInvalid => "occurrence_time_column_invalid",
         Error::Internal => "internal_error",
     }
 }
