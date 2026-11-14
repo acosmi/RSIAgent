@@ -112,8 +112,8 @@ pub use evo_storage::{
     ManagementOptimizationCallRef, ManagementOptimizationProgressV2,
     ManagementOptimizationResultV2, ManagementOptimizationStageRef, ManagementPartialResultV2,
     ManagementPendingTerminalState, ManagementResult, ManagementResultV2,
-    ManagementRevocationResultV2, ManagementSeedClassification, ManagementSeedResultV2,
-    ManagementTraceExportResultV2, VersionedManagementJob,
+    ManagementRevocationResultV2, ManagementRevocationSourceKind, ManagementSeedClassification,
+    ManagementSeedResultV2, ManagementTraceExportResultV2, VersionedManagementJob,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -387,15 +387,6 @@ const SOURCE_REVOKE_SCHEMA: &str = "rsia.management.source_revoke.v1";
 /// no reason field.
 const SOURCE_REVOKE_REASON: &str = "management_source_revoke";
 
-/// The two registered revocable source kinds (§11.3.1): a trusted run or a
-/// strict E16 `import_source` artifact.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SourceRevokeKind {
-    Run,
-    Artifact,
-}
-
 /// `source.revoke`: the one source whose watermark is raised. Actor, role,
 /// namespace, time and watermark come from authentication and the store.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -403,7 +394,7 @@ enum SourceRevokeKind {
 struct SourceRevokeManagementRequest {
     schema_version: String,
     request_key: String,
-    source_kind: SourceRevokeKind,
+    source_kind: ManagementRevocationSourceKind,
     source_id: String,
 }
 
@@ -4175,8 +4166,8 @@ async fn run_source_revoke(
         let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
         let source = evo_storage::lifecycle::TypedObjectRef {
             kind: match request.source_kind {
-                SourceRevokeKind::Run => "run",
-                SourceRevokeKind::Artifact => "artifact",
+                ManagementRevocationSourceKind::Run => "run",
+                ManagementRevocationSourceKind::Artifact => "artifact",
             }
             .into(),
             id: request.source_id,
@@ -4194,7 +4185,7 @@ async fn run_source_revoke(
             step: "source_revoked".into(),
             result: Some(ManagementResultV2::Revocation(
                 ManagementRevocationResultV2::SourceRevoked {
-                    source_kind: status.source.kind,
+                    source_kind: request.source_kind,
                     source_id: status.source.id,
                     cleanup_job_id: status.job_id,
                     watermark_seq: status.watermark_seq,
@@ -4242,6 +4233,12 @@ async fn run_cleanup_continue(
             now()?,
         )
         .await?;
+        // The stored cleanup row names one of the two revocable kinds.
+        let source_kind = match status.source.kind.as_str() {
+            "run" => ManagementRevocationSourceKind::Run,
+            "artifact" => ManagementRevocationSourceKind::Artifact,
+            _ => return Err(Error::Internal),
+        };
         // A page that met an unknown scope commits the kernel's `failed`
         // state; the job reports the fixed code, never the kernel's
         // diagnostic text (it may quote stored schema strings).
@@ -4256,7 +4253,7 @@ async fn run_cleanup_continue(
             result: Some(ManagementResultV2::Revocation(
                 ManagementRevocationResultV2::CleanupContinued {
                     cleanup_job_id: status.job_id,
-                    source_kind: status.source.kind,
+                    source_kind,
                     source_id: status.source.id,
                     watermark_seq: status.watermark_seq,
                     cleanup_state: status.state,
@@ -5993,9 +5990,10 @@ async fn consumer_progress(
         // Each handler writes the revocation (watermark, tombstone, cleanup
         // rows) or one cleanup page together with the terminal job state in
         // one transaction and makes no budget call. A non-terminal record
-        // therefore proves no effect (it is never Unknown, so neither job
-        // drains); a terminal one with its bound result is its own committed
-        // outcome.
+        // therefore proves no effect (it is never Unknown); a terminal one with
+        // its bound result is its own committed outcome. The handlers never set
+        // Draining themselves: a cancel of a running job passes through Draining
+        // on the generic cancel path and recovery lands it on Cancelled.
         if is_terminal(record.identity().state)
             && matches!(record.result(), Some(ManagementResultV2::Revocation(_)))
         {
@@ -8494,7 +8492,7 @@ pub enum ManagementCommittedEffect {
         local_digest: String,
     },
     SourceRevoked {
-        source_kind: String,
+        source_kind: ManagementRevocationSourceKind,
         source_id: String,
         cleanup_job_id: String,
         watermark_seq: u64,
@@ -8777,7 +8775,7 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
             watermark_seq,
             ..
         })) => vec![ManagementCommittedEffect::SourceRevoked {
-            source_kind: source_kind.clone(),
+            source_kind: *source_kind,
             source_id: source_id.clone(),
             cleanup_job_id: cleanup_job_id.clone(),
             watermark_seq: *watermark_seq,

@@ -11,7 +11,9 @@
 //!
 //! R10 Draining rules (§1.5): both revocation operations are claimed while a
 //! Draining job holds the only dispatch slot, while a non-closure job stays
-//! Queued behind it; neither operation ever drains itself.
+//! Queued behind it. Neither handler sets Draining itself; a cancel of a
+//! claimed job passes through Draining on the generic cancel path and
+//! recovery lands it on Cancelled with no page written.
 #[path = "support/revocation_management.rs"]
 mod revocation_management;
 
@@ -393,4 +395,63 @@ async fn revocation_operations_are_claimed_while_a_draining_job_holds_the_slot()
     let holder = fixture.get("job", &draining.id).await.unwrap();
     assert_eq!(holder["state"], json!("draining"));
     assert_eq!(fixture.concurrent_dispatches().await, 1);
+}
+
+/// R10 §1.5.1, V101.b: the handler never sets Draining itself, but a cancel of
+/// a claimed job goes through the generic cancel path and is Draining until
+/// recovery observes the exited worker: it proved no effect, so the job lands
+/// on Cancelled with no business row written.
+#[tokio::test]
+async fn cancelling_a_running_page_drains_until_recovery_cancels_it() {
+    let fixture = Fixture::new().await;
+    fixture.graph("source").await;
+    revoked_cleanup(&fixture, "source").await;
+    let before = fixture.snapshot();
+    let job = seeded_job(
+        &fixture.admin,
+        OPERATION,
+        "cancel-running",
+        ManagementJobState::Running,
+    );
+    fixture.put_job(&job).await;
+    let draining = fixture
+        .dispatcher
+        .cancel(&fixture.admin, &job.id)
+        .await
+        .unwrap();
+    assert_eq!(draining.identity().state, ManagementJobState::Draining);
+    assert!(draining.cancel_requested());
+    let restarted = evo_engine::dispatch::ManagementDispatcher::new(
+        fixture.store.clone(),
+        vec![fixture.admin.clone()],
+    )
+    .unwrap();
+    assert_eq!(restarted.recover_pending().await.unwrap(), 1);
+    let landed = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        loop {
+            let job = fixture
+                .dispatcher
+                .status(&fixture.admin, &job.id)
+                .await
+                .unwrap();
+            if job.identity().state != ManagementJobState::Draining {
+                break job;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the cancelled job leaves Draining");
+    assert_eq!(
+        landed.identity().state,
+        ManagementJobState::Cancelled,
+        "{:?}",
+        serde_json::to_value(&landed).unwrap()
+    );
+    assert_eq!(
+        landed.cancel_arrival(),
+        Some(ManagementCancelArrival::BeforeSideEffect)
+    );
+    assert!(landed.result().is_none());
+    assert_eq!(fixture.snapshot(), before, "no cleanup page");
 }

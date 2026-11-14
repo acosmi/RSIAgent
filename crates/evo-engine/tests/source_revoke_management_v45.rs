@@ -6,14 +6,17 @@
 //! revoked source writes nothing and returns its existing cleanup job.
 //!
 //! R10 Draining rule: the job makes no budget call and commits in one
-//! transaction, so it never drains. Every status poll asserts the state is
-//! never `draining`, and a restarted Running job fails closed instead.
+//! transaction, so the handler never sets Draining itself; every status poll
+//! of a job that runs asserts it, and a restarted Running job fails closed. A
+//! cancel of a claimed job passes through Draining on the generic cancel path
+//! and recovery lands it on Cancelled with no business write.
 #[path = "support/revocation_management.rs"]
 mod revocation_management;
 
 use evo_core::{Error, Role};
 use evo_engine::dispatch::{
     ManagementCancelArrival, ManagementJobState, ManagementResultV2, ManagementRevocationResultV2,
+    ManagementRevocationSourceKind,
 };
 use evo_storage::lifecycle::CleanupState;
 use revocation_management::{
@@ -25,7 +28,15 @@ use serde_json::{Value, json};
 const OPERATION: &str = "source.revoke";
 
 /// The typed result of a succeeded revocation job.
-fn revoked(status: &Value) -> (String, String, String, u64, CleanupState) {
+fn revoked(
+    status: &Value,
+) -> (
+    ManagementRevocationSourceKind,
+    String,
+    String,
+    u64,
+    CleanupState,
+) {
     assert_eq!(status["state"], json!("succeeded"), "{status}");
     assert_eq!(status["step"], json!("source_revoked"));
     assert_eq!(status["error_code"], Value::Null);
@@ -56,7 +67,10 @@ async fn the_revocation_commits_its_facts_and_names_the_cleanup() {
         .run_job(OPERATION, revoke_payload("revoke-1", "run", "source"))
         .await;
     let (kind, id, cleanup_job_id, seq, state) = revoked(&status);
-    assert_eq!((kind.as_str(), id.as_str()), ("run", "source"));
+    assert_eq!(
+        (kind, id.as_str()),
+        (ManagementRevocationSourceKind::Run, "source")
+    );
     assert_eq!(state, CleanupState::Pending);
     let snapshot = fixture.snapshot();
     assert_eq!(snapshot["watermark"], json!([[seq]]));
@@ -147,12 +161,13 @@ async fn a_missing_source_or_a_kind_conflict_writes_no_revocation() {
 
     // An artifact that is not a strict import_source is not revocable.
     fixture.put("artifact", "plain", &fact("plain"), &[]).await;
+    let with_plain = fixture.snapshot();
     let plain = fixture
         .run_job(OPERATION, revoke_payload("plain", "artifact", "plain"))
         .await;
     assert_eq!(plain["state"], json!("failed"), "{plain}");
     assert_eq!(plain["error_code"], json!("invalid_input"));
-    assert_eq!(fixture.snapshot(), after);
+    assert_eq!(fixture.snapshot(), with_plain);
 }
 
 #[tokio::test]
@@ -170,7 +185,10 @@ async fn an_import_source_artifact_is_revocable() {
         .run_job(OPERATION, revoke_payload("import", "artifact", "imported"))
         .await;
     let (kind, id, cleanup_job_id, seq, _) = revoked(&status);
-    assert_eq!((kind.as_str(), id.as_str()), ("artifact", "imported"));
+    assert_eq!(
+        (kind, id.as_str()),
+        (ManagementRevocationSourceKind::Artifact, "imported")
+    );
     let snapshot = fixture.snapshot();
     assert_eq!(
         snapshot["tombstones"],
@@ -410,4 +428,66 @@ async fn a_restarted_running_revocation_fails_closed_without_draining() {
     assert_eq!(failed["error_code"], json!("management_worker_exited"));
     assert_eq!(failed["result"], Value::Null);
     assert_eq!(fixture.snapshot(), before);
+}
+
+/// R10 §1.5.1, V101.b: the handler never sets Draining itself, but a cancel of
+/// a claimed job goes through the generic cancel path and is Draining until
+/// recovery observes the exited worker: it proved no effect, so the job lands
+/// on Cancelled with no business row written.
+#[tokio::test]
+async fn cancelling_a_running_revocation_drains_until_recovery_cancels_it() {
+    let fixture = Fixture::new().await;
+    fixture.run("source").await;
+    let before = fixture.snapshot();
+    let job = seeded_job(
+        &fixture.admin,
+        OPERATION,
+        "cancel-running",
+        ManagementJobState::Running,
+    );
+    fixture.put_job(&job).await;
+    let draining = fixture
+        .dispatcher
+        .cancel(&fixture.admin, &job.id)
+        .await
+        .unwrap();
+    assert_eq!(draining.identity().state, ManagementJobState::Draining);
+    assert!(draining.cancel_requested());
+    let restarted = evo_engine::dispatch::ManagementDispatcher::new(
+        fixture.store.clone(),
+        vec![fixture.admin.clone()],
+    )
+    .unwrap();
+    assert_eq!(restarted.recover_pending().await.unwrap(), 1);
+    let landed = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        loop {
+            let job = fixture
+                .dispatcher
+                .status(&fixture.admin, &job.id)
+                .await
+                .unwrap();
+            if job.identity().state != ManagementJobState::Draining {
+                break job;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the cancelled job leaves Draining");
+    assert_eq!(
+        landed.identity().state,
+        ManagementJobState::Cancelled,
+        "{:?}",
+        serde_json::to_value(&landed).unwrap()
+    );
+    assert_eq!(
+        landed.cancel_arrival(),
+        Some(ManagementCancelArrival::BeforeSideEffect)
+    );
+    assert!(landed.result().is_none());
+    assert_eq!(
+        fixture.snapshot(),
+        before,
+        "no tombstone, watermark or cleanup row"
+    );
 }

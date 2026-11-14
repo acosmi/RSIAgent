@@ -523,7 +523,7 @@ pub enum ManagementResultV2 {
 #[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
 pub enum ManagementRevocationResultV2 {
     SourceRevoked {
-        source_kind: String,
+        source_kind: ManagementRevocationSourceKind,
         source_id: String,
         cleanup_job_id: String,
         watermark_seq: u64,
@@ -533,13 +533,22 @@ pub enum ManagementRevocationResultV2 {
     /// is still pending, complete or failed.
     CleanupContinued {
         cleanup_job_id: String,
-        source_kind: String,
+        source_kind: ManagementRevocationSourceKind,
         source_id: String,
         watermark_seq: u64,
         cleanup_state: lifecycle::CleanupState,
         processed_nodes: u64,
         pending_nodes: u64,
     },
+}
+
+/// The two registered revocable source kinds (§11.3.1): a trusted run or a
+/// strict E16 `import_source` artifact, named by their physical object kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementRevocationSourceKind {
+    Run,
+    Artifact,
 }
 
 /// Closed management results of the seed operations. `seed.install` reports
@@ -1235,24 +1244,18 @@ fn monitoring_result_binding_is_valid(job: &ManagementJobV2) -> bool {
 fn revocation_result_binding_is_valid(job: &ManagementJobV2) -> bool {
     match job.result.as_ref() {
         Some(ManagementResultV2::Revocation(ManagementRevocationResultV2::SourceRevoked {
-            source_kind,
             source_id,
             cleanup_job_id,
             ..
         })) => {
-            job.operation == "source.revoke"
-                && matches!(source_kind.as_str(), "run" | "artifact")
-                && !source_id.is_empty()
-                && !cleanup_job_id.is_empty()
+            job.operation == "source.revoke" && !source_id.is_empty() && !cleanup_job_id.is_empty()
         }
         Some(ManagementResultV2::Revocation(ManagementRevocationResultV2::CleanupContinued {
             cleanup_job_id,
-            source_kind,
             source_id,
             ..
         })) => {
             job.operation == "cleanup.continue"
-                && matches!(source_kind.as_str(), "run" | "artifact")
                 && !source_id.is_empty()
                 && !cleanup_job_id.is_empty()
         }
