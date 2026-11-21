@@ -413,7 +413,9 @@ const EXPECTED_RELATIONS: &[(&str, &str, &str)] = &[
 /// UTF-8; evo_core::canonical_fingerprint) without plan_recheck of all 138 records: the 93
 /// historical records retained from the v4.3 index binding (base a389c4e3) and the 45 records
 /// added by AG-182 (PR #200), pinned by AG-200 after the merge of PR #200 (02a135aa) was
-/// backfilled into its 33 records.
+/// backfilled into its 33 records, and the 82 records folded in by AG-210 from the
+/// index requests of 42 pull requests (#201-#251), all bound to plan v4.5 with their reviewed
+/// merges: 220 in all.
 const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
     (
         "E00.controller_acceptance",
@@ -967,6 +969,334 @@ const EXPECTED_RECORD_DIGESTS: &[(&str, &str)] = &[
         "E18.disabled_rejection_controller_acceptance",
         "75279240c222bbd5e5a65656afa30f7cb0b186253f95ec496d3b27f04acee0a1",
     ),
+    (
+        "E01.ag174a_controlled_task_profile_registration_v45",
+        "707aca4d0d11a649737b7377c8523fafd0edb908460f06aa212169ce81a917e3",
+    ),
+    (
+        "E01.ag174b_config_precedence_generator_oracle_v45",
+        "91ef81236cc67e9c7e994033312cda5a9afa23717556307c7e7504601a2365da",
+    ),
+    (
+        "E01.ag185_noninferiority_equality_alignment_v45",
+        "7a3acbb2933e2446f2772cd70415fce91a0fe64680ae8238067bd4577fda9e90",
+    ),
+    (
+        "E01.ag192_fixed_sample_regression_threshold_v45",
+        "baaca3398fc46e758c410faeeca12ed33331c38e1c4e242f936a80f0725800c9",
+    ),
+    (
+        "E02.ag135a_host_surface_v2_typed_data_v45",
+        "df4d173d64ef6ebe608003fd119e048e6c10d9ed1376115ec3f4a8ce43a3794b",
+    ),
+    (
+        "E02.ag135a_core_digest_preimage_v45",
+        "f69fc5780bc017995d18333d29cbd696e1e068ff9670a00af64b455231eea97a",
+    ),
+    (
+        "E02.ag135b_current_digest_consumers_v45",
+        "1507d9610c54400ac8d812660a906aba9939f5d2abe7912db15818312cb2af75",
+    ),
+    (
+        "E02.ag135b_current_empty_root_preimages_v45",
+        "b6430e3198d840a8cecb2abdd333082ed046f8f62a3def4cd254a4bed7c02464",
+    ),
+    (
+        "E02.ag155_versioned_management_job_status_v45",
+        "7f1da30f1b5efc4a27b4414496bafe426e4fc849ccb397a9cd7aed7e6ada91bc",
+    ),
+    (
+        "E02.ag159_v45_consumer_contract",
+        "edd97321ea2b25934d3665b5dddf9fc58c742b49f9528a84f31555e1313c470b",
+    ),
+    (
+        "E02.ag168_complete_tool_source_contract_v45",
+        "4139bc30e481d0dfa31a1668cb9fe7fb93d68671a7235873dd505bf2fda9daea",
+    ),
+    (
+        "E02.ag168_tool_schema_environment_v45",
+        "11bdd9e1094da57f41ee9e21cfe2d494da374a3f2b7ed81c67810fbe0bab547e",
+    ),
+    (
+        "E02.ag169_tool_only_capability_v45",
+        "13a3b2e1b5b7d0d213ed4721d226b3ae0d7bfba43555c0622b4986e8807158ea",
+    ),
+    (
+        "E02.ag186_v45_management_registry_codes",
+        "fe8f456b269c97fb099d4bbab5c0ef16d46e93657c3e0a0c27e497f05c26b829",
+    ),
+    (
+        "E03.ag183_registered_settlement_recompute_v45",
+        "0f3451b929012ba0c219563d11570436f1219c86968565d58b6749f8654562f7",
+    ),
+    (
+        "E03.ag189_config_projection_consumed_development_v45",
+        "da4b70d2641424fe694277159f7ae9f27fcd81ffb75fea51307fddbf75e8db68",
+    ),
+    (
+        "E04.ag141_same_tx_stage_gate_v45",
+        "78a9cb8bd1630b3c8d1ba0712eb6c400d3847004cb35b15ac5466b840f1a8124",
+    ),
+    (
+        "E04.ag146_budget_management_entrypoints_v45",
+        "04bdf0277038926abb2176bd7d351f7b27ad3f47eae70669ab6c9188a1b83b5c",
+    ),
+    (
+        "E04.ag146_budget_transaction_entrypoints_v45",
+        "ea1cd17cf727f7b0678c8e00f40668ea9781741d61e6ce2412a3ff737817b9b9",
+    ),
+    (
+        "E04.ag155_management_cancellation_consumers_v45",
+        "0fede162e172f84175d775173ed4946c12f3f571ddcb18d1eb5a97f160072c80",
+    ),
+    (
+        "E04.ag206_reconcile_without_output_v45",
+        "7842011e2b668b517b2fbdc9c99da1965b9e9d9206afbcef555ae5b4b5059575",
+    ),
+    (
+        "E05.ag163_formal_report_version_lineage_v43",
+        "1056659f18dd8fd7991098a53c30af957952715273400af915e9687c854aa315",
+    ),
+    (
+        "E05.ag181_first_late_feedback_once_v45",
+        "c567d4dd73009235c351e7a11d275297fe049c5dd754ed6118d45910647df2e8",
+    ),
+    (
+        "E05.ag192_fixed_sample_verdicts_v45",
+        "dbbdc53da625f542b8bd414fcc41c4c9cd447991bbda2ddef63334cc2d1495ce",
+    ),
+    (
+        "E05.ag192_legacy_plan_binding_v45",
+        "47b84313b3facc251746cf5dfa67dbc64af90abb0dfb87ef8995396da998e000",
+    ),
+    (
+        "E06.ag169_tool_only_software_boundaries_v45",
+        "5bef30128e4f86c317442cefd1d915629f790ca98682bf11333c7d49e5c6d2ef",
+    ),
+    (
+        "E06.ag169_release_store_recheck_v45",
+        "df12793c6fdc9b1818d7f7b435fa0663e78a34df8f54859c21bbd11b8241c302",
+    ),
+    (
+        "E06.ag202_audit_witness_prefix_v45",
+        "4646fe072c355473d64f7b6743cb537e828f47b28bfc3a358d1b16b4626ce16d",
+    ),
+    (
+        "E07.ag174b_config_precedence_local_reference_v45",
+        "9198fae9944845b35e30889d788fc303294eb6c2bcece52be5a8f4962857bd75",
+    ),
+    (
+        "E08.ag119_revocation_winner_precedes_first_write_v45",
+        "791f3ad1308e9c062d20a69c450a35f71572dbcc0b5e5238e8364d0cdaa8348b",
+    ),
+    (
+        "E08.ag164_backup_create_management_v45",
+        "79bcf10480d9beeda3a02b5148572761afeda0b294f4b5a7c0aa80ed2ea98e98",
+    ),
+    (
+        "E08.ag181_corrupt_ref_isolation_v45",
+        "09581a45c703f8e2fdb43f94a45df1fb06a9f3df6226589759834d30b7812cbd",
+    ),
+    (
+        "E08.ag204_practice_request_closure_cleanup_v45",
+        "c4886327c31e200c68ee31d6aa6ad3762abcb3f8b8b641d77183ad37668bce04",
+    ),
+    (
+        "E09.ag189_exploration_current_projection_content_v45",
+        "0db04e54f7567336131cdfe852429bca7b0d00a7f544bb2c9782132d40d5bfde",
+    ),
+    (
+        "E11.ag178_cluster_lcb_economic_report_v2_v45",
+        "b7a7abc899986b0dc0061fbdcdd474110e21965c86a47e67d0905c7fbdf513c0",
+    ),
+    (
+        "E11.ag178_v2_report_write_legacy_v1_read_and_route_closure_v45",
+        "0bd0b0ef58f5915d49b17bd89efeae6bb6558adb6e09abf5e350d2f059b0bd47",
+    ),
+    (
+        "E11.ag179_direction_hint_descriptive_ablation_v45",
+        "7016468bac7075cbd5890a970eb9f4c466fa860d4c28e83b67071412ceeaddba",
+    ),
+    (
+        "E12.ag170_curriculum_failure_records_and_selection_v2_v45",
+        "e9a09d83ce5937125c28a943ca07b5ffbb586c8e646a68d4cd47effac42b63e0",
+    ),
+    (
+        "E12.ag170_learner_state_v3_failure_reducer_core_v45",
+        "787f0bdd99be238c1347b7af94f6d526b5ee7d8625a909e5f1d989cba4cf58f5",
+    ),
+    (
+        "E12.ag201_curriculum_release_witness_selection_v45",
+        "5c105e7eede2f704df5d239d9b74bf1123d6905ae43f57f52527a35532620081",
+    ),
+    (
+        "E12.ag201_curriculum_entry_capacity_core_v45",
+        "278b41b9414acc1ce19405ecba8df014ecee8720206f279fa899f0b4e23d8bb2",
+    ),
+    (
+        "E13.ag166d_drift_management",
+        "1893392605986ee3f16587b1eda6fcda99fcecec70dbb49688d927a198212477",
+    ),
+    (
+        "E13.ag166d_drift_recovery",
+        "dcd478c4d16226704229283b6c25fe885ad4698843df95d8c4fa027a72c4695e",
+    ),
+    (
+        "E13.ag169_monitoring_recheck_v45",
+        "9b0ac8ecc9fbd8ebc00ea1e52fae969fb16f2f14c99de3111bd75384b0216880",
+    ),
+    (
+        "E13.ag187_runner_contract_content_use_gate_v45",
+        "c22ca7a394b1e745df5190316ad37e9f4f7876808c3bf462d9728ad87e5ce3f5",
+    ),
+    (
+        "E13.ag187_identity_only_consolidation_content_gate_v45",
+        "b319ce4df115674d98bb4c8df5b73cc809f780033b993eaa058363966da6fdaa",
+    ),
+    (
+        "E13.ag189_consolidation_projection_content_v45",
+        "5538286cedbc583c72849f62c28177f8104bb09ca657a07a10166821d9fd2d37",
+    ),
+    (
+        "E16.1.ag148_native_trace_reader_first_gate_v45",
+        "94e2c0d72c311c9ae99678a81213b2b81a88cefad2a6497692aca14481b3c00b",
+    ),
+    (
+        "E16.1.ag148_import_result_version_capacity_v45",
+        "abc3356ba1bb18202f62d2d600078fa3eace6ed1e5f39b52ab1d900bcbcf001e",
+    ),
+    (
+        "E16.1.ag166a_import_management_wiring",
+        "d1e8cca3b02a3f921405aabb942dc39edc1b8597f3b9bd4e54211a0896598eb8",
+    ),
+    (
+        "E16.1.ag166a_import_job_recovery",
+        "57fc99d8b32e96ae99bb4ea62296ab10101024a207312a41dc28d7d6c12aafc7",
+    ),
+    (
+        "E16.1.ag166a_import_blob_input",
+        "8b5421906789e1878b3266058751cca0d782c0d5263998bd9e174074572f2ae1",
+    ),
+    (
+        "E16.1.ag166a_import_format_and_coverage",
+        "cdeada808fde341978722356dc1cdec3164f0de0a716857681753e5fc0ff2a45",
+    ),
+    (
+        "E16.1.ag166a_import_registry_boundary",
+        "dcbbad61fcc7aa5bf60f600dc6ac2fe18e7faf1122c94cbb67e37db8d56760c3",
+    ),
+    (
+        "E16.2.ag166b_asset_export_management",
+        "d957b7acb729fe7b606574b8455f85471bf3e7b9c9f85256cfe4eec64f10d461",
+    ),
+    (
+        "E16.2.ag166b_asset_export_recovery",
+        "e1331492d4b80841873697d2aeca2014fcfcef25f95e01af94dae0b8e1cb74ae",
+    ),
+    (
+        "E16.2.ag166b_package_projection_parity",
+        "bd4d8f3a7ad910dcb3000030f62867dd3b3342f96015561f9face958e55e59f9",
+    ),
+    (
+        "E16.2.ag166b_local_export_fence",
+        "18196705778c4f6249a8e61dfcf0ad566e64b8ab3c0156fb86d879a136189afb",
+    ),
+    (
+        "E16.2.ag173_restricted_zip_reader_v45",
+        "295b4a8ac0939a47324545206d78f214ed629a5cee370130826016cfee02c9ee",
+    ),
+    (
+        "E16.2.ag175_trace_export_native_roundtrip_v45",
+        "d527eb0b834cd805947d7d4ed40727871e18516a4052719ed02073a97d79d834",
+    ),
+    (
+        "E16.2.ag175_trace_export_management_v45",
+        "9213231c2b48eed1d74ab5371e544bd63436fb2be15be5a73dbb19a61ad232a0",
+    ),
+    (
+        "E16.3.ag158_install_comparison_v45",
+        "a7a2d0fcf253faaf607cdd1ee146f07001fdfc108751b5086b30b8476d1f9f4e",
+    ),
+    (
+        "E16.3.ag158_builtin_seed_catalog_v45",
+        "9c96b886761a436be53b30b912e5093384dd9e064ad7e1d88c502cb747ff4694",
+    ),
+    (
+        "E16.3.ag166c_seed_install_management",
+        "53053a5c8682f15cc3e43a3976b0368bdac00b7612719ba24758eae3d6f2ded9",
+    ),
+    (
+        "E16.3.ag166c_seed_install_recovery",
+        "e1fcec25997bb91a118f29a072ad36e2a0725f391252cbd6d966f377606e8d91",
+    ),
+    (
+        "E16.3.ag166c_seed_blob_management",
+        "76b17de51a9b0b67942f7a93ee2198aafefc114634873c46f6a2c19ea2f1769e",
+    ),
+    (
+        "E16.3.ag166c_seed_install_compat",
+        "693fd0557b0abf4531d9e8d85c8eefdb5a197f45a4c575db534322f9705a8c7f",
+    ),
+    (
+        "E16.3.ag166c_seed_classification_adapter",
+        "608f37bfcc7d91bfc19a56e3ef600f9724c83f1b9e3fcbd7bdc02a445b0b4188",
+    ),
+    (
+        "E16.4.ag159_v45_consumer_legacy_boundary",
+        "8123b12d427f271296394607ec6c72607674cec1f71832dc6ea309d11568f139",
+    ),
+    (
+        "E16.4.ag169_hosts_store_recheck_v45",
+        "8cea52b197b4a0c0759a7bff6b481b79a42aff43a3b11632d1e1ce798f1425f5",
+    ),
+    (
+        "E16.5.ag119_qualified_source_identity_v45",
+        "30b08fd4f115ba320c8a4e9c320b4bc5f2175c0ddbcd6680e447a00310e4c22e",
+    ),
+    (
+        "E16.5.ag135b_current_digest_restore_v45",
+        "784f8223b3ba1cb39cc1c7792f79ea3f6211509b74ee385cf0ebb1d2f4771442",
+    ),
+    (
+        "E16.5.ag138_capacity_production_admission_v45",
+        "62d4af4f2cd4a48299f300a53b9b3d9aac01f41c40250809c6cd37d31df28782",
+    ),
+    (
+        "E16.5.ag138_capacity_single_authority_v45",
+        "b68214d608c379b02108dd8db255efb8ccaa8e3e90a872a8b0a26346122ba7a6",
+    ),
+    (
+        "E16.5.ag157_local_data_directory_permissions_v45",
+        "22979dfa30aaf76a8efa0e47454fec84364c787507881cc56388feedde1ee691",
+    ),
+    (
+        "E16.5.ag157_cli_entry_permissions_v45",
+        "c758e6977f8f84eddb9b020b65bfff4afe76b1934d834bc7a671b95d6bea862b",
+    ),
+    (
+        "E16.5.ag160_cli_env_credentials_v45",
+        "530e09aa4b58d24fe098281d9232a7be10e411cdf82d5f529321af46ee38cb66",
+    ),
+    (
+        "E16.5.ag163_formal_history_cleanup_v43",
+        "02881959eb03096b23aee465356d9a3133f2e80bd1f8bee35794b237827f3a46",
+    ),
+    (
+        "E16.5.ag173a_inflate_dependency_registration_v45",
+        "722d3ecd35ee31717132d43ad1ea10eeabb463332ed84369d6df1f5c02795f60",
+    ),
+    (
+        "E16.5.ag203_trace_export_capacity_v45",
+        "0d2d59f703a10385bad1ad1f5afdbe5538c621b6cbc188fc2b28f1522d8b73cf",
+    ),
+    (
+        "E16.5.ag205_trace_export_capacity_single_authority_v45",
+        "75b262bc21befd843c7086168286a6917dabf455d38d29b525362b0cfcc8a254",
+    ),
+    (
+        "E16.5.ag207_closure_operations_bypass_dispatch_slot_v45",
+        "c5adb9ec1b53e633ffbb5d64ff31a9e9f4521986e20a70e67b91e1b7c210e9c4",
+    ),
 ];
 /// Reviewed (record_id, field, path) entries of the missing-evidence register (42).
 const EXPECTED_MISSING_TRIPLES: &[(&str, &str, &str)] = &[
@@ -1484,18 +1814,30 @@ const STATUS_RANK: &[(&str, u8)] = &[
     ("verified", 3),
 ];
 
-/// The reviewed V080.d pins shared by both checkers: withdrawn tuples, relation pairs, record
-/// digests, missing-register triples and the register file SHA-256.
+const PUBLIC_RECORD_PINS: &str = include_str!("../../../reports/support-scope-public-digests.json");
+const PUBLIC_RECORD_PINS_SHA256: &str =
+    "38bbd223389c9c63b794f344bd45de4873e325cd56af2a13dafa00948288e36a";
+const ORIGINAL_RECORDS_PATH: &str =
+    "out/audit-20260930/qa/ag-210-public-evidence/original-records.json";
+
+/// The reviewed V080.d pins shared by both checkers: withdrawn tuples, relation pairs, original
+/// and public record digests, missing-register triples and the register file SHA-256.
 struct ReviewedPins {
     withdrawn: BTreeMap<String, (u64, String, String, String)>,
     relations: BTreeSet<(String, String, String)>,
     records: BTreeMap<String, String>,
+    public_records: BTreeMap<String, String>,
     missing: BTreeSet<(String, String, String)>,
     register_sha256: String,
 }
 
 impl ReviewedPins {
     fn reviewed() -> Self {
+        assert_eq!(
+            evo_core::hash(PUBLIC_RECORD_PINS.as_bytes()),
+            PUBLIC_RECORD_PINS_SHA256,
+            "public record digest table differs from its pinned SHA-256"
+        );
         Self {
             withdrawn: EXPECTED_WITHDRAWN
                 .iter()
@@ -1519,6 +1861,8 @@ impl ReviewedPins {
                 .iter()
                 .map(|(id, digest)| (id.to_string(), digest.to_string()))
                 .collect(),
+            public_records: serde_json::from_str(PUBLIC_RECORD_PINS)
+                .expect("reviewed public record digest table"),
             missing: EXPECTED_MISSING_TRIPLES
                 .iter()
                 .map(|(id, field, path)| (id.to_string(), field.to_string(), path.to_string()))
@@ -2077,6 +2421,49 @@ fn expected_merge_for_pr(pr: u64) -> Result<Option<&'static str>, String> {
         198 => Some("e012bba09cb662e9c01d61b52124a709106f75b8"),
         199 => Some("a389c4e32e315ff516eba996a0a3dd40faadba0f"),
         200 => Some("02a135aa918fce5dd2ea0c1c8eafc287318f10d2"),
+        201 => Some("a5b3de088568f985969a05ebc4e027d30ba78bd6"),
+        203 => Some("800eafc4ccaf39d5e4f3fb1b7891f9c142e6b482"),
+        204 => Some("d4a1851049097868b527ad70f6a7f86dd75035c3"),
+        205 => Some("b72a87515313618bd29f3d8b6d72183761dfe0df"),
+        206 => Some("ee75660a2ff86870cce4d69c93015008159d9958"),
+        207 => Some("f72d0fa434dc8eec5884c2332d62d27e9982f494"),
+        208 => Some("ee5ecf35076476c396a804cf6c34227add695d49"),
+        209 => Some("7d22edb5dfe6ec84f7a3167aba02ae683e9941be"),
+        210 => Some("14f2effc625c8a195a7f86649f628e3fe0b3a6ef"),
+        211 => Some("2ae41d4937fe307c90271f46855e1cde6325a967"),
+        212 => Some("125a08ceb38ccdb1bbba7f16d0a26063e82344fe"),
+        213 => Some("f54b013077af56dd08f1e1ddec6376bbe642f465"),
+        214 => Some("c9b1ecaa1a062c0d92e3a23701d8864ca43ebff5"),
+        215 => Some("2c23cf22154194931781d4dd0799d2ee622da236"),
+        216 => Some("1f1a23f8ef6fa93346fdd26e2d472e8e0ae8a769"),
+        217 => Some("8d50cb0b722391d182dbc42ba70d438c4e93fc11"),
+        218 => Some("9d7dddf3db6c1e75a3b566230bde4e2ee01bb4a5"),
+        219 => Some("f6e90e5ae72b866669e8eac2b82c2656f75d2c36"),
+        220 => Some("c4eb437e03c11655087267bcc3155a8294191159"),
+        221 => Some("e3e41db3d72067274746df3d73eecd96e8b42b7c"),
+        223 => Some("4ff79bab423874338b1ac0254d32190d3f86ba66"),
+        225 => Some("99770dcd440bbea6f0dffdf6ff6dfe7e1fd4dca1"),
+        226 => Some("225481c0500ea59af51e4daac5229b17ff7c32bc"),
+        228 => Some("c55fdf78025937ae63c886f09a6a27da3c85cad8"),
+        229 => Some("7b285b9c603b567648dd0df579c2c9100e3f1c99"),
+        230 => Some("be179ff731c9d3e696f716ff93fc3ee1e98c28cc"),
+        234 => Some("1507f2e5329ed880294d19126d10ed1fc0e8e911"),
+        235 => Some("98e48b1c051bd73aef82d706af5c21bb16267950"),
+        236 => Some("bd07d4b3eb7945c73c3cb1160a3de56d7169ef8d"),
+        238 => Some("643d6eb026c8b699d63bc7c79d423c84aa82f49d"),
+        239 => Some("def9069b00be0443d0086526902a4249bca84451"),
+        240 => Some("38b5313fc37730a03d21bf31b4cd216cf6c0db3e"),
+        241 => Some("85a175c162f984b84be68cf8d27944866defa5c6"),
+        242 => Some("64f02f6460db5cbd2ef5f7227fee8168db011003"),
+        243 => Some("be12cfaefa0be7ebc86178b1acd291eb8ee1732f"),
+        244 => Some("deb1af12b60a02a90e34e925d05d88250e379db5"),
+        245 => Some("de25f7f390a354a1b1e048156edfc3d1b54515e4"),
+        246 => Some("357700207427d72fb46ae0d44b30ae79e68977e6"),
+        247 => Some("bf1233d67aeb14839d9bf21bfc3a6933b07e9ce8"),
+        248 => Some("49f252fe40148f38a255d1c1ab5b790a4f864d6f"),
+        249 => Some("081bd4e6bca3548bd72e8dbc6f06f6ba27b24dfe"),
+        250 => Some("0e8a53832654480850a8066669f1b4dfc36ed5d8"),
+        251 => Some("efde9b7d09bfd033131653dd0ea2515c2023c3dc"),
         _ => return Err(format!("no reviewed merge status for PR {pr}")),
     })
 }
@@ -3362,7 +3749,7 @@ fn expected_field_semantics() -> Vec<(&'static str, String)> {
         ),
         (
             "execution",
-            format!("optional record-level object, required when the pull request number is above {EXECUTION_REQUIRED_ABOVE_PR}, stating what was actually run: runner (ctrl_verify.sh, codex_task or other), command (the literally executed command), scope (workspace or single_target), exit_code (the integer exit code of that command) and evidence (the log_path or the identifier of the summary line inside the acceptance receipt); command, exit_code and log_path of the record keep describing the declared target; earlier records are neither backfilled nor guessed"),
+            format!("optional record-level object, required when the pull request number is above {EXECUTION_REQUIRED_ABOVE_PR}, stating what was actually run: runner (ctrl_verify.sh, codex_task or other), command (the literally executed command), scope (workspace or single_target), exit_code (the integer exit code of that command) and evidence (the log_path or the identifier of the summary line inside the acceptance receipt); command, exit_code and log_path of the record keep describing the declared target; earlier records are neither backfilled nor guessed; reviewed public projections mark withheld host environment paths explicitly and use neutral evidence references; the original execution is kept in the local evidence store"),
         ),
         (
             "production_consumer",
@@ -3400,7 +3787,7 @@ fn expected_field_semantics() -> Vec<(&'static str, String)> {
         ),
         (
             "record_pins",
-            "both checkers pin the reviewed supersedes and completes pairs (new record id to old record id) and, for every historical record retained from the previous index binding, the SHA-256 of its canonical JSON (keys sorted, no insignificant whitespace, UTF-8) without plan_recheck; a missing, extra or rewritten pin fails; the records added by an index pull request are pinned by the next index pull request, after the merge of the adding pull request is backfilled".to_string(),
+            "both checkers pin the reviewed supersedes and completes pairs (new record id to old record id) and, for every historical record retained from the previous index binding, the SHA-256 of its canonical JSON (keys sorted, no insignificant whitespace, UTF-8) without plan_recheck; a missing, extra or rewritten pin fails; the records added by an index pull request are pinned by the next index pull request, after the merge of the adding pull request is backfilled; for reviewed public projections both checkers additionally pin the whole public record, and local evidence judgment requires the original record to match its unchanged historical digest".to_string(),
         ),
         // Appended by AG-200 (fail-closed evidence judgment, Rust evidence-store input, register file
         // pin, merge facts); the thirteen definitions above are unchanged.
@@ -3686,19 +4073,57 @@ fn validate_record_pins(
     records: &BTreeMap<String, (String, Value)>,
     pins: &ReviewedPins,
 ) -> Result<(), String> {
+    if !pins
+        .public_records
+        .keys()
+        .all(|id| pins.records.contains_key(id))
+    {
+        return Err("public record digest table contains an unpinned historical id".into());
+    }
     for (id, expected) in &pins.records {
         let (_, record) = records.get(id).ok_or_else(|| {
             format!(
                 "{id} pinned historical record is missing from verified_subscopes; a historical record leaves the index only through a reviewed withdrawal"
             )
         })?;
-        if record_digest(record)? != *expected {
+        if record_digest(record)? != *pins.public_records.get(id).unwrap_or(expected) {
             return Err(format!(
                 "{id} historical record differs from its pinned digest (canonical JSON without plan_recheck); a historical record is never rewritten"
             ));
         }
     }
     Ok(())
+}
+
+fn read_original_records(
+    evidence_root: &Path,
+    pins: &ReviewedPins,
+) -> Result<BTreeMap<String, Value>, String> {
+    if pins.public_records.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    validate_repo_file(
+        evidence_root,
+        ORIGINAL_RECORDS_PATH,
+        "original record archive",
+    )?;
+    let content = std::fs::read(evidence_root.join(ORIGINAL_RECORDS_PATH))
+        .map_err(|error| format!("could not read original record archive: {error}"))?;
+    let originals: BTreeMap<String, Value> = serde_json::from_slice(&content)
+        .map_err(|error| format!("invalid original record archive: {error}"))?;
+    if !originals.keys().eq(pins.public_records.keys()) {
+        return Err(
+            "original record archive does not cover the exact public projection set".into(),
+        );
+    }
+    for (id, original) in &originals {
+        if pins.records.get(id) != Some(&record_digest(original)?) {
+            return Err(format!(
+                "{id}: original record differs from its historical digest"
+            ));
+        }
+    }
+    Ok(originals)
 }
 
 fn iso_utc_or_unknown(value: &Value) -> bool {
@@ -4182,12 +4607,20 @@ fn validate_manifest_with_evidence(
         &so_ids,
         &evidence_ids,
     )?;
-    let records = collect_records(&value["e_scopes"]);
+    let mut records = collect_records(&value["e_scopes"]);
     validate_withdrawn_records(&value["withdrawn_records"], &records, pins)?;
-    validate_missing_register(value, root, &records, pins, evidence_root)?;
     validate_hsf_sources(&value["traceability"]["hsf_sources"])?;
     validate_hs_borrowings(&value["traceability"]["hs_borrowings"], &evidence_ids)?;
-    validate_record_pins(&records, pins)
+    validate_record_pins(&records, pins)?;
+    if let Some(evidence_root) = evidence_root {
+        let mut originals = read_original_records(evidence_root, pins)?;
+        for (id, (_, record)) in &mut records {
+            if let Some(original) = originals.remove(id) {
+                *record = original;
+            }
+        }
+    }
+    validate_missing_register(value, root, &records, pins, evidence_root)
 }
 
 /// The local evidence store for the test of the real manifest (plan §18.10, AG-200): the absolute
@@ -5539,6 +5972,7 @@ fn withdrawn_entry_mut<'a>(value: &'a mut Value, id: &str) -> &'a mut Value {
 fn repinned(value: &Value) -> ReviewedPins {
     let records = collect_records(&value["e_scopes"]);
     let mut pins = ReviewedPins::reviewed();
+    pins.public_records.clear();
     pins.records = pins
         .records
         .keys()
@@ -5738,12 +6172,42 @@ fn current_records_state_not_affected_and_relations_need_v45() {
         .map(|(_, record)| record)
         .filter(|record| record["plan_version"] == PLAN_VERSION)
         .collect();
-    assert_eq!(current.len(), 33);
+    assert_eq!(current.len(), 115);
+    // The 33 AG-182 records of PR #200 keep their original assertion.
+    let ag182: Vec<&&Value> = current
+        .iter()
+        .filter(|record| record["pr"] == "https://github.com/acosmi/RSIAgent/pull/200")
+        .collect();
+    assert_eq!(ag182.len(), 33);
     assert!(
-        current
+        ag182
             .iter()
-            .all(|record| record["plan_recheck"] == "not_affected"
-                && record["pr"] == "https://github.com/acosmi/RSIAgent/pull/200")
+            .all(|record| record["plan_recheck"] == "not_affected")
+    );
+    // AG-210 folded 82 records of exactly these 42 pull requests, all marked not_affected.
+    let folded: Vec<&&Value> = current
+        .iter()
+        .filter(|record| record["pr"] != "https://github.com/acosmi/RSIAgent/pull/200")
+        .collect();
+    assert_eq!(folded.len(), 82);
+    assert!(
+        folded
+            .iter()
+            .all(|record| record["plan_recheck"] == "not_affected")
+    );
+    let folded_prs: BTreeSet<u64> = folded
+        .iter()
+        .map(|record| pull_request_number(&record["pr"], "pr").unwrap())
+        .collect();
+    assert_eq!(
+        folded_prs,
+        [
+            201, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218,
+            219, 220, 221, 223, 225, 228, 229, 230, 234, 235, 236, 238, 239, 240, 241, 242, 243,
+            244, 245, 246, 247, 248, 249, 250, 251
+        ]
+        .into_iter()
+        .collect::<BTreeSet<u64>>()
     );
     let backfills: Vec<&Value> = records
         .values()
@@ -5839,14 +6303,19 @@ fn withdrawn_tuples_relation_pairs_and_historical_records_are_pinned() {
         25
     );
     // AG-200 pins every current record: the 93 retained historical records and the 45 records added
-    // by AG-182 (12 backfills and the 33 PR #200 records carrying the backfilled merge 02a135aa).
-    assert_eq!(pins.records.len(), 138);
+    // by AG-182 (12 backfills and the 33 PR #200 records carrying the backfilled merge 02a135aa);
+    // AG-210 adds the 82 records folded in from the index requests of 42 pull requests (#201-#251).
+    assert_eq!(pins.records.len(), 220);
     assert_eq!(
         pins.records.keys().collect::<BTreeSet<_>>(),
         records.keys().collect::<BTreeSet<_>>()
     );
     for (id, digest) in &pins.records {
-        assert_eq!(record_digest(&records[id].1).unwrap(), *digest, "{id}");
+        assert_eq!(
+            record_digest(&records[id].1).unwrap(),
+            *pins.public_records.get(id).unwrap_or(digest),
+            "{id}"
+        );
     }
     let added = records
         .values()
@@ -6292,6 +6761,53 @@ impl Drop for EvidenceStoreFixture {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.root).unwrap();
     }
+}
+
+#[test]
+fn original_and_public_record_pins_are_independent() {
+    let id = "E01.fixture_record".to_string();
+    let original =
+        serde_json::json!({"id": id, "exit_code": 0, "log_path": "out/fixture/source.log"});
+    let mut public = original.clone();
+    public["log_path"] = serde_json::json!("out/fixture/alias.log");
+    let mut pins = ReviewedPins::reviewed();
+    pins.records = BTreeMap::from([(id.clone(), record_digest(&original).unwrap())]);
+    pins.public_records = BTreeMap::from([(id.clone(), record_digest(&public).unwrap())]);
+    let mut records = BTreeMap::from([(id.clone(), ("E01".into(), public.clone()))]);
+    validate_record_pins(&records, &pins).unwrap();
+    records.get_mut(&id).unwrap().1 = original.clone();
+    assert!(
+        validate_record_pins(&records, &pins)
+            .unwrap_err()
+            .contains("historical record differs")
+    );
+    records.get_mut(&id).unwrap().1 = public.clone();
+    records.get_mut(&id).unwrap().1["exit_code"] = serde_json::json!(1);
+    assert!(
+        validate_record_pins(&records, &pins)
+            .unwrap_err()
+            .contains("historical record differs")
+    );
+    let store = EvidenceStoreFixture::new();
+    assert!(read_original_records(&store.root, &pins).is_err());
+    let originals = BTreeMap::from([(id.clone(), original)]);
+    store.write(
+        ORIGINAL_RECORDS_PATH,
+        &serde_json::to_vec(&originals).unwrap(),
+    );
+    assert_eq!(
+        read_original_records(&store.root, &pins).unwrap(),
+        originals
+    );
+    store.write(
+        ORIGINAL_RECORDS_PATH,
+        &serde_json::to_vec(&BTreeMap::from([(id, public)])).unwrap(),
+    );
+    assert!(
+        read_original_records(&store.root, &pins)
+            .unwrap_err()
+            .contains("original record differs")
+    );
 }
 
 fn fixture_evidence(path: &str) -> Vec<u8> {
