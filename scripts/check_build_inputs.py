@@ -311,7 +311,7 @@ REQUIRED_DEPENDENCY_STAGES = {
 
 # Only the previously unparsed workflow/job prefix is fixed. Existing step
 # parsing and pinned/quoted Cargo admission remain unchanged.
-WORKFLOW_HEADERS = {'ci.yml': '6f863bd03c4ca6fb2a6d0b947d2a9559a3979bc8d76709e5e03961ca6574edc7', 'dependency-audit.yml': '0b3c8b06b7164ed6f19faabab12a229fa1eff10132a111f3fe02d722a36703aa', 'offline-build-kit.yml': '8075cbbf94ad69d3af378c0630bec4e83c0bece8b3564043ec4e6445530e2b5a'}
+WORKFLOW_HEADERS = {'ci.yml': 'ba3bfa9cb3c2c13d9507e5b1e9d2170d64ad96e0c88fe21e16b3690a0e95e545', 'dependency-audit.yml': '0b3c8b06b7164ed6f19faabab12a229fa1eff10132a111f3fe02d722a36703aa', 'offline-build-kit.yml': '8075cbbf94ad69d3af378c0630bec4e83c0bece8b3564043ec4e6445530e2b5a'}
 
 def _workflow_errors(name: str, text: str) -> list[str]:
     if name == "non-rust-delivery.yml":
