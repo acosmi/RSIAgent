@@ -1227,7 +1227,7 @@
     }
   ],
   "inputs": {
-    "cargo_lock_sha256": "13df38fc85826bd279bac426ca5086eb99e1e9861d158f209359bff6d6e86435",
+    "cargo_lock_sha256": "bb76d88a50b5ae0dab16d1c6b434131e8f6aa086c9d6bcf61dbc6143812da80f",
     "manifests": {
       "Cargo.toml": "b509c760a653938dcb00fed78a4ead63c43aa7b6bd1537f4e6dd0fb3e5c45f61",
       "apps/rsia/Cargo.toml": "f7a01045b14b22b99d6f1b0d442013ff836392a159226613f8fa21674935bc46",
@@ -1455,7 +1455,7 @@
       "version": "0.2.0"
     }
   ],
-  "inventory_sha256": "9fee59d3c32f0cc9f69fde949e83f1a38d2d9243a5e85bf14fb4d7c8c2cdc95c",
+  "inventory_sha256": "9078da418d596cac94fb06cdc143266d9468612a76050b2d4a7f846b2ddb1904",
   "legacy_license_exceptions": {
     "Apache-2.0/MIT": [
       {
