@@ -335,6 +335,9 @@ async fn a_cancelled_running_reset_leaves_draining_on_cancelled_with_nothing_sta
         .await
         .unwrap();
     let behind_id = behind.identity().id;
+    // The cancel and the accepted, still waiting request wrote no business
+    // row.
+    assert_eq!(fixture.business_shape().await, before);
 
     // A closure job is claimed and runs while the slot is held.
     let closed = fixture
@@ -349,13 +352,14 @@ async fn a_cancelled_running_reset_leaves_draining_on_cancelled_with_nothing_sta
         .await;
     assert_eq!(closed["state"], json!("succeeded"), "{closed}");
     assert_eq!(closed["result"]["state"], json!("aborted"));
+    let after_abort = fixture.business_shape().await;
     // The claim of the waiting reset is retried every 200 ms; three retries
     // later it is still Queued and has staged nothing.
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
     assert_eq!(
         fixture
             .dispatcher
-            .status(&fixture.admin, &behind_id)
+            .status(&fixture.admin, behind_id)
             .await
             .unwrap()
             .identity()
@@ -369,10 +373,11 @@ async fn a_cancelled_running_reset_leaves_draining_on_cancelled_with_nothing_sta
             .await,
         None
     );
+    assert_eq!(fixture.business_shape().await, after_abort);
     // It must not run once the slot is free again: the control cancels it.
     let cancelled = fixture
         .dispatcher
-        .cancel(&fixture.admin, &behind_id)
+        .cancel(&fixture.admin, behind_id)
         .await
         .unwrap();
     assert_eq!(
@@ -418,6 +423,8 @@ async fn a_cancelled_running_reset_leaves_draining_on_cancelled_with_nothing_sta
         Some(ManagementCancelArrival::BeforeSideEffect)
     );
     assert!(landed.result().is_none());
+    // The waiting job's cancel and the recovery wrote no business row either.
+    assert_eq!(fixture.business_shape().await, after_abort);
     // Nothing was staged for the cancelled job.
     assert_eq!(
         fixture.get("artifact", &staged_id("cancel-running")).await,
