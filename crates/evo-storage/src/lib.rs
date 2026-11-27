@@ -2978,12 +2978,13 @@ impl Store {
         // Retain the pool even when connecting/migrating fails. Dropping its
         // last handle does not await background connection shutdown, so it
         // must be explicitly closed before the caller releases its OS guard.
-        let opened = async {
-            sqlx::migrate!("./migrations")
-                .run(&pool)
-                .await
-                .map_err(internal)?;
-            // Again after migration, which records its own installed_on.
+        if let Err(error) = sqlx::migrate!("./migrations").run(&pool).await {
+            pool.close().await;
+            return Err(internal(error));
+        }
+        // Again after migration, which records its own installed_on. A refused
+        // floor closes the pool the same way before the caller sees the error.
+        let admitted = async {
             let mut conn = pool.acquire().await.map_err(internal)?;
             if let Some(floor) = occurrence::occurrence_floor_millis(&mut conn).await? {
                 evo_core::clock::admit_floor(floor)?;
@@ -2991,7 +2992,7 @@ impl Store {
             Ok::<(), Error>(())
         }
         .await;
-        if let Err(error) = opened {
+        if let Err(error) = admitted {
             pool.close().await;
             return Err(error);
         }
