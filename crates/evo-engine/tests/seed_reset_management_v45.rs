@@ -603,3 +603,239 @@ async fn seed_reset_stage_is_refused_after_the_install_source_is_revoked() {
     assert_eq!(fixture.staged_packages().await, 0);
     fixture.store.close().await;
 }
+
+/// One request key freezes one intent (§6.1.2): the same key with the same
+/// wire replays the original job and writes nothing, the same key with
+/// another run id is refused at submit, and a new key stages a second asset
+/// of the same install.
+#[tokio::test]
+async fn seed_reset_stage_replays_a_key_and_refuses_another_run_under_it() {
+    let fixture = Fixture::new().await;
+    let install_id = fixture.install_id.clone();
+    let first = fixture
+        .run_job(
+            "seed.reset_stage",
+            reset_payload("one-key", &install_id, RUN_ID),
+        )
+        .await;
+    assert_eq!(first["state"], json!("succeeded"), "{first}");
+    let first_id = first["id"].as_str().unwrap().to_owned();
+    let before = fixture.business_shape().await;
+
+    let replay = fixture
+        .submit(
+            "seed.reset_stage",
+            reset_payload("one-key", &install_id, RUN_ID),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.identity().id, first_id);
+    assert_eq!(fixture.business_shape().await, before);
+
+    let error = fixture
+        .submit(
+            "seed.reset_stage",
+            reset_payload("one-key", &install_id, "another-run"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Conflict(message)
+            if message == "idempotency key reused with different content"),
+        "{error:?}"
+    );
+    assert_eq!(
+        fixture.job_count().await,
+        1,
+        "the refused request created no job"
+    );
+    assert_eq!(fixture.business_shape().await, before);
+
+    let second = fixture
+        .run_job(
+            "seed.reset_stage",
+            reset_payload("two-key", &install_id, RUN_ID),
+        )
+        .await;
+    assert_eq!(second["state"], json!("succeeded"), "{second}");
+    assert_ne!(second["id"], first["id"]);
+    assert_eq!(
+        second["result"]["staged_asset_id"],
+        json!(staged_id("two-key"))
+    );
+    assert_ne!(
+        second["result"]["staged_asset_id"],
+        first["result"]["staged_asset_id"]
+    );
+    let asset = fixture
+        .get("artifact", &staged_id("two-key"))
+        .await
+        .unwrap();
+    assert_eq!(asset["payload"]["state"], json!("staged"));
+    assert_eq!(asset["request_key"], json!("two-key"));
+    assert_eq!(fixture.staged_packages().await, 2);
+    fixture.store.close().await;
+}
+
+/// The management path passes the same staging limit as the public one
+/// (§3.3.1). Twenty reset jobs fill it; a new key is then refused with the
+/// conflict code and writes nothing, and at the limit the replay of an
+/// existing key is served from its original job and writes nothing either.
+#[tokio::test]
+async fn seed_reset_stage_obeys_the_staging_limit() {
+    let fixture = Fixture::new().await;
+    let install_id = fixture.install_id.clone();
+    let mut fill_zero_job = String::new();
+    for index in 0..20 {
+        let status = fixture
+            .run_job(
+                "seed.reset_stage",
+                reset_payload(&format!("fill-{index}"), &install_id, RUN_ID),
+            )
+            .await;
+        assert_eq!(
+            status["state"],
+            json!("succeeded"),
+            "fill-{index}: {status}"
+        );
+        if index == 0 {
+            fill_zero_job = status["id"].as_str().unwrap().to_owned();
+        }
+    }
+    assert_eq!(fixture.staged_packages().await, 20);
+    let before = fixture.business_shape().await;
+
+    let refused = fixture
+        .run_job(
+            "seed.reset_stage",
+            reset_payload("fill-20", &install_id, RUN_ID),
+        )
+        .await;
+    assert_eq!(refused["state"], json!("failed"), "{refused}");
+    assert_eq!(refused["error_code"], json!("conflict"));
+    assert_eq!(refused["result"], Value::Null);
+    assert_eq!(fixture.get("artifact", &staged_id("fill-20")).await, None);
+    assert_eq!(fixture.staged_packages().await, 20);
+    assert_eq!(
+        fixture.business_shape().await,
+        before,
+        "the refused 21st staging wrote nothing"
+    );
+
+    // At the limit the same key is still the original job, not a new request.
+    let replay = fixture
+        .submit(
+            "seed.reset_stage",
+            reset_payload("fill-0", &install_id, RUN_ID),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.identity().id, fill_zero_job);
+    assert_eq!(fixture.business_shape().await, before);
+    // The replay branch of the kernel precedes the admission for a management
+    // product too: the public API, with the same key, returns the asset the
+    // job wrote instead of the capacity conflict (§3.3.2).
+    let replayed = PersistentSeedStore::stage_reset_to_baseline(
+        &fixture.admin,
+        &fixture.store,
+        &install_id,
+        "fill-0",
+        &fixture.run_environment_digest,
+        COMPILER_VERSION,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replayed.id, staged_id("fill-0"));
+    assert_eq!(fixture.business_shape().await, before);
+    assert_eq!(fixture.staged_packages().await, 20);
+    fixture.store.close().await;
+}
+
+/// The staged reset is an unactivated staging (E16.3): rollback only closes
+/// it, through `asset.abort`, and never touches the install. It is not a
+/// validated package projection, so `asset.handoff` and `export.prepare`
+/// refuse it and write nothing.
+#[tokio::test]
+async fn a_staged_reset_is_closed_by_asset_abort_and_by_nothing_else() {
+    let fixture = Fixture::new().await;
+    let install_id = fixture.install_id.clone();
+    let staged = fixture
+        .run_job(
+            "seed.reset_stage",
+            reset_payload("abort-me", &install_id, RUN_ID),
+        )
+        .await;
+    assert_eq!(staged["state"], json!("succeeded"), "{staged}");
+    let staged_id = staged_id("abort-me");
+    let before = fixture.business_shape().await;
+    for (operation, payload) in [
+        (
+            "asset.handoff",
+            json!({
+                "schema_version": "rsia.management.asset_handoff.v1",
+                "request_key": "handoff",
+                "staged_asset_id": staged_id,
+                "candidate_id": "no-such-candidate",
+            }),
+        ),
+        (
+            "export.prepare",
+            json!({
+                "schema_version": "rsia.management.export_prepare.v1",
+                "request_key": "export",
+                "staged_asset_id": staged_id,
+            }),
+        ),
+    ] {
+        let refused = fixture.run_job(operation, payload).await;
+        assert_eq!(refused["state"], json!("failed"), "{operation}: {refused}");
+        assert_eq!(refused["error_code"], json!("invalid_input"));
+        assert_eq!(refused["result"], Value::Null);
+    }
+    assert_eq!(
+        fixture.business_shape().await,
+        before,
+        "neither the handoff nor the export wrote anything"
+    );
+
+    let aborted = fixture
+        .run_job(
+            "asset.abort",
+            json!({
+                "schema_version": "rsia.management.asset_abort.v1",
+                "request_key": "abort",
+                "staged_asset_id": staged_id,
+            }),
+        )
+        .await;
+    assert_eq!(aborted["state"], json!("succeeded"), "{aborted}");
+    assert_eq!(aborted["step"], json!("asset_aborted"));
+    assert_eq!(aborted["result"]["result"], json!("asset_aborted"));
+    assert_eq!(aborted["result"]["state"], json!("aborted"));
+    let asset = fixture.get("artifact", &staged_id).await.unwrap();
+    assert_eq!(asset["payload"]["state"], json!("aborted"));
+    assert_eq!(fixture.audit_count("e16.staged_asset.abort", &staged_id), 1);
+    // Against the shape before the abort: the same number of objects with the
+    // staged asset as the only changed row, one more business audit record,
+    // and no file touched. The install keeps its edge to the closed asset:
+    // closing an unactivated update does not overwrite the local copy.
+    assert_eq!(
+        fixture.dependents("artifact", &install_id).await,
+        vec![("artifact".to_owned(), staged_id)]
+    );
+    let after = fixture.business_shape().await;
+    let old_objects = before["objects"].as_array().unwrap();
+    let objects = after["objects"].as_array().unwrap();
+    assert_eq!(objects.len(), old_objects.len());
+    let changed: Vec<&Value> = objects
+        .iter()
+        .filter(|row| !old_objects.contains(row))
+        .collect();
+    assert_eq!(changed.len(), 1, "{changed:?}");
+    assert_eq!(changed[0][1], json!(staged_id));
+    let mut expected_audit = before["audit"].as_array().unwrap().clone();
+    expected_audit.push(json!(["e16.staged_asset.abort", staged_id]));
+    assert_eq!(after["audit"], json!(expected_audit));
+    assert_eq!(after["files"], before["files"]);
+    fixture.store.close().await;
+}
