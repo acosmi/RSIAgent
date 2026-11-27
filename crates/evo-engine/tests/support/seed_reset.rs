@@ -391,7 +391,8 @@ impl Fixture {
         jobs.len()
     }
 
-    /// Revokes the install's one source run through the lifecycle API.
+    /// Revokes the install's one source run through the lifecycle API, at
+    /// the current clock.
     pub async fn revoke_install_source(&self) {
         LifecycleStore::begin_revoke(
             &self.admin,
@@ -401,7 +402,7 @@ impl Fixture {
                 id: "seed-source".into(),
             },
             "seed reset fixture",
-            2,
+            now().unwrap(),
         )
         .await
         .unwrap();

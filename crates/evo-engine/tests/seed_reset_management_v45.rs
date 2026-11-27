@@ -398,9 +398,10 @@ async fn seed_reset_stage_wire_is_flat_and_strict() {
         ("install_id", json!("../install"), NOT_AN_IDENTIFIER),
         ("run_id", json!("run/other"), NOT_AN_IDENTIFIER),
     ] {
+        let what = format!("{field}: {value}");
         let mut payload = well_formed.clone();
         payload[field] = value;
-        refused.push((format!("{field}: {value}"), payload, code));
+        refused.push((what, payload, code));
     }
     for (what, payload, code) in refused {
         let error = fixture
@@ -821,7 +822,7 @@ async fn a_staged_reset_is_closed_by_asset_abort_and_by_nothing_else() {
     // closing an unactivated update does not overwrite the local copy.
     assert_eq!(
         fixture.dependents("artifact", &install_id).await,
-        vec![("artifact".to_owned(), staged_id)]
+        vec![("artifact".to_owned(), staged_id.clone())]
     );
     let after = fixture.business_shape().await;
     let old_objects = before["objects"].as_array().unwrap();
