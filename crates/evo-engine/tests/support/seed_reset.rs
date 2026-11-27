@@ -279,15 +279,23 @@ impl Fixture {
 
     /// The status view as JSON once terminal.
     pub async fn terminal(&self, job_id: &str) -> Value {
+        self.terminal_for(&self.dispatcher, &self.admin, job_id)
+            .await
+    }
+
+    /// The status view as JSON once terminal, read by `ctx` through
+    /// `dispatcher`: for a job that another actor of the namespace owns.
+    pub async fn terminal_for(
+        &self,
+        dispatcher: &ManagementDispatcher,
+        ctx: &Context,
+        job_id: &str,
+    ) -> Value {
         tokio::time::timeout(std::time::Duration::from_secs(90), async {
             loop {
-                let status = serde_json::to_value(
-                    self.dispatcher
-                        .status_view(&self.admin, job_id)
-                        .await
-                        .unwrap(),
-                )
-                .unwrap();
+                let status =
+                    serde_json::to_value(dispatcher.status_view(ctx, job_id).await.unwrap())
+                        .unwrap();
                 if matches!(
                     status["state"].as_str(),
                     Some("succeeded" | "failed" | "cancelled" | "blocked")

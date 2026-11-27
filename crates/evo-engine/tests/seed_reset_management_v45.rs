@@ -32,7 +32,9 @@ mod seed_reset;
 use evo_core::{Context, Error, Role, fingerprint, hash};
 use evo_engine::dispatch::ManagementDispatcher;
 use evo_engine::packages::E16Envelope;
-use evo_engine::seeds::{E16_SEED_INSTALL_SCHEMA, SeedInstallPayloadV1, SeedStatus};
+use evo_engine::seeds::{
+    E16_SEED_INSTALL_SCHEMA, PersistentSeedStore, SeedInstallPayloadV1, SeedStatus,
+};
 use seed_reset::{BASELINE, COMPILER_VERSION, Fixture, NS, RUN_ID, reset_payload, staged_id};
 use serde_json::{Value, json};
 
@@ -439,5 +441,165 @@ async fn seed_reset_stage_wire_is_flat_and_strict() {
         "no refused request wrote anything"
     );
     assert!(!fixture.has_staging_audit());
+    fixture.store.close().await;
+}
+
+/// One refused reset: the job fails with the fixed code, no staged row and
+/// no staging audit exist, and the business shape is unchanged.
+async fn assert_refused_reset(
+    fixture: &Fixture,
+    key: &str,
+    install_id: &str,
+    run_id: &str,
+    code: &str,
+) {
+    let before = fixture.business_shape().await;
+    let status = fixture
+        .run_job("seed.reset_stage", reset_payload(key, install_id, run_id))
+        .await;
+    assert_eq!(status["state"], json!("failed"), "{status}");
+    assert_eq!(status["error_code"], json!(code), "{status}");
+    assert_eq!(status["result"], Value::Null);
+    assert_eq!(status["committed_side_effects"], json!([]), "{status}");
+    assert_eq!(
+        fixture.business_shape().await,
+        before,
+        "zero business writes"
+    );
+    assert!(!fixture.has_staging_audit());
+    assert_eq!(fixture.get("artifact", &staged_id(key)).await, None);
+}
+
+/// The request names a run and an install; neither is taken on faith. A run
+/// that does not exist supplies no current environment, and an install that
+/// does not exist supplies no B: each fails the job with `not_found` before
+/// the first write.
+#[tokio::test]
+async fn seed_reset_stage_refuses_a_missing_run_or_install() {
+    let fixture = Fixture::new().await;
+    let install_id = fixture.install_id.clone();
+    assert_refused_reset(
+        &fixture,
+        "missing-run",
+        &install_id,
+        "no-such-run",
+        "not_found",
+    )
+    .await;
+    assert_refused_reset(
+        &fixture,
+        "missing-install",
+        "e16-seed-install-missing",
+        RUN_ID,
+        "not_found",
+    )
+    .await;
+    assert_eq!(fixture.staged_packages().await, 0);
+    fixture.store.close().await;
+}
+
+/// The install must be the caller's own record: another Admin of the
+/// namespace is refused with the conflict code, and the install is
+/// byte-for-byte unchanged.
+#[tokio::test]
+async fn seed_reset_stage_refuses_an_install_of_another_owner() {
+    let fixture = Fixture::new().await;
+    let other = Context::new(NS, "admin-two", Role::Admin).unwrap();
+    let dispatcher = ManagementDispatcher::new(fixture.store.clone(), vec![other.clone()]).unwrap();
+    let install_body = fixture.raw_body("artifact", &fixture.install_id).await;
+    let before = fixture.business_shape().await;
+    let queued = dispatcher
+        .submit(
+            &other,
+            "seed.reset_stage",
+            reset_payload("other-owner", &fixture.install_id, RUN_ID),
+        )
+        .await
+        .unwrap();
+    let status = fixture
+        .terminal_for(&dispatcher, &other, &queued.identity().id)
+        .await;
+    assert_eq!(status["state"], json!("failed"), "{status}");
+    assert_eq!(status["error_code"], json!("conflict"));
+    assert_eq!(status["owner_actor"], json!("admin-two"));
+    assert_eq!(status["result"], Value::Null);
+    assert_eq!(
+        fixture.business_shape().await,
+        before,
+        "zero business writes"
+    );
+    assert!(!fixture.has_staging_audit());
+    assert_eq!(
+        fixture.raw_body("artifact", &fixture.install_id).await,
+        install_body
+    );
+    assert_eq!(
+        fixture.get("artifact", &staged_id("other-owner")).await,
+        None
+    );
+    fixture.store.close().await;
+}
+
+/// Only an Installed record is a resettable image. An install record that is
+/// still Prepared, as an interrupted installation leaves it, is refused with
+/// the conflict code and nothing is staged.
+#[tokio::test]
+async fn seed_reset_stage_refuses_an_install_that_is_not_installed() {
+    let fixture = Fixture::new().await;
+    let mut install = fixture.get("artifact", &fixture.install_id).await.unwrap();
+    assert_eq!(install["payload"]["status"], json!("installed"));
+    install["payload"]["status"] = json!("prepared");
+    fixture.put("artifact", &fixture.install_id, &install).await;
+    assert_refused_reset(
+        &fixture,
+        "not-installed",
+        &fixture.install_id,
+        RUN_ID,
+        "conflict",
+    )
+    .await;
+    assert_eq!(fixture.staged_packages().await, 0);
+    fixture.store.close().await;
+}
+
+/// A revoked source blocks the reset at submit (V075, V078): the request
+/// depends on the install and the install on its source run, so the submit
+/// check refuses the request before its first write, with no job at all. The
+/// same revocation blocks the public API.
+#[tokio::test]
+async fn seed_reset_stage_is_refused_after_the_install_source_is_revoked() {
+    let fixture = Fixture::new().await;
+    fixture.revoke_install_source().await;
+    let before = fixture.business_shape().await;
+    let jobs_before = fixture.job_count().await;
+    let error = fixture
+        .submit(
+            "seed.reset_stage",
+            reset_payload("after-revoke", &fixture.install_id, RUN_ID),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, Error::Conflict(message)
+            if message.starts_with("management request") && message.contains("run seed-source")),
+        "{error:?}"
+    );
+    assert_eq!(fixture.job_count().await, jobs_before, "no job was created");
+    assert!(
+        PersistentSeedStore::stage_reset_to_baseline(
+            &fixture.admin,
+            &fixture.store,
+            &fixture.install_id,
+            "after-revoke-public",
+            &fixture.run_environment_digest,
+            COMPILER_VERSION,
+        )
+        .await
+        .is_err(),
+        "the public API is blocked by the same revocation"
+    );
+    assert_eq!(fixture.business_shape().await, before);
+    assert!(!fixture.has_staging_audit());
+    assert_eq!(fixture.staged_packages().await, 0);
     fixture.store.close().await;
 }
