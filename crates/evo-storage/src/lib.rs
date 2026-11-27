@@ -553,9 +553,10 @@ pub enum ManagementRevocationSourceKind {
 
 /// Closed management results of the seed operations. `seed.install` reports
 /// only the committed install identity, a closed classification and the three
-/// material digests (with an optional staged update): never the baseline,
-/// local, upstream or private seed content, a merged preview, a physical path,
-/// a root or a fee assertion.
+/// material digests (with an optional staged update); `seed.reset_stage`
+/// reports only the reset install, the one staged asset it produced and the
+/// baseline digest: never the baseline, local, upstream or private seed
+/// content, a merged preview, a physical path, a root or a fee assertion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
 pub enum ManagementSeedResultV2 {
@@ -566,6 +567,11 @@ pub enum ManagementSeedResultV2 {
         local_digest: String,
         upstream_digest: Option<String>,
         staged_asset_id: Option<String>,
+    },
+    SeedResetStaged {
+        install_id: String,
+        staged_asset_id: String,
+        baseline_digest: String,
     },
 }
 
@@ -1274,22 +1280,35 @@ fn seed_install_result_binding_is_valid(job: &ManagementJobV2) -> bool {
     let Some(ManagementResultV2::Seed(result)) = job.result.as_ref() else {
         return true;
     };
-    let ManagementSeedResultV2::SeedInstalled {
-        install_id,
-        baseline_digest,
-        local_digest,
-        upstream_digest,
-        staged_asset_id,
-        ..
-    } = result;
-    job.operation == "seed.install"
-        && !install_id.is_empty()
-        && storage_sha256_is_valid(baseline_digest)
-        && storage_sha256_is_valid(local_digest)
-        && upstream_digest
-            .as_deref()
-            .is_none_or(storage_sha256_is_valid)
-        && staged_asset_id.as_deref().is_none_or(|id| !id.is_empty())
+    match result {
+        ManagementSeedResultV2::SeedInstalled {
+            install_id,
+            baseline_digest,
+            local_digest,
+            upstream_digest,
+            staged_asset_id,
+            ..
+        } => {
+            job.operation == "seed.install"
+                && !install_id.is_empty()
+                && storage_sha256_is_valid(baseline_digest)
+                && storage_sha256_is_valid(local_digest)
+                && upstream_digest
+                    .as_deref()
+                    .is_none_or(storage_sha256_is_valid)
+                && staged_asset_id.as_deref().is_none_or(|id| !id.is_empty())
+        }
+        ManagementSeedResultV2::SeedResetStaged {
+            install_id,
+            staged_asset_id,
+            baseline_digest,
+        } => {
+            job.operation == "seed.reset_stage"
+                && !install_id.is_empty()
+                && !staged_asset_id.is_empty()
+                && storage_sha256_is_valid(baseline_digest)
+        }
+    }
 }
 
 fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {

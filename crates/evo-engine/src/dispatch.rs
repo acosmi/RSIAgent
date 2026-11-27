@@ -85,10 +85,8 @@ fn required_management_role(ctx: &Context, operation: &str) -> Result<()> {
         | "budget.stage_plan.bind"
         | "budget.calls.list_open"
         | "budget.call.reconcile"
-        // seed.install is the one wired seed operation. seed.reset_stage
-        // keeps the unknown-operation default: its trusted current
-        // environment supplier does not exist, so it is not wired here.
         | "seed.install"
+        | "seed.reset_stage"
         // monitoring.environment.record stays on the unknown-operation default:
         // its Host entry and same-session registered-control source are not
         // implemented here. The drift administration itself is Admin-only.
@@ -453,6 +451,22 @@ struct SeedInstallManagementRequest {
     upstream_blob_digest: String,
 }
 
+const SEED_RESET_STAGE_SCHEMA: &str = "rsia.management.seed_reset_stage.v1";
+
+/// `seed.reset_stage`: one existing seed install and the live Host-written
+/// run whose environment the reset is checked against. The current
+/// environment digest is read from that run by the kernel; the wire carries
+/// no environment or compiler label, path, root, role, owner, namespace or
+/// content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SeedResetStageManagementRequest {
+    schema_version: String,
+    request_key: String,
+    install_id: String,
+    run_id: String,
+}
+
 const ASSET_STAGE_SCHEMA: &str = "rsia.management.asset_stage.v1";
 const ASSET_ABORT_SCHEMA: &str = "rsia.management.asset_abort.v1";
 const ASSET_HANDOFF_SCHEMA: &str = "rsia.management.asset_handoff.v1";
@@ -540,6 +554,7 @@ enum ParsedRequest {
     MonitoringDriftRecord(Box<MonitoringDriftRecordManagementRequest>),
     ConsolidationTrigger(Box<ConsolidationTriggerManagementRequest>),
     SeedInstall(Box<SeedInstallManagementRequest>),
+    SeedResetStage(Box<SeedResetStageManagementRequest>),
     SourceRevoke(Box<SourceRevokeManagementRequest>),
     CleanupContinue(Box<CleanupContinueManagementRequest>),
 }
@@ -584,6 +599,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
             MonitoringDriftRecord(Box<MonitoringDriftRecordManagementRequest>),
             ConsolidationTrigger(Box<ConsolidationTriggerManagementRequest>),
             SeedInstall(Box<SeedInstallManagementRequest>),
+            SeedResetStage(Box<SeedResetStageManagementRequest>),
             SourceRevoke(Box<SourceRevokeManagementRequest>),
             CleanupContinue(Box<CleanupContinueManagementRequest>),
         }
@@ -614,6 +630,7 @@ impl<'de> Deserialize<'de> for ParsedRequest {
                 Other::MonitoringDriftRecord(value) => Self::MonitoringDriftRecord(value),
                 Other::ConsolidationTrigger(value) => Self::ConsolidationTrigger(value),
                 Other::SeedInstall(value) => Self::SeedInstall(value),
+                Other::SeedResetStage(value) => Self::SeedResetStage(value),
                 Other::SourceRevoke(value) => Self::SourceRevoke(value),
                 Other::CleanupContinue(value) => Self::CleanupContinue(value),
             },
@@ -1472,6 +1489,7 @@ impl ParsedRequest {
             Self::MonitoringDriftRecord(request) => &request.request_key,
             Self::ConsolidationTrigger(request) => &request.request_key,
             Self::SeedInstall(request) => &request.request_key,
+            Self::SeedResetStage(request) => &request.request_key,
             Self::SourceRevoke(request) => &request.request_key,
             Self::CleanupContinue(request) => &request.request_key,
         }
@@ -2480,6 +2498,9 @@ async fn execute_request(
         }
         ParsedRequest::SeedInstall(request) => {
             return run_seed_install(ctx, store, claimed.clone(), *request, control).await;
+        }
+        ParsedRequest::SeedResetStage(request) => {
+            return run_seed_reset_stage(ctx, store, claimed.clone(), *request, control).await;
         }
         ParsedRequest::SourceRevoke(request) => {
             return run_source_revoke(ctx, store, claimed.clone(), *request, control).await;
@@ -4421,6 +4442,54 @@ async fn run_seed_install(
     commit_management_outcome(session, claimed, finished).await
 }
 
+/// `seed.reset_stage`: the staged asset, its edge, its audit record and the
+/// terminal job state share one registered write session. The kernel reads
+/// the install and the live run inside that session; the handler adds no
+/// check of its own.
+async fn run_seed_reset_stage(
+    ctx: &Context,
+    store: &Store,
+    claimed: ManagementJobV2,
+    request: SeedResetStageManagementRequest,
+    control: &WorkerControl,
+) -> Result<ObservedWorkerExit> {
+    ctx.require(&[Role::Admin])?;
+    let mut session = store.registered_blob_write_session().await?;
+    let finished = async {
+        let mut current = begin_management_step(ctx, &mut session, &claimed, control).await?;
+        let staged = crate::seeds::PersistentSeedStore::stage_reset_managed_in_session(
+            ctx,
+            &mut session,
+            &request.install_id,
+            &request.request_key,
+            &request.run_id,
+        )
+        .await?;
+        let outcome = JobOutcome {
+            state: ManagementJobState::Succeeded,
+            step: "seed_reset_staged".into(),
+            result: Some(ManagementResultV2::Seed(
+                ManagementSeedResultV2::SeedResetStaged {
+                    install_id: request.install_id,
+                    staged_asset_id: staged.id,
+                    baseline_digest: staged.payload.baseline_digest,
+                },
+            )),
+            error_code: None,
+        };
+        apply_completed_outcome(&mut current, &outcome)?;
+        session
+            .put(ctx, "job", &current.id, ctx.actor(), &current)
+            .await?;
+        session
+            .audit(ctx, "management.job.finish", &current.id)
+            .await?;
+        Ok::<JobOutcome, Error>(outcome)
+    }
+    .await;
+    commit_management_outcome(session, claimed, finished).await
+}
+
 fn import_management_result_state(
     state: crate::import::ImportResultState,
 ) -> ManagementImportResultState {
@@ -4659,6 +4728,15 @@ fn validate_request_authority(ctx: &Context, request: &ParsedRequest) -> Result<
             ] {
                 crate::packages::validate_digest(digest, "seed install blob")?;
             }
+        }
+        ParsedRequest::SeedResetStage(request) => {
+            ctx.require(&[Role::Admin])?;
+            identifier(&request.request_key)?;
+            // Both ids become dependency rows at submit; whether the install
+            // is a Current record of the caller and whether the run is live
+            // are judged by the kernel before its first write.
+            identifier(&request.install_id)?;
+            identifier(&request.run_id)?;
         }
         ParsedRequest::TraceExportPrepare(request) => {
             ctx.require(&[Role::Admin])?;
@@ -6006,12 +6084,16 @@ async fn consumer_progress(
         }
         return Ok(ConsumerProgress::NotCommitted);
     }
-    if record.identity().operation == "seed.install" {
-        // The install handler writes Prepared, the three registered blobs,
-        // Installed, the edges, the audit record and the terminal job state in
-        // one transaction. A non-terminal record therefore proves no install
-        // effect; a terminal one with its bound result is its own committed
-        // outcome.
+    if matches!(
+        record.identity().operation,
+        "seed.install" | "seed.reset_stage"
+    ) {
+        // Each seed handler writes its business rows, the edges, the audit
+        // records and the terminal job state in one transaction and makes no
+        // budget call. A non-terminal record therefore proves no seed effect
+        // (it is never Unknown, so neither job drains, not even after a
+        // revocation redacted its private input); a terminal one with its
+        // bound result is its own committed outcome.
         if is_terminal(record.identity().state)
             && matches!(record.result(), Some(ManagementResultV2::Seed(_)))
         {
@@ -6645,8 +6727,10 @@ async fn consumer_progress(
         ParsedRequest::MonitoringDriftRecord(_) | ParsedRequest::ConsolidationTrigger(_) => {
             Ok(ConsumerProgress::NotCommitted)
         }
-        // Unreachable: the seed short-circuit above owns this operation.
-        ParsedRequest::SeedInstall(_) => Ok(ConsumerProgress::NotCommitted),
+        // Unreachable: the seed short-circuit above owns both operations.
+        ParsedRequest::SeedInstall(_) | ParsedRequest::SeedResetStage(_) => {
+            Ok(ConsumerProgress::NotCommitted)
+        }
         // Unreachable: the revocation short-circuit above owns these two.
         ParsedRequest::SourceRevoke(_) | ParsedRequest::CleanupContinue(_) => {
             Ok(ConsumerProgress::NotCommitted)
@@ -7523,8 +7607,10 @@ async fn cancel_job_atomic(
                 saved.operation.as_str(),
                 "monitoring.drift.record" | "consolidation.trigger"
             ) && matches!(saved.result, Some(ManagementResultV2::Monitoring(_))))
-            || (saved.operation == "seed.install"
-                && matches!(saved.result, Some(ManagementResultV2::Seed(_))))
+            || (matches!(
+                saved.operation.as_str(),
+                "seed.install" | "seed.reset_stage"
+            ) && matches!(saved.result, Some(ManagementResultV2::Seed(_))))
             || (matches!(
                 saved.operation.as_str(),
                 "source.revoke" | "cleanup.continue"
@@ -7904,6 +7990,16 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
                 ));
             }
         },
+        "seed.reset_stage" => match payload["schema_version"].as_str() {
+            Some(SEED_RESET_STAGE_SCHEMA) => ParsedRequest::SeedResetStage(Box::new(
+                serde_json::from_value(payload).map_err(|_| invalid())?,
+            )),
+            _ => {
+                return Err(Error::Invalid(
+                    "unsupported management payload schema".into(),
+                ));
+            }
+        },
         "meta.start" => {
             ParsedRequest::Blocked(serde_json::from_value(payload).map_err(|_| invalid())?)
         }
@@ -7945,6 +8041,7 @@ fn parse_request(operation: &str, payload: Value) -> Result<ParsedRequest> {
         ParsedRequest::MonitoringDriftRecord(request) => &request.schema_version,
         ParsedRequest::ConsolidationTrigger(request) => &request.schema_version,
         ParsedRequest::SeedInstall(request) => &request.schema_version,
+        ParsedRequest::SeedResetStage(request) => &request.schema_version,
         ParsedRequest::SourceRevoke(request) => &request.schema_version,
         ParsedRequest::CleanupContinue(request) => &request.schema_version,
     };
@@ -8152,6 +8249,12 @@ fn private_dependencies(request: &ParsedRequest) -> Result<Vec<(String, String)>
             ] {
                 dependencies.push(("blob".into(), digest.clone()));
             }
+        }
+        ParsedRequest::SeedResetStage(request) => {
+            // The install being reset is the physical input of the staged
+            // asset; a revoked install source redacts the request with the job
+            // that holds it. The run only supplies the current environment.
+            dependencies.push(("artifact".into(), request.install_id.clone()));
         }
         ParsedRequest::TraceExportPrepare(request) => {
             // The private input depends on every captured source run, so a
@@ -8491,6 +8594,11 @@ pub enum ManagementCommittedEffect {
         baseline_digest: String,
         local_digest: String,
     },
+    SeedResetStaged {
+        install_id: String,
+        staged_asset_id: String,
+        baseline_digest: String,
+    },
     SourceRevoked {
         source_kind: ManagementRevocationSourceKind,
         source_id: String,
@@ -8767,6 +8875,15 @@ fn committed_effects(result: Option<&ManagementResultV2>) -> Vec<ManagementCommi
             install_id: install_id.clone(),
             baseline_digest: baseline_digest.clone(),
             local_digest: local_digest.clone(),
+        }],
+        Some(ManagementResultV2::Seed(ManagementSeedResultV2::SeedResetStaged {
+            install_id,
+            staged_asset_id,
+            baseline_digest,
+        })) => vec![ManagementCommittedEffect::SeedResetStaged {
+            install_id: install_id.clone(),
+            staged_asset_id: staged_asset_id.clone(),
+            baseline_digest: baseline_digest.clone(),
         }],
         Some(ManagementResultV2::Revocation(ManagementRevocationResultV2::SourceRevoked {
             source_kind,
