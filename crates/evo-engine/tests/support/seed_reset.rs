@@ -22,6 +22,7 @@ use evo_engine::seeds::{
     SeedUpstream,
 };
 use evo_storage::Store;
+use evo_storage::lifecycle::{LifecycleStore, TypedObjectRef};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -369,6 +370,75 @@ impl Fixture {
             .await
             .unwrap();
         session.commit().await.unwrap();
+    }
+
+    /// The number of stored management job rows of the namespace.
+    pub async fn job_count(&self) -> usize {
+        let mut session = self.store.session().await.unwrap();
+        let jobs: Vec<Value> = session.list(&self.admin, "job").await.unwrap();
+        session.commit().await.unwrap();
+        jobs.len()
+    }
+
+    /// Revokes the install's one source run through the lifecycle API.
+    pub async fn revoke_install_source(&self) {
+        LifecycleStore::begin_revoke(
+            &self.admin,
+            &self.store,
+            TypedObjectRef {
+                kind: "run".into(),
+                id: "seed-source".into(),
+            },
+            "seed reset fixture",
+            2,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn exec_sql(&self, statement: &str) {
+        let output = std::process::Command::new("python3")
+            .args([
+                "-B",
+                "-c",
+                "import sqlite3,sys\nc=sqlite3.connect(sys.argv[1], timeout=30)\nc.execute(sys.argv[2])\nc.commit()\n",
+            ])
+            .arg(&self.database)
+            .arg(statement)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "statement failed: {statement}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A trigger that makes the database refuse the insert of any staged
+    /// asset row: the fault the atomicity control injects.
+    pub fn arm_staged_insert_trigger(&self, name: &str) {
+        self.exec_sql(&format!(
+            "CREATE TRIGGER {name} BEFORE INSERT ON objects WHEN json_extract(NEW.body,'$.schema_version')='rsia.e16.staged_asset.v1' BEGIN SELECT RAISE(ABORT,'injected-{name}'); END"
+        ));
+    }
+
+    pub fn drop_trigger(&self, name: &str) {
+        self.exec_sql(&format!("DROP TRIGGER {name}"));
+    }
+
+    /// How many audit records of one operation name one entity.
+    pub fn audit_count(&self, operation: &str, entity: &str) -> usize {
+        self.audit()
+            .iter()
+            .filter(|(recorded, subject)| recorded == operation && subject == entity)
+            .count()
+    }
+
+    /// Whether any staging audit record exists at all.
+    pub fn has_staging_audit(&self) -> bool {
+        self.business_audit()
+            .iter()
+            .any(|(operation, _)| operation == "e16.seed_reset.stage")
     }
 
     /// Puts one object and its edges in a plain session.

@@ -19,10 +19,18 @@
 //! The legacy control is a head-side test only: a legacy install record
 //! carries no Current authority, so its reset fails with the fixed conflict
 //! code and writes nothing.
+//!
+//! The head-side management controls pin the entry and the kernel: the Admin
+//! gate precedes the payload, the wire is flat and strict, the kernel refuses
+//! with zero business writes whatever is missing or foreign, a revoked source
+//! blocks the request at submit, a request key freezes the run id, the
+//! staging limit admits the management path too, and the staged reset is
+//! closed by `asset.abort` and by nothing else.
 #[path = "support/seed_reset.rs"]
 mod seed_reset;
 
-use evo_core::{fingerprint, hash};
+use evo_core::{Context, Error, Role, fingerprint, hash};
+use evo_engine::dispatch::ManagementDispatcher;
 use evo_engine::packages::E16Envelope;
 use evo_engine::seeds::{E16_SEED_INSTALL_SCHEMA, SeedInstallPayloadV1, SeedStatus};
 use seed_reset::{BASELINE, COMPILER_VERSION, Fixture, NS, RUN_ID, reset_payload, staged_id};
@@ -298,5 +306,138 @@ async fn a_legacy_install_confers_no_reset_and_writes_nothing() {
         None
     );
     assert_eq!(fixture.staged_packages().await, 0);
+    fixture.store.close().await;
+}
+
+/// The role gate comes first: a non-Admin surface is refused before the
+/// payload is parsed, whatever the payload is, and without acquiring the
+/// connection the held Session occupies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seed_reset_stage_requires_admin_before_the_payload_is_observed() {
+    let fixture = Fixture::new().await;
+    let evaluator = Context::new(NS, "evaluator", Role::Evaluator).unwrap();
+    let dispatcher = ManagementDispatcher::new(
+        fixture.store.clone(),
+        vec![fixture.admin.clone(), evaluator.clone()],
+    )
+    .unwrap();
+    let blocker = fixture.store.session().await.unwrap();
+    for payload in [Value::Null, json!(["not a business DTO"])] {
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            dispatcher.submit(&evaluator, "seed.reset_stage", payload),
+        )
+        .await
+        .expect("the role gate must not acquire the held connection")
+        .unwrap_err();
+        assert!(matches!(error, Error::Forbidden), "{error:?}");
+    }
+    blocker.commit().await.unwrap();
+    // A well-formed payload does not help a non-Admin surface, and a context
+    // the dispatcher was not given is refused before its role is read.
+    let well_formed = reset_payload("role-first", &fixture.install_id, RUN_ID);
+    assert!(matches!(
+        dispatcher
+            .submit(&evaluator, "seed.reset_stage", well_formed)
+            .await
+            .unwrap_err(),
+        Error::Forbidden
+    ));
+    let agent = Context::new(NS, "agent", Role::Agent).unwrap();
+    assert!(matches!(
+        dispatcher
+            .submit(&agent, "seed.reset_stage", Value::Null)
+            .await
+            .unwrap_err(),
+        Error::Forbidden
+    ));
+    assert_eq!(fixture.job_count().await, 0);
+    assert_eq!(fixture.staged_packages().await, 0);
+    fixture.store.close().await;
+}
+
+/// The wire is flat and strict: a request key, an install id and a run id.
+/// An environment or compiler label, a path, a root, a role, an owner, a
+/// namespace or content is refused before any session, and so is a missing
+/// field, a foreign schema and an id or key that is not an identifier.
+#[tokio::test]
+async fn seed_reset_stage_wire_is_flat_and_strict() {
+    let fixture = Fixture::new().await;
+    let well_formed = reset_payload("strict", &fixture.install_id, RUN_ID);
+    let before = fixture.business_shape().await;
+    const NOT_A_DTO: &str = "invalid management payload";
+    const NOT_AN_IDENTIFIER: &str = "invalid identifier";
+    const EMPTY_IDENTIFIER: &str = "identifier: expected nonempty text <= 128 bytes";
+    let mut refused = Vec::new();
+    for (field, value) in [
+        ("environment_digest", json!(fixture.run_environment_digest)),
+        ("compiler_version", json!(COMPILER_VERSION)),
+        ("path", json!("seeds/baseline.txt")),
+        ("root", json!("seed-root")),
+        ("role", json!("admin")),
+        ("owner", json!("admin")),
+        ("namespace", json!(NS)),
+        ("actor", json!("admin")),
+        ("content", json!("baseline bytes")),
+        ("baseline_digest", json!(fixture.baseline_digest)),
+        ("created_at", json!(1)),
+    ] {
+        let mut payload = well_formed.clone();
+        payload[field] = value;
+        refused.push((format!("extra {field}"), payload, NOT_A_DTO));
+    }
+    for field in ["request_key", "install_id", "run_id"] {
+        let mut payload = well_formed.clone();
+        payload.as_object_mut().unwrap().remove(field);
+        refused.push((format!("missing {field}"), payload, NOT_A_DTO));
+    }
+    for (field, value, code) in [
+        ("request_key", json!(""), EMPTY_IDENTIFIER),
+        ("install_id", json!("../install"), NOT_AN_IDENTIFIER),
+        ("run_id", json!("run/other"), NOT_AN_IDENTIFIER),
+    ] {
+        let mut payload = well_formed.clone();
+        payload[field] = value;
+        refused.push((format!("{field}: {value}"), payload, code));
+    }
+    for (what, payload, code) in refused {
+        let error = fixture
+            .submit("seed.reset_stage", payload)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Invalid(message) if message == code),
+            "{what}: {error:?}"
+        );
+        assert_eq!(fixture.job_count().await, 0, "{what}");
+    }
+    // The schema is named by the operation and cannot be absent or borrowed
+    // from another operation.
+    for schema in [Value::Null, json!("rsia.management.seed_install.v1")] {
+        let mut payload = well_formed.clone();
+        payload["schema_version"] = schema;
+        let error = fixture
+            .submit("seed.reset_stage", payload)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, Error::Invalid(message)
+                if message == "unsupported management payload schema"),
+            "{error:?}"
+        );
+    }
+    let mut schemaless = well_formed.clone();
+    schemaless.as_object_mut().unwrap().remove("schema_version");
+    assert!(matches!(
+        fixture.submit("seed.reset_stage", schemaless).await.unwrap_err(),
+        Error::Invalid(ref message) if message == "unsupported management payload schema"
+    ));
+    assert_eq!(fixture.job_count().await, 0);
+    assert_eq!(
+        fixture.business_shape().await,
+        before,
+        "no refused request wrote anything"
+    );
+    assert!(!fixture.has_staging_audit());
     fixture.store.close().await;
 }
