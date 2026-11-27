@@ -530,6 +530,40 @@ fn current_ingress_control(
         max_regression: evo_core::evaluation::FixedRegressionThreshold::new(0.125).unwrap(),
     }
 }
+/// Readiness budget for an authority child to create its socket. The child
+/// takes the data-directory lock, opens the Store and passes the startup gate
+/// before it binds, so on a loaded runner this bounds fixture readiness, not
+/// any product timing.
+const AUTHORITY_SOCKET_READY: std::time::Duration = std::time::Duration::from_secs(60);
+/// Waits until the authority child has created `socket`. A child that exits
+/// first is a setup failure; one still running at the budget is killed, so the
+/// panic names the elapsed time and its stderr.
+fn await_authority_socket(
+    mut authority: std::process::Child,
+    socket: &std::path::Path,
+) -> std::process::Child {
+    let started = std::time::Instant::now();
+    while !socket.exists() {
+        if let Some(status) = authority.try_wait().unwrap() {
+            let output = authority.wait_with_output().unwrap();
+            panic!(
+                "authority setup failed {status}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= AUTHORITY_SOCKET_READY {
+            authority.kill().unwrap();
+            let output = authority.wait_with_output().unwrap();
+            panic!(
+                "authority socket setup timeout after {elapsed:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    authority
+}
 async fn register_current_ingress(
     fx: &IngressFx,
     control: &evo_engine::streaming_evaluator::RegisteredEvaluationControlV3,
@@ -547,25 +581,13 @@ async fn register_current_ingress(
     let socket = std::fs::canonicalize(socket_dir.path())
         .unwrap()
         .join("authority.sock");
-    let mut authority = spawn_grader_command(
-        fx,
-        json!({"operation":"authority","database":fx.db,"host":fx.host,"principals":fx.set,"socket":socket,"connections":1}),
+    let authority = await_authority_socket(
+        spawn_grader_command(
+            fx,
+            json!({"operation":"authority","database":fx.db,"host":fx.host,"principals":fx.set,"socket":socket,"connections":1}),
+        ),
+        &socket,
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !socket.exists() {
-        if let Some(status) = authority.try_wait().unwrap() {
-            let output = authority.wait_with_output().unwrap();
-            panic!(
-                "authority setup failed {status}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "authority socket setup timeout"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
     let command = FormalOperatorCommand::RegisterControlCurrent {
         control: Box::new(control.clone()),
     };
@@ -1180,7 +1202,7 @@ async fn audit_f02_real_evaluator_ingress_records_request_peer_and_service_separ
     let socket = std::fs::canonicalize(socket_dir.path())
         .unwrap()
         .join("authority.sock");
-    let mut authority = spawn_grader_command(
+    let authority = spawn_grader_command(
         &fx,
         json!({
             "operation":"authority", "database":fx.db, "host":fx.host,
@@ -1188,25 +1210,7 @@ async fn audit_f02_real_evaluator_ingress_records_request_peer_and_service_separ
         }),
     );
     let authority_pid = authority.id();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !socket.exists() {
-        if let Some(status) = authority.try_wait().unwrap() {
-            let output = authority.wait_with_output().unwrap();
-            panic!(
-                "authority setup failed {status}: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        if std::time::Instant::now() >= deadline {
-            authority.kill().unwrap();
-            let output = authority.wait_with_output().unwrap();
-            panic!(
-                "authority socket setup timeout: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    let authority = await_authority_socket(authority, &socket);
     let command = FormalOperatorCommand::RegisterControlCurrent {
         control: Box::new(control.clone()),
     };

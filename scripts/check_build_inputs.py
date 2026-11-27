@@ -237,11 +237,11 @@ REVIEWED_STEPS = {
         '758f2f3b3ebae29ef6818d2aa9b0eb006d0b015d0e3d32d2212f45be89e87f21',
         '8b982ad2e5049c5ba521e6eb2d20f2c59cd048a001d5abb6cf6b1b889860f81d',
         'a9b6c103140046e27ec459a17606ef0bec0ec5a9c778495d2a28dd58ca1b0f28',
+        'ab0d944ad33e647d4fa88001ec991a830a66e7829c60fbee431374d76524a231',
         'be7fca0a63238911dc4902147243d5e805472f14dbc0d011a11bcab0eaa21ea8',
         'c8a4ec17087dcb4588d39a0b583af55b84978a346c2ebe2ceedf60e91ef927af',
         'ddf38305ea4a215feddb6646e136aec5f74e93ec761f71f90f6d5070508a430f',
         'df7d3533f01c028fe0d3b4510ade0961edacc87254b6b391fef47eb0b1215f75',
-        'dfd36b50b3f0532b2c653b8dc31c7c1fee7dcbb0883ec347a91aad9c8f4a1fb7',
         'ec4df22d439ddaa8b5ec35ee753434bd5baa5a8a10df33865f8d507c93c63026',
         'f5a004bcd710de40a1805e0cff5e7a0b29037f5cb27c4fc8fef44bf95d912e5c',
         'fc5a7074a7f127d88a251e9c3821823eb8aa7b427e33c5ae59dcb4832a3d9d66',
@@ -311,7 +311,7 @@ REQUIRED_DEPENDENCY_STAGES = {
 
 # Only the previously unparsed workflow/job prefix is fixed. Existing step
 # parsing and pinned/quoted Cargo admission remain unchanged.
-WORKFLOW_HEADERS = {'ci.yml': '6f863bd03c4ca6fb2a6d0b947d2a9559a3979bc8d76709e5e03961ca6574edc7', 'dependency-audit.yml': '0b3c8b06b7164ed6f19faabab12a229fa1eff10132a111f3fe02d722a36703aa', 'offline-build-kit.yml': '8075cbbf94ad69d3af378c0630bec4e83c0bece8b3564043ec4e6445530e2b5a'}
+WORKFLOW_HEADERS = {'ci.yml': 'ba3bfa9cb3c2c13d9507e5b1e9d2170d64ad96e0c88fe21e16b3690a0e95e545', 'dependency-audit.yml': '0b3c8b06b7164ed6f19faabab12a229fa1eff10132a111f3fe02d722a36703aa', 'offline-build-kit.yml': '8075cbbf94ad69d3af378c0630bec4e83c0bece8b3564043ec4e6445530e2b5a'}
 
 def _workflow_errors(name: str, text: str) -> list[str]:
     if name == "non-rust-delivery.yml":

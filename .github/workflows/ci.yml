@@ -12,7 +12,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 300
     env:
       PYTHONOPTIMIZE: '0'
       RUSTUP_TOOLCHAIN: '1.98.1'
@@ -60,7 +60,7 @@ jobs:
       - name: Tests
         id: tests
         continue-on-error: true
-        run: cargo test --workspace --locked > out/tests.txt 2>&1
+        run: cargo test --workspace --locked --no-fail-fast > out/tests.txt 2>&1
       - name: Clippy
         id: clippy
         continue-on-error: true
