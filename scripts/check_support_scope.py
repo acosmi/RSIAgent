@@ -85,7 +85,8 @@ FIELD_SEMANTICS = {
         "runner (ctrl_verify.sh, codex_task or other), command (the literally executed command), scope (workspace or single_target), "
         "exit_code (the integer exit code of that command) and evidence (the log_path or the identifier of the summary line inside the "
         "acceptance receipt); command, exit_code and log_path of the record keep describing the declared target; "
-        "earlier records are neither backfilled nor guessed"
+        "earlier records are neither backfilled nor guessed; "
+        "reviewed public projections mark withheld host environment paths explicitly and use neutral evidence references; the original execution is kept in the local evidence store"
     ),
     "production_consumer": (
         "optional record-level marker: none_library_only means the recorded module has no production caller in engine/http/mcp/apps "
@@ -131,7 +132,8 @@ FIELD_SEMANTICS = {
         "both checkers pin the reviewed supersedes and completes pairs (new record id to old record id) and, for every historical record retained "
         "from the previous index binding, the SHA-256 of its canonical JSON (keys sorted, no insignificant whitespace, UTF-8) without plan_recheck; a "
         "missing, extra or rewritten pin fails; the records added by an index pull request are pinned by the next index pull request, after the merge "
-        "of the adding pull request is backfilled"
+        "of the adding pull request is backfilled; "
+        "for reviewed public projections both checkers additionally pin the whole public record, and local evidence judgment requires the original record to match its unchanged historical digest"
     ),
     # Appended by AG-200 (fail-closed evidence judgment, Rust evidence-store input, register file pin, merge facts); the thirteen
     # definitions above are unchanged.
@@ -273,6 +275,7 @@ EXPECTED_RELATIONS = {
 # V080.d "旧记录被改写": SHA-256 of the canonical JSON (keys sorted, no insignificant whitespace, UTF-8) without plan_recheck of all 138
 # records: the 93 historical records retained from the v4.3 index binding (base a389c4e3) and the 45 records added by AG-182 (PR #200),
 # pinned by AG-200 after the merge of PR #200 (02a135aa) was backfilled into its 33 records (FIELD_SEMANTICS["record_pins"]).
+# AG-210 adds the 82 records folded in from the index requests of 42 pull requests (#201-#251): 220 in all.
 EXPECTED_RECORD_DIGESTS = {
     "E00.controller_acceptance": "1d8594a791d51459e7272f8c97bc17df016df597bd85b696ce2b2379313ee80a",
     "E00.ag099_step_future_default_test_stack": "ff982495a71a566a1a2f30c43a74ebce147321b32a65979fcc6ea9c9bfd229fa",
@@ -412,6 +415,88 @@ EXPECTED_RECORD_DIGESTS = {
     "E16.6.ag182_plan_v45_index_binding": "3fe7f10b44b56128e6f19a6955def29b91be3493271112169d89437c50d38cc2",
     "E17.disabled_rejection_controller_acceptance": "6046a7d9fe6f644c02b88ad8b52ccd2a25aa16078563031332fb1e15c9084442",
     "E18.disabled_rejection_controller_acceptance": "75279240c222bbd5e5a65656afa30f7cb0b186253f95ec496d3b27f04acee0a1",
+    "E01.ag174a_controlled_task_profile_registration_v45": "707aca4d0d11a649737b7377c8523fafd0edb908460f06aa212169ce81a917e3",
+    "E01.ag174b_config_precedence_generator_oracle_v45": "91ef81236cc67e9c7e994033312cda5a9afa23717556307c7e7504601a2365da",
+    "E01.ag185_noninferiority_equality_alignment_v45": "7a3acbb2933e2446f2772cd70415fce91a0fe64680ae8238067bd4577fda9e90",
+    "E01.ag192_fixed_sample_regression_threshold_v45": "baaca3398fc46e758c410faeeca12ed33331c38e1c4e242f936a80f0725800c9",
+    "E02.ag135a_host_surface_v2_typed_data_v45": "df4d173d64ef6ebe608003fd119e048e6c10d9ed1376115ec3f4a8ce43a3794b",
+    "E02.ag135a_core_digest_preimage_v45": "f69fc5780bc017995d18333d29cbd696e1e068ff9670a00af64b455231eea97a",
+    "E02.ag135b_current_digest_consumers_v45": "1507d9610c54400ac8d812660a906aba9939f5d2abe7912db15818312cb2af75",
+    "E02.ag135b_current_empty_root_preimages_v45": "b6430e3198d840a8cecb2abdd333082ed046f8f62a3def4cd254a4bed7c02464",
+    "E02.ag155_versioned_management_job_status_v45": "7f1da30f1b5efc4a27b4414496bafe426e4fc849ccb397a9cd7aed7e6ada91bc",
+    "E02.ag159_v45_consumer_contract": "edd97321ea2b25934d3665b5dddf9fc58c742b49f9528a84f31555e1313c470b",
+    "E02.ag168_complete_tool_source_contract_v45": "4139bc30e481d0dfa31a1668cb9fe7fb93d68671a7235873dd505bf2fda9daea",
+    "E02.ag168_tool_schema_environment_v45": "11bdd9e1094da57f41ee9e21cfe2d494da374a3f2b7ed81c67810fbe0bab547e",
+    "E02.ag169_tool_only_capability_v45": "13a3b2e1b5b7d0d213ed4721d226b3ae0d7bfba43555c0622b4986e8807158ea",
+    "E02.ag186_v45_management_registry_codes": "fe8f456b269c97fb099d4bbab5c0ef16d46e93657c3e0a0c27e497f05c26b829",
+    "E03.ag183_registered_settlement_recompute_v45": "0f3451b929012ba0c219563d11570436f1219c86968565d58b6749f8654562f7",
+    "E03.ag189_config_projection_consumed_development_v45": "da4b70d2641424fe694277159f7ae9f27fcd81ffb75fea51307fddbf75e8db68",
+    "E04.ag141_same_tx_stage_gate_v45": "78a9cb8bd1630b3c8d1ba0712eb6c400d3847004cb35b15ac5466b840f1a8124",
+    "E04.ag146_budget_management_entrypoints_v45": "04bdf0277038926abb2176bd7d351f7b27ad3f47eae70669ab6c9188a1b83b5c",
+    "E04.ag146_budget_transaction_entrypoints_v45": "ea1cd17cf727f7b0678c8e00f40668ea9781741d61e6ce2412a3ff737817b9b9",
+    "E04.ag155_management_cancellation_consumers_v45": "0fede162e172f84175d775173ed4946c12f3f571ddcb18d1eb5a97f160072c80",
+    "E04.ag206_reconcile_without_output_v45": "7842011e2b668b517b2fbdc9c99da1965b9e9d9206afbcef555ae5b4b5059575",
+    "E05.ag163_formal_report_version_lineage_v43": "1056659f18dd8fd7991098a53c30af957952715273400af915e9687c854aa315",
+    "E05.ag181_first_late_feedback_once_v45": "c567d4dd73009235c351e7a11d275297fe049c5dd754ed6118d45910647df2e8",
+    "E05.ag192_fixed_sample_verdicts_v45": "dbbdc53da625f542b8bd414fcc41c4c9cd447991bbda2ddef63334cc2d1495ce",
+    "E05.ag192_legacy_plan_binding_v45": "47b84313b3facc251746cf5dfa67dbc64af90abb0dfb87ef8995396da998e000",
+    "E06.ag169_tool_only_software_boundaries_v45": "5bef30128e4f86c317442cefd1d915629f790ca98682bf11333c7d49e5c6d2ef",
+    "E06.ag169_release_store_recheck_v45": "df12793c6fdc9b1818d7f7b435fa0663e78a34df8f54859c21bbd11b8241c302",
+    "E06.ag202_audit_witness_prefix_v45": "4646fe072c355473d64f7b6743cb537e828f47b28bfc3a358d1b16b4626ce16d",
+    "E07.ag174b_config_precedence_local_reference_v45": "9198fae9944845b35e30889d788fc303294eb6c2bcece52be5a8f4962857bd75",
+    "E08.ag119_revocation_winner_precedes_first_write_v45": "791f3ad1308e9c062d20a69c450a35f71572dbcc0b5e5238e8364d0cdaa8348b",
+    "E08.ag164_backup_create_management_v45": "79bcf10480d9beeda3a02b5148572761afeda0b294f4b5a7c0aa80ed2ea98e98",
+    "E08.ag181_corrupt_ref_isolation_v45": "09581a45c703f8e2fdb43f94a45df1fb06a9f3df6226589759834d30b7812cbd",
+    "E08.ag204_practice_request_closure_cleanup_v45": "c4886327c31e200c68ee31d6aa6ad3762abcb3f8b8b641d77183ad37668bce04",
+    "E09.ag189_exploration_current_projection_content_v45": "0db04e54f7567336131cdfe852429bca7b0d00a7f544bb2c9782132d40d5bfde",
+    "E11.ag178_cluster_lcb_economic_report_v2_v45": "b7a7abc899986b0dc0061fbdcdd474110e21965c86a47e67d0905c7fbdf513c0",
+    "E11.ag178_v2_report_write_legacy_v1_read_and_route_closure_v45": "0bd0b0ef58f5915d49b17bd89efeae6bb6558adb6e09abf5e350d2f059b0bd47",
+    "E11.ag179_direction_hint_descriptive_ablation_v45": "7016468bac7075cbd5890a970eb9f4c466fa860d4c28e83b67071412ceeaddba",
+    "E12.ag170_curriculum_failure_records_and_selection_v2_v45": "e9a09d83ce5937125c28a943ca07b5ffbb586c8e646a68d4cd47effac42b63e0",
+    "E12.ag170_learner_state_v3_failure_reducer_core_v45": "787f0bdd99be238c1347b7af94f6d526b5ee7d8625a909e5f1d989cba4cf58f5",
+    "E12.ag201_curriculum_release_witness_selection_v45": "5c105e7eede2f704df5d239d9b74bf1123d6905ae43f57f52527a35532620081",
+    "E12.ag201_curriculum_entry_capacity_core_v45": "278b41b9414acc1ce19405ecba8df014ecee8720206f279fa899f0b4e23d8bb2",
+    "E13.ag166d_drift_management": "1893392605986ee3f16587b1eda6fcda99fcecec70dbb49688d927a198212477",
+    "E13.ag166d_drift_recovery": "dcd478c4d16226704229283b6c25fe885ad4698843df95d8c4fa027a72c4695e",
+    "E13.ag169_monitoring_recheck_v45": "9b0ac8ecc9fbd8ebc00ea1e52fae969fb16f2f14c99de3111bd75384b0216880",
+    "E13.ag187_runner_contract_content_use_gate_v45": "c22ca7a394b1e745df5190316ad37e9f4f7876808c3bf462d9728ad87e5ce3f5",
+    "E13.ag187_identity_only_consolidation_content_gate_v45": "b319ce4df115674d98bb4c8df5b73cc809f780033b993eaa058363966da6fdaa",
+    "E13.ag189_consolidation_projection_content_v45": "5538286cedbc583c72849f62c28177f8104bb09ca657a07a10166821d9fd2d37",
+    "E16.1.ag148_native_trace_reader_first_gate_v45": "94e2c0d72c311c9ae99678a81213b2b81a88cefad2a6497692aca14481b3c00b",
+    "E16.1.ag148_import_result_version_capacity_v45": "abc3356ba1bb18202f62d2d600078fa3eace6ed1e5f39b52ab1d900bcbcf001e",
+    "E16.1.ag166a_import_management_wiring": "d1e8cca3b02a3f921405aabb942dc39edc1b8597f3b9bd4e54211a0896598eb8",
+    "E16.1.ag166a_import_job_recovery": "57fc99d8b32e96ae99bb4ea62296ab10101024a207312a41dc28d7d6c12aafc7",
+    "E16.1.ag166a_import_blob_input": "8b5421906789e1878b3266058751cca0d782c0d5263998bd9e174074572f2ae1",
+    "E16.1.ag166a_import_format_and_coverage": "cdeada808fde341978722356dc1cdec3164f0de0a716857681753e5fc0ff2a45",
+    "E16.1.ag166a_import_registry_boundary": "dcbbad61fcc7aa5bf60f600dc6ac2fe18e7faf1122c94cbb67e37db8d56760c3",
+    "E16.2.ag166b_asset_export_management": "d957b7acb729fe7b606574b8455f85471bf3e7b9c9f85256cfe4eec64f10d461",
+    "E16.2.ag166b_asset_export_recovery": "e1331492d4b80841873697d2aeca2014fcfcef25f95e01af94dae0b8e1cb74ae",
+    "E16.2.ag166b_package_projection_parity": "bd4d8f3a7ad910dcb3000030f62867dd3b3342f96015561f9face958e55e59f9",
+    "E16.2.ag166b_local_export_fence": "18196705778c4f6249a8e61dfcf0ad566e64b8ab3c0156fb86d879a136189afb",
+    "E16.2.ag173_restricted_zip_reader_v45": "295b4a8ac0939a47324545206d78f214ed629a5cee370130826016cfee02c9ee",
+    "E16.2.ag175_trace_export_native_roundtrip_v45": "d527eb0b834cd805947d7d4ed40727871e18516a4052719ed02073a97d79d834",
+    "E16.2.ag175_trace_export_management_v45": "9213231c2b48eed1d74ab5371e544bd63436fb2be15be5a73dbb19a61ad232a0",
+    "E16.3.ag158_install_comparison_v45": "a7a2d0fcf253faaf607cdd1ee146f07001fdfc108751b5086b30b8476d1f9f4e",
+    "E16.3.ag158_builtin_seed_catalog_v45": "9c96b886761a436be53b30b912e5093384dd9e064ad7e1d88c502cb747ff4694",
+    "E16.3.ag166c_seed_install_management": "53053a5c8682f15cc3e43a3976b0368bdac00b7612719ba24758eae3d6f2ded9",
+    "E16.3.ag166c_seed_install_recovery": "e1fcec25997bb91a118f29a072ad36e2a0725f391252cbd6d966f377606e8d91",
+    "E16.3.ag166c_seed_blob_management": "76b17de51a9b0b67942f7a93ee2198aafefc114634873c46f6a2c19ea2f1769e",
+    "E16.3.ag166c_seed_install_compat": "693fd0557b0abf4531d9e8d85c8eefdb5a197f45a4c575db534322f9705a8c7f",
+    "E16.3.ag166c_seed_classification_adapter": "608f37bfcc7d91bfc19a56e3ef600f9724c83f1b9e3fcbd7bdc02a445b0b4188",
+    "E16.4.ag159_v45_consumer_legacy_boundary": "8123b12d427f271296394607ec6c72607674cec1f71832dc6ea309d11568f139",
+    "E16.4.ag169_hosts_store_recheck_v45": "8cea52b197b4a0c0759a7bff6b481b79a42aff43a3b11632d1e1ce798f1425f5",
+    "E16.5.ag119_qualified_source_identity_v45": "30b08fd4f115ba320c8a4e9c320b4bc5f2175c0ddbcd6680e447a00310e4c22e",
+    "E16.5.ag135b_current_digest_restore_v45": "784f8223b3ba1cb39cc1c7792f79ea3f6211509b74ee385cf0ebb1d2f4771442",
+    "E16.5.ag138_capacity_production_admission_v45": "62d4af4f2cd4a48299f300a53b9b3d9aac01f41c40250809c6cd37d31df28782",
+    "E16.5.ag138_capacity_single_authority_v45": "b68214d608c379b02108dd8db255efb8ccaa8e3e90a872a8b0a26346122ba7a6",
+    "E16.5.ag157_local_data_directory_permissions_v45": "22979dfa30aaf76a8efa0e47454fec84364c787507881cc56388feedde1ee691",
+    "E16.5.ag157_cli_entry_permissions_v45": "c758e6977f8f84eddb9b020b65bfff4afe76b1934d834bc7a671b95d6bea862b",
+    "E16.5.ag160_cli_env_credentials_v45": "530e09aa4b58d24fe098281d9232a7be10e411cdf82d5f529321af46ee38cb66",
+    "E16.5.ag163_formal_history_cleanup_v43": "02881959eb03096b23aee465356d9a3133f2e80bd1f8bee35794b237827f3a46",
+    "E16.5.ag173a_inflate_dependency_registration_v45": "722d3ecd35ee31717132d43ad1ea10eeabb463332ed84369d6df1f5c02795f60",
+    "E16.5.ag203_trace_export_capacity_v45": "0d2d59f703a10385bad1ad1f5afdbe5538c621b6cbc188fc2b28f1522d8b73cf",
+    "E16.5.ag205_trace_export_capacity_single_authority_v45": "75b262bc21befd843c7086168286a6917dabf455d38d29b525362b0cfcc8a254",
+    "E16.5.ag207_closure_operations_bypass_dispatch_slot_v45": "c5adb9ec1b53e633ffbb5d64ff31a9e9f4521986e20a70e67b91e1b7c210e9c4",
 }
 
 # Missing-evidence register (plan §18.10 "本地缺失的证据路径", v4.5 Q-50).
@@ -1176,15 +1261,41 @@ def record_digest(record: dict[str, Any]) -> str:
     body = {key: value for key, value in record.items() if key != "plan_recheck"}
     return hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
 
-def validate_record_pins(evidence_records: list[dict[str, Any]]) -> None:
+PUBLIC_RECORD_PINS_PATH = "reports/support-scope-public-digests.json"
+PUBLIC_RECORD_PINS_SHA256 = "38bbd223389c9c63b794f344bd45de4873e325cd56af2a13dafa00948288e36a"
+ORIGINAL_RECORDS_PATH = "out/audit-20260930/qa/ag-210-public-evidence/original-records.json"
+
+def load_public_record_pins(repo_root: Path) -> dict[str, str]:
+    path = inspect_relative(repo_root, PUBLIC_RECORD_PINS_PATH, "public record digest table", True)
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != PUBLIC_RECORD_PINS_SHA256:
+        raise CheckerError("public record digest table differs from its pinned SHA-256")
+    pins = load_json_strict(raw.decode("utf-8"))
+    if not isinstance(pins, dict) or not pins.keys() <= EXPECTED_RECORD_DIGESTS.keys():
+        raise CheckerError("public record digest table contains an unpinned historical id")
+    return pins
+
+def validate_record_pins(evidence_records: list[dict[str, Any]], public_pins: dict[str, str]) -> None:
     """plan §18.10 / V080.d: the historical records retained from the previous index binding are never rewritten."""
     by_id = {record["id"]: record for record in evidence_records}
     for identifier, expected in EXPECTED_RECORD_DIGESTS.items():
         record = by_id.get(identifier)
         if record is None:
             raise CheckerError(f"{identifier}: pinned historical record is missing from verified_subscopes; a historical record leaves the index only through a reviewed withdrawal")
-        if record_digest(record) != expected:
+        if record_digest(record) != public_pins.get(identifier, expected):
             raise CheckerError(f"{identifier}: historical record differs from its pinned digest (canonical JSON without plan_recheck); a historical record is never rewritten")
+
+def read_original_records(evidence_root: Path, public_pins: dict[str, str]) -> dict[str, dict[str, Any]]:
+    if not public_pins:
+        return {}
+    path = inspect_relative(evidence_root, ORIGINAL_RECORDS_PATH, "original record archive", True)
+    originals = load_json_strict(path.read_text(encoding="utf-8"))
+    if not isinstance(originals, dict) or originals.keys() != public_pins.keys():
+        raise CheckerError("original record archive does not cover the exact public projection set")
+    for identifier, record in originals.items():
+        if not isinstance(record, dict) or record_digest(record) != EXPECTED_RECORD_DIGESTS[identifier]:
+            raise CheckerError(f"{identifier}: original record differs from its historical digest")
+    return originals
 
 def _missing_identity(entry: dict[str, Any], what: str) -> tuple[int | None, str | None]:
     size, digest = entry["expected_bytes"], entry["expected_sha256"]
@@ -1336,8 +1447,8 @@ def validate_harness2(trace: dict[str, Any], evidence_owner: dict[str, str]) -> 
 def validate_manifest(manifest: Any, repo_root: Path, known_missing: str = DEFAULT_KNOWN_MISSING) -> list[dict[str, Any]]:
     return _validate_manifest(manifest, repo_root, known_missing)[0]
 
-def _validate_manifest(manifest: Any, repo_root: Path, known_missing: str) -> tuple[list[dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
-    """Structure of the whole manifest; returns the evidence records and the validated missing-evidence register."""
+def _validate_manifest(manifest: Any, repo_root: Path, known_missing: str) -> tuple[list[dict[str, Any]], dict[tuple[str, str], dict[str, Any]], dict[str, str]]:
+    """Structure of the whole manifest, including the validated register and public record pins."""
     if not isinstance(manifest, dict):
         raise CheckerError("manifest root must be an object")
     if manifest.get("schema_version") != SCHEMA_VERSION:
@@ -1589,8 +1700,9 @@ def _validate_manifest(manifest: Any, repo_root: Path, known_missing: str) -> tu
             if verification != "verified":
                 nonempty(entry.get("remaining"), f"{cid} remaining")
     validate_harness2(trace, evidence_owner)
-    validate_record_pins(evidence_records)
-    return evidence_records, register
+    public_pins = load_public_record_pins(repo_root)
+    validate_record_pins(evidence_records, public_pins)
+    return evidence_records, register, public_pins
 
 @dataclass
 class CheckReport:
@@ -1724,7 +1836,12 @@ def run_check(repo_root: Path, manifest_rel: str, source_of_truth: Path | None, 
         manifest = load_json_strict(manifest_path.read_text(encoding="utf-8"))
         report.plan_version = manifest.get("plan_version") if isinstance(manifest, dict) else None
         report.plan_sha256 = manifest.get("plan_sha256") if isinstance(manifest, dict) else None
-        evidence, register = _validate_manifest(manifest, repo_root, register_rel)
+        evidence, register, public_pins = _validate_manifest(manifest, repo_root, register_rel)
+        if evidence_root is not None:
+            originals = read_original_records(evidence_root, public_pins)
+            evidence = [originals.get(record["id"], record) for record in evidence]
+        elif public_pins:
+            report.needs_verification.append("public record digests were checked; original record digests require the local evidence root")
         report.input_binding_available = check_local_evidence(report, evidence, register, register_rel, repo_root, evidence_root, structure_only)
         if not structure_only:
             report.evidence_judgment = "judged"

@@ -65,6 +65,7 @@ def _repinned(manifest: dict, register: dict | None = None):
     records = {record["id"]: record for scope in manifest["e_scopes"].values() for record in scope["verified_subscopes"]}
     patches = {
         "EXPECTED_RECORD_DIGESTS": {identifier: css.record_digest(records[identifier]) for identifier in css.EXPECTED_RECORD_DIGESTS if identifier in records},
+        "load_public_record_pins": lambda _root: {},
         "EXPECTED_WITHDRAWN": {
             entry["id"]: (int(entry["withdrawn_in_pr"].rsplit("/", 1)[1]), entry["clause"], entry["owner_task"], entry["status"])
             for entry in manifest["withdrawn_records"]
@@ -109,6 +110,7 @@ class FixtureRepo:
         # The pinned missing-evidence register and the tracked (non out/) record sources travel with the checkout.
         (root / css.DEFAULT_KNOWN_MISSING).parent.mkdir(parents=True, exist_ok=True)
         (root / css.DEFAULT_KNOWN_MISSING).write_bytes((REAL_ROOT / css.DEFAULT_KNOWN_MISSING).read_bytes())
+        (root / css.PUBLIC_RECORD_PINS_PATH).write_bytes((REAL_ROOT / css.PUBLIC_RECORD_PINS_PATH).read_bytes())
         for scope in self.manifest["e_scopes"].values():
             for record in scope["verified_subscopes"]:
                 source = record.get("record_source")
@@ -1298,10 +1300,17 @@ class V45RebindTests(unittest.TestCase):
         manifest = _valid_manifest_dict()
         records = [r for scope in manifest["e_scopes"].values() for r in scope["verified_subscopes"]]
         current = [r for r in records if r["plan_version"] == css.PLAN_VERSION]
-        self.assertEqual(len(current), 33)
-        self.assertTrue(all(r["plan_recheck"] == "not_affected" and r["pr"].endswith("/pull/200") for r in current))
+        self.assertEqual(len(current), 115)
+        ag182 = [r for r in current if r["pr"].endswith("/pull/200")]
+        self.assertEqual(len(ag182), 33)
+        self.assertTrue(all(r["plan_recheck"] == "not_affected" for r in ag182))
         # AG-200 backfilled the merge of PR #200 (02a135aa, merged 2026-10-25T04:39:38Z) into its 33 records.
-        self.assertTrue(all((r["merged_sha"], r["pr_state"]) == ("02a135aa918fce5dd2ea0c1c8eafc287318f10d2", "merged") for r in current))
+        self.assertTrue(all((r["merged_sha"], r["pr_state"]) == ("02a135aa918fce5dd2ea0c1c8eafc287318f10d2", "merged") for r in ag182))
+        # AG-210 folded 82 records of exactly these 42 pull requests, all marked not_affected.
+        folded = [r for r in current if not r["pr"].endswith("/pull/200")]
+        self.assertEqual(len(folded), 82)
+        self.assertTrue(all(r["plan_recheck"] == "not_affected" for r in folded))
+        self.assertEqual({int(r["pr"].rsplit("/", 1)[1]) for r in folded}, {201, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 223, 225, 228, 229, 230, 234, 235, 236, 238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251})
         backfills = [r for r in records if r["pr"].rsplit("/", 1)[1] in {"178", "180", "187", "188", "189", "191", "192", "194", "195", "197", "198", "199"}]
         self.assertEqual(len(backfills), 12)
         self.assertTrue(all((r["plan_version"], r["plan_sha256"], r["plan_recheck"]) == ("v4.3", css.PLAN_LINEAGE["v4.3"]["sha256"], "rechecked_v4.5") for r in backfills))
@@ -1342,10 +1351,12 @@ class V45RebindTests(unittest.TestCase):
         self.assertEqual(sorted(kind for kind, _, _ in css.EXPECTED_RELATIONS).count("supersedes"), 7)
         self.assertEqual(sorted(kind for kind, _, _ in css.EXPECTED_RELATIONS).count("completes"), 25)
         # AG-200 pins every current record: the 93 retained historical records and the 45 records added by AG-182 (12 backfills
-        # and the 33 PR #200 records, which carry the backfilled merge 02a135aa).
-        self.assertEqual(len(css.EXPECTED_RECORD_DIGESTS), 138)
+        # and the 33 PR #200 records, which carry the backfilled merge 02a135aa); AG-210 adds the 82 records folded in from the
+        # index requests of 42 pull requests (#201-#251).
+        self.assertEqual(len(css.EXPECTED_RECORD_DIGESTS), 220)
         self.assertEqual(set(css.EXPECTED_RECORD_DIGESTS), set(records))
-        self.assertEqual({i: css.record_digest(records[i]) for i in css.EXPECTED_RECORD_DIGESTS}, css.EXPECTED_RECORD_DIGESTS)
+        self.assertEqual({identifier: css.record_digest(record) for identifier, record in records.items()},
+                         css.EXPECTED_RECORD_DIGESTS | css.load_public_record_pins(REAL_ROOT))
         added = {i for i in records if records[i]["pr"].rsplit("/", 1)[1] in {"178", "180", "187", "188", "189", "191", "192", "194", "195", "197", "198", "199", "200"}}
         self.assertEqual(len(added), 45)
         # The digest is the canonical JSON without plan_recheck: a recheck marker change is judged by the recheck rule only.
@@ -1779,6 +1790,35 @@ class V45RebindTests(unittest.TestCase):
 
 def _identity_known(entry: dict) -> bool:
     return entry["expected_sha256"] != "unknown" and entry["expected_bytes"] != "unknown"
+
+
+class PublicRecordIntegrityTests(unittest.TestCase):
+    def test_original_and_public_record_pins_are_independent(self):
+        identifier = "E01.fixture_record"
+        original = {"id": identifier, "exit_code": 0, "log_path": "out/fixture/source.log"}
+        public = {**original, "log_path": "out/fixture/alias.log"}
+        public_pins = {identifier: css.record_digest(public)}
+        with mock.patch.object(css, "EXPECTED_RECORD_DIGESTS", {identifier: css.record_digest(original)}), tempfile.TemporaryDirectory() as temp:
+            store = Path(temp)
+            archive = store / css.ORIGINAL_RECORDS_PATH
+            css.validate_record_pins([public], public_pins)
+            for changed in (original, {**public, "exit_code": 1}):
+                with self.assertRaisesRegex(css.CheckerError, "historical record differs"):
+                    css.validate_record_pins([changed], public_pins)
+            with self.assertRaisesRegex(css.CheckerError, "original record archive"):
+                css.read_original_records(store, public_pins)
+            _write(archive, json.dumps({identifier: original}))
+            self.assertEqual(css.read_original_records(store, public_pins), {identifier: original})
+            _write(archive, json.dumps({identifier: public}))
+            with self.assertRaisesRegex(css.CheckerError, "original record differs"):
+                css.read_original_records(store, public_pins)
+
+    def test_public_pin_table_cannot_be_rewritten(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _write(root / css.PUBLIC_RECORD_PINS_PATH, "{}")
+            with self.assertRaisesRegex(css.CheckerError, "public record digest table differs"):
+                css.load_public_record_pins(root)
 
 
 class FailClosedEvidenceJudgmentTests(unittest.TestCase):
@@ -2216,12 +2256,12 @@ class IndexOwnershipAndMergeFactsTests(unittest.TestCase):
 
     def test_runtime_reads_the_single_reviewed_rust_table(self):
         facts = css.reviewed_merge_facts(REAL_ROOT)
-        self.assertEqual(len(facts), 132)
+        self.assertEqual(len(facts), 175)
         # The AG-182 rebind PR, unmerged when its records were registered; AG-200 backfilled its merge.
         self.assertEqual(facts[200], "02a135aa918fce5dd2ea0c1c8eafc287318f10d2")
         self.assertNotIn(None, facts.values())
         records = [record for scope in _valid_manifest_dict()["e_scopes"].values() for record in scope["verified_subscopes"]]
-        self.assertEqual(len(records), 138)
+        self.assertEqual(len(records), 220)
         for record in records:
             self.assertEqual(record["merged_sha"], facts[int(record["pr"].rsplit("/", 1)[1])])
             self.assertNotEqual(record["source_sha"], record["merged_sha"])
