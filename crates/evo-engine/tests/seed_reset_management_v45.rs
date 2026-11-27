@@ -15,10 +15,16 @@
 //!   that returns the original job and writes nothing;
 //! - CPP-B (semantics): an install labelled for another environment is
 //!   refused with zero business writes.
+//!
+//! The legacy control is a head-side test only: a legacy install record
+//! carries no Current authority, so its reset fails with the fixed conflict
+//! code and writes nothing.
 #[path = "support/seed_reset.rs"]
 mod seed_reset;
 
 use evo_core::{fingerprint, hash};
+use evo_engine::packages::E16Envelope;
+use evo_engine::seeds::{E16_SEED_INSTALL_SCHEMA, SeedInstallPayloadV1, SeedStatus};
 use seed_reset::{BASELINE, COMPILER_VERSION, Fixture, NS, RUN_ID, reset_payload, staged_id};
 use serde_json::{Value, json};
 
@@ -197,6 +203,99 @@ async fn cpp_b_seed_reset_stage_refuses_an_install_labelled_for_another_environm
     assert_eq!(
         fixture.raw_body("artifact", &fixture.install_id).await,
         install_body
+    );
+    assert_eq!(fixture.staged_packages().await, 0);
+    fixture.store.close().await;
+}
+
+/// A legacy install record carries no Current authority. A well-formed reset
+/// request for it is refused before the first write: the job fails with the
+/// fixed conflict code, no staged row and no staging audit exist, and the
+/// legacy record is byte-for-byte unchanged.
+#[tokio::test]
+async fn a_legacy_install_confers_no_reset_and_writes_nothing() {
+    let fixture = Fixture::new().await;
+    let legacy_id = "e16-seed-install-legacy";
+    let baseline = b"legacy baseline";
+    let baseline_blob = fixture
+        .store
+        .put_blob_bounded(&fixture.admin, baseline, 1024 * 1024)
+        .await
+        .unwrap();
+    let current = fixture.get("artifact", &fixture.install_id).await.unwrap();
+    let legacy = E16Envelope {
+        schema_version: E16_SEED_INSTALL_SCHEMA.into(),
+        id: legacy_id.into(),
+        namespace: NS.into(),
+        owner_actor: fixture.admin.actor().into(),
+        request_key: "legacy-install".into(),
+        input_digest: hash(b"legacy-input"),
+        created_at: 1,
+        updated_at: 1,
+        source_refs: serde_json::from_value(current["source_refs"].clone()).unwrap(),
+        revoke_watermark: 1,
+        payload: SeedInstallPayloadV1 {
+            publisher: "org.rsia".into(),
+            asset_id: "legacy-seed".into(),
+            kind: "skill".into(),
+            baseline_blob_digest: baseline_blob.clone(),
+            baseline_digest: hash(baseline),
+            local_blob_digest: baseline_blob,
+            local_digest: hash(baseline),
+            upstream_blob_digest: None,
+            upstream_digest: None,
+            environment_digest: fixture.run_environment_digest.clone(),
+            status: SeedStatus::Installed,
+            quarantine_reason: None,
+        },
+    };
+    let mut session = fixture.store.session().await.unwrap();
+    session
+        .put(
+            &fixture.admin,
+            "artifact",
+            legacy_id,
+            fixture.admin.actor(),
+            &legacy,
+        )
+        .await
+        .unwrap();
+    for source in &legacy.source_refs {
+        session
+            .put_edge(
+                &fixture.admin,
+                "artifact",
+                legacy_id,
+                &source.kind,
+                &source.id,
+            )
+            .await
+            .unwrap();
+    }
+    session.commit().await.unwrap();
+    let legacy_body = fixture.raw_body("artifact", legacy_id).await;
+    let before = fixture.business_shape().await;
+    let status = fixture
+        .run_job(
+            "seed.reset_stage",
+            reset_payload("legacy-reset", legacy_id, RUN_ID),
+        )
+        .await;
+    assert_eq!(status["state"], json!("failed"), "{status}");
+    assert_eq!(status["error_code"], json!("conflict"));
+    assert_eq!(status["result"], Value::Null);
+    assert_eq!(status["committed_side_effects"], json!([]), "{status}");
+    assert_eq!(fixture.business_shape().await, before);
+    assert!(
+        !fixture
+            .business_audit()
+            .iter()
+            .any(|(operation, _)| operation == "e16.seed_reset.stage")
+    );
+    assert_eq!(fixture.raw_body("artifact", legacy_id).await, legacy_body);
+    assert_eq!(
+        fixture.get("artifact", &staged_id("legacy-reset")).await,
+        None
     );
     assert_eq!(fixture.staged_packages().await, 0);
     fixture.store.close().await;

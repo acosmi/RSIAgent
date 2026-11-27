@@ -101,13 +101,12 @@ fn model_tools_keep_their_surface_and_are_disjoint_from_the_catalog() {
 /// including the dedicated sync view — fails closed inside `submit` with zero rows
 /// written: no job, no private input, no audit, no call. The four budget
 /// operations, the two import operations, the six asset/local-export
-/// operations, `monitoring.drift.record`, `seed.install` and
-/// `consolidation.trigger` are wired, so they fail at their own strict DTO
+/// operations, `monitoring.drift.record`, `seed.install`, `seed.reset_stage`
+/// and `consolidation.trigger` are wired, so they fail at their own strict DTO
 /// boundary rather than
 /// `management_operation_not_wired`; their real consumers are exercised by the
 /// positive controls. `monitoring.environment.record` stays unwired in this
-/// drift-only range, and `seed.reset_stage` stays unwired in the install-only
-/// range.
+/// drift-only range.
 #[tokio::test]
 async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemented_names() {
     let (dir, store) = store().await;
@@ -219,10 +218,12 @@ async fn submit_stays_fail_closed_with_zero_writes_for_registered_but_unimplemen
                 // source or the cleanup job and page limit, so each is refused
                 // at the DTO before any session, with zero writes.
                 ("source.revoke" | "cleanup.continue", _) => "invalid management payload",
-                // seed.reset_stage stays unwired in this install-only range:
-                // the trusted current environment supplier it needs is not
-                // implemented here.
-                ("seed.reset_stage", _) => "management_operation_not_wired",
+                // seed.reset_stage migrated from the unwired set to its strict
+                // wire: this boundary payload lacks the install id and the
+                // live run id, so it is refused at the DTO before any
+                // session, with zero writes. Its real consumer is covered by
+                // the seed reset management controls.
+                ("seed.reset_stage", _) => "invalid management payload",
                 // monitoring.environment.record stays unwired in this
                 // drift-only range: its Host entry and same-session registered
                 // control source are not implemented here.
