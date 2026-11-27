@@ -16,7 +16,7 @@ use evo_core::optimization::{OptimizationTrace, TraceOutcome};
 use evo_core::{Context, Error, Role, Strategy, fingerprint, hash, now};
 use evo_engine::dispatch::{
     ManagementAssetExportResultV2, ManagementDispatcher, ManagementJobState, ManagementJobStatusV1,
-    ManagementJobV2, ManagementResultV2,
+    ManagementJobV2, ManagementResultV2, VersionedManagementJob,
 };
 use evo_engine::evidence::{StoredRunRecord, StoredTraceAuthority, store_trace_authority};
 use evo_engine::packages::{
@@ -28,6 +28,8 @@ use evo_engine::packages::{
 use evo_engine::release_store::{
     CurrentStageBundleRequest as StageBundleRequest, ReleaseStore, TypedSourceRef,
 };
+use evo_storage::budget::RootBudgetAuthorization;
+use evo_storage::lifecycle::{CleanupState, LifecycleStore, TypedObjectRef};
 use evo_storage::{Store, decode_management_job};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -827,7 +829,9 @@ async fn export_publish_then_job_crash_recovers_actual_receipt() {
 }
 
 // A published tree whose identities do not match is never converted into a
-// success or a false failure: it stays Draining with the attempt Prepared.
+// success or a false failure: it stays Draining with the attempt Prepared and
+// tells the operator what to do. Once the tree is moved away, a restart
+// reconciliation finds nothing published and fails the job.
 #[tokio::test]
 async fn export_published_tree_mismatch_stays_draining() {
     let (dir, store) = store().await;
@@ -888,6 +892,10 @@ async fn export_published_tree_mismatch_stays_draining() {
     let draining = wait_state(&dispatcher, &ctx, &job_id, ManagementJobState::Draining).await;
     assert_eq!(draining.state, ManagementJobState::Draining);
     assert_eq!(
+        draining.step, "export_tree_unverified_operator_action",
+        "PARENT-EXPECTED-FAILURE: an unverified tree must tell the operator what to do"
+    );
+    assert_eq!(
         artifact_value(&store, &ctx, &attempt.id).await["payload"]["state"],
         "prepared"
     );
@@ -899,6 +907,24 @@ async fn export_published_tree_mismatch_stays_draining() {
             .all(|(schema, _)| schema != "rsia.e16.delivery_audit.v2")
     );
     assert_eq!(tree_image(&export_dir), tampered, "never rewritten");
+
+    tokio::fs::remove_dir_all(&export_dir).await.unwrap();
+    let restarted = ManagementDispatcher::new(store.clone(), vec![ctx.clone()]).unwrap();
+    assert_eq!(restarted.recover_pending().await.unwrap(), 1);
+    let failed = terminal_within(
+        &restarted,
+        &ctx,
+        &job_id,
+        "export.complete after the tree was moved away",
+    )
+    .await;
+    assert_eq!(failed.state, ManagementJobState::Failed, "{failed:?}");
+    assert!(failed.result.is_none());
+    assert_eq!(
+        artifact_value(&store, &ctx, &attempt.id).await["payload"]["state"],
+        "prepared",
+        "the exit invents no delivery"
+    );
     store.close().await;
 }
 
@@ -1304,4 +1330,340 @@ fn asset_export_results_are_bound_to_their_physical_operation() {
             "{operation}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// AG-208: a Draining `export.complete` must have an exit.
+// ---------------------------------------------------------------------------
+
+/// A fixed tree settles these jobs at once; past this a job counts as stuck.
+const SETTLE_WITHIN: std::time::Duration = std::time::Duration::from_secs(15);
+
+async fn terminal_within(
+    dispatcher: &ManagementDispatcher,
+    ctx: &Context,
+    job_id: &str,
+    what: &str,
+) -> ManagementJobStatusV1 {
+    match tokio::time::timeout(SETTLE_WITHIN, terminal(dispatcher, ctx, job_id)).await {
+        Ok(status) => status,
+        Err(_) => {
+            let stuck = dispatcher.status_view(ctx, job_id).await.unwrap();
+            panic!(
+                "PARENT-EXPECTED-FAILURE: {what} is still {:?} ({}) after {SETTLE_WITHIN:?}",
+                stuck.state, stuck.step
+            );
+        }
+    }
+}
+
+/// A real accepted job (input, edge, audit) that no worker ever claimed: the
+/// submitting runtime is dropped before its spawned claim can run.
+async fn submit_unclaimed(
+    store: &Store,
+    ctx: &Context,
+    operation: &str,
+    payload: Value,
+) -> ManagementJobV2 {
+    let (store, ctx, operation) = (store.clone(), ctx.clone(), operation.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let accepted = runtime.block_on(async {
+            let dispatcher = ManagementDispatcher::new(store, vec![ctx.clone()]).unwrap();
+            dispatcher.submit(&ctx, &operation, payload).await.unwrap()
+        });
+        drop(runtime);
+        match accepted {
+            VersionedManagementJob::V2(job) => job,
+            VersionedManagementJob::V1(_) => panic!("expected the current management job"),
+        }
+    })
+    .await
+    .unwrap()
+}
+
+/// A claimed `export.complete` whose worker is gone and whose private input a
+/// real source-revocation cleanup has redacted, with no tree ever published.
+/// With `file_in_the_way` a plain file sits where the tree belongs: the cleanup
+/// refuses to delete it and ends Failed, but still redacts.
+/// Returns the seeded job and the export id its input named.
+async fn redacted_export_job(
+    key: &str,
+    file_in_the_way: bool,
+) -> (tempfile::TempDir, Store, ManagementJobV2, String) {
+    let (dir, store) = store().await;
+    let ctx = admin();
+    let host = Context::new("tenant", "host", Role::Host).unwrap();
+    let authority = trusted_authority(&format!("{key}-run"), "redaction source");
+    store_trace_authority(&store, &host, &authority)
+        .await
+        .unwrap();
+    let run = E16SourceRef {
+        kind: "run".into(),
+        id: authority.record.id.clone(),
+        digest: fingerprint(&serde_json::to_value(&authority).unwrap()).unwrap(),
+    };
+    bump(&store, &ctx, &format!("{key}-watermark")).await;
+    let staged = direct_stage(
+        &store,
+        &ctx,
+        &format!("{key}-staged"),
+        "redacted_export_asset",
+        package_files(),
+        vec![run],
+    )
+    .await;
+    let attempt = direct_prepare(&store, &ctx, &format!("{key}-attempt"), &staged.id).await;
+    let queued = submit_unclaimed(
+        &store,
+        &ctx,
+        "export.complete",
+        complete_payload(&format!("{key}-complete"), &attempt.id),
+    )
+    .await;
+    if file_in_the_way {
+        let export_dir = store.local_export_directory(&ctx, &attempt.id).unwrap();
+        tokio::fs::create_dir_all(export_dir.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&export_dir, b"not a directory")
+            .await
+            .unwrap();
+    }
+
+    let mut cleanup = LifecycleStore::begin_revoke(
+        &ctx,
+        &store,
+        TypedObjectRef {
+            kind: "run".into(),
+            id: authority.record.id.clone(),
+        },
+        "source revoked",
+        500,
+    )
+    .await
+    .unwrap();
+    // One page covers the whole closure: a Failed cleanup must not stop before
+    // the private input has been reached.
+    for at in 501..2_500 {
+        if matches!(cleanup.state, CleanupState::Complete | CleanupState::Failed) {
+            break;
+        }
+        cleanup = LifecycleStore::cleanup_step(&ctx, &store, &cleanup.job_id, 64, at)
+            .await
+            .unwrap();
+    }
+    if file_in_the_way {
+        assert_eq!(cleanup.state, CleanupState::Failed, "{cleanup:?}");
+        assert!(
+            cleanup
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("invalid_local_export_directory")),
+            "{cleanup:?}"
+        );
+    } else {
+        assert_eq!(cleanup.state, CleanupState::Complete, "{cleanup:?}");
+    }
+    let mut session = store.session().await.unwrap();
+    let input: Value = session
+        .need(&ctx, "artifact", &queued.private_input_ref)
+        .await
+        .unwrap();
+    let edges = session
+        .dependency_edges(&ctx, "artifact", &queued.private_input_ref)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    assert_eq!(input["schema_version"], "rsia.redacted.v1");
+    assert_eq!(
+        edges,
+        [("artifact".to_owned(), attempt.id.clone())],
+        "the cleanup keeps the edge from the redacted input to its export id"
+    );
+
+    let mut seeded = queued;
+    seeded.state = ManagementJobState::Running;
+    seeded.step = "claimed".into();
+    seeded.generation = 1;
+    seeded.lease_token = Some(hash(b"dead-export-complete-lease"));
+    seeded.lease_until = 0;
+    let mut session = store.session().await.unwrap();
+    session
+        .put(&ctx, "job", &seeded.id, ctx.actor(), &seeded)
+        .await
+        .unwrap();
+    session.commit().await.unwrap();
+    (dir, store, seeded, attempt.id)
+}
+
+// An export id that names no attempt can never have published anything, so the
+// job fails with the worker's own code instead of holding the only dispatch
+// slot Draining for good.
+#[tokio::test]
+async fn export_complete_of_an_absent_export_id_fails_instead_of_draining() {
+    let (_dir, store) = store().await;
+    let ctx = admin();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![ctx.clone()]).unwrap();
+    let queued = dispatcher
+        .submit(
+            &ctx,
+            "export.complete",
+            complete_payload("absent-export", "e16-export-absent"),
+        )
+        .await
+        .unwrap();
+    let status = terminal_within(
+        &dispatcher,
+        &ctx,
+        queued.identity().id,
+        "export.complete of an absent export id",
+    )
+    .await;
+    assert_eq!(status.state, ManagementJobState::Failed, "{status:?}");
+    assert_eq!(status.step, "failed");
+    assert_eq!(status.error_code.as_deref(), Some("not_found"));
+    assert!(status.result.is_none());
+    assert_eq!(status.generation, 1, "one claim, no re-run");
+    store.close().await;
+}
+
+// A redacted input hides the export id but not its dependency edge. With no tree
+// at the formal directory the job left nothing behind: it fails as revoked.
+#[tokio::test]
+async fn redacted_export_complete_without_a_tree_fails_as_source_revoked() {
+    let (_dir, store, seeded, _export_id) = redacted_export_job("redacted-no-tree", false).await;
+    let ctx = admin();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![ctx.clone()]).unwrap();
+    assert_eq!(dispatcher.recover_pending().await.unwrap(), 1);
+    let failed = terminal_within(
+        &dispatcher,
+        &ctx,
+        &seeded.id,
+        "redacted export.complete without a tree",
+    )
+    .await;
+    assert_eq!(failed.state, ManagementJobState::Failed, "{failed:?}");
+    assert_eq!(failed.step, "private_input_redacted");
+    assert_eq!(failed.error_code.as_deref(), Some("source_revoked"));
+    assert!(failed.result.is_none());
+    assert_eq!(failed.generation, seeded.generation, "no new claim");
+    store.close().await;
+}
+
+// The same redaction, but the cleanup was blocked at the formal directory (a
+// plain file sits there) and left it: the job stays Draining and names the
+// operator action, and the dispatcher deletes nothing. While it waits it holds
+// the only dispatch slot, yet a closure operation is still claimed. Once the
+// operator has moved the file away the job fails.
+#[tokio::test]
+async fn redacted_export_complete_with_a_tree_waits_for_the_operator_then_fails() {
+    let (_dir, store, seeded, export_id) = redacted_export_job("redacted-tree", true).await;
+    let ctx = admin();
+    let export_dir = store.local_export_directory(&ctx, &export_id).unwrap();
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![ctx.clone()]).unwrap();
+    assert_eq!(dispatcher.recover_pending().await.unwrap(), 1);
+    let draining = wait_state(&dispatcher, &ctx, &seeded.id, ManagementJobState::Draining).await;
+    assert_eq!(
+        draining.step, "export_tree_unverified_operator_action",
+        "PARENT-EXPECTED-FAILURE: a Draining job must tell the operator what to do"
+    );
+    assert!(export_dir.is_file(), "nothing is deleted");
+
+    // Listing open calls derives no new work, so it is claimed although the
+    // Draining job holds the only slot (AG-207). The listing needs an
+    // authorized root for its billing scope.
+    store
+        .authorize_root_budget(
+            &ctx,
+            &RootBudgetAuthorization {
+                root_budget_id: "draining-root".into(),
+                billing_scope: "draining-scope".into(),
+                allowed_namespaces: vec!["tenant".into()],
+                currency: "USD".into(),
+                pricing_version: "price-v1".into(),
+                payment_subject: "fixture-only".into(),
+                authorization_receipt_digest: hash(b"draining-root-authorization"),
+                per_call_cap_micros: 20,
+                total_limit_micros: 1000,
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let listed = done(
+        &dispatcher,
+        &ctx,
+        "budget.calls.list_open",
+        json!({
+            "schema_version": "rsia.management.budget_calls_list_open.v1",
+            "request_key": "draining-list-open",
+            "billing_scope": "draining-scope",
+        }),
+    )
+    .await;
+    assert_eq!(listed.state, ManagementJobState::Succeeded, "{listed:?}");
+    let held = dispatcher.status_view(&ctx, &seeded.id).await.unwrap();
+    assert_eq!(
+        held.state,
+        ManagementJobState::Draining,
+        "the closure job ran while the export.complete still held the slot: {held:?}"
+    );
+
+    tokio::fs::remove_file(&export_dir).await.unwrap();
+    let restarted = ManagementDispatcher::new(store.clone(), vec![ctx.clone()]).unwrap();
+    assert_eq!(restarted.recover_pending().await.unwrap(), 1);
+    let failed = terminal_within(
+        &restarted,
+        &ctx,
+        &seeded.id,
+        "redacted export.complete after the tree was moved away",
+    )
+    .await;
+    assert_eq!(failed.state, ManagementJobState::Failed, "{failed:?}");
+    assert_eq!(failed.step, "private_input_redacted");
+    assert_eq!(failed.error_code.as_deref(), Some("source_revoked"));
+    store.close().await;
+}
+
+// Closing the stuck job frees the only dispatch slot: a non-closure job that was
+// kept Queued behind it is claimed and succeeds.
+#[tokio::test]
+async fn closing_a_running_export_complete_frees_the_dispatch_slot() {
+    let (_dir, store, seeded, _export_id) = redacted_export_job("slot-holder", false).await;
+    let ctx = admin();
+    let live = source(&store, &ctx, "slot-live-source").await;
+    bump(&store, &ctx, "slot-live-watermark").await;
+    let input = stage_input_bytes("slot_asset", &package_files(), &[live], None);
+    let digest = put_blob(&store, &ctx, &input).await;
+    let dispatcher = ManagementDispatcher::new(store.clone(), vec![ctx.clone()]).unwrap();
+    let waiting = dispatcher
+        .submit(&ctx, "asset.stage", stage_payload("slot-stage", &digest))
+        .await
+        .unwrap();
+    let waiting_id = waiting.identity().id.to_owned();
+    tokio::time::sleep(ManagementDispatcher::CAPACITY_WAIT_RETRY * 3).await;
+    let queued = dispatcher.status_view(&ctx, &waiting_id).await.unwrap();
+    assert_eq!(
+        queued.state,
+        ManagementJobState::Queued,
+        "the claimed export.complete holds the only slot: {queued:?}"
+    );
+    assert_eq!(queued.generation, 0);
+
+    dispatcher.recover_pending().await.unwrap();
+    let staged = terminal_within(
+        &dispatcher,
+        &ctx,
+        &waiting_id,
+        "asset.stage behind a claimed export.complete",
+    )
+    .await;
+    assert_eq!(staged.state, ManagementJobState::Succeeded, "{staged:?}");
+    let closed = dispatcher.status_view(&ctx, &seeded.id).await.unwrap();
+    assert_eq!(closed.state, ManagementJobState::Failed, "{closed:?}");
+    store.close().await;
 }
