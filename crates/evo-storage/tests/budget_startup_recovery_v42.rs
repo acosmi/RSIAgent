@@ -33,6 +33,11 @@
 //! uncertain and closes their executions, in every namespace (T6), after which a
 //! late settlement is refused and an Admin reconciles the call (T7).
 //!
+//! AG-209: the same step closes the execution of a call finalized without a response
+//! (reconciled before the restart) and leaves its state and amounts as they were; a
+//! finalized call with a response is left to `recover_settled_open_executions`
+//! (T6, T8).
+//!
 //! Real SQLite store and real budget APIs; no model, no provider, and the only
 //! money is the fixture charge of a settlement.
 
@@ -973,8 +978,9 @@ const RESTARTED: &str = "process_restarted";
 /// dispatched turns uncertain and every open execution of a dispatched or uncertain
 /// call is closed, in every namespace of the data directory (a root the service
 /// Admin is not a member of included). A close already recorded keeps its reason, an
-/// uncertain reason is kept, and finalized calls are not read. A second run writes
-/// nothing.
+/// uncertain reason is kept, a finalized call without a response has only its
+/// execution closed (AG-209), and one with a response is not read. A second run
+/// writes nothing.
 #[tokio::test]
 async fn t6_interrupted_dispatches_become_uncertain_with_their_executions_closed() {
     let (_dir, path, store) = database().await;
@@ -1028,6 +1034,7 @@ async fn t6_interrupted_dispatches_become_uncertain_with_their_executions_closed
         recovered,
         [
             key_of(&in_flight),
+            key_of(&unanswered),
             key_of(&dispatched_closed),
             key_of(&uncertain),
             key_of(&outside),
@@ -1046,8 +1053,8 @@ async fn t6_interrupted_dispatches_become_uncertain_with_their_executions_closed
         (&before["root_budget_events"], &after["root_budget_events"]);
     assert!(events_before.iter().all(|row| events_after.contains(row)));
     // Two events for each call that was dispatched with its execution open, one
-    // for each of the other two.
-    assert_eq!(events_after.len(), events_before.len() + 6);
+    // for each of the other three.
+    assert_eq!(events_after.len(), events_before.len() + 7);
 
     for (ctx, call) in [(admin(), &in_flight), (admin_of(NS_C), &outside)] {
         let mut expected = call.clone();
@@ -1101,7 +1108,18 @@ async fn t6_interrupted_dispatches_become_uncertain_with_their_executions_closed
         1
     );
     assert_eq!(call_of(&store, "scope-s", "call-s").await, settled);
-    assert_eq!(call_of(&store, "scope-f", "call-f").await, unanswered);
+    let mut expected = unanswered.clone();
+    expected.execution_closed = true;
+    expected.execution_closed_at = Some(70);
+    expected.execution_close_reason = Some(RESTARTED.into());
+    assert_eq!(call_of(&store, "scope-f", "call-f").await, expected);
+    assert_eq!(
+        events_of(&path, "call-f", "execution_closed").await,
+        [(
+            70,
+            json!({"dispatch_id": unanswered.dispatch_id, "reason": RESTARTED})
+        )]
+    );
     assert_eq!(
         (
             root_of(&store, "scope-d").await,
@@ -1176,4 +1194,78 @@ async fn t7_a_recovered_call_refuses_a_late_settlement_and_is_reconciled() {
     );
     assert!(execution_open(&store, "scope-a").await.is_empty());
     assert_eq!(begin(&store, &next, 14).await, Ok(true));
+}
+
+/// T8. A call reconciled before the restart is finalized without a response, with
+/// its execution open, and holds its root. The startup step closes its execution
+/// and changes nothing else: state, terminal reason, amounts and root stay, and no
+/// `usage_uncertain` event is written. A finalized call with a persisted response
+/// is not touched; the settled recovery closes it under its own reason, and lists
+/// nothing left open. A second run writes nothing.
+#[tokio::test]
+async fn t8_a_call_reconciled_before_the_restart_has_only_its_execution_closed() {
+    let (_dir, path, store) = database().await;
+    authorize(&store, "scope-r", &[NS_A, NS_B]).await;
+    authorize(&store, "scope-s", &[NS_A, NS_B]).await;
+    let reconciled =
+        finalized_without_response(&store, NS_A, "scope-r", "call-r", 10, Booked::Reconcile).await;
+    let settled = settled_open(&store, NS_B, "scope-s", "call-s", 20).await;
+    let root = root_of(&store, "scope-r").await;
+    let uncertain_events = events_of(&path, "call-r", "usage_uncertain").await;
+    let before = all_rows(&path).await;
+
+    let recovered = store.recover_interrupted_dispatches(30).await.unwrap();
+
+    assert_eq!(recovered, [key_of(&reconciled)]);
+    let mut expected = reconciled.clone();
+    expected.execution_closed = true;
+    expected.execution_closed_at = Some(30);
+    expected.execution_close_reason = Some(RESTARTED.into());
+    let closed = call_of(&store, "scope-r", "call-r").await;
+    assert_eq!(closed, expected);
+    assert_eq!(closed.state, BudgetCallState::Finalized);
+    assert_eq!(
+        events_of(&path, "call-r", "execution_closed").await,
+        [(
+            30,
+            json!({"dispatch_id": reconciled.dispatch_id, "reason": RESTARTED})
+        )]
+    );
+    assert_eq!(
+        events_of(&path, "call-r", "usage_uncertain").await,
+        uncertain_events
+    );
+    assert_only_closes_written(&before, &all_rows(&path).await, &[&reconciled]);
+    assert_eq!(root_of(&store, "scope-r").await, root);
+    assert!(execution_open(&store, "scope-r").await.is_empty());
+    assert_eq!(call_of(&store, "scope-s", "call-s").await, settled);
+
+    let before = all_rows(&path).await;
+    assert!(
+        store
+            .recover_interrupted_dispatches(40)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_nothing_written(&before, &all_rows(&path).await, "the second run");
+
+    let recovery = store
+        .recover_settled_open_executions(&admin(), 50)
+        .await
+        .unwrap();
+    assert_eq!(
+        recovery,
+        SettledOpenRecovery {
+            closed: vec![key_of(&settled)],
+            open_without_artifact: Vec::new(),
+        }
+    );
+    assert_eq!(
+        call_of(&store, "scope-s", "call-s")
+            .await
+            .execution_close_reason
+            .as_deref(),
+        Some(RECOVERED)
+    );
 }

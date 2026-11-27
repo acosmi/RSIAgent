@@ -1092,8 +1092,9 @@ pub struct SettledOpenRecovery {
     /// The finalized calls with a persisted response whose execution this run closed.
     pub closed: Vec<BudgetCallKey>,
     /// The finalized calls whose execution is open and that carry no persisted
-    /// response. Nothing shows that their execution ended, so they are left open
-    /// for an Admin to close or reconcile explicitly.
+    /// response, left open: no response shows that their execution ended. Under
+    /// `rsia serve` none is left, as `recover_interrupted_dispatches` closes them
+    /// first under the lock.
     pub open_without_artifact: Vec<BudgetCallKey>,
 }
 
@@ -2231,10 +2232,10 @@ impl Store {
     ///   real bill is cleared). A finalized call with an open execution always holds
     ///   its dispatch id: the dispatch writes it in the update that opens the execution.
     /// * a call that carries no response is listed in `open_without_artifact` and left
-    ///   open: nothing shows that its execution ended (plan §6.6: a status does not
-    ///   report as exited what may not have exited), so an Admin closes or reconciles
-    ///   it explicitly (E04: what is unknown is left to a manual reconciliation and
-    ///   nothing is feigned).
+    ///   open: no response shows that its execution ended (plan §6.6: a status does
+    ///   not report as exited what may not have exited). `rsia serve` closes such
+    ///   calls before this runs, through `recover_interrupted_dispatches`, whose lock
+    ///   is that evidence; a run without it leaves them to that step.
     ///
     /// Dispatched and uncertain calls are not read (plan §6.6: a dispatched call whose
     /// cost is unknown stays uncertain until it is reconciled), nor are closed calls,
@@ -2325,8 +2326,10 @@ impl Store {
     /// Every execution runs inside the process that holds the lock (plan §7.3.1), so
     /// holding it proves the previous process and its executions have ended. That is
     /// the exit evidence no other writer records: without it a crashed call stays
-    /// dispatched, or uncertain with its execution open, and its job drains forever,
-    /// because reconciliation books the cost but never closes the execution.
+    /// dispatched, or uncertain or reconciled without a response with its execution
+    /// open, and its job drains forever, because reconciliation books the cost but
+    /// never closes the execution. A reconciled call keeps its state and amounts; only
+    /// its execution is closed.
     ///
     /// It covers every namespace of the data directory (plan §6.1.1). It must never
     /// run while this process dispatches: it would close live executions.
@@ -2349,7 +2352,9 @@ impl Store {
                 "SELECT billing_scope,call_id,state,dispatch_id,execution_closed
                  FROM root_budget_calls
                  WHERE (state='dispatched'
-                     OR (state='uncertain' AND dispatch_id IS NOT NULL AND execution_closed=0))
+                     OR (state='uncertain' AND dispatch_id IS NOT NULL AND execution_closed=0)
+                     OR (state='finalized' AND dispatch_id IS NOT NULL AND execution_closed=0
+                       AND response_artifact_body IS NULL))
                    AND (? IS NULL OR billing_scope>? OR (billing_scope=? AND call_id>?))
                  ORDER BY billing_scope,call_id LIMIT ?",
             )
@@ -2383,7 +2388,8 @@ impl Store {
                 // SQLite evaluates every assignment against the old row, so the
                 // CASEs see the state and close flag the page read.
                 sqlx::query(
-                    "UPDATE root_budget_calls SET state='uncertain',
+                    "UPDATE root_budget_calls
+                       SET state=CASE WHEN state='dispatched' THEN 'uncertain' ELSE state END,
                        terminal_reason=CASE WHEN state='dispatched'
                          THEN COALESCE(terminal_reason,?) ELSE terminal_reason END,
                        execution_closed_at=CASE WHEN execution_closed=0

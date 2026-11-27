@@ -1075,7 +1075,25 @@ async fn uncertain_dispatched_retry_after_revoke_keeps_unknown_charge_and_no_rep
     assert_eq!(call.state, BudgetCallState::Uncertain);
     assert!(call.dispatch_id.is_some());
     assert!(call.response_artifact.is_none());
-    assert!(!call.execution_closed);
+    // AG-209: the returned transport future closed the execution; the charge stays
+    // unknown.
+    assert!(call.execution_closed);
+    assert_eq!(call.execution_closed_at, Some(20));
+    assert_eq!(
+        call.execution_close_reason.as_deref(),
+        Some("transport_returned_usage_unknown")
+    );
+    let events = &before["root_budget_events"];
+    let kind = column(events, "event_kind");
+    assert_eq!(
+        events["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row[kind] == json!("'execution_closed'"))
+            .count(),
+        1
+    );
     fixture.assert_accounting(20, 0).await;
 }
 
