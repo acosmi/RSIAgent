@@ -28,6 +28,11 @@
 //! * a root the Admin is not a member of is neither read nor listed, and only an
 //!   Admin runs the recovery (T5).
 //!
+//! AG-184: `Store::recover_interrupted_dispatches`, which `rsia serve` runs first
+//! under the data-directory lock, turns the dispatched calls a crashed process left
+//! uncertain and closes their executions, in every namespace (T6), after which a
+//! late settlement is refused and an Admin reconciles the call (T7).
+//!
 //! Real SQLite store and real budget APIs; no model, no provider, and the only
 //! money is the fixture charge of a settlement.
 
@@ -955,4 +960,220 @@ async fn t5_only_an_admin_recovers_and_only_the_roots_it_is_a_member_of() {
             open_without_artifact: vec![key_of(&outside_unanswered)],
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// T6-T7 (AG-184): the calls a crashed process left dispatched
+// ---------------------------------------------------------------------------
+
+/// The reason `Store::recover_interrupted_dispatches` records its changes with.
+const RESTARTED: &str = "process_restarted";
+
+/// T6. Holding the lock proves the previous process ended, so every call it left
+/// dispatched turns uncertain and every open execution of a dispatched or uncertain
+/// call is closed, in every namespace of the data directory (a root the service
+/// Admin is not a member of included). A close already recorded keeps its reason, an
+/// uncertain reason is kept, and finalized calls are not read. A second run writes
+/// nothing.
+#[tokio::test]
+async fn t6_interrupted_dispatches_become_uncertain_with_their_executions_closed() {
+    let (_dir, path, store) = database().await;
+    for scope in ["scope-d", "scope-f", "scope-k", "scope-s", "scope-u"] {
+        authorize(&store, scope, &[NS_A, NS_B]).await;
+    }
+    authorize(&store, "scope-x", &[NS_C]).await;
+    let in_flight = dispatched(&store, NS_B, "scope-d", "call-d", 10).await;
+    let outside = dispatched(&store, NS_C, "scope-x", "call-x", 20).await;
+    let dispatched_closed = dispatched(&store, NS_A, "scope-k", "call-k", 30).await;
+    let dispatched_closed = store
+        .close_budget_call_execution(
+            &host(NS_A),
+            "scope-k",
+            "call-k",
+            dispatched_closed.dispatch_id.as_deref().unwrap(),
+            "transport_completion_persisted",
+            30,
+        )
+        .await
+        .unwrap();
+    assert_eq!(dispatched_closed.state, BudgetCallState::Dispatched);
+    assert!(dispatched_closed.execution_closed);
+    let uncertain = dispatched(&store, NS_A, "scope-u", "call-u", 40).await;
+    let uncertain = store
+        .mark_budget_call_uncertain(
+            &host(NS_A),
+            &fence(&uncertain, 40),
+            "provider receipt pending",
+        )
+        .await
+        .unwrap();
+    assert!(!uncertain.execution_closed);
+    let settled = settled_open(&store, NS_B, "scope-s", "call-s", 50).await;
+    let unanswered =
+        finalized_without_response(&store, NS_A, "scope-f", "call-f", 60, Booked::Finalize).await;
+    let roots = (
+        root_of(&store, "scope-d").await,
+        store
+            .root_budget(&admin_of(NS_C), "scope-x")
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    let before = all_rows(&path).await;
+
+    let recovered = store.recover_interrupted_dispatches(70).await.unwrap();
+
+    let after = all_rows(&path).await;
+    assert_eq!(
+        recovered,
+        [
+            key_of(&in_flight),
+            key_of(&dispatched_closed),
+            key_of(&uncertain),
+            key_of(&outside),
+        ]
+    );
+    for table in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
+        if table != "root_budget_calls" && table != "root_budget_events" {
+            assert_eq!(
+                before.get(table),
+                after.get(table),
+                "recovery wrote {table}"
+            );
+        }
+    }
+    let (events_before, events_after) =
+        (&before["root_budget_events"], &after["root_budget_events"]);
+    assert!(events_before.iter().all(|row| events_after.contains(row)));
+    // Two events for each call that was dispatched with its execution open, one
+    // for each of the other two.
+    assert_eq!(events_after.len(), events_before.len() + 6);
+
+    for (ctx, call) in [(admin(), &in_flight), (admin_of(NS_C), &outside)] {
+        let mut expected = call.clone();
+        expected.state = BudgetCallState::Uncertain;
+        expected.terminal_reason = Some(RESTARTED.into());
+        expected.execution_closed = true;
+        expected.execution_closed_at = Some(70);
+        expected.execution_close_reason = Some(RESTARTED.into());
+        assert_eq!(
+            call_as(&store, &ctx, &call.billing_scope, &call.call_id).await,
+            expected
+        );
+        assert_eq!(
+            events_of(&path, &call.call_id, "usage_uncertain").await,
+            [(70, json!({"reason": RESTARTED}))]
+        );
+        assert_eq!(
+            events_of(&path, &call.call_id, "execution_closed").await,
+            [(
+                70,
+                json!({"dispatch_id": call.dispatch_id, "reason": RESTARTED})
+            )]
+        );
+    }
+    let mut expected = dispatched_closed.clone();
+    expected.state = BudgetCallState::Uncertain;
+    expected.terminal_reason = Some(RESTARTED.into());
+    assert_eq!(call_of(&store, "scope-k", "call-k").await, expected);
+    assert_eq!(
+        events_of(&path, "call-k", "execution_closed").await,
+        [(
+            30,
+            json!({
+                "dispatch_id": dispatched_closed.dispatch_id,
+                "reason": "transport_completion_persisted",
+            })
+        )]
+    );
+    assert_eq!(events_of(&path, "call-k", "usage_uncertain").await.len(), 1);
+    let mut expected = uncertain.clone();
+    expected.execution_closed = true;
+    expected.execution_closed_at = Some(70);
+    expected.execution_close_reason = Some(RESTARTED.into());
+    assert_eq!(call_of(&store, "scope-u", "call-u").await, expected);
+    assert_eq!(
+        events_of(&path, "call-u", "usage_uncertain").await,
+        [(40, json!({"reason": "provider receipt pending"}))]
+    );
+    assert_eq!(
+        events_of(&path, "call-u", "execution_closed").await.len(),
+        1
+    );
+    assert_eq!(call_of(&store, "scope-s", "call-s").await, settled);
+    assert_eq!(call_of(&store, "scope-f", "call-f").await, unanswered);
+    assert_eq!(
+        (
+            root_of(&store, "scope-d").await,
+            store
+                .root_budget(&admin_of(NS_C), "scope-x")
+                .await
+                .unwrap()
+                .unwrap(),
+        ),
+        roots,
+        "the amounts of a root changed"
+    );
+
+    let before = all_rows(&path).await;
+    assert!(
+        store
+            .recover_interrupted_dispatches(80)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_nothing_written(&before, &all_rows(&path).await, "the second run");
+    let invalid = store.recover_interrupted_dispatches(-1).await;
+    assert!(matches!(invalid, Err(Error::Invalid(_))), "{invalid:?}");
+}
+
+/// T7. A broker of the crashed process that settles late, inside its lease, is
+/// refused: its call is no longer dispatched. An Admin reconciles the uncertain
+/// call from the bill, which finalizes it with its execution already closed, and
+/// its root dispatches again.
+#[tokio::test]
+async fn t7_a_recovered_call_refuses_a_late_settlement_and_is_reconciled() {
+    let (_dir, _path, store) = database().await;
+    authorize(&store, "scope-a", &[NS_A, NS_B]).await;
+    authorize(&store, "scope-b", &[NS_A, NS_B]).await;
+    let finalized = dispatched(&store, NS_A, "scope-a", "call-a", 10).await;
+    let settled = dispatched(&store, NS_B, "scope-b", "call-b", 10).await;
+    assert_eq!(
+        store.recover_interrupted_dispatches(11).await.unwrap(),
+        [key_of(&finalized), key_of(&settled)]
+    );
+    let late = store
+        .finalize_budget_call(&host(NS_A), &fence(&finalized, 12), &charge("call-a"))
+        .await;
+    assert!(
+        matches!(&late, Err(Error::Conflict(code)) if code == "finalize_requires_dispatched_call"),
+        "{late:?}"
+    );
+    let late = store
+        .settle_model_budget_call(
+            &host(NS_B),
+            &fence(&settled, 12),
+            &charge("call-b"),
+            &evidence("call-b"),
+        )
+        .await;
+    assert!(
+        matches!(&late, Err(Error::Conflict(code))
+            if code == "model settlement requires dispatched call"),
+        "{late:?}"
+    );
+    let next = reserve(&store, NS_A, "scope-a", "next-a", 13).await;
+    let reconciled = store
+        .reconcile_budget_call_cost(&admin(), "scope-a", "call-a", &charge("call-a"), 13)
+        .await
+        .unwrap();
+    assert_eq!(reconciled.state, BudgetCallState::Finalized);
+    assert_eq!(reconciled.actual_cost_micros, Some(9));
+    assert_eq!(
+        reconciled.execution_close_reason.as_deref(),
+        Some(RESTARTED)
+    );
+    assert!(execution_open(&store, "scope-a").await.is_empty());
+    assert_eq!(begin(&store, &next, 14).await, Ok(true));
 }
