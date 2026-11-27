@@ -342,11 +342,14 @@ impl Fixture {
         body
     }
 
-    /// The direct dependents of one object.
+    /// The direct dependents of one object among the business objects. The
+    /// private input of a management job depends on whatever its job reads;
+    /// those rows are left out.
     pub async fn dependents(&self, kind: &str, id: &str) -> Vec<(String, String)> {
         let mut session = self.store.session().await.unwrap();
         let mut dependents = session.dependents(&self.admin, kind, id).await.unwrap();
         session.commit().await.unwrap();
+        dependents.retain(|(_, source)| !source.starts_with("management-"));
         dependents.sort();
         dependents
     }
