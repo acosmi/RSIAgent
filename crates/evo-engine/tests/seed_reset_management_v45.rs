@@ -839,3 +839,54 @@ async fn a_staged_reset_is_closed_by_asset_abort_and_by_nothing_else() {
     assert_eq!(after["files"], before["files"]);
     fixture.store.close().await;
 }
+
+fn sorted_keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The result and the committed effect carry identifiers and digests only:
+/// the install id, the staged asset id and B's digest. The run, the
+/// environment label, the compiler version, the content, a path and any fee
+/// field are not part of what a caller gets back.
+#[tokio::test]
+async fn seed_reset_stage_result_and_effect_expose_identifiers_only() {
+    let fixture = Fixture::new().await;
+    let install_id = fixture.install_id.clone();
+    let status = fixture
+        .run_job(
+            "seed.reset_stage",
+            reset_payload("exposed", &install_id, RUN_ID),
+        )
+        .await;
+    assert_eq!(status["state"], json!("succeeded"), "{status}");
+    let result = &status["result"];
+    assert_eq!(
+        sorted_keys(result),
+        ["baseline_digest", "install_id", "result", "staged_asset_id"]
+    );
+    let effects = status["committed_side_effects"].as_array().unwrap();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(
+        sorted_keys(&effects[0]),
+        ["baseline_digest", "install_id", "kind", "staged_asset_id"]
+    );
+    let exposed = json!([result, effects]).to_string();
+    assert!(!exposed.contains(RUN_ID), "{exposed}");
+    assert!(
+        !exposed.contains(&fixture.run_environment_digest),
+        "the environment label is not returned"
+    );
+    assert!(!exposed.contains(COMPILER_VERSION), "{exposed}");
+    assert!(
+        !exposed.contains(std::str::from_utf8(BASELINE).unwrap()),
+        "no baseline content is returned"
+    );
+    fixture.store.close().await;
+}

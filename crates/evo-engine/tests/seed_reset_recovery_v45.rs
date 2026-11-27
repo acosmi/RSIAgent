@@ -274,7 +274,8 @@ async fn a_restarted_running_reset_fails_closed_without_draining() {
 /// the tombstone a source revocation leaves, so recovery must not need to
 /// read it: the seed short-circuit judges the job by its state and its bound
 /// result alone, proves no effect, and lands it on Cancelled. While the job
-/// drains, a closure job is still claimed and runs.
+/// drains, a closure job is still claimed and runs, and a new reset job,
+/// which is no closure operation, waits behind it.
 #[tokio::test]
 async fn a_cancelled_running_reset_leaves_draining_on_cancelled_with_nothing_staged() {
     let fixture = Fixture::new().await;
@@ -323,6 +324,18 @@ async fn a_cancelled_running_reset_leaves_draining_on_cancelled_with_nothing_sta
         "the draining job holds the only dispatch slot"
     );
 
+    // A reset is not a closure operation: it derives a new object, so it is
+    // not on the claim exemption list and a new reset job waits behind the
+    // draining one.
+    let behind = fixture
+        .submit(
+            "seed.reset_stage",
+            reset_payload("behind-the-drain", &install_id, RUN_ID),
+        )
+        .await
+        .unwrap();
+    let behind_id = behind.identity().id;
+
     // A closure job is claimed and runs while the slot is held.
     let closed = fixture
         .run_job(
@@ -336,6 +349,37 @@ async fn a_cancelled_running_reset_leaves_draining_on_cancelled_with_nothing_sta
         .await;
     assert_eq!(closed["state"], json!("succeeded"), "{closed}");
     assert_eq!(closed["result"]["state"], json!("aborted"));
+    // The claim of the waiting reset is retried every 200 ms; three retries
+    // later it is still Queued and has staged nothing.
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    assert_eq!(
+        fixture
+            .dispatcher
+            .status(&fixture.admin, &behind_id)
+            .await
+            .unwrap()
+            .identity()
+            .state,
+        ManagementJobState::Queued,
+        "a reset job is not claimed while a draining job holds the slot"
+    );
+    assert_eq!(
+        fixture
+            .get("artifact", &staged_id("behind-the-drain"))
+            .await,
+        None
+    );
+    // It must not run once the slot is free again: the control cancels it.
+    let cancelled = fixture
+        .dispatcher
+        .cancel(&fixture.admin, &behind_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        cancelled.identity().state,
+        ManagementJobState::Cancelled,
+        "{cancelled:?}"
+    );
     assert_eq!(
         fixture
             .dispatcher
