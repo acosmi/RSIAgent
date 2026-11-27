@@ -518,7 +518,7 @@ async fn seed_reset_stage_refuses_an_install_of_another_owner() {
         .await
         .unwrap();
     let status = fixture
-        .terminal_for(&dispatcher, &other, &queued.identity().id)
+        .terminal_for(&dispatcher, &other, queued.identity().id)
         .await;
     assert_eq!(status["state"], json!("failed"), "{status}");
     assert_eq!(status["error_code"], json!("conflict"));
