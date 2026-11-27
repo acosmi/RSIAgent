@@ -252,7 +252,7 @@ impl Fixture {
         let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
         Self {
             dispatcher,
-            run_environment_digest: snapshot.environment_digest,
+            run_environment_digest: snapshot.environment_digest.clone(),
             install_environment_digest: installed.install.payload.environment_digest,
             baseline_blob_digest: installed.install.payload.baseline_blob_digest,
             baseline_digest: installed.install.payload.baseline_digest,
@@ -414,17 +414,19 @@ print(json.dumps(rows))
 
     /// The audit chain as (operation, entity) pairs, in order.
     pub fn audit(&self) -> Vec<(String, String)> {
-        self.sqlite(
-            r#"
+        let rows: Value = self
+            .sqlite(
+                r#"
 import json, sqlite3, sys
 c = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
 rows = [list(r) for r in c.execute("SELECT json_extract(payload,'$.operation'),json_extract(payload,'$.entity') FROM audit WHERE namespace=? ORDER BY seq", (sys.argv[2],))]
 print(json.dumps(rows))
 "#,
-            NS,
-        )
-        .parse()
-        .unwrap()
+                NS,
+            )
+            .parse()
+            .unwrap();
+        serde_json::from_value(rows).unwrap()
     }
 
     /// The audit records that are not the management job lifecycle.
