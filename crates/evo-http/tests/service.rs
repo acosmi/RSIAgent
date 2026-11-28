@@ -2383,7 +2383,7 @@ async fn authenticated_management_submit_preserves_three_exact_fixed_codes() {
         ("evo_prepare", "unknown_management_operation"),
         ("release.rollback", "management_operation_plane_mismatch"),
         ("restore", "management_operation_plane_mismatch"),
-        ("source.revoke", "management_operation_not_wired"),
+        ("consolidation.run", "management_operation_not_wired"),
         (
             "development.probe_compose.enable",
             "management_operation_not_wired",

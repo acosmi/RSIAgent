@@ -512,6 +512,43 @@ pub enum ManagementResultV2 {
     AssetExport(ManagementAssetExportResultV2),
     Monitoring(ManagementMonitoringResultV2),
     Seed(ManagementSeedResultV2),
+    Revocation(ManagementRevocationResultV2),
+}
+
+/// Closed management results of the revocation operations (§11.3, E08). They
+/// carry the committed revocation identity and the cleanup kernel's counters
+/// and state: never the revocation reason, a watermark digest, the cleanup's
+/// diagnostic text or a claim of physical erasure.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
+pub enum ManagementRevocationResultV2 {
+    SourceRevoked {
+        source_kind: ManagementRevocationSourceKind,
+        source_id: String,
+        cleanup_job_id: String,
+        watermark_seq: u64,
+        cleanup_state: lifecycle::CleanupState,
+    },
+    /// One committed cleanup page; `cleanup_state` says whether the cleanup
+    /// is still pending, complete or failed.
+    CleanupContinued {
+        cleanup_job_id: String,
+        source_kind: ManagementRevocationSourceKind,
+        source_id: String,
+        watermark_seq: u64,
+        cleanup_state: lifecycle::CleanupState,
+        processed_nodes: u64,
+        pending_nodes: u64,
+    },
+}
+
+/// The two registered revocable source kinds (§11.3.1): a trusted run or a
+/// strict E16 `import_source` artifact, named by their physical object kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementRevocationSourceKind {
+    Run,
+    Artifact,
 }
 
 /// Closed management results of the seed operations. `seed.install` reports
@@ -1204,6 +1241,28 @@ fn monitoring_result_binding_is_valid(job: &ManagementJobV2) -> bool {
     }
 }
 
+fn revocation_result_binding_is_valid(job: &ManagementJobV2) -> bool {
+    match job.result.as_ref() {
+        Some(ManagementResultV2::Revocation(ManagementRevocationResultV2::SourceRevoked {
+            source_id,
+            cleanup_job_id,
+            ..
+        })) => {
+            job.operation == "source.revoke" && !source_id.is_empty() && !cleanup_job_id.is_empty()
+        }
+        Some(ManagementResultV2::Revocation(ManagementRevocationResultV2::CleanupContinued {
+            cleanup_job_id,
+            source_id,
+            ..
+        })) => {
+            job.operation == "cleanup.continue"
+                && !source_id.is_empty()
+                && !cleanup_job_id.is_empty()
+        }
+        _ => true,
+    }
+}
+
 fn storage_sha256_is_valid(value: &str) -> bool {
     value.len() == 64
         && value
@@ -1279,6 +1338,7 @@ fn management_job_from_value(value: Value) -> Result<VersionedManagementJob> {
                 || !monitoring_result_binding_is_valid(&job)
                 || !seed_install_result_binding_is_valid(&job)
                 || !budget_result_binding_is_valid(&job)
+                || !revocation_result_binding_is_valid(&job)
             {
                 return Err(invalid_shape());
             }

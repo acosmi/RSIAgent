@@ -962,11 +962,27 @@ impl LifecycleStore {
         reason: &str,
         now: i64,
     ) -> Result<CleanupStatus> {
+        let mut session = store.session().await?;
+        let status = Self::begin_revoke_in_session(ctx, &mut session, source, reason, now).await?;
+        session.commit().await?;
+        Ok(status)
+    }
+
+    /// `begin_revoke` inside the caller's transaction: the watermark, the
+    /// tombstone, the pending cleanup row, its three frontier rows and the
+    /// `logical_block_committed` event are written to `session` and commit or
+    /// roll back with it. Every refusal returns before the first write.
+    pub async fn begin_revoke_in_session(
+        ctx: &Context,
+        session: &mut crate::Session,
+        source: TypedObjectRef,
+        reason: &str,
+        now: i64,
+    ) -> Result<CleanupStatus> {
         ctx.require(&[Role::Admin])?;
         validate_source(&source)?;
         evo_core::text(reason, "revoke reason", 512)?;
         valid_time(now)?;
-        let mut session = store.session().await?;
         let existing_source = session.object_row(ctx, &source.kind, &source.id).await?;
         let existing_tombstone = session
             .object_row(ctx, "tombstone", &source.id)
@@ -1017,7 +1033,6 @@ impl LifecycleStore {
                 tombstone.watermark_seq,
             )
             .await?;
-            session.commit().await?;
             return status.ok_or(Error::Internal);
         }
         if source.kind == "artifact" {
@@ -1112,16 +1127,35 @@ impl LifecycleStore {
             json!({"watermark_seq":watermark_seq,"watermark_digest":watermark_digest}),
         )
         .await?;
-        let status = load_status(&mut session.tx, ctx.namespace(), &job_id)
+        load_status(&mut session.tx, ctx.namespace(), &job_id)
             .await?
-            .ok_or(Error::Internal)?;
-        session.commit().await?;
-        Ok(status)
+            .ok_or(Error::Internal)
     }
 
     pub async fn cleanup_step(
         ctx: &Context,
         store: &Store,
+        job_id: &str,
+        edge_page_limit: usize,
+        now: i64,
+    ) -> Result<CleanupStatus> {
+        let mut session = store.registered_blob_write_session().await?;
+        let status =
+            Self::cleanup_step_in_session(ctx, store, &mut session, job_id, edge_page_limit, now)
+                .await?;
+        session.commit().await?;
+        Ok(status)
+    }
+
+    /// One `cleanup_step` page inside the caller's transaction. The session
+    /// must already hold the blob write lock
+    /// (`Store::registered_blob_write_session`): a page deletes local export
+    /// directories and blobs together with its rows. A page that classifies an
+    /// unknown scope marks the job `failed` and still returns `Ok`.
+    pub async fn cleanup_step_in_session(
+        ctx: &Context,
+        store: &Store,
+        session: &mut crate::Session,
         job_id: &str,
         edge_page_limit: usize,
         now: i64,
@@ -1134,18 +1168,19 @@ impl LifecycleStore {
                 "edge page limit must be 1..={MAX_CLEANUP_EDGE_PAGE}"
             )));
         }
-        let _blob_guard = store.blob_lock.write().await;
-        let mut tx = store.pool.begin().await.map_err(internal)?;
-        let status = load_status(&mut tx, ctx.namespace(), job_id)
+        if session.blob_write.is_none() {
+            return Err(Error::Internal);
+        }
+        let tx = &mut session.tx;
+        let status = load_status(tx, ctx.namespace(), job_id)
             .await?
             .ok_or(Error::NotFound)?;
         if status.state == CleanupState::Complete {
-            tx.commit().await.map_err(internal)?;
             return Ok(status);
         }
-        ensure_logical_block(&mut tx, ctx, &status).await?;
+        ensure_logical_block(tx, ctx, &status).await?;
         if status.state == CleanupState::Failed && ctx.role() == Role::Admin {
-            prepare_failed_cleanup_retry(&mut tx, ctx, &status, now).await?;
+            prepare_failed_cleanup_retry(tx, ctx, &status, now).await?;
         }
         sqlx::query(
             "UPDATE revoke_cleanup_jobs SET state='running',updated_at=?
@@ -1154,7 +1189,7 @@ impl LifecycleStore {
         .bind(now)
         .bind(ctx.namespace())
         .bind(job_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await
         .map_err(internal)?;
         for _ in 0..edge_page_limit.min(128) {
@@ -1165,12 +1200,12 @@ impl LifecycleStore {
             )
             .bind(ctx.namespace())
             .bind(job_id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(&mut **tx)
             .await
             .map_err(internal)?;
             let Some(frontier) = frontier else { break };
             expand_frontier(
-                &mut tx,
+                tx,
                 store,
                 ctx,
                 job_id,
@@ -1182,14 +1217,14 @@ impl LifecycleStore {
             .await?;
         }
         let formal_caught_up =
-            catch_up_old_formal_cleanup(&mut tx, ctx, job_id, edge_page_limit, now).await?;
+            catch_up_old_formal_cleanup(tx, ctx, job_id, edge_page_limit, now).await?;
         let pending: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM revoke_cleanup_frontier
              WHERE namespace=? AND job_id=? AND expanded=0 AND node_kind!='__formal_ticket_scan'",
         )
         .bind(ctx.namespace())
         .bind(job_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(internal)?;
         // An empty queue is not yet a closed closure. A node's dependents are read
@@ -1214,7 +1249,7 @@ impl LifecycleStore {
         // argument holds after a restart.
         if pending == 0
             && formal_caught_up
-            && !closure_is_open(&mut tx, ctx, job_id, &status.source, edge_page_limit, now).await?
+            && !closure_is_open(tx, ctx, job_id, &status.source, edge_page_limit, now).await?
         {
             let completed = sqlx::query(
                 "UPDATE revoke_cleanup_jobs SET state='complete',last_error=NULL,updated_at=?
@@ -1223,12 +1258,12 @@ impl LifecycleStore {
             .bind(now)
             .bind(ctx.namespace())
             .bind(job_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await
             .map_err(internal)?;
             if completed.rows_affected() == 1 {
                 insert_cleanup_event(
-                    &mut tx,
+                    tx,
                     ctx.namespace(),
                     job_id,
                     None,
@@ -1239,11 +1274,9 @@ impl LifecycleStore {
                 .await?;
             }
         }
-        let status = load_status(&mut tx, ctx.namespace(), job_id)
+        load_status(tx, ctx.namespace(), job_id)
             .await?
-            .ok_or(Error::Internal)?;
-        tx.commit().await.map_err(internal)?;
-        Ok(status)
+            .ok_or(Error::Internal)
     }
 
     pub async fn cleanup_status(
