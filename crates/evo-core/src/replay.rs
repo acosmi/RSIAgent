@@ -2189,7 +2189,8 @@ impl ReplayFailureKind {
             Error::Budget => Self::Budget,
             Error::Cancelled => Self::Cancelled,
             Error::ClockRegressed => Self::ClockRegressed,
-            Error::Internal => Self::Internal,
+            // Only Store::open refuses with it, before any replay runs.
+            Error::OccurrenceTimeColumnInvalid | Error::Internal => Self::Internal,
         }
     }
 }

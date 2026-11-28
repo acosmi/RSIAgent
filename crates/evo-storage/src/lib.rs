@@ -4,6 +4,7 @@ pub mod budget;
 pub mod capacity;
 pub mod dependency_read;
 pub mod lifecycle;
+pub mod occurrence;
 pub mod replay;
 pub mod revocation;
 pub mod typed_budget;
@@ -2931,6 +2932,21 @@ pub(crate) async fn upstream_rows_in_tx(
 impl Store {
     pub async fn open(path: &Path) -> Result<Self> {
         let root = local_data_directory(path);
+        // V110.d: an existing database is held against the clock before
+        // mkdir, staging cleanup or migration may write anything.
+        if path.try_exists().map_err(internal)? {
+            let mut conn = SqliteConnectOptions::new()
+                .filename(path)
+                .read_only(true)
+                .connect()
+                .await
+                .map_err(internal)?;
+            let floor = occurrence::occurrence_floor_millis(&mut conn).await;
+            sqlx::Connection::close(conn).await.map_err(internal)?;
+            if let Some(floor) = floor? {
+                evo_core::clock::admit_floor(floor)?;
+            }
+        }
         if !root.try_exists().map_err(internal)? {
             let mut directory = std::fs::DirBuilder::new();
             #[cfg(unix)]
@@ -2965,6 +2981,20 @@ impl Store {
         if let Err(error) = sqlx::migrate!("./migrations").run(&pool).await {
             pool.close().await;
             return Err(internal(error));
+        }
+        // Again after migration, which records its own installed_on. A refused
+        // floor closes the pool the same way before the caller sees the error.
+        let admitted = async {
+            let mut conn = pool.acquire().await.map_err(internal)?;
+            if let Some(floor) = occurrence::occurrence_floor_millis(&mut conn).await? {
+                evo_core::clock::admit_floor(floor)?;
+            }
+            Ok::<(), Error>(())
+        }
+        .await;
+        if let Err(error) = admitted {
+            pool.close().await;
+            return Err(error);
         }
         Ok(Self {
             pool,

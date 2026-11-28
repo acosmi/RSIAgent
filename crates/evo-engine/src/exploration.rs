@@ -2137,6 +2137,7 @@ fn verdict_for_gate_error(error: &Error) -> CandidateVerdict {
             CandidateVerdict::Rejected
         }
         Error::ClockRegressed
+        | Error::OccurrenceTimeColumnInvalid
         | Error::Budget
         | Error::Capacity(_)
         | Error::Cancelled

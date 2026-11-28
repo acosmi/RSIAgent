@@ -1608,11 +1608,16 @@ async fn role_witness_rejects_a_later_unrelated_broken_chain_instead_of_returnin
 async fn role_witness_rejects_hash_valid_malformed_private_audit_payloads() {
     let operation = content_operation("ns-a", "artifact", "host");
     let entity = content_entity("ns-a", "artifact", "host", &json!({"version":1}));
-    let malformed = vec![
+    // Rows without a valid registered `$.timestamp` refuse at open (AG-132).
+    let invalid_timestamp = [
         json!(["admin", "admin", operation, entity, 1]).to_string(),
+        json!({"actor":"admin","role":"admin","operation":operation,"entity":entity,"timestamp":-1}).to_string(),
+    ];
+    let malformed = vec![
+        invalid_timestamp[0].clone(),
         json!({"actor":"admin","role":"super_admin","operation":operation,"entity":entity,"timestamp":1}).to_string(),
         json!({"actor":"admin","role":"admin","operation":operation,"entity":42,"timestamp":1}).to_string(),
-        json!({"actor":"admin","role":"admin","operation":operation,"entity":entity,"timestamp":-1}).to_string(),
+        invalid_timestamp[1].clone(),
         json!({"actor":"bad actor","role":"admin","operation":operation,"entity":entity,"timestamp":1}).to_string(),
         json!({"actor":"admin","role":"admin","operation":operation,"entity":entity,"timestamp":1,"extra":true}).to_string(),
         format!("{{\"actor\":\"admin\",\"role\":\"admin\",\"role\":\"worker\",\"operation\":{},\"entity\":{},\"timestamp\":1}}",
@@ -1640,7 +1645,12 @@ async fn role_witness_rejects_hash_valid_malformed_private_audit_payloads() {
             .await
             .unwrap();
         connection.close().await.unwrap();
-        let store = Store::open(&dir.path().join("rsia.sqlite3")).await.unwrap();
+        let opened = Store::open(&dir.path().join("rsia.sqlite3")).await;
+        if invalid_timestamp.contains(&payload) {
+            assert!(matches!(opened, Err(Error::OccurrenceTimeColumnInvalid)));
+            continue;
+        }
+        let store = opened.unwrap();
         let mut session = store.session().await.unwrap();
         assert!(matches!(
             session

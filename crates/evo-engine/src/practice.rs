@@ -1077,6 +1077,7 @@ fn error_class(error: &Error) -> &'static str {
         Error::Budget => "budget",
         Error::Cancelled => "cancelled",
         Error::ClockRegressed => "clock_regressed",
+        Error::OccurrenceTimeColumnInvalid => "occurrence_time_column_invalid",
         Error::Internal => "internal",
     }
 }

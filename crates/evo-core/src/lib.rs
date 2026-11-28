@@ -43,6 +43,8 @@ pub enum Error {
     Cancelled,
     #[error("clock_regressed")]
     ClockRegressed,
+    #[error("occurrence_time_column_invalid")]
+    OccurrenceTimeColumnInvalid,
     #[error("internal storage or transport failure")]
     Internal,
 }
@@ -135,7 +137,7 @@ pub fn canonical_fingerprint<T: Serialize>(v: &T) -> Result<String> {
     fingerprint(&serde_json::to_value(v).map_err(|_| Error::Internal)?)
 }
 pub fn now() -> Result<i64> {
-    clock::unix_seconds_at(std::time::SystemTime::now())
+    Ok(clock::sample_millis()? / 1000)
 }
 pub trait Validate {
     fn validate(&self) -> Result<()>;
