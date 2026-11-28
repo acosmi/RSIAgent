@@ -343,6 +343,11 @@ async fn seed_install_uses_real_blob_and_catalog_identity() {
             );
             assert!(staged_asset_id.is_none());
         }
+        // `seed.install` never reports a staged reset: that is the result of
+        // `seed.reset_stage` alone.
+        ManagementSeedResultV2::SeedResetStaged { .. } => {
+            panic!("seed.install reported a staged reset")
+        }
     }
     let install: E16Envelope<SeedInstallPayloadV2> =
         PersistentSeedStore::read_install(&fixture.admin, &fixture.store, &install_id)

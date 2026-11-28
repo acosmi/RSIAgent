@@ -632,6 +632,39 @@ struct ReadSeedInstall {
     raw: serde_json::Value,
 }
 
+/// The Current install as the common material the read paths and the reset
+/// tail consume. Nothing is persisted: the identity, the three material
+/// digests and the environment label are the Current record's own values.
+fn current_as_v1(current: &E16Envelope<SeedInstallPayloadV2>) -> E16Envelope<SeedInstallPayloadV1> {
+    let p = &current.payload;
+    E16Envelope {
+        schema_version: current.schema_version.clone(),
+        id: current.id.clone(),
+        namespace: current.namespace.clone(),
+        owner_actor: current.owner_actor.clone(),
+        request_key: current.request_key.clone(),
+        input_digest: current.input_digest.clone(),
+        created_at: current.created_at,
+        updated_at: current.updated_at,
+        source_refs: current.source_refs.clone(),
+        revoke_watermark: current.revoke_watermark,
+        payload: SeedInstallPayloadV1 {
+            publisher: p.publisher.clone(),
+            asset_id: p.asset_id.clone(),
+            kind: p.kind.clone(),
+            baseline_blob_digest: p.baseline_blob_digest.clone(),
+            baseline_digest: p.baseline_digest.clone(),
+            local_blob_digest: p.local_blob_digest.clone(),
+            local_digest: p.local_digest.clone(),
+            upstream_blob_digest: p.upstream_blob_digest.clone(),
+            upstream_digest: p.upstream_digest.clone(),
+            environment_digest: p.environment_digest.clone(),
+            status: p.status,
+            quarantine_reason: p.quarantine_reason.clone(),
+        },
+    }
+}
+
 pub struct PersistentSeedStore;
 
 impl PersistentSeedStore {
@@ -1243,33 +1276,7 @@ impl PersistentSeedStore {
             _ => return Err(Error::Conflict("seed install is invalid".into())),
         };
         let envelope: E16Envelope<SeedInstallPayloadV1> = if let Some(current) = &current {
-            let p = &current.payload;
-            E16Envelope {
-                schema_version: current.schema_version.clone(),
-                id: current.id.clone(),
-                namespace: current.namespace.clone(),
-                owner_actor: current.owner_actor.clone(),
-                request_key: current.request_key.clone(),
-                input_digest: current.input_digest.clone(),
-                created_at: current.created_at,
-                updated_at: current.updated_at,
-                source_refs: current.source_refs.clone(),
-                revoke_watermark: current.revoke_watermark,
-                payload: SeedInstallPayloadV1 {
-                    publisher: p.publisher.clone(),
-                    asset_id: p.asset_id.clone(),
-                    kind: p.kind.clone(),
-                    baseline_blob_digest: p.baseline_blob_digest.clone(),
-                    baseline_digest: p.baseline_digest.clone(),
-                    local_blob_digest: p.local_blob_digest.clone(),
-                    local_digest: p.local_digest.clone(),
-                    upstream_blob_digest: p.upstream_blob_digest.clone(),
-                    upstream_digest: p.upstream_digest.clone(),
-                    environment_digest: p.environment_digest.clone(),
-                    status: p.status,
-                    quarantine_reason: p.quarantine_reason.clone(),
-                },
-            }
+            current_as_v1(current)
         } else {
             serde_json::from_value(raw.clone())
                 .map_err(|_| Error::Conflict("seed install is invalid".into()))?
@@ -1398,7 +1405,96 @@ impl PersistentSeedStore {
                 MAX_FILE as usize,
             )
             .await?;
-        if hash(&baseline) != install.payload.baseline_digest {
+        let mut session = store.session().await?;
+        let staged = Self::stage_reset_in_session(
+            ctx,
+            &mut session,
+            &install,
+            &fingerprint(&install_raw)?,
+            &baseline,
+            request_key,
+            compiler_version,
+        )
+        .await?;
+        session.commit().await?;
+        Ok(staged)
+    }
+
+    /// The in-transaction reset kernel of the `seed.reset_stage` management
+    /// handler. An administrator restoring the safe B must check the current
+    /// environment, the sources and the authorization (§11.1), so nothing of
+    /// the three is a parameter: the install is read in this session and must
+    /// be a Current record of the caller that is Installed and still a valid
+    /// image; the current environment is read from the live run the request
+    /// names, in this same session, and must equal the install's own
+    /// environment label. The caller owns the single registered write session
+    /// and commits it; `request_key` was checked at the entry.
+    pub(crate) async fn stage_reset_managed_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        install_id: &str,
+        request_key: &str,
+        run_id: &str,
+    ) -> Result<E16Envelope<StagedAssetPayload>> {
+        let raw: serde_json::Value = session.need(ctx, "artifact", install_id).await?;
+        match raw["schema_version"].as_str() {
+            Some(E16_CURRENT_SEED_INSTALL_SCHEMA) => {}
+            Some(E16_SEED_INSTALL_SCHEMA) => {
+                return Err(Error::Conflict("seed_install_legacy".into()));
+            }
+            _ => return Err(Error::Conflict("seed install is invalid".into())),
+        }
+        let install: E16Envelope<SeedInstallPayloadV2> = serde_json::from_value(raw.clone())
+            .map_err(|_| Error::Conflict("seed install is invalid".into()))?;
+        if install.owner_actor != ctx.actor() {
+            return Err(Error::Conflict("seed reset owner differs".into()));
+        }
+        Self::verify_installed_image_in_session(ctx, session, &install).await?;
+        let snapshot = crate::release_store::ReleaseStore::validate_run_snapshot_live_in_session(
+            ctx, session, run_id,
+        )
+        .await?;
+        if snapshot.expected_environment_digest()? != install.payload.environment_digest {
+            return Err(Error::Conflict("seed reset environment differs".into()));
+        }
+        let baseline = session
+            .reverify_blob_input(
+                ctx,
+                &install.payload.baseline_blob_digest,
+                MAX_FILE as usize,
+            )
+            .await?;
+        Self::stage_reset_in_session(
+            ctx,
+            session,
+            &current_as_v1(&install),
+            &fingerprint(&raw)?,
+            &baseline,
+            request_key,
+            &install.payload.compiler_version,
+        )
+        .await
+    }
+
+    /// The staging tail the public API and the management handler share; it
+    /// never commits. B is checked against the install and, for a builtin,
+    /// against the compiled-in catalog. The staged asset id, its source
+    /// closure (the install's sources and the install) and its input digest
+    /// are derived; the watermark and the sources are judged in the caller's
+    /// session. A replay of the request key's existing image returns that
+    /// image. Only a new staging is a new derivation, and it is admitted
+    /// against the instance-wide staging and Skill limits after the replay
+    /// branch and before the first write (§3.3.1, §3.3.2).
+    async fn stage_reset_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        install: &E16Envelope<SeedInstallPayloadV1>,
+        install_digest: &str,
+        baseline: &[u8],
+        request_key: &str,
+        compiler_version: &str,
+    ) -> Result<E16Envelope<StagedAssetPayload>> {
+        if hash(baseline) != install.payload.baseline_digest {
             return Err(Error::Conflict("seed baseline blob is corrupt".into()));
         }
         if install.payload.publisher == "rsia.builtin" {
@@ -1407,16 +1503,17 @@ impl PersistentSeedStore {
                 asset_id: install.payload.asset_id.clone(),
                 kind: install.payload.kind.clone(),
             })?;
-            if hash(&baseline) != entry.content_sha256 {
+            if hash(baseline) != entry.content_sha256 {
                 return Err(Error::Invalid("seed_catalog_mismatch".into()));
             }
         }
+        let environment_digest = install.payload.environment_digest.as_str();
         let id = e16_storage_id("staged-asset", ctx.namespace(), ctx.actor(), request_key)?;
         let mut sources = install.source_refs.clone();
         sources.push(E16SourceRef {
             kind: "artifact".into(),
             id: install.id.clone(),
-            digest: fingerprint(&install_raw)?,
+            digest: install_digest.into(),
         });
         let sources = canonical_sources(sources)?;
         let input_digest = fingerprint(&(
@@ -1426,12 +1523,11 @@ impl PersistentSeedStore {
             compiler_version,
             install.payload.baseline_digest.as_str(),
         ))?;
-        let mut session = store.session().await?;
-        let watermark = current_watermark(&mut session, ctx).await?;
+        let watermark = current_watermark(session, ctx).await?;
         if watermark != install.revoke_watermark {
             return Err(Error::Conflict("seed install watermark advanced".into()));
         }
-        verify_sources(&mut session, ctx, &sources).await?;
+        verify_sources(session, ctx, &sources).await?;
         if let Some(existing) = session
             .get::<E16Envelope<StagedAssetPayload>>(ctx, "artifact", &id)
             .await?
@@ -1448,10 +1544,18 @@ impl PersistentSeedStore {
             {
                 return Err(Error::Conflict("seed reset request key changed".into()));
             }
-            verify_sources(&mut session, ctx, &existing.source_refs).await?;
-            session.commit().await?;
+            verify_sources(session, ctx, &existing.source_refs).await?;
             return Ok(existing);
         }
+        session
+            .admit_capacity(&[
+                (evo_core::capacity::CapacityItem::StagingPackage, 1),
+                (
+                    evo_core::capacity::CapacityItem::Skill,
+                    u64::from(install.payload.kind == "skill"),
+                ),
+            ])
+            .await?;
         let timestamp = now()?;
         let envelope = E16Envelope {
             schema_version: E16_STAGED_ASSET_SCHEMA.into(),
@@ -1483,14 +1587,13 @@ impl PersistentSeedStore {
                 candidate_ref: None,
             },
         };
-        put_envelope(&mut session, ctx, &envelope).await?;
+        put_envelope(session, ctx, &envelope).await?;
         session
             .put_edge(ctx, "artifact", &envelope.id, "artifact", &install.id)
             .await?;
         session
             .audit(ctx, "e16.seed_reset.stage", &envelope.id)
             .await?;
-        session.commit().await?;
         Ok(envelope)
     }
 }

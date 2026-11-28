@@ -913,10 +913,12 @@ async fn management_seed_replay_preserves_original_baseline_and_local_bytes() {
 }
 
 // =========================================================================
-// AG-166c: a legacy read confers no Current authority and no management reset.
+// AG-166c: a legacy read confers no Current authority. The management
+// refusal of a legacy install is asserted by the `seed.reset_stage` controls
+// in `seed_reset_management_v45.rs` (AG-166c-reset).
 // =========================================================================
 #[tokio::test]
-async fn management_legacy_install_read_does_not_authorize_new_reset() {
+async fn legacy_install_read_confers_no_current_authority() {
     let (_directory, store, admin, sources) = seed_store().await;
     let baseline = b"legacy baseline";
     let local = b"legacy local";
@@ -974,43 +976,13 @@ async fn management_legacy_install_read_does_not_authorize_new_reset() {
         PersistentSeedStore::read_install(&admin, &store, &envelope.id).await,
         Err(Error::Conflict(message)) if message == "seed_install_legacy"
     ));
-    // The management reset stays unwired: a legacy read cannot mint a reset
-    // job, and the stored record is untouched.
-    let dispatcher = ManagementDispatcher::new(store.clone(), vec![admin.clone()]).unwrap();
-    let error = dispatcher
-        .submit(
-            &admin,
-            "seed.reset_stage",
-            serde_json::json!({
-                "schema_version": "rsia.management.seed_reset_stage.v1",
-                "request_key": "legacy-reset",
-                "install_id": envelope.id,
-            }),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&error, Error::Invalid(message) if message == "management_operation_not_wired"),
-        "{error:?}"
-    );
+    // The two reads leave the stored record untouched.
     let mut session = store.session().await.unwrap();
     let body: serde_json::Value = session
         .need(&admin, "artifact", &envelope.id)
         .await
         .unwrap();
-    let jobs: Vec<serde_json::Value> = session.list(&admin, "job").await.unwrap();
-    let staged: Vec<serde_json::Value> = session.list(&admin, "artifact").await.unwrap();
     session.commit().await.unwrap();
     assert_eq!(body, serde_json::to_value(&envelope).unwrap());
-    assert!(jobs.is_empty());
-    let seed_artifacts = staged
-        .iter()
-        .filter(|body| {
-            body["schema_version"]
-                .as_str()
-                .is_some_and(|schema| schema.starts_with("rsia.e16.seed"))
-        })
-        .count();
-    assert_eq!(seed_artifacts, 1, "only the legacy install artifact");
     store.close().await;
 }
