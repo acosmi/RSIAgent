@@ -548,8 +548,9 @@ pub enum ManagementSeedClassification {
 
 /// Closed management results of the monitoring operations. A result carries
 /// only the committed monitoring identifiers (the drift and its two
-/// environments/scope); never the diagnostic reason text, an environment
-/// snapshot, a source or a physical path.
+/// environments/scope, or the closed cycle and its claim) and fixed state
+/// codes; never the diagnostic reason text, an environment snapshot, a source
+/// or a physical path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "result", deny_unknown_fields)]
 pub enum ManagementMonitoringResultV2 {
@@ -559,6 +560,42 @@ pub enum ManagementMonitoringResultV2 {
         current_environment_id: String,
         invalidated_scope_id: String,
     },
+    ConsolidationTriggered {
+        cycle_id: String,
+        scope_id: String,
+        completed_cycles: u64,
+        trigger_state: ManagementConsolidationTriggerState,
+        claim_id: Option<String>,
+        claim_state: Option<ManagementConsolidationClaimState>,
+        /// Older generations the trigger wrote as terminal, ascending.
+        terminated_generations: Vec<u64>,
+    },
+}
+
+/// What a `consolidation.trigger` made of the newest complete generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementConsolidationTriggerState {
+    NotEligible,
+    Claimed,
+    AlreadyClaimed,
+}
+
+/// The reported claim's state, mirroring the engine's `ConsolidationClaimState`
+/// codes so a persisted result can only hold a known state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagementConsolidationClaimState {
+    Claimed,
+    NoContrast,
+    Running,
+    CompletedNoChange,
+    CompletedCandidate,
+    CompletedRejected,
+    CompletedUncertain,
+    CompletedRevoked,
+    BlockedBudget,
+    GenerationExpired,
 }
 
 /// Closed management results of the four budget operations. They carry only
@@ -1156,11 +1193,15 @@ fn asset_export_result_binding_is_valid(job: &ManagementJobV2) -> bool {
 }
 
 fn monitoring_result_binding_is_valid(job: &ManagementJobV2) -> bool {
-    let Some(ManagementResultV2::Monitoring(result)) = job.result.as_ref() else {
-        return true;
-    };
-    let ManagementMonitoringResultV2::EnvironmentDriftRecorded { .. } = result;
-    job.operation == "monitoring.drift.record"
+    match job.result.as_ref() {
+        Some(ManagementResultV2::Monitoring(
+            ManagementMonitoringResultV2::EnvironmentDriftRecorded { .. },
+        )) => job.operation == "monitoring.drift.record",
+        Some(ManagementResultV2::Monitoring(
+            ManagementMonitoringResultV2::ConsolidationTriggered { .. },
+        )) => job.operation == "consolidation.trigger",
+        _ => true,
+    }
 }
 
 fn storage_sha256_is_valid(value: &str) -> bool {

@@ -737,6 +737,9 @@ pub enum ConsolidationClaimState {
     CompletedUncertain,
     CompletedRevoked,
     BlockedBudget,
+    /// A generation with a contrast that never ran before a later generation was
+    /// claimed (plan L851): explicitly terminal, never dispatchable.
+    GenerationExpired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -758,6 +761,17 @@ pub enum ClaimOutcome {
     NotEligible { completed_cycles: usize },
     Claimed(ConsolidationClaim),
     AlreadyClaimed(ConsolidationClaim),
+}
+
+/// A claim attempt made inside a caller's Session, with what the management
+/// trigger reports beyond [`ClaimOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GenerationClaim {
+    pub(crate) outcome: ClaimOutcome,
+    pub(crate) completed_cycles: usize,
+    /// Older generations this attempt wrote as terminal (`no_contrast` or
+    /// `generation_expired`), ascending.
+    pub(crate) terminated_generations: Vec<u64>,
 }
 
 /// What the consolidation trigger made of a closed cycle; see
@@ -1187,9 +1201,23 @@ impl MonitoringCoordinator {
         store: &Store,
         request: CompleteDevelopmentCycleRequest,
     ) -> Result<DevelopmentCycleRecord> {
+        let mut session = store.session().await?;
+        let cycle = Self::close_development_cycle_in_session(ctx, &mut session, request).await?;
+        session.commit().await?;
+        Ok(cycle)
+    }
+
+    /// [`Self::close_development_cycle`] inside the caller's Session: every read
+    /// and write happens there and nothing is committed, so the management
+    /// trigger can close the cycle and claim in one transaction.
+    pub(crate) async fn close_development_cycle_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        request: CompleteDevelopmentCycleRequest,
+    ) -> Result<DevelopmentCycleRecord> {
         ctx.require(&[Role::Worker, Role::Admin])?;
         validate_cycle_request(&request)?;
-        let root = store
+        let root = session
             .root_budget(ctx, &request.billing_scope)
             .await?
             .ok_or(Error::Budget)?;
@@ -1198,18 +1226,17 @@ impl MonitoringCoordinator {
                 "development cycle root budget mismatch".into(),
             ));
         }
-        let mut session = store.session().await?;
-        require_watermark(&mut session, ctx, request.revoke_watermark).await?;
+        require_watermark(session, ctx, request.revoke_watermark).await?;
         let source_ids = canonical_strings(request.source_ids.clone(), "cycle source")?;
         if source_ids.is_empty() {
             return Err(Error::Invalid("completed cycle requires sources".into()));
         }
-        validate_stored_sources(&mut session, ctx, &source_ids, request.revoke_watermark).await?;
-        let sources = load_source_dependencies(&mut session, ctx, &source_ids).await?;
+        validate_stored_sources(session, ctx, &source_ids, request.revoke_watermark).await?;
+        let sources = load_source_dependencies(session, ctx, &source_ids).await?;
         let environment: LoadedEnvironment = session
             .need(ctx, ARTIFACT_KIND, &request.environment_id)
             .await?;
-        validate_environment_live(&mut session, ctx, &environment).await?;
+        validate_environment_live(session, ctx, &environment).await?;
         if environment.namespace != ctx.namespace()
             || environment.profile_id != request.profile_id
             || environment.development_manifest_digest != request.development_manifest_digest
@@ -1225,13 +1252,13 @@ impl MonitoringCoordinator {
             .need(ctx, ARTIFACT_KIND, &request.report_fact_id)
             .await?;
         fact.validate()?;
-        reject_consolidation_own_episode(&mut session, ctx, &fact.episode_id).await?;
+        reject_consolidation_own_episode(session, ctx, &fact.episode_id).await?;
         require_development_observed(ctx, &fact)?;
         let report: DevelopmentRunReport = serde_json::from_value(fact.payload.clone())
             .map_err(|_| Error::Invalid("development fact is not a strict report".into()))?;
         let evidence = CycleEvidence::declared_by(&report);
         validate_development_fact(
-            &mut session,
+            session,
             ctx,
             &fact,
             &source_ids,
@@ -1240,13 +1267,13 @@ impl MonitoringCoordinator {
         )
         .await?;
         validate_report_scope(&report, &request, &environment)?;
-        validate_report_receipts(&mut session, ctx, &fact, &report, evidence).await?;
+        validate_report_receipts(session, ctx, &fact, &report, evidence).await?;
         if evidence == CycleEvidence::Verified {
-            verify_trusted_development(&mut session, ctx, &fact, &report, &request, &environment)
+            verify_trusted_development(session, ctx, &fact, &report, &request, &environment)
                 .await?;
         }
         validate_cycle_cost_evidence(
-            &mut session,
+            session,
             ctx,
             &request.billing_scope,
             &fact.episode_id,
@@ -1295,9 +1322,7 @@ impl MonitoringCoordinator {
             .iter()
             .position(|id| id == &request.report_fact_id)
         {
-            let cycle = load_cycle(&mut session, ctx, &index.cycle_ids[position]).await?;
-            session.commit().await?;
-            return Ok(cycle);
+            return load_cycle(session, ctx, &index.cycle_ids[position]).await;
         }
         let ordinal = u64::try_from(index.cycle_ids.len())
             .map_err(|_| Error::Invalid("cycle ordinal overflow".into()))?
@@ -1342,8 +1367,8 @@ impl MonitoringCoordinator {
                 cycle_delta,
             )])
             .await?;
-        put_immutable(&mut session, ctx, &binding.id, &binding).await?;
-        put_immutable(&mut session, ctx, &cycle.id, &cycle).await?;
+        put_immutable(session, ctx, &binding.id, &binding).await?;
+        put_immutable(session, ctx, &cycle.id, &cycle).await?;
         // The binding names the report fact and cycle of a completed cycle; without
         // an edge revocation cleanup could never reach it.
         session
@@ -1383,7 +1408,6 @@ impl MonitoringCoordinator {
         session
             .audit(ctx, "monitoring.development_cycle.complete", &cycle.id)
             .await?;
-        session.commit().await?;
         Ok(cycle)
     }
 
@@ -1403,10 +1427,11 @@ impl MonitoringCoordinator {
     /// - a generation is two cycles (`completed cycles / 2`), so the first cycle is
     ///   `NotEligible`, the second `Claimed`, the third `AlreadyClaimed` and the
     ///   fourth claims generation two;
-    /// - only the newest complete generation is ever claimed. If four cycles are
-    ///   closed without a claim in between (through `close_development_cycle`
-    ///   alone, or while the trigger was `Unavailable`), generation one is skipped
-    ///   for good. Calling this for every cycle keeps each generation claimable;
+    /// - only the newest complete generation is claimed, and no generation is
+    ///   skipped silently (plan L851): the claim also writes every older
+    ///   generation that has no claim yet as terminal (`NoContrast` without a
+    ///   contrast, `GenerationExpired` with one) and expires an older `Claimed`
+    ///   one that never ran;
     /// - two concurrent calls for one generation produce exactly one `Claimed`.
     ///
     /// A trigger is not a run. `Claimed` only freezes the generation: the
@@ -1433,32 +1458,57 @@ impl MonitoringCoordinator {
         store: &Store,
         scope_id: &str,
     ) -> Result<ClaimOutcome> {
+        let mut session = store.session().await?;
+        let claimed = Self::claim_consolidation_in_session(ctx, &mut session, scope_id).await?;
+        session.commit().await?;
+        Ok(claimed.outcome)
+    }
+
+    /// [`Self::claim_consolidation`] inside the caller's Session, uncommitted.
+    ///
+    /// Claiming generation N also settles every older one (plan L851, V100.b: no
+    /// generation is skipped silently): a generation without a claim record is
+    /// written as terminal (`NoContrast` without a contrast, `GenerationExpired`
+    /// with one), and an older claim still `Claimed` (never run) is rewritten to
+    /// `GenerationExpired`. Running, blocked and completed claims are left alone.
+    /// All of it is validated before the first write and admitted against the
+    /// claim capacity at once. An `AlreadyClaimed` newest generation returns
+    /// before any of this.
+    pub(crate) async fn claim_consolidation_in_session(
+        ctx: &Context,
+        session: &mut Session,
+        scope_id: &str,
+    ) -> Result<GenerationClaim> {
         ctx.require(&[Role::Worker, Role::Admin])?;
         identifier(scope_id)?;
-        let mut session = store.session().await?;
         let mut index: ConsolidationScopeIndex = session.need(ctx, ARTIFACT_KIND, scope_id).await?;
         validate_scope_index(&index)?;
         if index.invalidated_by.is_some() {
             return Err(Error::Conflict("consolidation scope is invalidated".into()));
         }
-        require_watermark(&mut session, ctx, index.scope.revoke_watermark).await?;
-        let generation = u64::try_from(index.cycle_ids.len() / 2)
+        require_watermark(session, ctx, index.scope.revoke_watermark).await?;
+        let completed_cycles = index.cycle_ids.len();
+        let generation = u64::try_from(completed_cycles / 2)
             .map_err(|_| Error::Invalid("generation overflow".into()))?;
         if generation == 0 {
-            session.commit().await?;
-            return Ok(ClaimOutcome::NotEligible {
-                completed_cycles: index.cycle_ids.len(),
+            return Ok(GenerationClaim {
+                outcome: ClaimOutcome::NotEligible { completed_cycles },
+                completed_cycles,
+                terminated_generations: Vec::new(),
             });
         }
         if let Some(claim_id) = index.claim_ids.get(&generation) {
-            let claim = load_live_claim(&mut session, ctx, claim_id).await?;
-            session.commit().await?;
-            return Ok(ClaimOutcome::AlreadyClaimed(claim));
+            let claim = load_live_claim(session, ctx, claim_id).await?;
+            return Ok(GenerationClaim {
+                outcome: ClaimOutcome::AlreadyClaimed(claim),
+                completed_cycles,
+                terminated_generations: Vec::new(),
+            });
         }
         let environment: LoadedEnvironment = session
             .need(ctx, ARTIFACT_KIND, &index.scope.environment_id)
             .await?;
-        validate_environment_live(&mut session, ctx, &environment).await?;
+        validate_environment_live(session, ctx, &environment).await?;
         if environment.identity_digest != index.scope.environment_identity_digest
             || environment.environment_digest != index.scope.environment_digest
         {
@@ -1466,69 +1516,110 @@ impl MonitoringCoordinator {
                 "claim differs from current complete environment".into(),
             ));
         }
-        let start = usize::try_from((generation - 1) * 2)
-            .map_err(|_| Error::Invalid("generation overflow".into()))?;
-        let cycle_ids = index.cycle_ids[start..start + 2].to_vec();
-        let mut sources = BTreeSet::new();
-        let mut has_contrast = false;
-        for cycle_id in &cycle_ids {
-            let cycle = load_cycle(&mut session, ctx, cycle_id).await?;
-            if cycle.scope_id != scope_id {
-                return Err(Error::Conflict("cycle escaped consolidation scope".into()));
+        let mut created = Vec::new();
+        let mut expired = Vec::new();
+        for current in 1..=generation {
+            if let Some(claim_id) = index.claim_ids.get(&current) {
+                let mut claim = load_claim_record(session, ctx, claim_id).await?;
+                if claim.state == ConsolidationClaimState::Claimed {
+                    claim.state = ConsolidationClaimState::GenerationExpired;
+                    expired.push(claim);
+                }
+                continue;
             }
-            has_contrast |= cycle.has_contrast;
-            sources.extend(cycle.sources);
+            let start = usize::try_from((current - 1) * 2)
+                .map_err(|_| Error::Invalid("generation overflow".into()))?;
+            let cycle_ids = index.cycle_ids[start..start + 2].to_vec();
+            let mut sources = BTreeSet::new();
+            let mut has_contrast = false;
+            for cycle_id in &cycle_ids {
+                let cycle = load_cycle(session, ctx, cycle_id).await?;
+                if cycle.scope_id != scope_id {
+                    return Err(Error::Conflict("cycle escaped consolidation scope".into()));
+                }
+                has_contrast |= cycle.has_contrast;
+                sources.extend(cycle.sources);
+            }
+            let sources: Vec<_> = sources.into_iter().collect();
+            validate_source_dependency_identities(&sources)?;
+            let source_ids = sources
+                .iter()
+                .map(|source| source.id.clone())
+                .collect::<Vec<_>>();
+            validate_stored_sources(session, ctx, &source_ids, index.scope.revoke_watermark)
+                .await?;
+            let state = match (current == generation, has_contrast) {
+                (true, true) => ConsolidationClaimState::Claimed,
+                (false, true) => ConsolidationClaimState::GenerationExpired,
+                (_, false) => ConsolidationClaimState::NoContrast,
+            };
+            created.push(ConsolidationClaim {
+                id: format!(
+                    "{CLAIM_ID_PREFIX}{}",
+                    &fingerprint(&(scope_id, current))?[..32]
+                ),
+                schema_version: CONSOLIDATION_CLAIM_SCHEMA.into(),
+                scope_id: scope_id.into(),
+                generation: current,
+                cycle_ids,
+                sources,
+                revoke_watermark: index.scope.revoke_watermark,
+                state,
+                execution_input_digest: None,
+            });
         }
-        let sources: Vec<_> = sources.into_iter().collect();
-        validate_source_dependency_identities(&sources)?;
-        let source_ids = sources
-            .iter()
-            .map(|source| source.id.clone())
-            .collect::<Vec<_>>();
-        validate_stored_sources(&mut session, ctx, &source_ids, index.scope.revoke_watermark)
-            .await?;
-        let claim_id = format!(
-            "{CLAIM_ID_PREFIX}{}",
-            &fingerprint(&(scope_id, generation))?[..32]
-        );
-        let claim = ConsolidationClaim {
-            id: claim_id.clone(),
-            schema_version: CONSOLIDATION_CLAIM_SCHEMA.into(),
-            scope_id: scope_id.into(),
-            generation,
-            cycle_ids,
-            sources,
-            revoke_watermark: index.scope.revoke_watermark,
-            state: if has_contrast {
-                ConsolidationClaimState::Claimed
-            } else {
-                ConsolidationClaimState::NoContrast
-            },
-            execution_input_digest: None,
-        };
+        // Rewriting an older claim to its terminal state takes no new slot.
         session
-            .admit_capacity(&[(evo_core::capacity::CapacityItem::ConsolidationClaim, 1)])
+            .admit_capacity(&[(
+                evo_core::capacity::CapacityItem::ConsolidationClaim,
+                created.len() as u64,
+            )])
             .await?;
-        put_immutable(&mut session, ctx, &claim.id, &claim).await?;
-        for cycle_id in &claim.cycle_ids {
+        for claim in &created {
+            put_immutable(session, ctx, &claim.id, claim).await?;
+            for cycle_id in &claim.cycle_ids {
+                session
+                    .put_edge(ctx, ARTIFACT_KIND, &claim.id, ARTIFACT_KIND, cycle_id)
+                    .await?;
+            }
+            for source in &claim.sources {
+                session
+                    .put_edge(ctx, ARTIFACT_KIND, &claim.id, "run", &source.id)
+                    .await?;
+            }
+            index.claim_ids.insert(claim.generation, claim.id.clone());
+            let action = if claim.state == ConsolidationClaimState::GenerationExpired {
+                "monitoring.consolidation.expire"
+            } else {
+                "monitoring.consolidation.claim"
+            };
+            session.audit(ctx, action, &claim.id).await?;
+        }
+        for claim in &expired {
             session
-                .put_edge(ctx, ARTIFACT_KIND, &claim.id, ARTIFACT_KIND, cycle_id)
+                .put(ctx, ARTIFACT_KIND, &claim.id, ctx.actor(), claim)
+                .await?;
+            session
+                .audit(ctx, "monitoring.consolidation.expire", &claim.id)
                 .await?;
         }
-        for source in &claim.sources {
-            session
-                .put_edge(ctx, ARTIFACT_KIND, &claim.id, "run", &source.id)
-                .await?;
-        }
-        index.claim_ids.insert(generation, claim_id);
         session
             .put(ctx, ARTIFACT_KIND, scope_id, ctx.actor(), &index)
             .await?;
-        session
-            .audit(ctx, "monitoring.consolidation.claim", &claim.id)
-            .await?;
-        session.commit().await?;
-        Ok(ClaimOutcome::Claimed(claim))
+        let mut terminated_generations = created
+            .iter()
+            .chain(&expired)
+            .map(|claim| claim.generation)
+            .filter(|&terminated| terminated != generation)
+            .collect::<Vec<_>>();
+        terminated_generations.sort_unstable();
+        // The newest generation had no claim, so the loop created it last.
+        let newest = created.pop().ok_or(Error::Internal)?;
+        Ok(GenerationClaim {
+            outcome: ClaimOutcome::Claimed(newest),
+            completed_cycles,
+            terminated_generations,
+        })
     }
 
     pub async fn complete_no_contrast(
