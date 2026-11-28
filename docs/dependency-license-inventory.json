@@ -1,6 +1,6 @@
 {
   "inputs": {
-    "cargo_lock_sha256": "13df38fc85826bd279bac426ca5086eb99e1e9861d158f209359bff6d6e86435",
+    "cargo_lock_sha256": "bb76d88a50b5ae0dab16d1c6b434131e8f6aa086c9d6bcf61dbc6143812da80f",
     "manifests": {
       "Cargo.toml": "b509c760a653938dcb00fed78a4ead63c43aa7b6bd1537f4e6dd0fb3e5c45f61",
       "apps/rsia/Cargo.toml": "f7a01045b14b22b99d6f1b0d442013ff836392a159226613f8fa21674935bc46",
@@ -1226,22 +1226,22 @@
     {
       "bundled_license_texts": [
         {
-          "path": "form_urlencoded-1.2.2/LICENSE-APACHE",
+          "path": "form_urlencoded-1.2.3/LICENSE-APACHE",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
         },
         {
-          "path": "form_urlencoded-1.2.2/LICENSE-MIT",
+          "path": "form_urlencoded-1.2.3/LICENSE-MIT",
           "sha256": "20c7855c364d57ea4c97889a5e8d98470a9952dade37bd9248b9a54431670e5e"
         }
       ],
       "bundled_text_status": "present",
-      "checksum": "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf",
+      "checksum": "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e",
       "license": "MIT OR Apache-2.0",
       "license_file": null,
-      "metadata_sha256": "118b1d87e862ea329b8bc84b389085a2f8e049d4c0b8b3c38ac2bffbe3501928",
+      "metadata_sha256": "47a39fced5fea0239010d6cc5e65bdd6312ef348e029be8389e4be8a14b5ce99",
       "name": "form_urlencoded",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "1.2.2"
+      "version": "1.2.3"
     },
     {
       "bundled_license_texts": [
@@ -2922,42 +2922,42 @@
     {
       "bundled_license_texts": [
         {
-          "path": "quinn-proto-0.11.18/LICENSE-APACHE",
+          "path": "quinn-proto-0.11.19/LICENSE-APACHE",
           "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
         },
         {
-          "path": "quinn-proto-0.11.18/LICENSE-MIT",
+          "path": "quinn-proto-0.11.19/LICENSE-MIT",
           "sha256": "4b2d0aca6789fa39e03d6738e869ea0988cceba210ca34ebb59c15c463e93a04"
         }
       ],
       "bundled_text_status": "present",
-      "checksum": "a9746dbde176634f4f2f1faf2404e30a31b2bc1e9cafb5329c95d8177a18c9fc",
+      "checksum": "0e750cca55fe4f0439a15d0bb529da9651e79993e8e72c61a899a36d462befbe",
       "license": "MIT OR Apache-2.0",
       "license_file": null,
-      "metadata_sha256": "739f19627faef023b9c24932441d4e23b82b5786c8c57e37a1419d93189ef5c5",
+      "metadata_sha256": "95aaf88c74814dd46a53d07ca82c0ec90bcb7275c57a739336d287a7478feb58",
       "name": "quinn-proto",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.11.18"
+      "version": "0.11.19"
     },
     {
       "bundled_license_texts": [
         {
-          "path": "quinn-udp-0.5.15/LICENSE-APACHE",
+          "path": "quinn-udp-0.5.16/LICENSE-APACHE",
           "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
         },
         {
-          "path": "quinn-udp-0.5.15/LICENSE-MIT",
+          "path": "quinn-udp-0.5.16/LICENSE-MIT",
           "sha256": "4b2d0aca6789fa39e03d6738e869ea0988cceba210ca34ebb59c15c463e93a04"
         }
       ],
       "bundled_text_status": "present",
-      "checksum": "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694",
+      "checksum": "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016",
       "license": "MIT OR Apache-2.0",
       "license_file": null,
-      "metadata_sha256": "eec4b520d44d810c97b906f1a2dcb6118c0ca46b620803dcce78bd13f39ac2b6",
+      "metadata_sha256": "9d69f5f0c3781f22d1e4287ea1427875bea2a119ff0de668d982dd8ead87b967",
       "name": "quinn-udp",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.5.15"
+      "version": "0.5.16"
     },
     {
       "bundled_license_texts": [
@@ -3387,26 +3387,26 @@
     {
       "bundled_license_texts": [
         {
-          "path": "rustls-0.23.45/LICENSE-APACHE",
+          "path": "rustls-0.23.46/LICENSE-APACHE",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
         },
         {
-          "path": "rustls-0.23.45/LICENSE-ISC",
+          "path": "rustls-0.23.46/LICENSE-ISC",
           "sha256": "7cfafc877eccc46c0e346ccbaa5c51bb6b894d2b818e617d970211e232785ad4"
         },
         {
-          "path": "rustls-0.23.45/LICENSE-MIT",
+          "path": "rustls-0.23.46/LICENSE-MIT",
           "sha256": "709e3175b4212f7b13aa93971c9f62ff8c69ec45ad8c6532a7e0c41d7a7d6f8c"
         }
       ],
       "bundled_text_status": "present",
-      "checksum": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634",
+      "checksum": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf",
       "license": "Apache-2.0 OR ISC OR MIT",
       "license_file": null,
-      "metadata_sha256": "9f101ca003e89fff8231fe6da21e67a866b5c1139c8af2a5bc6015b72f4fe383",
+      "metadata_sha256": "ef983ace35d7ad699e22682ee0ee45211f805b074fc9e84190b62f200259070f",
       "name": "rustls",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.23.45"
+      "version": "0.23.46"
     },
     {
       "bundled_license_texts": [
@@ -3431,18 +3431,18 @@
     {
       "bundled_license_texts": [
         {
-          "path": "rustls-webpki-0.103.15/LICENSE",
+          "path": "rustls-webpki-0.103.16/LICENSE",
           "sha256": "5b698ca13897be3afdb7174256fa1574f8c6892b8bea1a66dd6469d3fe27885a"
         }
       ],
       "bundled_text_status": "present",
-      "checksum": "f3c3cf1d8b1e7d4927e2d154c3fcb02979afb9939629c62cd9048d4f07b60ac2",
+      "checksum": "4443b1b6d39d7c663139942cc4558262562d2c84123bb6282ef177009ca8b281",
       "license": "ISC",
       "license_file": null,
-      "metadata_sha256": "828ab5e8a7973ba0eef93956128a41ac135479367ed10ddaeaec44616d395355",
+      "metadata_sha256": "5b759da0e12ee54e9b3ee5e0d3fac82e0ecee11317d464f9dfbb53e9d73d0948",
       "name": "rustls-webpki",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.103.15"
+      "version": "0.103.16"
     },
     {
       "bundled_license_texts": [
@@ -4683,22 +4683,22 @@
     {
       "bundled_license_texts": [
         {
-          "path": "url-2.5.8/LICENSE-APACHE",
+          "path": "url-2.5.9/LICENSE-APACHE",
           "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
         },
         {
-          "path": "url-2.5.8/LICENSE-MIT",
+          "path": "url-2.5.9/LICENSE-MIT",
           "sha256": "b38f11f6096706e6de553dabe2a7ed142d59b6fa8c97e290c67496154745cdd5"
         }
       ],
       "bundled_text_status": "present",
-      "checksum": "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed",
+      "checksum": "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a",
       "license": "MIT OR Apache-2.0",
       "license_file": null,
-      "metadata_sha256": "7003e5562b5ab8454b9d78376303151af79011f5dd684c1891e0f46bc9112016",
+      "metadata_sha256": "8f084b776440d30dd3c1334d0a35126ecf2d2fa8ef18d3ac6c4318ec747adbbd",
       "name": "url",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "2.5.8"
+      "version": "2.5.9"
     },
     {
       "bundled_license_texts": [
@@ -5025,18 +5025,18 @@
     {
       "bundled_license_texts": [
         {
-          "path": "webpki-roots-1.0.9/LICENSE",
+          "path": "webpki-roots-1.0.10/LICENSE",
           "sha256": "e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8"
         }
       ],
       "bundled_text_status": "present",
-      "checksum": "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a",
+      "checksum": "1c1c8e20c8a38fc7d65abfe74eb7280e4aa667e8eec8bc84996d2874810748d9",
       "license": "CDLA-Permissive-2.0",
       "license_file": null,
-      "metadata_sha256": "c065fa807b0670e11a766526477abf5af99074821f2fe9d6117770229884ccff",
+      "metadata_sha256": "de646fd479c785c735b30fa970d95d0b883688b9edc817aed5e6a6a3eac39013",
       "name": "webpki-roots",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "1.0.9"
+      "version": "1.0.10"
     },
     {
       "bundled_license_texts": [
